@@ -289,8 +289,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     const bool single = typed;
     const bool legacy = !single;
-    const UINT width = bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const bool detile = GetEnvironmentVariableW(L"X2W_TEST_DETILE_SRV", nullptr, 0) != 0;  // a 64x64 check target
+    const UINT width = detile ? 64 : bc_chain ? 384 : bc7 ? (bc7->small4k ? 48 : bc7->width) : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = detile ? 64 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
@@ -302,7 +303,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain && !detile ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -326,6 +327,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (detile) {
+        extern int draw_detile_srvs(void*, void*);
+        if (const int result = draw_detile_srvs(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ANNOUNCED_SRV", nullptr, 0)) {
+        extern int draw_announced_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_announced_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", nullptr, 0)) {
+        extern int draw_uav_stores(ID3D12Device*, void*, void*);
+        if (const int result = draw_uav_stores(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_MEMORY_SRV_DIAG", nullptr, 0)) {
         extern int draw_memory_srv_diagnostics(ID3D12Device*, void*, void*);
         if (const int result = draw_memory_srv_diagnostics(desktop.Get(), guest, list)) return result;
@@ -491,7 +501,32 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 12, 3, 1);
         last = 2;
     }
+    // X2W_TEST_FRAME_COPY=reuse: execute the first list, wait, and record the second half of the frame on the same
+    // list after Reset (startup_frame_copy.cpp).
+    char copy_mode[8] = "";
+    GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", copy_mode, sizeof(copy_mode));
+    const bool copy_reuse = std::strcmp(copy_mode, "reuse") == 0;
+    if (copy_reuse) {
+        if (const int rc = submit(1)) return rc;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return 35;
+        invoke(list, 50, 1, arg(&rtv));
+        invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(list, 25, arg(pso));
+        extern int draw_frame_copies_again(void*, UINT, UINT);
+        if (const int result = draw_frame_copies_again(list, width, height)) return result;
+        last = 2;
+    }
     if (const int rc = submit(last)) return rc;
+    if (copy_reuse) {
+        extern int write_ring_counters();
+        if (const int result = write_ring_counters()) return result;
+    }
+    if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", nullptr, 0)) {
+        extern void report_uav_stores();
+        report_uav_stores();
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_report();
         if (const int rc = root_heap_report()) return rc;

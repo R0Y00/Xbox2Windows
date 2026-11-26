@@ -102,12 +102,12 @@ struct Probe {
                SUCCEEDED(queue1->RegisterMessageCallback(on_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie));
     }
 
-    bool readback_depth(ID3D12Resource* target, UINT width, UINT height, std::vector<float>& out)
+    bool readback_depth(ID3D12Resource* target, UINT width, UINT height, std::vector<float>& out, UINT subresource = 0)
     {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         UINT64 total = 0;
         const auto desc = target->GetDesc();
-        desktop->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+        desktop->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, nullptr, nullptr, &total);
 
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
         const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -132,6 +132,7 @@ struct Probe {
         D3D12_TEXTURE_COPY_LOCATION to{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
         to.PlacedFootprint = footprint;
         D3D12_TEXTURE_COPY_LOCATION from{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        from.SubresourceIndex = subresource;
         copy->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
         transition(copy.Get(), target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
@@ -237,7 +238,7 @@ int main(int argc, char** argv)
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
-    } dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0},
+    } dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 6, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0},
       rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0};
 
     void* dsv_heap = nullptr;
@@ -306,6 +307,29 @@ int main(int argc, char** argv)
     clear_dsv(list, handle_a, static_cast<D3D12_CLEAR_FLAGS>(0), 0.5f, 0, 0, nullptr);
     if (!check_count("6 zero clear flags", seen, 0)) return 15;
 
+    ComPtr<ID3D12Resource> mixed;
+    auto mixed_desc = depth_desc(8, 8);
+    mixed_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    mixed_desc.MipLevels = 2;
+    mixed_desc.DepthOrArraySize = 2;
+    if (FAILED(probe.desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &mixed_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                      nullptr, IID_PPV_ARGS(&mixed)))) return 22;
+    unsigned before_binds = 0, after_binds = 0;
+    x2w_d3d12_render_target_stats(&before_binds, nullptr);
+    for (UINT i = 0; i < 2; ++i) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+        view.Format = mixed_desc.Format;
+        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray.ArraySize = 2;
+        view.Flags = i ? D3D12_DSV_FLAG_READ_ONLY_STENCIL : D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(dsv_cpu + (4 + i) * dsv_stride)};
+        invoke(device, 21, arg(mixed.Get()), arg(&view), handle.ptr);
+        invoke(list, 50, 0, 0, FALSE, arg(&handle));
+        clear_dsv(list, handle, i ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL, 0.5f, 7, 0, nullptr);
+    }
+    x2w_d3d12_render_target_stats(&after_binds, nullptr);
+    if (after_binds != before_binds + 2) return 23;
+
     // Close and submit
     invoke(list, 9);
     if (!probe.submit(list)) return 16;
@@ -323,6 +347,17 @@ int main(int argc, char** argv)
         if (values_b[i] != 0.75f) return 20;
     }
 
+    // Read the first texel from both planes of each array layer after alternating their write masks.
+    for (UINT slice = 0; slice < 2; ++slice) {
+        std::vector<float> depth, stencil;
+        if (!probe.readback_depth(mixed.Get(), 1, 1, depth, 2 * slice) ||
+            !probe.readback_depth(mixed.Get(), 1, 1, stencil, 4 + 2 * slice)) return 24;
+        UINT d = 0, s = 0;
+        std::memcpy(&d, depth.data(), sizeof(d));
+        std::memcpy(&s, stencil.data(), sizeof(s));
+        std::printf("mixed D24S8 slice %u: depth %08x stencil %08x\n", slice, d, s);
+        if ((d & 0xffffff) != 0x800000 || (s & 0xff) != 7) return 25;
+    }
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     const unsigned long long errors = debug_error_count.load();
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),

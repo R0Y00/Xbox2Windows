@@ -12,6 +12,8 @@ def run(mode, rgb=""):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_PRESENT_SIGNATURE_EVERY="1", X2W_RED_PRODUCER_FRAMES="", X2W_RED_PRODUCER_AUTO="",
                X2W_RED_PRODUCER_RGB=rgb)
+    if mode == "title-window":
+        env["X2W_PRESENT_IN_TITLE_WINDOW"] = "1"
     if mode.startswith("auto"):
         env["X2W_RED_PRODUCER_AUTO"] = "4,2"
     else:
@@ -61,6 +63,10 @@ def check_barriers():
 
 if __name__ == "__main__" and OPTIONS == ["barriers"]:
     check_barriers()
+elif __name__ == "__main__" and OPTIONS == ["title-window"]:
+    logs, _, adapter = run("title-window")
+    assert "first flip on the original window" in logs, logs
+    print(f"Original window received the flip and retained its title after resize ({adapter})")
 elif __name__ == "__main__":
     check(False)
     check(True)

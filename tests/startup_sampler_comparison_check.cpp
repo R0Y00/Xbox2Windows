@@ -56,6 +56,31 @@ int main()
         expect(both[1].ShaderRegister == 1 && both[1].Filter == 0x80 && both[1].ComparisonFunc == D3D12_COMPARISON_FUNC_LESS,
                "comparison sampler at register 1", both[1].Filter, both[1].ComparisonFunc);
     }
+    // Signed 14-bit fixed-point LOD bias uses eight fractional bits.
+    {
+        using x2w_startup::decode_sampler;
+        const auto biased = decode_sampler({0, 0xfffu << 12, (1u << 26) | ((1u << 14) - 128), 0}, 0, false, false, true);
+        expect(biased.MipLODBias == -0.5f && biased.MinLOD == 0.0f && biased.MaxLOD == D3D12_FLOAT32_MAX, "bias -0.5");
+        expect(decode_sampler({0, 0, 0x100, 0}, 0, false, false, true).MipLODBias == 1.0f, "bias +1");
+        expect(decode_sampler({0, 0, 0x2000, 0}, 0, false, false, true).MipLODBias == D3D12_MIP_LOD_BIAS_MIN, "bias clamped low");
+        expect(decode_sampler({0, 0, 0x1fff, 0}, 0, false, false, true).MipLODBias == D3D12_MIP_LOD_BIAS_MAX, "bias clamped high");
+        const auto limited = decode_sampler({0, 0x180u | 0x280u << 12, 0, 1u << 30}, 0, false, false, true);
+        expect(limited.MinLOD == 1.5f && limited.MaxLOD == 2.5f, "min 1.5 max 2.5");
+        expect(limited.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK, "border opaque black");
+        expect(decode_sampler({0, 0, 0, 2u << 30}, 0, false, false, true).BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+               "border opaque white");
+        expect(decode_sampler({0, 0, 0, 3u << 30}, 0, false, false, true).BorderColor == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+               "border register -> transparent black");
+        expect(decode_sampler({0, 0x300u | 0x100u << 12, 0, 0}, 0, false, false, true).MaxLOD == 3.0f, "max below min raised to min");
+        // Border color is decoded independently of the optional LOD fields.
+        const auto plain = decode_sampler({0, 0x180u | 0x280u << 12, (1u << 26) | ((1u << 14) - 128), 2u << 30}, 0, false, false, false);
+        expect(plain.MipLODBias == 0.0f && plain.MinLOD == 0.0f && plain.MaxLOD == D3D12_FLOAT32_MAX &&
+               plain.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE, "border retained with LOD fields off");
+        const auto dynamic = x2w_startup::dynamic_sampler({0, 0, 0, 2u << 30}, true);
+        expect(dynamic.BorderColor[0] == 1.0f && dynamic.BorderColor[3] == 1.0f, "dynamic border white");
+        const auto fallback = x2w_startup::border_sampler();
+        expect(fallback.MaxLOD == D3D12_FLOAT32_MAX, "fallback sampler unlimited");
+    }
     // An smpl line (image_sample_b) carries MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12), u4.8, to MinLOD and
     // MaxLOD; the same words on an smp line keep MinLOD 0 and an unbounded MaxLOD.
     x2w_startup::TranslatedSamplers limits;

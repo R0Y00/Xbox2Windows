@@ -58,6 +58,21 @@ inline QueryRegion query_region()
 }
 } // namespace placed_detail
 
+// OpenExistingHeapFromAddress imports the whole private allocation. VirtualQuery
+// splits it at any change of commitment or page protection; a second region
+// belonging to the same allocation therefore disqualifies the import.
+inline bool private_heap_importable(void* base)
+{
+    MEMORY_BASIC_INFORMATION first{}, next{};
+    if (!base || VirtualQuery(base, &first, sizeof(first)) != sizeof(first) ||
+        first.AllocationBase != base || first.BaseAddress != base || first.Type != MEM_PRIVATE ||
+        first.State != MEM_COMMIT || (first.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(base);
+    if (first.RegionSize > UINTPTR_MAX - start) return false;
+    return VirtualQuery(reinterpret_cast<void*>(start + first.RegionSize), &next, sizeof(next)) == sizeof(next) &&
+           next.AllocationBase != base;
+}
+
 // False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
 // exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
 // full walk measures.

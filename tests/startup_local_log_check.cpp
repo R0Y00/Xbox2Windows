@@ -465,10 +465,10 @@ void test_probe_and_access(bool guard_drop_mutate)
     std::memset(raw, 0x5A, kPages * kPage);
 
     // Invalid addresses and zero-byte lengths.
-    check(x2w_local::probe_readable(0, 16) == 0, "probe_readable rejects null");
-    check(x2w_local::probe_readable(0xFFFFu, 16) == 0, "probe_readable rejects < 0x10000");
-    check(x2w_local::probe_readable(0x00007FFFFFFF0000ull, 16) == 0, "probe_readable rejects > user limit");
-    check(x2w_local::probe_readable(base, 0) == 0, "probe_readable rejects 0 bytes");
+    check(x2w_local::probe_descriptor_address(0, 16) == 0, "probe_readable rejects null");
+    check(x2w_local::probe_descriptor_address(0xFFFFu, 16) == 0, "probe_readable rejects < 0x10000");
+    check(x2w_local::probe_descriptor_address(0x00007FFFFFFF0000ull, 16) == 0, "probe_readable rejects > user limit");
+    check(x2w_local::probe_descriptor_address(base, 0) == 0, "probe_readable rejects 0 bytes");
 
     check(!x2w_local::readable(nullptr, 1) && !x2w_local::writable(nullptr, 1), "accessible rejects null");
     const auto low_ptr = reinterpret_cast<const void*>(std::uintptr_t{0xFFFF});
@@ -478,8 +478,8 @@ void test_probe_and_access(bool guard_drop_mutate)
     check(!x2w_local::readable(raw, 0) && !x2w_local::writable(raw, 0), "accessible rejects 0 bytes");
 
     // Multi-page readable range and unaligned slice.
-    check(x2w_local::probe_readable(base, kPages * kPage) == kPages * kPage, "probe_readable full 4 pages");
-    check(x2w_local::probe_readable(base + 0xF00u, 0x2200u) == 0x2200u, "probe_readable unaligned across pages");
+    check(x2w_local::probe_descriptor_address(base, kPages * kPage) == kPages * kPage, "probe_readable full 4 pages");
+    check(x2w_local::probe_descriptor_address(base + 0xF00u, 0x2200u) == 0x2200u, "probe_readable unaligned across pages");
     check(x2w_local::readable(raw, kPages * kPage) && x2w_local::writable(raw, kPages * kPage),
           "4-page RW region is readable and writable");
 
@@ -524,11 +524,11 @@ void test_probe_and_access(bool guard_drop_mutate)
     // PAGE_NOACCESS on page 2: truncates probe_readable prefix cleanly.
     check(VirtualProtect(reinterpret_cast<void*>(base + 2 * kPage), kPage, PAGE_NOACCESS, &old_prot) != 0,
           "VirtualProtect page 2 PAGE_NOACCESS");
-    check(x2w_local::probe_readable(base, kPages * kPage) == 2 * kPage,
+    check(x2w_local::probe_descriptor_address(base, kPages * kPage) == 2 * kPage,
           "probe_readable truncates before PAGE_NOACCESS");
-    check(x2w_local::probe_readable(base + 0x123u, kPages * kPage - 0x123u) == 2 * kPage - 0x123u,
+    check(x2w_local::probe_descriptor_address(base + 0x123u, kPages * kPage - 0x123u) == 2 * kPage - 0x123u,
           "probe_readable unaligned truncates before PAGE_NOACCESS");
-    check(x2w_local::probe_readable(base + 2 * kPage, kPage) == 0,
+    check(x2w_local::probe_descriptor_address(base + 2 * kPage, kPage) == 0,
           "probe_readable on PAGE_NOACCESS returns 0");
     check(!x2w_local::readable(reinterpret_cast<const void*>(base + 2 * kPage), 1) &&
           !x2w_local::writable(reinterpret_cast<const void*>(base + 2 * kPage), 1),
@@ -539,7 +539,7 @@ void test_probe_and_access(bool guard_drop_mutate)
     // PAGE_GUARD on page 1: probe stops before guard page and re-arms PAGE_GUARD.
     check(VirtualProtect(reinterpret_cast<void*>(base + kPage), kPage, PAGE_READWRITE | PAGE_GUARD, &old_prot) != 0,
           "VirtualProtect page 1 PAGE_GUARD");
-    check(x2w_local::probe_readable(base, 2 * kPage) == kPage,
+    check(x2w_local::probe_descriptor_address(base, 2 * kPage) == kPage,
           "probe_readable stops at PAGE_GUARD page");
     MEMORY_BASIC_INFORMATION mbi{};
     check(VirtualQuery(reinterpret_cast<const void*>(base + kPage), &mbi, sizeof(mbi)) != 0,
@@ -549,7 +549,7 @@ void test_probe_and_access(bool guard_drop_mutate)
     } else {
         check((mbi.Protect & PAGE_GUARD) != 0, "probe_readable re-arms PAGE_GUARD after trip");
         // Second probe must hit the re-armed guard page at the same offset and keep it armed.
-        check(x2w_local::probe_readable(base, 2 * kPage) == kPage,
+        check(x2w_local::probe_descriptor_address(base, 2 * kPage) == kPage,
               "second probe_readable still stops at re-armed PAGE_GUARD");
         MEMORY_BASIC_INFORMATION mbi2{};
         check(VirtualQuery(reinterpret_cast<const void*>(base + kPage), &mbi2, sizeof(mbi2)) != 0 &&
@@ -574,7 +574,7 @@ void test_probe_and_access(bool guard_drop_mutate)
         void* const first_committed = VirtualAlloc(reserved, kPage, MEM_COMMIT, PAGE_READWRITE);
         check(first_committed == reserved, "commit first page of reserved range");
         const auto rbase = reinterpret_cast<std::uintptr_t>(reserved);
-        check(x2w_local::probe_readable(rbase, 2 * kPage) == kPage,
+        check(x2w_local::probe_descriptor_address(rbase, 2 * kPage) == kPage,
               "probe_readable truncates before MEM_RESERVE");
         check(x2w_local::readable(reserved, kPage) && x2w_local::writable(reserved, kPage),
               "committed head of reserved range is readable and writable");
@@ -613,6 +613,10 @@ int main(int argc, char** argv)
         two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "cache-failure") == 0;
     // --mutate wrap: negative control running only the wrap-point case with the counting gate.
     const bool wrap_mutate = two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "wrap") == 0;
+    if (argc == 2 && std::strcmp(argv[1], "--probe-only") == 0) {
+        test_probe_and_access(false);
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && !guard_drop_mutate && !reopen_mutate && !cache_failure_mutate && !wrap_mutate) {
         std::printf("unknown mutation\n");
         return 2;

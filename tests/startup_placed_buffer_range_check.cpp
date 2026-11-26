@@ -345,10 +345,19 @@ int main(int argc, char** argv)
         if (heap) HeapDestroy(heap);
         auto* reservation = static_cast<char*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE, PAGE_READWRITE));
         if (reservation && VirtualAlloc(reservation + page, page, MEM_COMMIT, PAGE_READWRITE)) {
+            if (x2w_startup::private_heap_importable(reservation))
+                setup_fail("private heap import accepted a reserved prefix", reservation);
             current = partial;
             place(reservation + page, page, 0, "committed suffix after a reserved prefix");
             place(reservation + page, 2 * page, 0, "committed suffix with buffer past the allocation");
             current = other;
+            if (!VirtualAlloc(reservation, page, MEM_COMMIT, PAGE_READWRITE) ||
+                !x2w_startup::private_heap_importable(reservation))
+                setup_fail("private heap import rejected a newly completed allocation", reservation);
+            DWORD old = 0;
+            if (!VirtualProtect(reservation + page, page, PAGE_READONLY, &old) ||
+                x2w_startup::private_heap_importable(reservation))
+                setup_fail("private heap import accepted mixed page protection", reservation);
         } else {
             setup_fail("cannot construct an allocation with a reserved prefix", reservation);
         }

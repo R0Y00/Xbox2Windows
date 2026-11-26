@@ -16,6 +16,8 @@
 // Exit codes: 0 pass, 77 no physical adapter, other values name the failing step.
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
+#include "desktop_gpu.h"
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -238,6 +240,178 @@ int main(int argc, char** argv)
     invoke(readback, 9, 0, 0);
     if (!block_ok) return 22;
 
+    // The title receives its metering samples directly in a placed buffer. The console
+    // footprint starts at a byte offset and has no desktop row padding.
+    auto* title = static_cast<unsigned char*>(VirtualAlloc(nullptr, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!title) return 23;
+    auto place_desc = buffer_desc(1024);
+    void* placed{};
+    if (!ok(invoke(device, 133, arg(title + 8), arg(&place_desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                   arg(&__uuidof(ID3D12Resource)), arg(&placed))) || !placed) return 24;
+    std::array<float, 20> meter{};
+    for (UINT i = 0; i < meter.size(); ++i) meter[i] = 0.125f * (i + 1);
+    auto* bytes = reinterpret_cast<const unsigned char*>(meter.data());
+    if (!ok(invoke(upload, 8, 0, 0, arg(&memory))) || !memory) return 25;
+    std::memcpy(memory, bytes, sizeof(meter));
+    invoke(upload, 9);
+    if (!ok(invoke(list, 139, arg(allocator), 0))) return 26;
+    for (UINT w : {5u, 1u}) {
+        D3D12_RESOURCE_DESC meter_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, 1, 1, 1,
+                                       DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN};
+        void* meter_texture = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, meter_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!meter_texture) return 27;
+        const auto tex = subresource(meter_texture, 0);
+        auto up = footprint(upload, 0);
+        up.PlacedFootprint.Footprint = {meter_desc.Format, w, 1, 1, pitch};
+        copy(tex, up);
+        auto out = footprint(placed, w == 5 ? 7 : 110);
+        out.PlacedFootprint.Footprint = {meter_desc.Format, w, 1, 1, 16*w};
+        invoke(list, 85, arg(&out), 0, 0, 0, arg(&tex), 0, 0);
+    }
+    if (!ok(invoke(list, 9))) return 28;
+    for (int replay = 0; replay < 2; ++replay) {
+        std::memset(title, sentinel, 1024);
+        if (!replay) {
+            void* gate{};
+            if (!ok(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate))) ||
+                !ok(invoke(queue, 17, arg(gate), 1))) return 29;
+            void* lists[] = {list};
+            invoke(queue, 10, 1, arg(lists));
+            if (!ok(invoke(queue, 16, arg(fence), ++fence_value)) || title[15] != sentinel ||
+                invoke(fence, 8) >= fence_value) return 29;
+            if (!ok(invoke(gate, 10, 1)) || !wait_for(fence, fence_value)) return 29;
+        } else if (!submit()) return 29;
+        for (UINT i=0; i<1024; ++i) {
+            const auto expected = i >= 15 && i < 95 ? bytes[i-15] : i >= 118 && i < 134 ? bytes[i-118] : sentinel;
+            if (title[i] != expected) {
+                std::printf("meter replay %d byte %u got %02x expected %02x\n", replay, i, title[i], expected);
+                return 30;
+            }
+        }
+    }
+    // Reset discards the recording. An empty submission must not land it a third time.
+    std::memset(title, sentinel, 1024);
+    if (!ok(invoke(list, 139, arg(allocator), 0)) || !ok(invoke(list, 9)) || !submit() || title[16] != sentinel) return 31;
+    // A typeless texture, a typed sRGB texture, and a linear UNORM footprint share
+    // one copy format family. Verify the actual bytes survive both transfers.
+    auto family_desc = texture_desc;
+    family_desc.MipLevels = family_desc.DepthOrArraySize = 1;
+    family_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    auto* raw_texture = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, family_desc, D3D12_RESOURCE_STATE_COMMON);
+    family_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    auto* srgb_texture = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, family_desc, D3D12_RESOURCE_STATE_COMMON);
+    if (!raw_texture || !srgb_texture || !ok(invoke(list, 139, arg(allocator), 0))) return 32;
+    const auto raw = subresource(raw_texture, 0), srgb = subresource(srgb_texture, 0);
+    copy(raw, b_up);
+    invoke(list, 85, arg(&srgb), 0, 0, 0, arg(&raw));
+    copy(a_out, srgb);
+    if (!ok(invoke(list, 9)) || !submit() || !ok(invoke(readback, 8, 0, 0, arg(&memory))) || !memory) return 33;
+    const bool family_matches = image_matches(static_cast<const std::uint8_t*>(memory), 0, 1);
+    invoke(readback, 9);
+    if (!family_matches) return 34;
+
+    for (auto bc : {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC7_UNORM_SRGB}) {
+        const UINT block_bytes = bc == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+        auto packed_desc = family_desc;
+        packed_desc.Format = block_bytes == 8 ? DXGI_FORMAT_R32G32_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
+        auto bc_desc = packed_desc;
+        bc_desc.Format = bc;
+        bc_desc.Width *= 4;
+        bc_desc.Height *= 4;
+        auto* packed = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, packed_desc, D3D12_RESOURCE_STATE_COMMON);
+        auto* compressed = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, bc_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!packed || !compressed || !ok(invoke(upload, 8, 0, 0, arg(&memory))) || !memory) return 35;
+        for (UINT y = 0; y < side; ++y)
+            for (UINT i = 0; i < side * block_bytes; ++i)
+                static_cast<BYTE*>(memory)[y * pitch + i] = BYTE(17 * y + 3 * i + bc);
+        invoke(upload, 9);
+        if (!ok(invoke(list, 139, arg(allocator), 0))) return 36;
+        const auto blocks = subresource(packed, 0), material = subresource(compressed, 0);
+        copy(blocks, footprint(upload, 0, packed_desc.Format));
+        invoke(list, 85, arg(&material), 0, 0, 0, arg(&blocks));
+        auto bytes_out = footprint(readback, 0, bc);
+        bytes_out.PlacedFootprint.Footprint.Width = UINT(bc_desc.Width);
+        bytes_out.PlacedFootprint.Footprint.Height = bc_desc.Height;
+        copy(bytes_out, material);
+        if (!ok(invoke(list, 9)) || !submit() || !ok(invoke(readback, 8, 0, 0, arg(&memory))) || !memory) return 37;
+        bool intact = true;
+        for (UINT y = 0; y < side; ++y)
+            for (UINT i = 0; i < side * block_bytes; ++i)
+                intact &= static_cast<const BYTE*>(memory)[y * pitch + i] == BYTE(17 * y + 3 * i + bc);
+        invoke(readback, 9);
+        if (!intact) { std::printf("block payload mismatch, format %u\n", UINT(bc)); return 38; }
+        if (!ok(invoke(list, 139, arg(allocator), 0))) return 39;
+        const D3D12_BOX first_word{0, 0, 0, 1, 1, 1}, second_block{4, 4, 0, 8, 8, 1};
+        invoke(list, 85, arg(&material), 4, 4, 0, arg(&blocks), arg(&first_word));
+        invoke(list, 85, arg(&blocks), 2, 2, 0, arg(&material), arg(&second_block));
+        copy(footprint(readback, 0, packed_desc.Format), blocks);
+        if (!ok(invoke(list, 9)) || !submit() || !ok(invoke(readback, 8, 0, 0, arg(&memory))) || !memory) return 40;
+        for (UINT y = 0; y < side; ++y)
+            for (UINT i = 0; i < side * block_bytes; ++i) {
+                const bool replaced = y == 2 && i / block_bytes == 2;
+                const auto expected = BYTE((replaced ? 3 * (i % block_bytes) : 17 * y + 3 * i) + bc);
+                intact &= static_cast<const BYTE*>(memory)[y * pitch + i] == expected;
+            }
+        invoke(readback, 9);
+        if (!intact) return 41;
+    }
+#include "startup_bc_writer_srv.inl"
+    D3D12_RESOURCE_DESC planar_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 16, 2, 2,
+                                    DXGI_FORMAT_R32G8X24_TYPELESS, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+    void* planar = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, planar_desc, D3D12_RESOURCE_STATE_COMMON);
+    if (!planar || !ok(invoke(list, 139, arg(allocator), 0))) return 42;
+    LONG forwarded_before{}, refused_before{}, forwarded_after{}, refused_after{};
+    x2w_d3d12_list_copy_texture_stats(&forwarded_before, &refused_before);
+    for (UINT sub : {3u, 7u, 7u}) {
+        auto src = subresource(planar, sub);
+        auto dst = footprint(readback, 512, sub == 3 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UINT);
+        const D3D12_BOX region{1, 2, 0, 3, 4, 1};
+        invoke(list, 85, arg(&dst), 2, 3, 0, arg(&src), arg(&region), 0);
+    }
+    x2w_d3d12_list_copy_texture_stats(&forwarded_after, &refused_after);
+    if (forwarded_after != forwarded_before || refused_after - refused_before != 3 || !ok(invoke(list, 9))) return 43;
+    // Seed depth and stencil differently, copy only depth from mip 1, slice 1, and replay the recording.
+    if (!ok(invoke(list, 139, arg(allocator), 0))) return 44;
+    const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
+        heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE}, 0, 0};
+    void* dsv_heap{};
+    if (!ok(invoke(device, 14, arg(&heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&dsv_heap))) || !dsv_heap) return 45;
+    const Word handle = invoke(dsv_heap, 9);
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    dsv.Texture2DArray = {1, 1, 1};
+    invoke(device, 21, arg(planar), arg(&dsv), handle);
+    using Clear = void (WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+    reinterpret_cast<Clear>((*static_cast<void***>(list))[51])(list, {SIZE_T(handle)},
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375f, 0xa5, 0, nullptr);
+    auto depth_desc = planar_desc;
+    constexpr UINT depth_width = 128, depth_pitch = depth_width * sizeof(float);
+    depth_desc.Width = depth_width;
+    depth_desc.Height = 8;
+    depth_desc.DepthOrArraySize = depth_desc.MipLevels = 1;
+    depth_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    void* depth_copy = make_resource(device, D3D12_HEAP_TYPE_DEFAULT, depth_desc, D3D12_RESOURCE_STATE_COMMON);
+    void* depth_out = make_resource(device, D3D12_HEAP_TYPE_READBACK, buffer_desc(8 * depth_pitch), D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!depth_copy || !depth_out) return 46;
+    auto from_depth = subresource(planar, 3), to_depth = subresource(depth_copy, 0);
+    auto out_depth = footprint(depth_out, 0, DXGI_FORMAT_R32_TYPELESS);
+    out_depth.PlacedFootprint.Footprint.Width = depth_width;
+    out_depth.PlacedFootprint.Footprint.Height = 8;
+    out_depth.PlacedFootprint.Footprint.RowPitch = depth_pitch;
+    invoke(list, 85, arg(&to_depth), 0, 0, 0, arg(&from_depth), 0, 0);
+    copy(out_depth, to_depth);
+    x2w_d3d12_list_copy_texture_stats(&forwarded_before, &refused_before);
+    if (forwarded_before - forwarded_after != 2 || refused_before != refused_after || !ok(invoke(list, 9))) return 47;
+    for (unsigned replay = 0; replay < 2; ++replay) {
+        if (!submit() || !ok(invoke(depth_out, 8, 0, 0, arg(&memory))) || !memory) return 48;
+        bool intact = true;
+        for (unsigned y = 0; y < 8; ++y) for (unsigned x = 0; x < depth_width; ++x)
+            intact &= reinterpret_cast<const float*>(static_cast<const BYTE*>(memory) + y * depth_pitch)[x] == 0.375f;
+        invoke(depth_out, 9);
+        if (!intact) return 49;
+    }
     std::puts("ok");
     return 0;
 }

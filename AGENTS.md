@@ -180,6 +180,14 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_live_telemetry_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_watch_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_ldexp_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_literal_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mix_fma_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_named_dest_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f16_arith_check.py
+./out/pe-env/bin/python -B tests/startup_image_sample_implicit_lod_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_exec_lane_facts_check.py
+./out/pe-env/bin/python -B tests/startup_fma_exact_fxc_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sload_const_offset_check.py
@@ -245,6 +253,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cmp16_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_local_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_brev_fold_check.py

@@ -11,8 +11,13 @@ struct WindowPresenter {
     ID3D12DescriptorHeap* targets = nullptr;
     ID3D12DescriptorHeap* textures = nullptr;
     ID3D12Resource* buffers[2] = {};
-    ID3D12CommandAllocator* allocator = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
+    // LOCAL stall: two copy slots (allocator, list, view), each reused only once the fence value of its
+    // last copy has passed; a present whose slot is still busy skips the window copy instead of waiting.
+    ID3D12CommandAllocator* allocators[2] = {};
+    ID3D12GraphicsCommandList* lists[2] = {};
+    UINT64 slot_values[2] = {};
+    UINT next_slot = 0;
+    LONG skipped = 0;
     ID3D12RootSignature* root = nullptr;
     ID3D12PipelineState* pipeline = nullptr;
     ID3D12Fence* fence = nullptr;
@@ -22,6 +27,12 @@ struct WindowPresenter {
     bool failed = false;
 };
 WindowPresenter window_presenter;
+x2w_startup::TitleComposition title_composition;
+bool present_in_title_window()
+{
+    static const bool enabled = x2w_local::env_on("X2W_PRESENT_IN_TITLE_WINDOW");
+    return enabled;
+}
 LONG window_presents;
 
 // The output window belongs to this layer and has its own thread and message loop; the title's
@@ -117,14 +128,21 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        hr = factory->CreateSwapChainForHwnd(queue, window, &desc, nullptr, nullptr, &chain1);
-        if (SUCCEEDED(hr)) factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+        if (present_in_title_window()) {
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            desc.Scaling = DXGI_SCALING_STRETCH;
+            desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            hr = factory->CreateSwapChainForComposition(queue, &desc, nullptr, &chain1);
+        } else {
+            hr = factory->CreateSwapChainForHwnd(queue, window, &desc, nullptr, nullptr, &chain1);
+            if (SUCCEEDED(hr)) factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+        }
     }
     if (SUCCEEDED(hr)) hr = chain1->QueryInterface(IID_PPV_ARGS(&p.chain));
     if (chain1) chain1->Release();
     if (factory) factory->Release();
     const D3D12_DESCRIPTOR_HEAP_DESC target_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};  // one view per copy slot
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&target_heap, IID_PPV_ARGS(&p.targets));
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&texture_heap, IID_PPV_ARGS(&p.textures));
     const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -133,9 +151,11 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
         if (SUCCEEDED(hr))
             device->CreateRenderTargetView(p.buffers[i], nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{p.targets->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * step});
     }
-    if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocator));
-    if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocator, nullptr, IID_PPV_ARGS(&p.list));
-    if (SUCCEEDED(hr)) hr = p.list->Close();
+    for (int i = 0; i < 2; ++i) {
+        if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocators[i]));
+        if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocators[i], nullptr, IID_PPV_ARGS(&p.lists[i]));
+        if (SUCCEEDED(hr)) hr = p.lists[i]->Close();
+    }
     if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.fence));
     p.reached = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     static const char source[] =
@@ -186,6 +206,99 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     return SUCCEEDED(hr);
 }
 
+void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, const void* present_parameters)
+{
+    static const bool on = [] {
+        const bool value = x2w_local::env_on("X2W_PRESENT_PLANES_LOG");
+        if (value) log("x2w-present X2W_PRESENT_PLANES_LOG=1: plane changes and one line per 300 frames are logged");
+        return value;
+    }();
+    if (!on) return;
+    static UINT last_planes = ~0u;
+    static u64 last_count = ~0ull, last_shape = ~0ull;
+    static u64 known[8];
+    static UINT known_count, flips_since, extra_planes_since;
+    static u64 last_surface;
+    static LONG lines, summaries;
+    const auto* words = static_cast<const u64*>(plane_parameters);
+    const bool header = planes && words && x2w_local::readable(words, 0x18);
+    const u64 count = header ? words[1] : 0;
+    u64 surface = 0, shape = 0;
+    if (header && count >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
+        surface = *reinterpret_cast<const u64*>(words[2]);
+        Wrapper* wrapper = as_wrapper(reinterpret_cast<const void*>(surface));
+        if (wrapper && wrapper->own().kind == resource_kind && wrapper->own().real) {
+            const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(wrapper->own().real)->GetDesc();
+            shape = (desc.Width & 0xFFFFF) | (u64{desc.Height & 0xFFFFF} << 20) | (u64{static_cast<UINT>(desc.Format) & 0xFFF} << 40);
+        }
+    }
+    // Called from queue_present only, one thread at a time per queue; the statics are diagnostics.
+    if (surface != last_surface) ++flips_since;
+    last_surface = surface;
+    if (planes > 1 || count > 1) ++extra_planes_since;
+    bool fresh = false;
+    if (surface) {
+        UINT i = 0;
+        while (i < known_count && known[i] != surface) ++i;
+        if (i == known_count && known_count < 8) {
+            known[known_count++] = surface;
+            fresh = true;
+        }
+    }
+    if (frame % 300 == 0 && first_calls(summaries, 200)) {
+        log("x2w-present planes summary frame %ld: planes=%u resources=%llu %llux%llu format %llu; surfaces seen %u; surface changes %u and "
+            "presents with more than one plane or resource %u in the last 300 frames",
+            frame, planes, count, shape & 0xFFFFF, (shape >> 20) & 0xFFFFF, (shape >> 40) & 0xFFF, known_count, flips_since, extra_planes_since);
+        flips_since = extra_planes_since = 0;
+    }
+    if (planes == last_planes && count == last_count && shape == last_shape && !fresh) return;
+    last_planes = planes;
+    last_count = count;
+    last_shape = shape;
+    if (!first_calls(lines, 32)) return;
+    char a[3 * 0x60 + 1] = "", b[3 * 0x40 + 1] = "";
+    if (plane_parameters && x2w_local::readable(plane_parameters, 0x60)) hex_text(plane_parameters, 0x60, a, sizeof(a));
+    if (present_parameters && x2w_local::readable(present_parameters, 0x40)) hex_text(present_parameters, 0x40, b, sizeof(b));
+    log("x2w-present planes frame %ld: planes=%u resources=%llu surface=0x%llx %llux%llu format %llu; plane=[%s] present=[%s]", frame, planes,
+        count, surface, shape & 0xFFFFF, (shape >> 20) & 0xFFFFF, (shape >> 40) & 0xFFF, a, b);
+}
+
+void note_quiet_frame(LONG frame)
+{
+    static const LONG wanted = [] {
+        char value[16]{};
+        const LONG n = GetEnvironmentVariableA("X2W_D3D12_TRACE_QUIET", value, sizeof(value)) ? std::atol(value) : 0L;
+        if (n > 0) log("x2w-frame X2W_D3D12_TRACE_QUIET=%ld: one frame is traced after %ld quiet frames (1-8 translated draws) past a busy one", n, n);
+        return n > 0 ? n : 0L;
+    }();
+    if (!wanted) return;
+    static const bool dump_dir = GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", nullptr, 0) != 0;
+    static LONG last_total, quiet_run, end_frame, next_allowed, traces;
+    static bool armed;
+    const LONG total = translated_draws;
+    const LONG drawn = total - last_total;
+    last_total = total;
+    if (end_frame && frame == end_frame) {
+        InterlockedExchange(&trace_frame_active, 0);
+        log("x2w-frame ---- end quiet frame %ld (%ld translated draws)", frame, drawn);
+        summarise_indirect_calls();
+        end_frame = 0;
+        return;
+    }
+    static LONG busy_frames;
+    if (drawn >= 20 && ++busy_frames >= 300) armed = true;
+    quiet_run = armed && drawn >= 1 && drawn <= 8 ? quiet_run + 1 : 0;
+    if (end_frame || quiet_run < wanted || frame < next_allowed || traces >= 3) return;
+    ++traces;
+    quiet_run = 0;
+    next_allowed = frame + 3000;
+    end_frame = frame + 1;
+    if (dump_dir && !draw_dump_frame()) InterlockedExchange(&quiet_dump_frame, frame);
+    log("x2w-frame ---- begin quiet frame %ld (previous frame: %ld translated draws, %ld quiet frames)%s", frame + 1, drawn, wanted,
+        quiet_dump_frame == frame ? "; per-draw target dumps on" : "");
+    InterlockedExchange(&trace_frame_active, 1);
+}
+
 // Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
@@ -200,11 +313,28 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
                 desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
         return false;
     }
-    HWND window = output_window();
+    HWND window = present_in_title_window() ? title_composition.window : output_window();
+    if (present_in_title_window() && !IsWindow(window)) window = x2w_startup::title_picture_window();
     if (!window) return false;
     if (!p.chain && !create_window_presenter(queue, window)) {
         p.failed = true;
         return false;
+    }
+    if (present_in_title_window()) {
+        const HRESULT attached = title_composition.show(window, p.chain, p.width, p.height);
+        if (attached != S_OK) {
+            static LONG failures;
+            if (FAILED(attached) && first_calls(failures, 3))
+                log("x2w-present title composition failed: 0x%08lx", static_cast<unsigned long>(attached));
+            return false;
+        }
+    }
+    static const bool wait_each = x2w_local::env_on("X2W_PRESENT_WAIT");
+    const UINT slot = wait_each ? 0 : p.next_slot;
+    if (!wait_each && p.fence->GetCompletedValue() < p.slot_values[slot]) {
+        const LONG n = InterlockedIncrement(&p.skipped);
+        if (n <= 4 || n % 500 == 0) log("x2w-present window copy skipped %ld times (previous copies still queued)", n);
+        return true;  // the window keeps its last picture
     }
     ID3D12Device* device = device_of(the_device);
     const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
@@ -213,36 +343,48 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(surface, &view, p.textures->GetCPUDescriptorHandleForHeapStart());
+    const UINT view_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device->CreateShaderResourceView(surface, &view, D3D12_CPU_DESCRIPTOR_HANDLE{p.textures->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{slot} * view_step});
     const UINT index = p.chain->GetCurrentBackBufferIndex();
     const D3D12_CPU_DESCRIPTOR_HANDLE target{p.targets->GetCPUDescriptorHandleForHeapStart().ptr +
                                              SIZE_T{index} * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
-    if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.pipeline))) return false;
-    transition(p.list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12GraphicsCommandList* list = p.lists[slot];
+    if (FAILED(p.allocators[slot]->Reset()) || FAILED(list->Reset(p.allocators[slot], p.pipeline))) return false;
+    transition(list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(p.width), static_cast<float>(p.height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(p.width), static_cast<LONG>(p.height)};
-    p.list->SetGraphicsRootSignature(p.root);
-    p.list->SetDescriptorHeaps(1, &p.textures);
-    p.list->SetGraphicsRootDescriptorTable(0, p.textures->GetGPUDescriptorHandleForHeapStart());
-    p.list->RSSetViewports(1, &viewport);
-    p.list->RSSetScissorRects(1, &scissor);
-    p.list->OMSetRenderTargets(1, &target, FALSE, nullptr);
-    p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    p.list->DrawInstanced(3, 1, 0, 0);
-    transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    transition(p.list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (FAILED(p.list->Close())) {
+    list->SetGraphicsRootSignature(p.root);
+    list->SetDescriptorHeaps(1, &p.textures);
+    list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{p.textures->GetGPUDescriptorHandleForHeapStart().ptr + UINT64{slot} * view_step});
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    transition(list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    transition(list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (FAILED(list->Close())) {
         p.failed = true;
         return false;
     }
-    ID3D12CommandList* lists[] = {p.list};
+    ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
-    const HRESULT hr = p.chain->Present(0, 0);
-    // The allocator is reused next frame: wait until this frame's commands are done.
-    if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value)) && p.fence->GetCompletedValue() < p.fence_value &&
-        SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
-        WaitForSingleObject(p.reached, 2000);
+    // Without the wait, DO_NOT_WAIT: a full flip queue drops this window frame instead of blocking.
+    HRESULT hr = p.chain->Present(0, wait_each ? 0 : DXGI_PRESENT_DO_NOT_WAIT);
+    if (hr == S_OK && present_in_title_window()) {
+        static LONG reports;
+        if (first_calls(reports, 1)) log("x2w-present first flip on the original window");
+    }
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        const LONG n = InterlockedIncrement(&p.skipped);
+        if (n <= 4 || n % 500 == 0) log("x2w-present window flip skipped %ld times (flip queue full)", n);
+        hr = S_OK;
+    }
+    if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value))) p.slot_values[slot] = p.fence_value;
+    p.next_slot = (slot + 1) % 2;
+    if (wait_each && p.fence->GetCompletedValue() < p.fence_value && SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
+        WaitForSingleObject(p.reached, 2000);  // the allocator is reused next frame
     static LONG failures;
     if (FAILED(hr) && first_calls(failures, 4)) log("x2w-present Present failed 0x%08lx", static_cast<unsigned long>(hr));
     check_device("window present", 0);

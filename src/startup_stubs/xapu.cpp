@@ -257,6 +257,9 @@ extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r
     ReleaseSRWLockExclusive(&connection_lock);
     *reinterpret_cast<void**>(rdx) = buffer;
     *reinterpret_cast<void**>(r8) = reinterpret_cast<void*>(handle);
+#ifdef X2W_HAVE_OPUS
+    x2w_local::logf("x2w-audio XApu decoder=%s typed_completions=%d", opus_get_version_string(), typed_completions());
+#endif
     x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> handle %p, buffer %p (0x%x bytes), S_OK",
                     input, output, reinterpret_cast<void*>(handle), buffer, buffer_bytes);
     return hr_ok;
@@ -352,7 +355,14 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
         }
         if (hr == hr_ok) {
             place_result(*conn, entry);
-            if (pcm) std::memcpy(dest, pcm, entry.value);
+            if (pcm) {
+                std::memcpy(dest, pcm, entry.value);
+                static bool logged_decode = false;
+                if (!logged_decode) {
+                    logged_decode = true;
+                    x2w_local::logf("x2w-audio XApu first Opus packet decoded slot=%u pcm_bytes=%u", entry.slot, entry.value);
+                }
+            }
         }
 #else
         hr = push_result(*conn, entry) ? hr_ok : hr_out_of_memory;

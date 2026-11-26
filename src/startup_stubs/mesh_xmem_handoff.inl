@@ -288,10 +288,6 @@ void note_mesh_xmem_write(Wrapper* list, Wrapper* owner, u64 offset, u64 bytes,
         }
         if (lease->untracked || lease->owner != owner || lease->offset != offset || lease->bytes != bytes ||
             !lease->matches(address)) return;
-        auto& states = pass_of(list).states;
-        // Reserve before recording a barrier so a failed allocation cannot
-        // leave an untracked transition on the desktop list.
-        states.reserve(states.size() + 1);
         require_state(list, lease->buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
         desktop_list->CopyBufferRegion(lease->buffer.Get(), lease->lease.first_byte, source, source_offset, bytes);
         recorded.writers[index] = lease;
@@ -430,7 +426,9 @@ const char* record_mesh_xmem_reads(Wrapper* list, MeshXMemRead* reads, size_t co
     }
     try {
         auto& states = pass_of(list).states;
-        states.reserve(states.size() + count);
+        // Allocate tracking for every input before recording the first barrier.
+        for (size_t i = 0; i < count; ++i)
+            states.track(verified[mesh_xmem_index(reads[i].bytes)].lease->buffer.Get());
         auto& recorded = mesh_xmem_recordings[desktop_list];
         if (trace_call) recorded.trace_call = trace_call;
         for (size_t i = 0; i < count; ++i) {

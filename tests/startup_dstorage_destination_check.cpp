@@ -101,16 +101,22 @@ void refused(const char* name, DWORD protect, bool decommit_last)
     else if (!untouched(region, 0, page)) fail(name, "first page was written");
     else if (!decommit_last && !untouched(region, 2 * page, bytes)) fail(name, "last page was written");
     else std::printf("ok: %s refused, bytes before the bad page intact\n", name);
+    if (protect & PAGE_GUARD) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(region + page, &info, sizeof(info)) || !(info.Protect & PAGE_GUARD))
+            fail(name, "validation consumed the guard");
+    }
     VirtualFree(region, 0, MEM_RELEASE);
 }
 }  // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
-        std::printf("usage: startup_dstorage_destination_check <XCRDAPI.dll>\n");
+    if (argc < 2 || argc > 3) {
+        std::printf("usage: startup_dstorage_destination_check <XCRDAPI.dll> [xmem.dll]\n");
         return 2;
     }
+    if (argc == 3 && !LoadLibraryA(argv[2])) return 1;
     HMODULE library = LoadLibraryA(argv[1]);
     auto* get_factory = library ? reinterpret_cast<GetFactoryFn>(GetProcAddress(library, "DStorageGetFactory")) : nullptr;
     void* factory_pointer = nullptr;
@@ -132,6 +138,15 @@ int main(int argc, char** argv)
     refused("no-access middle page", PAGE_NOACCESS, false);
     // The capacity runs one page past what is committed; the data itself (one page) would fit.
     refused("capacity past the committed pages", 0, true);
+
+    // A one-page capacity can span two OS pages when the destination is unaligned.
+    unsigned char* crossing = fresh_region();
+    DWORD old = 0;
+    if (!crossing || !VirtualProtect(crossing + page, page, PAGE_READONLY, &old)) return 1;
+    const long crossing_hr = run_request(crossing + 1, page, page - 1);
+    if (crossing_hr == -1 || crossing_hr >= 0 || !untouched(crossing, 0, bytes))
+        fail("unaligned capacity", "did not refuse the last read-only byte before writing");
+    VirtualFree(crossing, 0, MEM_RELEASE);
 
     // Control and recovery on the same queue: a fully writable destination still succeeds exactly.
     unsigned char* region = fresh_region();

@@ -19,6 +19,8 @@
 
 namespace x2w_bcpack {
 
+// (The BC3/BC4/BC5 rank tables and dictionaries come from bcpack_tables.h, which includes bcpack_tables_bcn.inl.)
+
 inline void model_forward(uint8_t eab, uint8_t q, uint16_t sym, uint32_t& f, uint32_t& cf) {
     uint32_t s = sym;
     unsigned long seg = 0;
@@ -1160,6 +1162,32 @@ inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t targe
     }
     return true;
 }
+
+// BC3, BC4 and BC5 (formats 3, 4, 5), from Xbox2Windows upstream PR 1390, which adapts the
+// bcpack-rs rules and tables (revision c55c5fad, MIT OR Apache-2.0).
+// Lane layouts (alphabet bits; symbols per lane per block), each checked locally against every
+// BC3/BC4/BC5 archive interval (35/77/333): exact logical size, every compressed byte consumed,
+// legal final states.
+//   BC4 12 lanes {7,7,7,7,5x8}, 1/block: d, x, e0, e1, 8 pair lanes (texels 2k, 2k+1).
+//   BC5 12 lanes {3,3,7,7,5x8}, 2/block: d and x nibbles, R e0/e1, G e0/e1, 4 R + 4 G pair lanes.
+//   BC3 12 lanes {3,3,7,5,5,5,5,4,5,4,7,7}, 2/block: d, x, alpha e0/e1, 4 alpha pair lanes,
+//       R/G/B 565 endpoints (E = colour 0, O = colour 1), 2 colour quadrant lanes (TL TR, BL BR).
+// UNVERIFIED: the pair/quadrant rank tables and the pre-history dictionaries are fitted by
+// bcpack-rs, which itself reports only partial byte agreement. Locally, decoded pictures are
+// coherent, and each format's own pair table gives smoother texels than the other formats' tables
+// on every sampled interval, but there is no ground truth. 87% of BC5 blocks have an endpoint
+// reference chain that starts in the dictionary, so a wrong dictionary entry shifts them all.
+//
+// BC6H (format 6): lane layout only, not decoded. 16 lanes {3,3,7,7,7,4,4,4,5,5,5,7,7,7,7,4},
+// 2 symbols per lane per block, verified on all 268 local BC6H intervals as above. Measured on
+// real data: lane 15 E = BC6H mode (0..13), lane 15 O = partition (0..31, 0 for one-region modes);
+// lanes 8..10 (E, O) carry two full-width delta fields per channel in two-region modes and are
+// zero in one-region modes; lanes 2..4 and 5..7 carry the base and first delta fields split into
+// ceil/floor halves across E and O; lanes 11..14 carry index pairs (8 bits one-region, 6 bits
+// two-region). Missing: the prediction domain for endpoints across modes, the use of the index
+// reference x (non-zero in BC6H data, unlike BC3/4/5), and a dictionary for pre-history refs:
+// 93.5% of BC6H blocks have an endpoint reference chain, and 70% an index chain, that starts
+// before the first block, so no field mapping alone can give correct blocks.
 
 inline constexpr uint8_t ALPHA_CODE[8] = { 0, 2, 3, 4, 5, 6, 7, 1 };
 inline constexpr uint8_t COLOUR_CODE[4] = { 0, 2, 3, 1 };

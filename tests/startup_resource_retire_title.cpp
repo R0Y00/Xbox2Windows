@@ -55,6 +55,8 @@ extern "C" __declspec(dllimport) BOOL x2w_d3d12_written_probe(void*, unsigned lo
 extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void*, UINT, UINT);
 extern "C" __declspec(dllimport) void x2w_d3d12_list_copy_texture_stats(LONG*, LONG*);
 
+extern "C" __declspec(dllimport) int WINAPI x2w_memory_counters(char*, int);
+
 namespace {
 using namespace x2w_budget;
 
@@ -371,7 +373,7 @@ constexpr UINT draw_side = 4;      // 4x4 R8G8B8A8_UNORM target
 constexpr UINT draw_covered = 3;   // scissor leaves the last row and column untouched as the sentinel
 constexpr int draw_seed = 77;
 constexpr UINT draw_clear_pixel = 0xffff00ffu;  // ClearRenderTargetView({1, 0, 1, 1}) in R8G8B8A8_UNORM
-constexpr char draw_revision[] = "x2w-startup-shader-17";  // d3d12_draw.inl cached_translation
+constexpr char draw_revision[] = "x2w-startup-shader-3";  // d3d12_draw.inl cached_translation
 
 constexpr char draw_vertex_shader[] = R"(
 struct Varying { float4 position : SV_Position; };
@@ -973,12 +975,68 @@ bool case7_draw_samples_slot133_texture(Context& c, void* title_mem)
     return check_target("readback after the texture left the budget", target_bytes.data(), row_pitch);
 }
 
+// Count successful desktop priority changes and verify the same resource survives an observed reuse.
+bool cold_texture_check(Context& c, void* address, bool enabled)
+{
+    auto expect = [&](unsigned cold, unsigned restored) {
+        char text[2048]{};
+        if (!x2w_memory_counters(text, sizeof(text))) return false;
+        if (!enabled) return !std::strstr(text, "cold-priority");
+        char expected[192]{};
+        std::snprintf(expected, sizeof(expected), "cold-priority bytes/count %llu/%u, restored %llu/%u, failures 0",
+                      c.texture_bytes * cold, cold, c.texture_bytes * restored, restored);
+        if (std::strstr(text, expected)) return true;
+        std::printf("FAIL: expected %s in %s\n", expected, text);
+        return false;
+    };
+    Res& texture = c.make_slot133("cold texture", address);
+    IUnknown* guest = texture.guest.Get();
+    auto original = desktop_object<ID3D12Resource>(c.guest, c.device, guest);
+    if (!original || !expect(0, 0)) return false;
+    c.release(texture);
+    if (!expect(1, 0)) return false;
+    guest->AddRef();
+    if (!expect(0, 1)) return false;
+    auto same = desktop_object<ID3D12Resource>(c.guest, c.device, guest);
+    if (same.Get() != original.Get()) return false;
+    guest->Release();
+    if (!expect(0, 1)) return false;
+    // An actual SRV creation is an observed reuse even when the guest never AddRefs the wrapper.
+    Res& viewed = c.make_slot133("cold sampled SRV", address);
+    auto* raw = viewed.guest.Get();
+    c.release(viewed);
+    if (!expect(1, 1)) return false;
+    const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; UINT64 address, bytes; }
+        heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1}, 0, 0};
+    ComPtr<IUnknown> heap;
+    if (!require(invoke(c.guest, 14, &heap_desc, &__uuidof(ID3D12DescriptorHeap), heap.GetAddressOf()), "cold test SRV heap")) return false;
+    const auto handle = invoke<UINT64>(heap.Get(), 9);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    invoke<void>(c.guest, 18, raw, &srv, handle);
+    if (!expect(0, 2)) return false;
+    Res& ordinary = c.make_committed("ordinary committed texture");
+    c.release(ordinary);
+    c.desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Res& target = c.make_slot133("render target", address);
+    c.desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    c.release(target);
+    if (!expect(0, 2)) return false;
+    // A copy behind a held queue still reads the original pixels after the source's last guest Release.
+    if (!case1_slot133_copy_and_upload(c, false, address)) return false;
+    std::puts("cold texture priority: lower, restore, stable object and fenced texture readback passed");
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     if (argc < 2 || argc > 3 || (std::strcmp(argv[1], "warp") && std::strcmp(argv[1], "hardware")) ||
-        (argc == 3 && std::strcmp(argv[2], "off")))
+        (argc == 3 && std::strcmp(argv[2], "off") && std::strcmp(argv[2], "cold") && std::strcmp(argv[2], "cold-off")))
         return 2;
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -1014,6 +1072,7 @@ int main(int argc, char** argv)
     char switch_value[2]{};
     const bool switch_on = GetEnvironmentVariableA("X2W_D3D12_RELEASE_RETIRED", switch_value, sizeof(switch_value)) == 1 &&
         switch_value[0] == '1';
+    const bool cold_mode = argc == 3 && (!std::strcmp(argv[2], "cold") || !std::strcmp(argv[2], "cold-off"));
     const bool off_mode = argc == 3;
     if (switch_on == off_mode) return 2;
     const bool on = !off_mode;
@@ -1048,22 +1107,26 @@ int main(int argc, char** argv)
         if (!c.make_queue(c.direct) || !c.make_queue(c.gated) || !c.make_list(c.drain_list) || !c.close(c.drain_list)) return 4;
         if (!x2w_d3d12_budget_snapshot(&c.base, sizeof(c.base))) return 4;
 
-        if (!case1_slot133_copy_and_upload(c, on, mem1)) return 5;
-        std::puts("1 slot 133 copy and upload: held across closed list and gated submit, readback ok, retired");
-        if (!case2_same_address_and_slot70_reuse(c, on, mem1)) return 5;
-        std::puts("2 same-address and slot 70 reuse: existing_memory_texture + resource_address_index ok");
-        if (!case3_written_textures_cleanup(c, on, mem1, mem2)) return 5;
-        std::puts("3 written_textures cleanup: stale bc7_width cleared on address reuse");
-        if (!case4_descriptor_and_view_reuse(c, on, mem1, mem2)) return 5;
-        std::puts("4 descriptor and view reuse: tracked slot-18 SRV holds and retires on overwrite/heap release");
-        if (!on) {
-            if (!case5_ordinary_upload_switch_off(c)) return 5;
-            std::puts("5 switch-off ordinary texture copy: upload still recorded for a resource outside the retire class");
+        if (cold_mode) {
+            if (!cold_texture_check(c, mem1, !std::strcmp(argv[2], "cold"))) return 5;
         } else {
-            if (!case6_written_generation_preserved(c, mem3)) return 5;
-            std::puts("6 written_textures generation: newer generation of an address kept by the older one's retirement");
-            if (!case7_draw_samples_slot133_texture(c, mem1)) return 5;
-            std::puts("7 translated draw: slot 133 texture sampled through a descriptor table, held until the recording drained");
+            if (!case1_slot133_copy_and_upload(c, on, mem1)) return 5;
+            std::puts("1 slot 133 copy and upload: held across closed list and gated submit, readback ok, retired");
+            if (!case2_same_address_and_slot70_reuse(c, on, mem1)) return 5;
+            std::puts("2 same-address and slot 70 reuse: existing_memory_texture + resource_address_index ok");
+            if (!case3_written_textures_cleanup(c, on, mem1, mem2)) return 5;
+            std::puts("3 written_textures cleanup: stale bc7_width cleared on address reuse");
+            if (!case4_descriptor_and_view_reuse(c, on, mem1, mem2)) return 5;
+            std::puts("4 descriptor and view reuse: tracked slot-18 SRV holds and retires on overwrite/heap release");
+            if (!on) {
+                if (!case5_ordinary_upload_switch_off(c)) return 5;
+                std::puts("5 switch-off ordinary texture copy: upload still recorded for a resource outside the retire class");
+            } else {
+                if (!case6_written_generation_preserved(c, mem3)) return 5;
+                std::puts("6 written_textures generation: newer generation of an address kept by the older one's retirement");
+                if (!case7_draw_samples_slot133_texture(c, mem1)) return 5;
+                std::puts("7 translated draw: slot 133 texture sampled through a descriptor table, held until the recording drained");
+            }
         }
     } catch (int code) {
         VirtualFree(mem1, 0, MEM_RELEASE);
@@ -1077,6 +1140,6 @@ int main(int argc, char** argv)
     const UINT64 errors = debug ? debug->GetNumStoredMessages() : 0;
     std::printf("debug_errors_or_warnings=%llu\n", errors);
     if (errors || FAILED(device->GetDeviceRemovedReason())) return 4;
-    std::puts(on ? "release-retired title checks passed" : "switch-off title checks passed");
+    if (!cold_mode) std::puts(on ? "release-retired title checks passed" : "switch-off title checks passed");
     return 0;
 }

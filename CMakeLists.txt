@@ -3,6 +3,14 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+add_executable(shader_trace_misses tools/startup/shader_trace_misses.cpp)
+target_compile_features(shader_trace_misses PRIVATE cxx_std_17)
+
+add_executable(startup_frame_rgb_sample tests/startup_frame_rgb_sample.cpp)
+target_include_directories(startup_frame_rgb_sample PRIVATE src)
+target_compile_features(startup_frame_rgb_sample PRIVATE cxx_std_17)
+add_test(NAME startup_frame_rgb_sample COMMAND startup_frame_rgb_sample)
+
 # Python never caches the bytecode of the script it is started with, so every start of a big
 # tests/<name>.py recompiled it. tests/pyc_main.py <name> runs that file through the import system,
 # which reuses a valid .pyc. The add_test calls below keep naming the script; this wrapper swaps in
@@ -24,6 +32,8 @@ endfunction()
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
 if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME startup_shader_trace_misses COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_shader_trace_misses_check.py" $<TARGET_FILE:shader_trace_misses>)
     add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
     set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
@@ -167,7 +177,8 @@ set_tests_properties(era_physical_owns_last_page_control PROPERTIES PASS_REGULAR
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp src/xmem_census.cpp
+    src/xmem_gpu_pool.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -376,9 +387,22 @@ add_dependencies(x2w_build_rev x2w_build_rev_generate)
 target_include_directories(x2w_build_rev PRIVATE src)
 target_compile_options(x2w_build_rev PRIVATE /Zl)
 
+# The BLAKE3 reference C code (src/startup_stubs/blake3, from the official repository's c/ directory, version 1.8.7,
+# CC0 / Apache-2.0), portable implementation only: the shader database key (gpu_db.h, PLAN.md contract C1).
+enable_language(C)
+# Every target that compiles d3d12_xs_device.cpp also compiles X2W_GPU_SOURCES (each with its own CRT);
+# x2w_blake3 is the same code as a static library for fixtures and the shader database tools.
+set(X2W_BLAKE3_SOURCES src/startup_stubs/blake3/blake3.c src/startup_stubs/blake3/blake3_dispatch.c
+    src/startup_stubs/blake3/blake3_portable.c)
+set_source_files_properties(${X2W_BLAKE3_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "BLAKE3_NO_SSE2;BLAKE3_NO_SSE41;BLAKE3_NO_AVX2;BLAKE3_NO_AVX512;BLAKE3_USE_NEON=0")
+set(X2W_GPU_SOURCES src/startup_stubs/gpu_db.cpp src/shader_db/shader_db.cpp ${X2W_BLAKE3_SOURCES})
+add_library(x2w_blake3 STATIC ${X2W_BLAKE3_SOURCES})
+set_target_properties(x2w_blake3 PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp
-    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_device.cpp)
+    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_traps.cpp src/startup_stubs/d3d12_xs_device.cpp
+    ${X2W_GPU_SOURCES})
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
@@ -542,7 +566,7 @@ endif()
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
-target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_build_rev)
+target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 dcomp d3dcompiler dxgi x2w_build_rev)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -591,6 +615,44 @@ endforeach()
 set_tests_properties(startup_descriptor_increment_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(startup_descriptor_increment_hardware startup_descriptor_increment_warp PROPERTIES TIMEOUT 60
     ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+# The shader binding ABI switch (src/startup_stubs/gpu_abi.h, gpu_hooks.inl, PLAN.md WP0) on WARP: unset, device slots
+# 15, 14, 57, 62 and 86 answer as before and no hook counter moves; X2W_GPU_ABI=1, slot 15 answers 32/16, 57
+# refuses, 62/86 log their blake3 keys and reach the stubs. The mutated run flips the switch and is the negative control.
+add_executable(startup_gpu_abi_off_check tests/startup_gpu_abi_off_check.cpp)
+target_include_directories(startup_gpu_abi_off_check PRIVATE src)
+target_compile_features(startup_gpu_abi_off_check PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_abi_off_check PRIVATE d3d12_xs_shim x2w_blake3 d3d12 dxgi)
+set_target_properties(startup_gpu_abi_off_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME startup_gpu_abi_off COMMAND startup_gpu_abi_off_check off)
+add_test(NAME startup_gpu_abi_on COMMAND startup_gpu_abi_off_check on)
+add_test(NAME startup_gpu_abi_off_mutate_control COMMAND startup_gpu_abi_off_check off --mutate)
+set_tests_properties(startup_gpu_abi_off_mutate_control PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(startup_gpu_abi_off startup_gpu_abi_on startup_gpu_abi_off_mutate_control PROPERTIES TIMEOUT 60
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
+# WP3 vbind (gpu_roots.h, gpu_bind.inl): the header checks and the WARP binding checks.
+include(tests/gpu_bind.cmake)
+# WP5 rawtwins (gpu_heap.h, gpu_heap.inl, gpu_views.inl): the layout check, the device and shim tests.
+include(tests/gpu_heap_tests.cmake)
+add_executable(startup_gpu_abi_heap_start_check tests/startup_gpu_abi_heap_start_check.cpp)
+target_compile_features(startup_gpu_abi_heap_start_check PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_abi_heap_start_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+set_target_properties(startup_gpu_abi_heap_start_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME startup_gpu_abi_heap_start COMMAND startup_gpu_abi_heap_start_check)
+set_tests_properties(startup_gpu_abi_heap_start PROPERTIES TIMEOUT 60
+    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+add_executable(startup_gpu_heap_fit_check tests/startup_gpu_heap_fit_check.cpp)
+target_include_directories(startup_gpu_heap_fit_check PRIVATE src)
+target_compile_features(startup_gpu_heap_fit_check PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_heap_fit_check PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+  add_test(NAME startup_gpu_read_states_${backend} COMMAND startup_gpu_heap_fit_check ${backend} --read-states)
+  set_tests_properties(startup_gpu_read_states_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  add_test(NAME startup_gpu_heap_fit_${backend} COMMAND startup_gpu_heap_fit_check ${backend})
+  add_test(NAME startup_gpu_heap_fit_${backend}_mutate COMMAND startup_gpu_heap_fit_check ${backend} --mutate)
+  set_tests_properties(startup_gpu_heap_fit_${backend} startup_gpu_heap_fit_${backend}_mutate PROPERTIES TIMEOUT 60
+      SKIP_RETURN_CODE 77)
+  set_tests_properties(startup_gpu_heap_fit_${backend}_mutate PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Which heap type values slot 15 forwards to desktop (src/startup_stubs/descriptor_heap_type.h), without a
 # device. The mutated runs are the negative controls.
 add_executable(startup_descriptor_heap_type_check tests/startup_descriptor_heap_type_check.cpp)
@@ -636,6 +698,10 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(startup_view_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
+# BCPack BC6H rebuild and its dictionary fallback on synthetic lane symbols (bcpack_bc6h.h).
+add_executable(bcpack_bc6h_test tests/bcpack_bc6h_test.cpp)
+target_compile_features(bcpack_bc6h_test PRIVATE cxx_std_17)
+add_test(NAME bcpack_bc6h COMMAND bcpack_bc6h_test)
 add_executable(startup_gameinput_keys tests/startup_gameinput_keys.cpp)
 target_compile_features(startup_gameinput_keys PRIVATE cxx_std_17)
 add_test(NAME startup_gameinput_keys COMMAND startup_gameinput_keys "$<TARGET_FILE:startup_stub_gameinput>")
@@ -676,7 +742,10 @@ set_tests_properties(startup_present_signature_unheld_source_control_warp PROPER
 if(EXISTS "${INTAKE_PYTHON}")
     add_executable(startup_present_producer tests/startup_present_producer.cpp)
     target_compile_features(startup_present_producer PRIVATE cxx_std_17)
-    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi)
+    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi user32)
+    add_test(NAME startup_present_original_window_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_present_producer_check.py" warp "$<TARGET_FILE:startup_present_producer>" title-window)
+    set_tests_properties(startup_present_original_window_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_present_producer_${backend} COMMAND "${INTAKE_PYTHON}" -B
                  "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>")
@@ -690,6 +759,20 @@ add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
 add_test(NAME startup_placement_alloc COMMAND startup_placement_alloc)
+# Log caps that never wrap (src/startup_stubs/log_cap.h); the old wrapping pattern is the negative control.
+add_executable(startup_log_cap_check tests/startup_log_cap_check.cpp)
+target_compile_features(startup_log_cap_check PRIVATE cxx_std_17)
+target_include_directories(startup_log_cap_check PRIVATE src)
+add_test(NAME startup_log_cap COMMAND startup_log_cap_check)
+add_test(NAME startup_log_cap_wrap_control COMMAND startup_log_cap_check --mutate wrap)
+set_tests_properties(startup_log_cap_wrap_control PROPERTIES WILL_FAIL TRUE)
+# Status wait diagnostics of the DirectStorage stand-in (src/startup_stubs/dstorage_status_stats.h).
+add_executable(startup_dstorage_status_stats_check tests/startup_dstorage_status_stats_check.cpp)
+target_compile_features(startup_dstorage_status_stats_check PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_status_stats_check PRIVATE src)
+add_test(NAME startup_dstorage_status_stats COMMAND startup_dstorage_status_stats_check)
+add_test(NAME startup_dstorage_status_stats_stale_control COMMAND startup_dstorage_status_stats_check --mutate no-stale)
+set_tests_properties(startup_dstorage_status_stats_stale_control PROPERTIES WILL_FAIL TRUE)
 # The same registration under the lock held exclusively, and max_width kept at the widest record
 # (src/startup_stubs/placement_publish.h). The mutated run is the negative control.
 add_executable(startup_placement_publish_check tests/startup_placement_publish_check.cpp)
@@ -736,9 +819,9 @@ set_tests_properties(startup_list_copy_texture_slice_control PROPERTIES WILL_FAI
 
 # The same call through the wrapped command list: two array slices round-trip, and an out-of-range subresource
 # or a format mismatch is refused before any desktop copy.
-add_executable(startup_list_copy_texture_warp tests/startup_list_copy_texture_warp.cpp)
+add_executable(startup_list_copy_texture_warp tests/startup_list_copy_texture_warp.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_list_copy_texture_warp PRIVATE cxx_std_17)
-target_link_libraries(startup_list_copy_texture_warp PRIVATE d3d12_xs_shim d3d12 dxgi)
+target_link_libraries(startup_list_copy_texture_warp PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_copy_texture_${backend} COMMAND startup_list_copy_texture_warp ${backend})
     set_tests_properties(startup_list_copy_texture_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
@@ -883,9 +966,12 @@ endforeach()
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
 add_executable(startup_dstorage_destination_check tests/startup_dstorage_destination_check.cpp)
 target_compile_features(startup_dstorage_destination_check PRIVATE cxx_std_17)
-add_dependencies(startup_dstorage_destination_check startup_stub_xcrdapi)
+add_dependencies(startup_dstorage_destination_check startup_stub_xcrdapi xmem_shim)
 add_test(NAME startup_dstorage_destination COMMAND startup_dstorage_destination_check "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_dstorage_destination PROPERTIES TIMEOUT 60)
+add_test(NAME startup_dstorage_destination_xmem COMMAND startup_dstorage_destination_check
+    "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:xmem_shim>")
+set_tests_properties(startup_dstorage_destination_xmem PROPERTIES TIMEOUT 60 ENVIRONMENT "X2W_DSTORAGE_DEST_WAIT_MS=0")
 add_executable(startup_storage_worker_start tests/startup_storage_worker_start.cpp)
 target_compile_features(startup_storage_worker_start PRIVATE cxx_std_17)
 target_include_directories(startup_storage_worker_start PRIVATE src)
@@ -1095,6 +1181,17 @@ endif()
 add_executable(startup_host_cpu_probe tests/startup_host_cpu_probe.cpp)
 target_compile_features(startup_host_cpu_probe PRIVATE cxx_std_17)
 # Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
+add_executable(xmem_linear_placement_check tests/xmem_linear_placement.cpp tests/desktop_gpu.cpp)
+target_include_directories(xmem_linear_placement_check PRIVATE src)
+target_compile_features(xmem_linear_placement_check PRIVATE cxx_std_17)
+target_link_libraries(xmem_linear_placement_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi onecore)
+foreach(mode IN ITEMS linear baseline)
+    add_test(NAME xmem_linear_placement_${mode}_warp COMMAND xmem_linear_placement_check ${mode})
+endforeach()
+
+add_test(NAME xmem_linear_placement_linear_hardware COMMAND xmem_linear_placement_check linear hardware)
+set_tests_properties(xmem_linear_placement_linear_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
 target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
 target_link_libraries(xmem_page_runs_device_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi)
@@ -1108,6 +1205,11 @@ target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 # Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
 add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
 target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
+# Input for the sampling-profiler check (tests/startup_profile_check.py); with a pdb so frames get names.
+add_executable(startup_profile_probe tests/startup_profile_probe.cpp)
+target_compile_features(startup_profile_probe PRIVATE cxx_std_17)
+target_compile_options(startup_profile_probe PRIVATE /Zi)
+target_link_options(startup_profile_probe PRIVATE /DEBUG)
 # The DLL the probe calls for the debugger's call-hook case (--trace-calls).
 add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
 add_dependencies(startup_debug_probe startup_debug_calls)
@@ -1198,7 +1300,8 @@ add_test(NAME startup_typed_buffer_view COMMAND startup_typed_buffer_view)
 add_library(startup_stream_setup_obj OBJECT tests/startup_stream_setup.cpp)
 target_compile_features(startup_stream_setup_obj PRIVATE cxx_std_17)
 add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj> tests/startup_stream_draw.cpp
-    tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp)
+    tests/startup_address_srv.cpp tests/startup_root_cbv.cpp tests/startup_root_heap.cpp
+    tests/startup_draw_uav.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
@@ -1218,6 +1321,10 @@ add_executable(startup_draw_depth_target tests/startup_draw_depth_target.cpp $<T
 target_compile_features(startup_draw_depth_target PRIVATE cxx_std_17)
 target_link_libraries(startup_draw_depth_target PRIVATE d3d12_xs_shim d3d12 dxgi)
 
+# Decoded depth / cull / write-mask state of slot 57 pipelines on translated draws (X2W_DRAW_STATE_*).
+add_executable(startup_draw_state tests/startup_draw_state.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_draw_state PRIVATE cxx_std_17)
+target_link_libraries(startup_draw_state PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_executable(startup_stream_rasterizer tests/startup_stream_rasterizer.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_rasterizer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_rasterizer PRIVATE d3d12_xs_shim d3d12 dxgi)
@@ -1240,10 +1347,11 @@ target_link_libraries(startup_queue_page_batch PRIVATE d3d12_xs_shim dxgi OneCor
 add_dependencies(startup_queue_page_batch xmem_shim)
 add_test(NAME startup_queue_page_batch_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>")
 add_test(NAME startup_queue_page_batch_runs_warp COMMAND startup_queue_page_batch "$<TARGET_FILE:xmem_shim>" runs)
+# LOCAL: queue slot 31 runs upstream's page batch only with X2W_UPSTREAM_QUEUE_PAGE_BATCH=1.
 set_tests_properties(startup_queue_page_batch_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
+    ENVIRONMENT "X2W_UPSTREAM_QUEUE_PAGE_BATCH=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
 set_tests_properties(startup_queue_page_batch_runs_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90 SKIP_RETURN_CODE 77
-    ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
+    ENVIRONMENT "X2W_UPSTREAM_QUEUE_PAGE_BATCH=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
 
 # Closed lists stay submittable, also after their allocator's Reset (#1352).
 add_executable(startup_list_resubmit tests/startup_list_resubmit.cpp)
@@ -1266,6 +1374,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+# LOCAL: OMSetRenderTargets with a single descriptor range and handles that hold no view, through the outcome
+# counters (the local check, moved from tests/startup_rtv_bind.cpp at the upstream merge).
+add_executable(startup_rtv_bind_local tests/startup_rtv_bind_local.cpp)
+target_compile_features(startup_rtv_bind_local PRIVATE cxx_std_17)
+target_link_libraries(startup_rtv_bind_local PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_rtv_bind_local_${backend} COMMAND startup_rtv_bind_local ${backend})
+    set_tests_properties(startup_rtv_bind_local_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
 add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
 target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
 target_include_directories(startup_upload_arena PRIVATE src)
@@ -1384,6 +1502,13 @@ endforeach()
 
 # X2W_D3D12_RELEASE_RETIRED_VIEWS=1 frees a released class texture that only tracked slot-18 descriptor slots keep alive by
 # replacing those slots with null descriptors. `keep` is the negative control (views switch off, or retire switch off).
+add_test(NAME startup_cold_texture_priority_off_warp COMMAND startup_resource_retire_title warp cold-off)
+set_tests_properties(startup_cold_texture_priority_off_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_COLD_TEXTURE_PRIORITY=0;X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+add_test(NAME startup_cold_texture_priority_warp COMMAND startup_resource_retire_title warp cold)
+set_tests_properties(startup_cold_texture_priority_warp PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    ENVIRONMENT "X2W_D3D12_COLD_TEXTURE_PRIORITY=1;X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+
 add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)
 target_include_directories(startup_resource_retire_views PRIVATE src)
 target_compile_features(startup_resource_retire_views PRIVATE cxx_std_17)
@@ -1416,7 +1541,10 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
     add_test(NAME startup_indirect_root_constants_${backend} COMMAND startup_indirect_dispatch ${backend} constants)
     add_test(NAME startup_indirect_count_${backend} COMMAND startup_indirect_dispatch ${backend} count)
-    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30)
+    # LOCAL merge: upstream's ExecuteIndirect (list slot 61) and compute root handlers are behind switches here
+    # (docs/experiments.md, "Local runtime switches for upstream paths"); this upstream test exercises that path.
+    set_tests_properties(startup_indirect_dispatch_${backend} startup_indirect_root_constants_${backend} startup_indirect_count_${backend} PROPERTIES TIMEOUT 30
+        ENVIRONMENT "X2W_UPSTREAM_EXECUTE_INDIRECT=1;X2W_UPSTREAM_COMPUTE_ROOT=1")
 endforeach()
 set_tests_properties(startup_indirect_dispatch_hardware startup_indirect_root_constants_hardware startup_indirect_count_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -1529,6 +1657,25 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_rtv_bind_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+# LOCAL merge: these upstream tests exercise upstream paths that overlap local ones and are behind switches here
+# (docs/experiments.md, "Local runtime switches for upstream paths"): list slots 61, 33/43 and 148.
+set(x2w_upstream_list_paths "X2W_UPSTREAM_EXECUTE_INDIRECT=set:1;X2W_UPSTREAM_COMPUTE_ROOT=set:1;X2W_LIST_UPLOAD_PAGES=set:1;X2W_UPSTREAM_MESH86_CACHE=set:1")
+foreach(backend IN ITEMS warp hardware)
+    set(x2w_upstream_list_tests startup_slot148_acceptance_${backend} startup_slot148_acceptance_nodebug_${backend}
+        startup_resource_budget_${backend}_debug0 startup_resource_budget_${backend}_debug0_inline_control
+        startup_resource_budget_${backend}_debug1 startup_resource_budget_${backend}_debug1_inline_control
+        startup_indirect_mesh_request_${backend} startup_rtv_bind_${backend}
+        startup_slot148_acceptance_serialized_${backend} startup_slot148_acceptance_serialized_nodebug_${backend})
+    foreach(mode IN ITEMS draw_indexed draw translated_draw copy_provenance copy_provenance_off translated_indexed
+                          translated_indexed_upload translated_indexed_rect mesh mesh_console mesh_amplified
+                          mesh_xmem_arguments mesh_xmem_arguments_skip_wait rectlist translated_refusal_census
+                          other_refusal_census translated_indexed_alias translated_indexed_alias_off)
+        list(APPEND x2w_upstream_list_tests startup_indirect_${mode}_${backend})
+    endforeach()
+    set_tests_properties(${x2w_upstream_list_tests} PROPERTIES ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
+endforeach()
+set_tests_properties(startup_indirect_counts_control_warp startup_indirect_translated_refusal_census_control_warp
+    startup_indirect_other_refusal_census_control_warp PROPERTIES ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
 
 # CopyResource, ResolveSubresource and CopyBufferRegion on a recording list (slots 17, 19 and 15).
 add_executable(startup_list_copy tests/startup_list_copy.cpp)
@@ -1606,6 +1753,9 @@ add_test(NAME startup_slice_footprints COMMAND startup_slice_footprints_check)
 add_test(NAME startup_slice_footprints_padded_control COMMAND startup_slice_footprints_check --mutate padded-last-row)
 set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAIL TRUE)
 
+# LOCAL (local/startup-v2, never pushed): trap-by-default desktop DLLs for startup imports without a
+# public ABI yet (src/startup_stubs/trap.h), plus opt-in permissive paths for local startup runs.
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 foreach(stage mesh vertex pixel)
     if(stage STREQUAL mesh)
@@ -1633,24 +1783,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
         "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" warp
         "$<TARGET_FILE:xmem_shim>" dual-trace-disabled)
-    set_tests_properties(startup_indirect_mesh_lease_warp_dual-trace-disabled PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_indirect_mesh_lease_warp_dual-trace-disabled PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_indirect_mesh_lease_${backend}_dual-trace COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
             "$<TARGET_FILE:xmem_shim>" dual-trace)
-        set_tests_properties(startup_indirect_mesh_lease_${backend}_dual-trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_indirect_mesh_lease_${backend}_dual-trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         add_test(NAME startup_indirect_mesh_cache_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend})
-        set_tests_properties(startup_indirect_mesh_cache_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        # LOCAL merge: the slot-86 mesh stage cache runs only with X2W_UPSTREAM_MESH86_CACHE=1 here.
+        set_tests_properties(startup_indirect_mesh_cache_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         foreach(mode IN ITEMS ordered_control skip-wait dual dual-skip-srv dual-skip-argument dual-init-only loose-root)
             set(test_name startup_indirect_mesh_lease_${backend}_${mode})
             add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_mesh_cache_check.py"
                 "${DXC_EXECUTABLE}" "$<TARGET_FILE:startup_indirect_draw_indexed>" ${backend}
                 "$<TARGET_FILE:xmem_shim>" ${mode})
-            set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+                ENVIRONMENT_MODIFICATION "${x2w_upstream_list_paths}")
         endforeach()
     endforeach()
 endif()
@@ -1676,6 +1831,239 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
 endforeach()
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
+find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
+if(STARTUP_FXC)
+    foreach(backend IN ITEMS warp hardware)
+        # LOCAL (textures): X2W_MEMORY_SRV_DETILE; surfaces at addrlib's addresses when gfx10_layout_check has addrlib.
+        add_test(NAME startup_memory_srv_detile_${backend} COMMAND "${STARTUP_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_detile.ps1"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_memory_srv_detile_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_rgba8_dmode_${backend} COMMAND "${STARTUP_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_rgba8_dmode.ps1"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}")
+        set_tests_properties(startup_rgba8_dmode_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
+
+# LOCAL: ExecuteIndirect (list slot 61) with Dispatch arguments a compute writer stored in title memory.
+# The local check, moved from tests/startup_indirect_dispatch.cpp at the upstream merge (upstream has its own).
+set(startup_indirect_headers)
+foreach(entry IN ITEMS Writer Counter)
+    string(TOLOWER "${entry}" entry_lower)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_indirect_${entry_lower}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn startup_indirect_${entry_lower} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_dispatch.hlsl"
+        DEPENDS tests/startup_indirect_dispatch.hlsl VERBATIM)
+    list(APPEND startup_indirect_headers "${header}")
+endforeach()
+add_executable(startup_indirect_dispatch_local tests/startup_indirect_dispatch_local.cpp ${startup_indirect_headers})
+target_include_directories(startup_indirect_dispatch_local PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_indirect_dispatch_local PRIVATE cxx_std_17)
+target_link_libraries(startup_indirect_dispatch_local PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    # wrap / wrap-legacy / wrap-cap (LOCAL memcut): the argument ring chain, its legacy control and its cap.
+    foreach(mode IN ITEMS gpu no-writer zero off huge huge-product wrap wrap-legacy wrap-cap)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch_local ${backend} ${mode})
+        set(indirect_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "off")
+            set(indirect_env "${indirect_env};X2W_INDIRECT_OFF=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${indirect_env}")
+    endforeach()
+    # gpu mode with the read-back copies recorded (X2W_INDIRECT_READBACK) under the debug layer.
+    add_test(NAME startup_indirect_dispatch_gpu-readback_${backend} COMMAND startup_indirect_dispatch_local ${backend} gpu)
+    set_tests_properties(startup_indirect_dispatch_gpu-readback_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_INDIRECT_READBACK=8")
+    # LOCAL (scene): X2W_MESH_RECORD_TRACE in a traced frame (reset pass, raise pass, record at record / at end, writers);
+    # rectrace-off is the control without the switch (no such line).
+    foreach(mode IN ITEMS rectrace rectrace-off)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch_local ${backend} ${mode})
+        set(rectrace_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_D3D12_TRACE_ALL=1")
+        if(mode STREQUAL "rectrace")
+            set(rectrace_env "${rectrace_env};X2W_MESH_RECORD_TRACE=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${rectrace_env}")
+    endforeach()
+endforeach()
+
+# LOCAL meshrt: DispatchMesh ExecuteIndirect through a translated mesh pipeline (d3d12_mesh.inl, X2W_MESH=1).
+set(startup_mesh_headers)
+foreach(entry IN ITEMS "MeshMain;ms_6_5;ms" "MeshHeap;ms_6_5;heap_ms" "MeshDescword;ms_6_5;descword_ms" "PixelMain;ps_6_5;ps" "PixelSampler;ps_6_5;smp_ps" "PixelUint;ps_6_5;uint_ps" "PixelStore;ps_6_5;store_ps" "Writer;cs_6_0;writer")
+    list(GET entry 0 entry_name)
+    list(GET entry 1 entry_profile)
+    list(GET entry 2 entry_short)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_mesh_${entry_short}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${entry_profile} -E ${entry_name} -Vn startup_mesh_${entry_short} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh_dispatch.hlsl"
+        DEPENDS tests/startup_mesh_dispatch.hlsl VERBATIM)
+    list(APPEND startup_mesh_headers "${header}")
+endforeach()
+add_executable(startup_mesh_dispatch tests/startup_mesh_dispatch.cpp ${startup_mesh_headers})
+target_include_directories(startup_mesh_dispatch PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS gpu derived zero huge off missing depth words16 words32 wordsraw fmaprecise fmabad notargets rtvuint smpheap smpheapswap
+            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone rtvvariant uavtex uavtexnoflag rtvnops wordsoob stateclip stateclipon stateclipkeep
+            descword descwordoff srvwide srvwidecopy srvwideshort)
+        add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(NOT mode STREQUAL "off")
+            set(mesh_env "${mesh_env};X2W_MESH=1")
+        endif()
+        set_tests_properties(startup_mesh_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${mesh_env}")
+    endforeach()
+    # LOCAL meshrt: the same calls in a traced frame (x2w-frame mesh lines, targets noted for the read-back with
+    # snapshots); the runs above are the controls (no line, nothing noted).
+    # LOCAL (scene): rectrace / rectraceapart set X2W_MESH_RECORD_TRACE=1 themselves (d3d12_record_trace.inl images,
+    # heap reads, mesh reads against skipped dispatch ranges).
+    foreach(mode IN ITEMS statez notargets zero statecull stateculloff rectrace rectraceapart)
+        add_test(NAME startup_mesh_dispatch_trace_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_trace_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_D3D12_TRACE_ALL=1;X2W_D3D12_TRACE_TARGETS=1")
+    endforeach()
+    # LOCAL meshrt: NOT traced. dump_*: X2W_MESH_DUMP_INPUTS lists the key (statez: dumped; zero: X = 0, not dumped).
+    # framestats_*: X2W_MESH_STATS_FRAMES=1 (gpu: the frame counts, one target-set line; zero: not counted).
+    foreach(mode IN ITEMS statez zero)
+        add_test(NAME startup_mesh_dispatch_dump_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_dump_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_TEST_MESH_DUMP=1")
+    endforeach()
+    foreach(mode IN ITEMS gpu zero)
+        add_test(NAME startup_mesh_dispatch_framestats_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestats_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=1")
+        # framestatsmulti_*: X2W_MESH_STATS_FRAMES=2 through presents only (23 frames, slot wrap, 20 frames not counted).
+        add_test(NAME startup_mesh_dispatch_framestatsmulti_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestatsmulti_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=2;X2W_TEST_FS_MULTI=1")
+    endforeach()
+endforeach()
+
+# LOCAL stall: device slot 133 without the allocation walk once the heap is open (X2W_PLACED_FAST; walk = control).
+add_executable(startup_placed_fast tests/startup_placed_fast.cpp)
+target_compile_features(startup_placed_fast PRIVATE cxx_std_17)
+target_link_libraries(startup_placed_fast PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS fast walk)
+        add_test(NAME startup_placed_fast_${mode}_${backend} COMMAND startup_placed_fast ${backend} ${mode})
+        set(placed_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+        if(mode STREQUAL "fast")
+            set(placed_env "${placed_env};X2W_PLACED_FAST=1")
+        endif()
+        set_tests_properties(startup_placed_fast_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${placed_env}")
+    endforeach()
+endforeach()
+
+# LOCAL stall: probe_readable's unreadable-range cache (local_log.h, X2W_PROBE_CACHE; nocache = control). No GPU.
+add_executable(startup_probe_cache tests/startup_probe_cache.cpp)
+target_include_directories(startup_probe_cache PRIVATE src)
+target_compile_features(startup_probe_cache PRIVATE cxx_std_17)
+add_test(NAME startup_probe_cache_cache COMMAND startup_probe_cache cache)
+set_tests_properties(startup_probe_cache_cache PROPERTIES TIMEOUT 60 ENVIRONMENT "X2W_PROBE_CACHE=1;X2W_PROBE_CACHE_MS=100")
+add_test(NAME startup_probe_cache_query COMMAND startup_probe_cache query)
+set_tests_properties(startup_probe_cache_query PROPERTIES ENVIRONMENT "X2W_PROBE_CACHE=1;X2W_PROBE_QUERY_FIRST=1")
+add_test(NAME startup_probe_cache_lazy COMMAND startup_probe_cache lazy)
+set_tests_properties(startup_probe_cache_lazy PROPERTIES ENVIRONMENT "X2W_PROBE_CACHE=1;X2W_PROBE_QUERY_FIRST=1;X2W_XMEM_LAZY_COMMIT=1")
+add_test(NAME startup_probe_cache_nocache COMMAND startup_probe_cache nocache)
+set_tests_properties(startup_probe_cache_nocache PROPERTIES TIMEOUT 60)
+
+# LOCAL stall: draw_lock hold / wait time by site (d3d12_draw.inl, X2W_DRAW_LOCK_TIMES; off = control). No GPU.
+add_executable(startup_draw_lock_times tests/startup_draw_lock_times.cpp)
+target_compile_features(startup_draw_lock_times PRIVATE cxx_std_17)
+add_dependencies(startup_draw_lock_times d3d12_xs_shim)
+foreach(mode IN ITEMS on off)
+    add_test(NAME startup_draw_lock_times_${mode} COMMAND startup_draw_lock_times ${mode})
+    set(lock_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+    if(mode STREQUAL "on")
+        set(lock_env "${lock_env};X2W_DRAW_LOCK_TIMES=1")
+    endif()
+    set_tests_properties(startup_draw_lock_times_${mode} PROPERTIES TIMEOUT 60 ENVIRONMENT "${lock_env}")
+endforeach()
+
+# LOCAL stall: a translated slot-67 dispatch while its pipeline is held back (d3d12_compute.inl, X2W_CX_ASYNC).
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E HeapMain -Vn startup_cx_heap_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+# LOCAL: modes rawheap / rawheap-off, `heapraw 1` (d3d12_heap_raw.inl); the heap prelude the translator emits.
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_raw_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E RawHeapMain -Vn startup_cx_heap_raw_cs -I "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
+            -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_raw_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_heap_raw.hlsl"
+    DEPENDS tests/startup_cx_heap_raw.hlsl src/startup_stubs/heap_raw_prelude.hlsli VERBATIM)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_bench_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E RawBenchMain -Vn startup_cx_heap_bench_cs -I "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
+            -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_bench_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_heap_raw.hlsl"
+    DEPENDS tests/startup_cx_heap_raw.hlsl src/startup_stubs/heap_raw_prelude.hlsli VERBATIM)
+# LOCAL isa-gaps: mode heapwords, `heapwords 1` (heap descriptor words as numbers; the helper the translator emits).
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_words_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E WordsMain -Vn startup_cx_heap_words_cs
+            -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_words_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_heap_words.hlsl"
+    DEPENDS tests/startup_cx_heap_words.hlsl VERBATIM)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_sampler_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E SamplerMain -Vn startup_cx_sampler_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_sampler_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_executable(startup_cx_async tests/startup_cx_async.cpp "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h" "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_sampler_cs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_raw_cs.h" "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_bench_cs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_words_cs.h")
+target_include_directories(startup_cx_async PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_cx_async PRIVATE cxx_std_17)
+target_link_libraries(startup_cx_async PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS async sync known seen heap sampler rawheap rawheap-off rawheap-reset rawheap-late rawheap-bench slow slow-off heapwords heapwords-raw)
+        add_test(NAME startup_cx_async_${mode}_${backend} COMMAND startup_cx_async ${backend} ${mode})
+        set(cx_async_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "async")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1")
+        elseif(mode STREQUAL "rawheap-bench")
+            set(cx_async_env "${cx_async_env};X2W_HEAP_RAW_CHECK=1")
+        elseif(mode STREQUAL "known" OR mode STREQUAL "seen")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1;X2W_CX_PREWARM_ALL=1")
+        elseif(mode STREQUAL "slow")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1;X2W_CX_PREWARM_ALL=1;X2W_CX_PREWARM_THREADS=1;X2W_CX_SLOW_LOG_MS=500;X2W_CX_SLOW_MS=1500")
+        elseif(mode STREQUAL "slow-off")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1;X2W_CX_PREWARM_ALL=1;X2W_CX_PREWARM_THREADS=1;X2W_CX_SLOW_LOG_MS=500;X2W_CX_SLOW_MS=100000;X2W_CX_DEMAND_LANE=0")
+        endif()
+        set_tests_properties(startup_cx_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${cx_async_env}")
+    endforeach()
+endforeach()
+
+add_executable(startup_cx_pso_time tests/startup_cx_pso_time.cpp)
+target_compile_features(startup_cx_pso_time PRIVATE cxx_std_17)
+target_link_libraries(startup_cx_pso_time PRIVATE d3d12_xs_shim d3d12 dxgi)
+
+# LOCAL indirect: reserved-buffer tiles onto CreateHeap heaps (exact) and onto opened file-mapping heaps (refused by
+# the runtime, device removed: the X2W_RANGE_ALIAS gate in d3d12_range_alias.inl relies on it).
+add_executable(tile_mapping_shared_heap_check tests/tile_mapping_shared_heap_check.cpp)
+target_compile_features(tile_mapping_shared_heap_check PRIVATE cxx_std_17)
+target_link_libraries(tile_mapping_shared_heap_check PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS plain shared)
+        add_test(NAME tile_mapping_${mode}_heap_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode})
+        add_test(NAME tile_mapping_${mode}_heap_nodebug_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode} nodebug)
+        set_tests_properties(tile_mapping_${mode}_heap_${backend} tile_mapping_${mode}_heap_nodebug_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+
+# Which uses of a section_va chunk window (a buffer on a heap opened over a pagefile file mapping) the runtime takes.
+add_executable(section_window_ops_check tests/section_window_ops_check.cpp)
+target_compile_features(section_window_ops_check PRIVATE cxx_std_17)
+target_link_libraries(section_window_ops_check PRIVATE d3d12 dxgi d3dcompiler)
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
@@ -1722,14 +2110,14 @@ set(OFFSCREEN_AGILITY_620_DIR "" CACHE PATH "Agility SDK 1.620.2 x64 DLL directo
 # With OFFSCREEN_AGILITY_620_DIR the fixture compiles against the Agility headers instead: it keeps its
 # own copy below and the provider keeps its own. d3d12_xs_shim uses the static CRT and is not shared.
 if(NOT OFFSCREEN_AGILITY_620_DIR)
-    add_library(d3d12_xs_device_obj OBJECT src/startup_stubs/d3d12_xs_device.cpp)
+    add_library(d3d12_xs_device_obj OBJECT src/startup_stubs/d3d12_xs_device.cpp ${X2W_GPU_SOURCES})
     target_include_directories(d3d12_xs_device_obj PRIVATE src)
     target_compile_features(d3d12_xs_device_obj PRIVATE cxx_std_17)
     target_sources(offscreen_check PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
 else()
-    target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+    target_sources(offscreen_check PRIVATE src/startup_stubs/d3d12_xs_device.cpp ${X2W_GPU_SOURCES})
 endif()
-target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32 x2w_build_rev)
+target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32 dcomp x2w_build_rev)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(OFFSCREEN_AGILITY_620_DIR)
     if(EXISTS "${OFFSCREEN_AGILITY_620_DIR}/sdk.nupkg")
@@ -1923,6 +2311,16 @@ add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison
 target_include_directories(startup_sampler_comparison_check PRIVATE src)
 target_compile_features(startup_sampler_comparison_check PRIVATE cxx_std_17)
 add_test(NAME startup_sampler_comparison COMMAND startup_sampler_comparison_check)
+# LOCAL: console view facts for translated compute programs (src/startup_stubs/gfx10_view_words.h): typed buffer
+# view layout, GFX10_FORMAT codes, synthesized V#/T# words, integer UAV format. Mutated runs are negative controls.
+add_executable(startup_gfx10_view_words_check tests/startup_gfx10_view_words_check.cpp)
+target_include_directories(startup_gfx10_view_words_check PRIVATE src)
+target_compile_features(startup_gfx10_view_words_check PRIVATE cxx_std_17)
+add_test(NAME startup_gfx10_view_words COMMAND startup_gfx10_view_words_check)
+foreach(mutation IN ITEMS legacy width order uint)
+    add_test(NAME startup_gfx10_view_words_${mutation}_control COMMAND startup_gfx10_view_words_check --mutate ${mutation})
+    set_tests_properties(startup_gfx10_view_words_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
 add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
@@ -2108,6 +2506,18 @@ target_compile_features(startup_depth_state_check PRIVATE cxx_std_17)
 add_test(NAME startup_depth_state COMMAND startup_depth_state_check)
 add_test(NAME startup_depth_state_switch_control COMMAND startup_depth_state_check --mutate switch)
 set_tests_properties(startup_depth_state_switch_control PROPERTIES WILL_FAIL TRUE)
+# LOCAL: the local decoder check (moved from tests/startup_pipeline_state_check.cpp at the upstream merge).
+# Fixed-function state of slot 57 / 55 pipelines (src/startup_stubs/pipeline_state_decode.h): depth-stencil,
+# rasterizer and blend write masks from hand-built register words, both state block layouts, derived
+# records, depth-target adjustments and the X2W_DRAW_STATE_* switches. The mutated runs (front-face
+# convention inverted, mesh fields unshifted) are the negative controls.
+add_executable(startup_pipeline_state_local_check tests/startup_pipeline_state_local_check.cpp)
+target_include_directories(startup_pipeline_state_local_check PRIVATE src)
+target_compile_features(startup_pipeline_state_local_check PRIVATE cxx_std_17)
+add_test(NAME startup_pipeline_state_local COMMAND startup_pipeline_state_local_check)
+add_test(NAME startup_pipeline_state_local_winding_control COMMAND startup_pipeline_state_local_check --mutate winding)
+add_test(NAME startup_pipeline_state_local_mesh_shift_control COMMAND startup_pipeline_state_local_check --mutate mesh-shift)
+set_tests_properties(startup_pipeline_state_local_winding_control startup_pipeline_state_local_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
 # Root table handles resolved against a logical view heap, and the records a translated draw reads
 # from the window (src/startup_stubs/logical_view_table.h).
 add_executable(startup_logical_view_table_check tests/startup_logical_view_table_check.cpp)
@@ -2125,6 +2535,8 @@ add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
 target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
+add_test(NAME startup_local_log_query_first COMMAND startup_local_log_check --probe-only)
+set_tests_properties(startup_local_log_query_first PROPERTIES ENVIRONMENT "X2W_PROBE_QUERY_FIRST=1")
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
@@ -2704,6 +3116,31 @@ if(XBOX2WINDOWS_ADDRLIB_DIR)
 else()
     message(STATUS "xg_swizzle_select: addrlib not configured, the test will skip (77)")
 endif()
+# LOCAL (textures): the GFX10 layout of console-swizzled memory views (src/startup_stubs/gfx10_layout.h). The golden
+# check runs in every build (addrlib-recorded hashes); the addrlib check compares every element address with addrlib
+# itself and skips (77) without it. The two mutated runs are the negative controls.
+add_executable(gfx10_layout_check tests/gfx10_layout_check.cpp)
+target_compile_features(gfx10_layout_check PRIVATE cxx_std_17)
+target_include_directories(gfx10_layout_check PRIVATE src)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    target_link_libraries(gfx10_layout_check PRIVATE xbw_addrlib)
+    target_compile_definitions(gfx10_layout_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+endif()
+set(_gfx10_golden "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfx10_layout_golden.txt")
+add_test(NAME gfx10_layout_golden COMMAND gfx10_layout_check "${_gfx10_golden}")
+add_test(NAME gfx10_layout_floor_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate floor)
+add_test(NAME gfx10_layout_tail_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate tail)
+set_tests_properties(gfx10_layout_floor_control gfx10_layout_tail_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME gfx10_layout_addrlib COMMAND gfx10_layout_check --addrlib)
+set_tests_properties(gfx10_layout_addrlib PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# LOCAL (textures): the address index of memory buffer lookups (src/startup_stubs/buffer_address_index.h) against a
+# brute-force walk; the mutated window is the negative control.
+add_executable(buffer_address_index_check tests/buffer_address_index_check.cpp)
+target_compile_features(buffer_address_index_check PRIVATE cxx_std_17)
+target_include_directories(buffer_address_index_check PRIVATE src)
+add_test(NAME buffer_address_index COMMAND buffer_address_index_check)
+add_test(NAME buffer_address_index_control COMMAND buffer_address_index_check --mutate)
+set_tests_properties(buffer_address_index_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # 4 KiB allocation answers for small 2D textures (src/startup_stubs/small_texture_4k.h): literal sizes and
@@ -2912,6 +3349,13 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    # LOCAL (textures): the same probes with the samplers translated from S# words (the X2W_SAMPLER_LOD fields); the
+    # control drops the LOD and border fields and must mismatch.
+    add_test(NAME startup_sampler_lod_words_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words)
+    add_test(NAME startup_sampler_lod_words_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words-dropped)
+    set_tests_properties(startup_sampler_lod_words_${adapter} startup_sampler_lod_words_dropped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_sampler_lod_words_dropped_${adapter} PROPERTIES WILL_FAIL TRUE)
     # The dropped control resets the decoded LOD limits and must read the wrong mip for both entries.
     add_test(NAME startup_sampler_lod_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod)
     add_test(NAME startup_sampler_lod_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-lod-dropped)
@@ -3073,6 +3517,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
+    # Pixel-stage lowerings of mesh pairs (gfx2hlsl): translation checks with negative controls.
+    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode front_face quad_divergent scalar_const_fold sample_c_preclamp sample_c_border vopc_dpp image_get_lod)
+        add_test(NAME startup_${check} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_${check}_check.py")
+        set_tests_properties(startup_${check} PROPERTIES TIMEOUT 120)
+    endforeach()
     add_test(NAME startup_image_gather_c_lz COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py")
     # image_sample_b (#1996): translation controls, then a desktop draw whose mip level the bias selects.
@@ -3130,6 +3580,30 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_watch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_watch_check.py")
     set_tests_properties(startup_gfx2hlsl_watch PROPERTIES TIMEOUT 120)
+    # v_ldexp_f32 through x2w_ldexp (f32 denormals flushed), against an exact reference.
+    add_test(NAME startup_gfx2hlsl_ldexp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_ldexp_check.py")
+    add_test(NAME startup_gfx2hlsl_shift64_literal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_shift64_literal_check.py")
+    # X2W_DRAW_FEATURES=mixfma: v_fma_mix_f32 through x2w_fma_exact (x2w_mad_precise for a signed-zero addend).
+    add_test(NAME startup_gfx2hlsl_mix_fma COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_mix_fma_check.py")
+    # X2W_PS_WAVE_UNION=1: wave64 reduction chains over the host wave (translation controls; the draw mode needs a
+    # two-target dump tool and is run by hand).
+    add_test(NAME startup_gfx2hlsl_wave_union COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_wave_union_check.py")
+    add_test(NAME startup_gfx2hlsl_scalar_named_dest COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scalar_named_dest_check.py")
+    add_test(NAME startup_gfx2hlsl_f16_arith COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_arith_check.py")
+    add_test(NAME startup_image_sample_implicit_lod COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_implicit_lod_check.py")
+    # Draw-stage conflict registers fixed by the exec bit, back-edge loop heads and vcc descriptor copies.
+    add_test(NAME startup_gfx2hlsl_exec_lane_facts COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_exec_lane_facts_check.py")
+    # Draw-stage x2w_fma_exact keeps fxc double immediates out (device-free part).
+    add_test(NAME startup_fma_exact_fxc COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_fma_exact_fxc_check.py")
     add_test(NAME startup_gfx2hlsl_handler_arity COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_handler_arity_check.py")
     # gfx2hlsl names why s_getpc_b64 is refused instead of reporting the mnemonic alone.
@@ -3142,6 +3616,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers v_fma_mix_f32 and selects binary16 source halves on all three mixed-precision FMAs.
     add_test(NAME startup_gfx2hlsl_fma_mix COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_fma_mix_check.py")
+    # The mesh-stage translator checks (tools/startup/mesh2hlsl.py): hand-assembled gfx1013 NGG programs, each
+    # with its negative controls; pure Python, no arguments (the optional --write keeps the programs).
+    file(GLOB startup_mesh_python_checks CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh_*_check.py")
+    foreach(check ${startup_mesh_python_checks})
+        get_filename_component(check_name "${check}" NAME_WE)
+        string(REGEX REPLACE "_check$" "" check_name "${check_name}")
+        # (startup_mesh_spi_input is registered with the pixel-stage lowerings above)
+        if(NOT TEST ${check_name})
+            add_test(NAME ${check_name} COMMAND "${INTAKE_PYTHON}" -B "${check}")
+            set_tests_properties(${check_name} PROPERTIES TIMEOUT 300)
+        endif()
+    endforeach()
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
@@ -3243,7 +3730,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
-    find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+
     if(STARTUP_FXC)
         # The v_fma_mix* translations from startup_gfx2hlsl_fma_mix, compiled for ps_5_1.
         add_test(NAME startup_gfx2hlsl_fma_mix_fxc COMMAND "${INTAKE_PYTHON}" -B
@@ -3487,6 +3974,21 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_flat_param_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # binary16 interpolation (v_interp_p2_f16) on the same one-pixel renderer
+        add_test(NAME startup_interp_f16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_interp_f16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_interp_f16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # s_round_mode 0xc: binary16 results rounded toward zero, on the same renderer
+        add_test(NAME startup_round_mode_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_round_mode_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_round_mode_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # FRONT_FACE as SV_IsFrontFace (+1.0 / -1.0), on the same renderer
+        add_test(NAME startup_front_face_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_front_face_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_front_face_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME raster_winding_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/raster_winding_reference.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -3803,7 +4305,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_cli_check.py")
     set_tests_properties(startup_launch_cli_check PROPERTIES TIMEOUT 30)
-    find_program(STARTUP_POWERSHELL NAMES powershell pwsh REQUIRED)
+
+    add_test(NAME startup_profile COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_profile_check.py" "$<TARGET_FILE:startup_profile_probe>")
+    set_tests_properties(startup_profile PROPERTIES TIMEOUT 120)
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
     set_tests_properties(startup_stage_package PROPERTIES TIMEOUT 120)
@@ -3827,7 +4332,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_compute_binding_trace_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_binding_trace_check.py"
         "$<TARGET_FILE:startup_compute_binding_trace>")
-    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30)
+    # LOCAL merge: upstream test of its compute root and upload-page paths (switched here).
+    set_tests_properties(startup_compute_binding_trace_warp PROPERTIES TIMEOUT 30
+        ENVIRONMENT "X2W_UPSTREAM_COMPUTE_ROOT=1;X2W_LIST_UPLOAD_PAGES=1")
     add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
     add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
@@ -3859,6 +4366,20 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        # LOCAL stall: a draw while its desktop pipeline compile is held back (X2W_DRAW_ASYNC; sync = control)
+        foreach(mode IN ITEMS async sync)
+            add_test(NAME startup_draw_async_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_async_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
+        # LOCAL stall: two threads draw with a buffer srv at once (X2W_DRAW_LOCK_SPLIT; locked = control)
+        foreach(mode IN ITEMS split copy below locked)
+            add_test(NAME startup_draw_lock_split_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_lock_split_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_lock_split_${mode}_${backend} PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -3866,15 +4387,34 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_stream_fetch_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_fetch_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_stream_fetch_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_stream_fetch_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_STREAM_LAYOUT=1")
         add_test(NAME startup_stream_interface_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_interface_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_interface_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_stream_pc_table_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_pc_table_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_stream_pc_table_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_stream_ps_inputs_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_ps_inputs_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_stream_ps_inputs_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_draw_dump_inputs_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_dump_inputs_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_draw_dump_inputs_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_stream_depth_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_depth_check.py"
             "$<TARGET_FILE:startup_stream_depth>" "${backend}")
-        set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # LOCAL merge: list slot 24 (OMSetStencilRef) is installed here only on request (X2W_UPSTREAM_STENCIL_REF).
+        set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_STENCIL_REF=1")
+        add_test(NAME startup_draw_state_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_state_check.py"
+            "$<TARGET_FILE:startup_draw_state>" "${backend}")
+        set_tests_properties(startup_draw_state_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_stream_rasterizer_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_rasterizer_check.py"
             "$<TARGET_FILE:startup_stream_rasterizer>" "${backend}")
@@ -3928,6 +4468,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_requests_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_indirect_requests_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_draw_srv_limit_warp COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_srv_limit_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${STARTUP_FXC}")
+            set_tests_properties(startup_draw_srv_limit_warp PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_formatted_view_draw_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_formatted_view_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${STARTUP_FXC}")
@@ -3948,14 +4494,25 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_cbv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_root_cbv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # LOCAL stall: X2W_ROOT_SRV_LAZY (list slot 44 copies nothing at record time; control without the switch)
+        add_test(NAME startup_root_srv_lazy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_srv_lazy_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" ${backend})
+        set_tests_properties(startup_root_srv_lazy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_root_heap_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_heap_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
-        set_tests_properties(startup_root_heap_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # LOCAL merge: upstream's deferred descriptor-heap root arguments run with X2W_DEFER_HEAP_ROOTS=1 here.
+        set_tests_properties(startup_root_heap_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_DEFER_HEAP_ROOTS=1")
         add_test(NAME startup_address_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_memory_srv_announced_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_announced_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_memory_srv_announced_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         if(backend STREQUAL "warp")
             # Negative control for X2W_RESOURCE_INDEX_CHECK: mode 2 skips the index inserts, so the check must
             # report the first live resource it does not find (the run passes only on that report).
@@ -3981,7 +4538,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_address_single_element_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_single_element_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # LOCAL merge: upstream's single-element and console-layout memory SRVs run with X2W_UPSTREAM_CONSOLE_SRV=1.
+        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
         add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -4002,6 +4561,19 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_frame_copy_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_frame_copy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_draw_uav_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_uav_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # LOCAL (textures): X2W_HEAP_TEXTURE_UPLOAD; heap draws need 32-byte view slots (77 elsewhere, e.g. WARP).
+        add_test(NAME startup_heap_texture_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_heap_texture_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_buffer_heap_index_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_buffer_heap_index_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_buffer_heap_index_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -4013,7 +4585,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_address_console_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
         # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
         # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
         foreach(gate IN ITEMS gate gate-ring)
@@ -4021,7 +4594,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${gate}")
-            set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+                ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1")
+            # LOCAL merge: the local upload ring (d3d12_upload_ring.inl, X2W_UPLOAD_RING=chain default) never reuses
+            # unexecuted space, so the ring control needs the old wrapping 256 MiB ring it was written against.
+            if(gate STREQUAL "gate-ring")
+                set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES ENVIRONMENT "X2W_UPSTREAM_CONSOLE_SRV=1;X2W_UPLOAD_RING=legacy")
+            endif()
         endforeach()
         add_test(NAME startup_xg_bc_chain_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
@@ -4041,6 +4620,33 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Stream stage interface by semantic: the translator-only cases (draws: startup_stream_interface_<backend>).
     add_test(NAME startup_stream_interface_translate COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_interface_check.py")
+    # A stream vertex shader with data after its single reachable exit (a PC-relative table) is bounded there.
+    add_test(NAME startup_stream_vertex_exit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_vertex_exit_check.py")
+    # The s_getpc_b64 table pointer of such a shader: the translator-only cases (draws: startup_stream_pc_table_<backend>).
+    add_test(NAME startup_stream_pc_table_translate COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_pc_table_check.py")
+    # Resource-heap descriptors at a run-time offset in a vertex stage (X2W_DRAW_FEATURES=heap), CPU reference.
+    add_test(NAME startup_vs_heap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vs_heap_check.py")
+    # A stream pixel stage's SPI input layout from its FSSM header: the translator-only cases.
+    add_test(NAME startup_stream_ps_inputs_translate COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_ps_inputs_check.py")
+    # Startup shader translator: vertex-stage entry v3 as SV_InstanceID; entry v1 / v2 refused.
+    add_test(NAME startup_vs_instance_id COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_vs_instance_id_check.py")
+    # Startup shader translator: a draw stage's numeric read of a table descriptor word (X2W_DRAW_FEATURES=descword).
+    add_test(NAME startup_gfx2hlsl_draw_descword COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_draw_descword_check.py")
+    # Startup shader translator: a draw stage's scalar arithmetic over table descriptor words (descword).
+    add_test(NAME startup_gfx2hlsl_draw_descnum COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_draw_descnum_check.py")
+    # Startup shader translator: the SCC carry chain of s_add_u32 / s_addc_u32 and s_sub_u32 / s_subb_u32.
+    add_test(NAME startup_gfx2hlsl_scc_carry COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_scc_carry_check.py")
+    # Startup shader translator: waterfall loops (wave32/wave64, scc1 or execnz back edge) and s_nor_b32 of masks.
+    add_test(NAME startup_waterfall COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_waterfall_check.py")
     # Startup shader translator: descriptor offsets inside wide scalar loads (no game data).
     add_test(NAME startup_translator COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_translator_check.py")
@@ -4088,8 +4694,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Offline re-key of saved shader requests under the current cache revision (pure Python).
     add_test(NAME startup_shader_cache_rekey COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_check.py")
+    set_tests_properties(startup_shader_cache_rekey PROPERTIES ENVIRONMENT "X2W_UPSTREAM_SHADER_CACHE_REKEY=1")
     add_test(NAME runtime_shader_cache_rekey_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_cli_check.py")
+    set_tests_properties(runtime_shader_cache_rekey_cli_check PROPERTIES ENVIRONMENT "X2W_UPSTREAM_SHADER_CACHE_REKEY=1")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
@@ -7958,7 +8566,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     if(TARGET d3d12_xs_device_obj)
         target_sources(cpu_placed_dxr_provider PRIVATE $<TARGET_OBJECTS:d3d12_xs_device_obj>)
     else()
-        target_sources(cpu_placed_dxr_provider PRIVATE src/startup_stubs/d3d12_xs_device.cpp)
+        target_sources(cpu_placed_dxr_provider PRIVATE src/startup_stubs/d3d12_xs_device.cpp ${X2W_GPU_SOURCES})
     endif()
     target_include_directories(cpu_placed_dxr_provider PRIVATE tests src "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(cpu_placed_dxr_provider PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32 x2w_build_rev)
@@ -10216,3 +10824,232 @@ foreach(i RANGE 0 ${X2W_SLOW_TEST_COSTS_LAST} 2)
         set_tests_properties(${slow_name} PROPERTIES COST ${slow_cost})
     endif()
 endforeach()
+
+# ---- x2w_shader: C++ port of the upstream Rust shader crate (namespace x2w::vs) ----
+# vs-core: lib, dxbc, dxil, ir, gfx10 decoder. The other port packages add their sources with
+# target_sources(x2w_shader PRIVATE ...) in blocks of their own below.
+add_library(x2w_shader STATIC
+    src/x2w_shader/lib.cpp
+    src/x2w_shader/dxbc.cpp
+    src/x2w_shader/dxil.cpp
+    src/x2w_shader/ir.cpp
+    src/x2w_shader/gfx10/mod.cpp
+    src/x2w_shader/gfx10/fields.cpp
+    src/x2w_shader/gfx10/opcodes.cpp
+    src/x2w_shader/gfx10/sp3.cpp)
+target_include_directories(x2w_shader PUBLIC src)
+target_compile_features(x2w_shader PUBLIC cxx_std_20)
+
+# Unit tests ported from the #[cfg(test)] blocks of those modules, one ctest per Rust test.
+add_executable(x2w_shader_core_tests tests/x2w_shader/core_tests.cpp)
+target_link_libraries(x2w_shader_core_tests PRIVATE x2w_shader)
+foreach(x2w_vs_core_test IN ITEMS
+        dxbc_round_trips_parts dxbc_rejects_bad_input
+        dxil_parses_standard_layout dxil_detects_xbox_layout dxil_rejects_missing_bitcode_magic
+        gfx10_flat_offsets_ignore_bit_eleven gfx10_tables_are_sorted gfx10_lengths_and_names
+        gfx10_follows_branches_and_skips_data gfx10_follows_far_jumps gfx10_follows_far_jumps_backward
+        gfx10_rejects_bad_code opcodes_s_ttracedata_imm_is_sopp_0x28
+        sp3_scalar sp3_atc_probe_immediate_is_not_a_register sp3_lane_masks_follow_the_wave_size
+        sp3_vector_modifiers sp3_memory_and_export sp3_one_sided_packed_negation_is_printed
+        sp3_fields_the_instruction_lacks_are_not_printed sp3_image_d16_data_is_packed
+        ir_a_skip_is_left_out_when_the_scalars_it_changes_come_back_or_are_not_read
+        ir_joins_get_phis_only_where_values_differ ir_in_place_scalar_ops_read_their_destination
+        ir_loops_carry_values_through_phis ir_drops_scheduling_and_follows_far_jumps
+        ir_reports_what_it_cannot_express ir_relative_vgpr_access_spans_up_to_the_vgpr_count
+        ir_reverse_order_diamond_chain_eliminates_trivial_phis
+        ir_remove_trivial_phis_compresses_reverse_chain_in_bounded_steps
+        ir_non_trivial_phis_preserve_compressed_representatives)
+    add_test(NAME x2w_shader_core_${x2w_vs_core_test} COMMAND x2w_shader_core_tests ${x2w_vs_core_test})
+endforeach()
+
+# vs-front: native, io, resource, spill, structure, bvh (src/x2w_shader/front/CMakeLists.txt builds
+# them standalone too).
+target_sources(x2w_shader PRIVATE
+    src/x2w_shader/bvh.cpp
+    src/x2w_shader/native.cpp
+    src/x2w_shader/structure.cpp
+    src/x2w_shader/spill.cpp
+    src/x2w_shader/io.cpp
+    src/x2w_shader/resource.cpp)
+foreach(x2w_vs_front_test IN ITEMS vs_bvh_test vs_native_test vs_structure_test vs_spill_test vs_io_test
+        vs_resource_test)
+    add_executable(x2w_${x2w_vs_front_test} tests/x2w_shader/${x2w_vs_front_test}.cpp)
+    target_link_libraries(x2w_${x2w_vs_front_test} PRIVATE x2w_shader)
+    target_include_directories(x2w_${x2w_vs_front_test} PRIVATE tests/x2w_shader)
+    add_test(NAME x2w_${x2w_vs_front_test} COMMAND x2w_${x2w_vs_front_test})
+endforeach()
+
+# Real-program check: every native program of an archive decoded and built into SSA, compared hash
+# for hash with the upstream Rust implementation (reference lines from a helper outside the repo). Skipped
+# (77) unless X2W_VS_CORE_ARCHIVE and X2W_VS_CORE_REFERENCE are set: a sweep takes the machine lock.
+add_executable(x2w_shader_archive_decode_check tests/x2w_shader/archive_decode_check.cpp)
+target_link_libraries(x2w_shader_archive_decode_check PRIVATE x2w_shader)
+add_test(NAME x2w_shader_core_archive_decode COMMAND x2w_shader_archive_decode_check)
+set_tests_properties(x2w_shader_core_archive_decode PROPERTIES SKIP_RETURN_CODE 77)
+
+# vs-emit: the DXIL writer and the translator's entry points (src/x2w_shader/emit, port of the upstream Rust emit/ module; vs-lower's
+# lowering is a fragment of it), their ctests, and `x2w shaders <archives> --out <dir>` (tools/x2w), X2W's own shader
+# dump. src/x2w_shader/emit/CMakeLists.txt also builds standalone.
+add_subdirectory(src/x2w_shader/emit ${CMAKE_BINARY_DIR}/x2w_shader_emit)
+# LOCAL (vexport): X2W's shader database (src/shader_db): the reader the runtime maps, its writer, the archive
+# scan and x2w_shaders, the shader dump tool and its --compare option for a reference export.
+add_library(x2w_shader_db STATIC
+    src/shader_db/shader_db.cpp src/shader_db/shader_db_writer.cpp src/shader_db/archive_scan.cpp
+    src/shader_db/gpu_export.cpp)
+target_compile_features(x2w_shader_db PUBLIC cxx_std_17)
+target_include_directories(x2w_shader_db PUBLIC src src/shader_db)
+target_link_libraries(x2w_shader_db PUBLIC x2w_blake3)
+# The static CRT, as x2w_blake3 and the shim (which compiles shader_db.cpp itself, through X2W_GPU_SOURCES).
+set_target_properties(x2w_shader_db PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(TARGET x2w_shader AND EXISTS "${CMAKE_SOURCE_DIR}/src/shader_db/x2w_shaders_vs.cpp")
+    add_executable(x2w_shaders src/shader_db/x2w_shaders.cpp src/shader_db/x2w_shaders_vs.cpp)
+    target_link_libraries(x2w_shaders PRIVATE x2w_shader_db x2w_shader)
+else()
+    add_executable(x2w_shaders src/shader_db/x2w_shaders.cpp src/shader_db/x2w_shaders_no_translator.cpp)
+    target_link_libraries(x2w_shaders PRIVATE x2w_shader_db)
+endif()
+target_compile_definitions(x2w_shaders PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/" UNICODE _UNICODE)
+add_executable(shader_db_check tests/shader_db_check.cpp)
+target_link_libraries(shader_db_check PRIVATE x2w_shader_db)
+add_test(NAME shader_db_check COMMAND shader_db_check)
+add_test(NAME shader_db_check_control COMMAND shader_db_check --mutate)
+set_tests_properties(shader_db_check_control PROPERTIES WILL_FAIL TRUE)
+add_executable(startup_gpu_db_check tests/startup_gpu_db_check.cpp src/startup_stubs/gpu_db.cpp)
+target_link_libraries(startup_gpu_db_check PRIVATE x2w_shader_db)
+set_target_properties(x2w_shaders shader_db_check startup_gpu_db_check PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME startup_gpu_db_check COMMAND startup_gpu_db_check)
+add_test(NAME startup_gpu_db_check_control COMMAND startup_gpu_db_check --mutate)
+set_tests_properties(startup_gpu_db_check_control PROPERTIES WILL_FAIL TRUE)
+
+# LOCAL vpipe (WP2, PLAN.md): ABI pipelines and root signatures. The stream walk and graphics state
+# (src/startup_stubs/gpu_pipeline_state.h) without a device; the mutated runs are the negative controls.
+add_executable(startup_gpu_reference_library tests/startup_gpu_reference_library.cpp src/startup_stubs/gpu_db.cpp)
+add_test(NAME startup_gpu_reference_entry_locks COMMAND startup_gpu_reference_library --entry-locks)
+target_link_libraries(startup_gpu_reference_library PRIVATE x2w_shader_db d3d12 dxgi)
+set_target_properties(startup_gpu_reference_library PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+add_executable(startup_gpu_warm_bad tests/startup_gpu_warm_bad.cpp)
+target_include_directories(startup_gpu_warm_bad PRIVATE src)
+target_compile_features(startup_gpu_warm_bad PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_warm_bad PRIVATE x2w_blake3)
+add_test(NAME startup_gpu_warm_bad COMMAND startup_gpu_warm_bad)
+
+add_executable(startup_gpu_build_queue tests/startup_gpu_build_queue.cpp)
+target_include_directories(startup_gpu_build_queue PRIVATE src)
+target_compile_features(startup_gpu_build_queue PRIVATE cxx_std_17)
+add_test(NAME startup_gpu_build_queue COMMAND startup_gpu_build_queue)
+set_tests_properties(startup_gpu_build_queue PROPERTIES TIMEOUT 10)
+
+add_executable(startup_gpu_pipeline_state_check tests/startup_gpu_pipeline_state_check.cpp)
+target_include_directories(startup_gpu_pipeline_state_check PRIVATE src)
+target_compile_features(startup_gpu_pipeline_state_check PRIVATE cxx_std_17)
+add_test(NAME startup_gpu_pipeline_state COMMAND startup_gpu_pipeline_state_check)
+add_test(NAME startup_gpu_pipeline_state_desktop_numbering_control COMMAND startup_gpu_pipeline_state_check --mutate desktop-numbering)
+add_test(NAME startup_gpu_pipeline_state_blend_kept_control COMMAND startup_gpu_pipeline_state_check --mutate blend-kept)
+set_tests_properties(startup_gpu_pipeline_state_desktop_numbering_control startup_gpu_pipeline_state_blend_kept_control
+    PROPERTIES WILL_FAIL TRUE)
+# The host roots and pipelines (gpu_pipeline_build.h, gpu_pipeline_pending.h) from synthetic records over our own
+# HLSL written to the ABI (tests/startup_gpu_pipeline.hlsl, SM 6.6), on WARP and hardware: root layout, a compute
+# dispatch, a graphics draw from a console stream, a mesh draw (MS = 24). --mutate no-heap-flags drops the
+# DIRECTLY_INDEXED flags and must fail; the debug runs fail on any debug-layer error.
+set(startup_gpu_pipeline_headers)
+foreach(entry IN ITEMS "CsMain;cs_6_6;cs" "VsMain;vs_6_6;vs" "PsMain;ps_6_6;ps" "MsMain;ms_6_6;ms")
+    list(GET entry 0 entry_name)
+    list(GET entry 1 entry_profile)
+    list(GET entry 2 entry_short)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_gpu_pipeline_${entry_short}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -nologo -T ${entry_profile} -E ${entry_name} -Vn startup_gpu_pipeline_${entry_short} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gpu_pipeline.hlsl"
+        DEPENDS tests/startup_gpu_pipeline.hlsl VERBATIM)
+    list(APPEND startup_gpu_pipeline_headers "${header}")
+endforeach()
+add_executable(startup_gpu_pipeline tests/startup_gpu_pipeline.cpp ${startup_gpu_pipeline_headers})
+target_include_directories(startup_gpu_pipeline PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_gpu_pipeline PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_pipeline PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_gpu_reference_miss_${backend} COMMAND startup_gpu_pipeline ${backend} compute --reference-miss)
+    set_tests_properties(startup_gpu_reference_miss_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+    foreach(mode IN ITEMS root compute graphics mesh rectangles)
+        add_test(NAME startup_gpu_pipeline_${mode}_${backend} COMMAND startup_gpu_pipeline ${backend} ${mode})
+        add_test(NAME startup_gpu_pipeline_${mode}_${backend}_debug COMMAND startup_gpu_pipeline ${backend} ${mode} --debug)
+        add_test(NAME startup_gpu_pipeline_${mode}_${backend}_no_heap_flags_control
+            COMMAND startup_gpu_pipeline ${backend} ${mode} --mutate no-heap-flags)
+        set_tests_properties(startup_gpu_pipeline_${mode}_${backend} startup_gpu_pipeline_${mode}_${backend}_debug
+            PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_gpu_pipeline_${mode}_${backend}_no_heap_flags_control PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+    endforeach()
+endforeach()
+
+# WP4 (vindirect): the indirect execution core (src/startup_stubs/gpu_indirect_clamp.h) on a desktop
+# device: the argument clamp with the upstream test vectors, the per-list budget pool, 0x69 run as a dispatch,
+# mesh records run as DispatchMesh(x, 1, 1). Controls: --mutate (clamp bound removed) and restart-nozero must fail.
+set(startup_gpu_indirect_ms_header "${CMAKE_CURRENT_BINARY_DIR}/startup_gpu_indirect_ms.h")
+add_custom_command(OUTPUT "${startup_gpu_indirect_ms_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T ms_6_5 -E MeshMain -Vn startup_gpu_indirect_ms -Fh "${startup_gpu_indirect_ms_header}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gpu_indirect.hlsl"
+    DEPENDS tests/startup_gpu_indirect.hlsl VERBATIM)
+add_executable(startup_gpu_indirect tests/startup_gpu_indirect.cpp "${startup_gpu_indirect_ms_header}")
+target_include_directories(startup_gpu_indirect PRIVATE src/startup_stubs "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_gpu_indirect PRIVATE cxx_std_17)
+target_link_libraries(startup_gpu_indirect PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_gpu_indirect_layout COMMAND startup_gpu_indirect warp layout)
+foreach(adapter IN ITEMS warp hardware)
+    foreach(case IN ITEMS count window budget lanes restart pool dispatch69 mesh wide capture)
+        add_test(NAME startup_gpu_indirect_${case}_${adapter} COMMAND startup_gpu_indirect ${adapter} ${case})
+        set_tests_properties(startup_gpu_indirect_${case}_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endforeach()
+    add_test(NAME startup_gpu_indirect_mutate_${adapter} COMMAND startup_gpu_indirect ${adapter} count --mutate)
+    add_test(NAME startup_gpu_indirect_restart_nozero_${adapter} COMMAND startup_gpu_indirect ${adapter} restart-nozero)
+    set_tests_properties(startup_gpu_indirect_mutate_${adapter} startup_gpu_indirect_restart_nozero_${adapter}
+        PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77 TIMEOUT 120)
+endforeach()
+
+# vexport's x2w_shaders (src/shader_db) with this translator (src/shader_db/x2w_shaders_vs.cpp, which needs the dump's
+# per-container step and the repository root on the include path). x2w_shaders is built with the static CRT (/MT), the
+# translator's libraries with the DLL one, so it links a static-CRT copy of them (x2w_vs_translator_mt: the same
+# sources, compiled once more) in place of x2w_shader.
+if(TARGET x2w_shaders AND TARGET x2w_tool_dump)
+    set(x2w_vs_mt_sources "")
+    foreach(t IN ITEMS x2w_shader x2w_vs_emit_base x2w_vs_emit_opt x2w_vs_emit_dxil x2w_vs_emit_wave x2w_vs_emit_lower
+                       x2w_vs_emit x2w_tool_base x2w_tool_dump)
+        get_target_property(dir ${t} SOURCE_DIR)
+        get_target_property(list ${t} SOURCES)
+        foreach(f IN LISTS list)
+            if(NOT IS_ABSOLUTE "${f}")
+                set(f "${dir}/${f}")
+            endif()
+            list(APPEND x2w_vs_mt_sources "${f}")
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES x2w_vs_mt_sources)
+    add_library(x2w_vs_translator_mt STATIC ${x2w_vs_mt_sources})
+    target_include_directories(x2w_vs_translator_mt PUBLIC src ${CMAKE_SOURCE_DIR} tools/x2w
+        PRIVATE "$<TARGET_PROPERTY:x2w_vs_emit,INCLUDE_DIRECTORIES>")
+    target_compile_features(x2w_vs_translator_mt PUBLIC cxx_std_20)
+    target_compile_options(x2w_vs_translator_mt PRIVATE /permissive- /utf-8 /EHsc /bigobj)
+    target_compile_definitions(x2w_vs_translator_mt PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX X2W_VS_FINGERPRINT_HEADER
+        "X2W_TOOL_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\"")
+    add_dependencies(x2w_vs_translator_mt x2w_vs_fingerprint)
+    target_link_libraries(x2w_vs_translator_mt PUBLIC d3d12 dxgi)
+    set_target_properties(x2w_vs_translator_mt PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    get_target_property(x2w_vs_shaders_links x2w_shaders LINK_LIBRARIES)
+    list(REMOVE_ITEM x2w_vs_shaders_links x2w_shader)
+    set_property(TARGET x2w_shaders PROPERTY LINK_LIBRARIES ${x2w_vs_shaders_links} x2w_vs_translator_mt)
+
+    # Only the adapter to the C++20 shader emitter needs its language standard. Each
+    # consumer links the adapter with its own CRT, including the standalone device fixtures.
+    add_library(gpu_rect_mt STATIC src/startup_stubs/gpu_rect.cpp)
+    target_link_libraries(gpu_rect_mt PRIVATE x2w_vs_translator_mt)
+    set_target_properties(gpu_rect_mt PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_link_libraries(d3d12_xs_shim PRIVATE gpu_rect_mt)
+    add_library(gpu_rect STATIC src/startup_stubs/gpu_rect.cpp)
+    target_link_libraries(gpu_rect PRIVATE x2w_vs_emit_dxil)
+    target_link_libraries(startup_gpu_pipeline PRIVATE gpu_rect)
+    target_link_libraries(offscreen_check PRIVATE gpu_rect)
+    if(TARGET cpu_placed_dxr_provider)
+        target_link_libraries(cpu_placed_dxr_provider PRIVATE gpu_rect)
+    endif()
+endif()

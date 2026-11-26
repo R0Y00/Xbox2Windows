@@ -88,7 +88,7 @@ def check_negative_control(failures):
 
 class StubPipeline:
     def __init__(self, *args, **kwargs):
-        pass
+        self.ps_entry_reads = {}  # LOCAL translate_to refuses a pixel stage that reads an SPI input first
 
     def hlsl_vs(self):
         return 'void main() {}\n'

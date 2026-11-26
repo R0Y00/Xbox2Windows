@@ -19,6 +19,19 @@ inline bool is_title_window(HWND candidate, wchar_t (&name)[256])
     return GetClassNameW(candidate, name, 256) && lstrcmpW(name, presenter_class) != 0;
 }
 
+inline HWND title_picture_window()
+{
+    HWND window = nullptr;
+    EnumWindows([](HWND candidate, LPARAM out) -> BOOL {
+        wchar_t name[256]{};
+        if (!is_title_window(candidate, name) || lstrcmpW(name, dialog_class) == 0 ||
+            (GetWindowLongPtrW(candidate, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+        *reinterpret_cast<HWND*>(out) = candidate;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&window));
+    return window;
+}
+
 inline HWND overlay_window()
 {
     HWND window = nullptr;

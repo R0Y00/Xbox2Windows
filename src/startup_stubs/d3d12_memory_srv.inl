@@ -13,8 +13,32 @@ bool same_texture_description(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE
            a.SampleDesc.Quality == b.SampleDesc.Quality && a.Layout == b.Layout && a.Flags == b.Flags;
 }
 
+bool tiled_any_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_TILED_ANY");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_TILED_ANY=1: single-mip tiled memory SRVs of any 16-byte BC format and size");
+        return v;
+    }();
+    return on;
+}
+bool bc16_format(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
 bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 {
+    if (tiled_any_on() && bc16_format(r.Format) && static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
+        (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) && r.Width && r.Height &&
+        r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        return true;
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 1 &&
            r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
            (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
@@ -60,6 +84,14 @@ u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 }
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v);
+// LOCAL merge: upstream's by-address texture forms (a texture in a console layout of gfx10_layout.h, the
+// single-element texture) are new default-on memory SRV paths upstream; here they run only with
+// X2W_UPSTREAM_CONSOLE_SRV=1, so slot 70 refuses those calls as before unless asked (docs/experiments.md).
+bool upstream_console_srv_on()
+{
+    static const bool on = x2w_local::env_on("X2W_UPSTREAM_CONSOLE_SRV");
+    return on;
+}
 // The shapes slot 70 took before address_texture.h, or a texture in a console layout gfx10_layout.h
 // addresses with a view that stays inside it.
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
@@ -128,8 +160,9 @@ bool memory_srv_destination(u64 handle)
     for (const auto& heap : heap_infos()) {
         if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.increment) continue;
         const u64 base = heap.title_cpu ? heap.title_cpu : heap.desktop_cpu;
-        if (handle >= base && (handle - base) % heap.increment == 0 &&
-            (handle - base) / heap.increment < heap.count) {
+        const UINT step = heap.title_cpu && x2w_gpu::gpu_abi_on() ? x2w_gpu::abi::view_increment : heap.increment;
+        const UINT count = heap.title_cpu ? heap.logical_count : heap.count;
+        if (handle >= base && (handle - base) % step == 0 && (handle - base) / step < count) {
             valid = true;
             break;
         }
@@ -159,7 +192,7 @@ void check_resource_address_index()
     ExitProcess(3);
 }
 
-Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
+Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc, bool native_only = false)
 {
     X2W_ZONE("srv existing_memory_texture scan");
     Wrapper* match = nullptr;
@@ -168,7 +201,8 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (reinterpret_cast<u64>(wrapper->own().title_memory) != address ||
-            wrapper->own().tiled_address_srv ||
+            wrapper->own().tiled_address_srv || wrapper->own().partial_mip_srv ||
+            (native_only && (wrapper->own().linear_memory_srv || !wrapper->own().real)) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 ||
             !same_texture_description(desc, info.console)) return false;
         if (match) {
@@ -180,6 +214,57 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     });
     ReleaseSRWLockShared(&note_lock);
     return match;
+}
+
+Wrapper* native_tiled_bc_texture(u64 address, const D3D12_RESOURCE_DESC& desc, const D3D12_SHADER_RESOURCE_VIEW_DESC& srv)
+{
+    if (!tiled_bc_srv(desc) && !x2w_startup::bc64::supports(desc)) return nullptr;
+    auto* candidate = existing_memory_texture(address, desc, true);
+    if (!candidate) return nullptr;
+    const auto host = static_cast<ID3D12Resource*>(candidate->own().real)->GetDesc();
+    if ((host.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || !x2w_startup::address_view_fits(host, srv)) return nullptr;
+    return candidate;
+}
+
+bool packed_light_enabled()
+{
+    static const bool on = x2w_gpu::gpu_abi_on() && x2w_local::env_on("X2W_GPU_ALIAS_COPY");
+    return on;
+}
+
+// Resolve bitwise aliases between single-plane color formats.
+// Resolve the current writer at each read; never choose between overlapping writers.
+Microsoft::WRL::ComPtr<ID3D12Resource> packed_light_source(u64 address, const D3D12_RESOURCE_DESC& reader)
+{
+    Microsoft::WRL::ComPtr<ID3D12Resource> result;
+    if (!packed_light_enabled() || !address || !x2w_packed_light::color_bytes(reader.Format) ||
+        (reader.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) return result;
+    AcquireSRWLockShared(&note_lock);
+    const auto live_target = [](const Wrapper* w, const ResourceInfo& info) {
+        return w->own().real && InterlockedCompareExchange(&w->own().refs, 0, 0) > 0 &&
+            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (info.console.Flags & 7);
+    };
+    const Wrapper* owner = nullptr;
+    u64 span = 1;
+    resource_address_index().for_each_at(address, [&](const Wrapper* w) {
+        const auto& info = resource_infos().at(w);
+        if (!live_target(w, info) || !x2w_packed_light::compatible(info.console, reader)) return false;
+        auto* host = static_cast<ID3D12Resource*>(w->own().real);
+        const auto actual = host->GetDesc();
+        if (actual.Format != info.console.Format || !x2w_packed_light::compatible(actual, reader)) return false;
+        result = host;
+        owner = w;
+        span = info.bytes ? info.bytes : x2w_packed_light::minimum_span(actual);
+        return true;
+    });
+    if (owner) resource_address_index().for_each_reaching(address, span, [&](const Wrapper* w) {
+        if (w == owner || !live_target(w, resource_infos().at(w))) return false;
+        result.Reset();
+        return true;
+    });
+    ReleaseSRWLockShared(&note_lock);
+    return result;
 }
 
 // An unmatched or interior view must not reinterpret bytes owned by a live resource.
@@ -233,10 +318,51 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
             return nullptr;
         return const_cast<Wrapper*>(placed.owner);
     }
+    // LOCAL (textures): X2W_BUFFER_ADDRESS_INDEX=1 answers from buffer_address_index (d3d12_capture.inl) instead of the
+    // walk below; =check runs both and counts disagreements (logged at powers of two, first 8 with both answers).
+    static const int index_mode = [] {
+        char v[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_BUFFER_ADDRESS_INDEX", v, sizeof(v));
+        const int mode = n && n < sizeof(v) ? (std::strcmp(v, "1") == 0 ? 1 : std::strcmp(v, "check") == 0 ? 2 : 0) : 0;
+        if (mode) log("x2w-memsrv X2W_BUFFER_ADDRESS_INDEX=%s: memory buffer lookups use the address index%s", v,
+                      mode == 2 ? ", checked against the walk on every call" : "");
+        return mode;
+    }();
+    // The walk's filters, applied to each candidate either way.
+    const auto eligible = [](const Wrapper* wrapper, const ResourceInfo& info) {
+        return !(!wrapper->own().real && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) &&
+               info.placement == Placement::none && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+               !(info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+               InterlockedCompareExchange(&const_cast<Wrapper*>(wrapper)->own().refs, 0, 0) > 0;
+    };
+    Wrapper* indexed = nullptr;
+    if (index_mode) {
+        AcquireSRWLockShared(&note_lock);
+        bool ambiguous = false;
+        buffer_address_index().containing(address, bytes, [&](const Wrapper* wrapper, u64 base, u64) {
+            const auto found = resource_infos().find(wrapper);
+            if (found == resource_infos().end() || !eligible(wrapper, found->second)) return true;
+            // As the walk: the record's current base and width decide (the index holds them as noted).
+            const u64 now = reinterpret_cast<u64>(wrapper->own().title_memory), width = found->second.console.Width;
+            if (now != base || address < now || address - now >= width || bytes > width - (address - now)) return true;
+            if (indexed) {
+                ambiguous = true;
+                return false;
+            }
+            indexed = const_cast<Wrapper*>(wrapper);
+            return true;
+        });
+        ReleaseSRWLockShared(&note_lock);
+        if (ambiguous) indexed = nullptr;
+        if (index_mode == 1) return indexed;
+    }
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
+        // LOCAL: stand-in buffers (standin_memory_buffer, X2W_MEMORY_SRV_BUFFER: no desktop resource) are found through
+        // their own map, by address; here they would make real buffers they overlap ambiguous.
+        if (!wrapper->own().real && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return false;
         if (info.placement != Placement::none ||
             info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
@@ -254,6 +380,17 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
         return false;
     });
     ReleaseSRWLockShared(&note_lock);
+    if (index_mode == 2) {
+        static LONG64 checked, differed;
+        const LONG64 n = InterlockedIncrement64(&checked);
+        const bool same = indexed == match;
+        const LONG64 d = same ? differed : InterlockedIncrement64(&differed);
+        static LONG shown;
+        if (!same && first_calls(shown, 8))
+            log("x2w-memsrv buffer address index DIFFERS at 0x%llx (%llu bytes): index %p, walk %p", address, bytes, static_cast<void*>(indexed),
+                static_cast<void*>(match));
+        if ((n & (n - 1)) == 0) log("x2w-memsrv buffer address index checked %lld lookups against the walk: %lld differ", n, d);
+    }
     return match;
 }
 
@@ -350,7 +487,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
                 break;
             }
         }
-        if (!heap) {
+        if (!heap && x2w_startup::private_heap_importable(memory.base)) {
             ID3D12Device3* device3 = nullptr;
             if (SUCCEEDED(desktop->QueryInterface(IID_PPV_ARGS(&device3)))) {
                 if (SUCCEEDED(device3->OpenExistingHeapFromAddress(memory.base, IID_PPV_ARGS(&heap)))) {
@@ -467,7 +604,7 @@ bool latest_texture_write_is_rows(u64 address)
 // (the single texel, the 0x105 BC3/BC7 surface and the 0x109 BC chains keep their own paths).
 bool console_layout_srv(const D3D12_RESOURCE_DESC& desc)
 {
-    return x2w_startup::console_address_texture(desc) && !x2w_startup::single_element_bytes(desc) &&
+    return upstream_console_srv_on() && x2w_startup::console_address_texture(desc) && !x2w_startup::single_element_bytes(desc) &&
            !tiled_bc_srv(desc) && !x2w_startup::bc64::supports(desc);
 }
 
@@ -525,7 +662,7 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
 {
     const auto bytes = address_texture_bytes(device, desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
+    if (bytes > (64ull << 20) || !x2w_local::descriptor_memory_readable(address, bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {
@@ -549,6 +686,8 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
 ID3D12Resource* sampled_address_texture(Wrapper* resource)
 {
     if (!resource || resource->own().kind != resource_kind) return nullptr;
+    warm_texture(resource);
+    memcut_revive(resource);  // LOCAL memcut: X2W_MEMCUT_RELEASE (a freed texture is made again; no-op otherwise)
     if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
@@ -570,6 +709,534 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
         x2w_startup::mark_packed_stand_in(sampled.desktop.Get(), desktop_format(sampled.desc.Format));
     }
     return sampled.desktop.Get();
+}
+
+bool memory_srv_linear_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_LINEAR");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_LINEAR=1: plain 2D memory SRVs get a desktop texture uploaded from the view address");
+        return v;
+    }();
+    return on;
+}
+// view_slot does not check mip, array or plane ranges, and desktop removes the device on a view it
+// rejects, so the range is checked here (MipLevels ~0u means "all from the most detailed mip").
+bool linear_view_in_range(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    const UINT mips = r.MipLevels, slices = r.DepthOrArraySize;
+    const auto mip_range = [&](UINT most, UINT count, float clamp) {
+        return most < mips && (count == ~0u || (count > 0 && count <= mips - most)) && clamp >= 0.0f && clamp <= static_cast<float>(mips);
+    };
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+        return mip_range(v.Texture2D.MostDetailedMip, v.Texture2D.MipLevels, v.Texture2D.ResourceMinLODClamp) && v.Texture2D.PlaneSlice == 0;
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        const auto& a = v.Texture2DArray;
+        return mip_range(a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp) && a.PlaneSlice == 0 && a.FirstArraySlice < slices &&
+               a.ArraySize > 0 && a.ArraySize <= slices - a.FirstArraySlice;
+    }
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width == r.Height && slices == 6 &&
+               mip_range(v.TextureCube.MostDetailedMip, v.TextureCube.MipLevels, v.TextureCube.ResourceMinLODClamp);
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) {
+        const auto& c = v.TextureCubeArray;
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width == r.Height && slices % 6 == 0 && c.NumCubes > 0 &&
+               c.First2DArrayFace < slices && u64{c.NumCubes} * 6 <= u64{slices} - c.First2DArrayFace &&
+               mip_range(c.MostDetailedMip, c.MipLevels, c.ResourceMinLODClamp);
+    }
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+               mip_range(v.Texture1D.MostDetailedMip, v.Texture1D.MipLevels, v.Texture1D.ResourceMinLODClamp);
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) {
+        const auto& a = v.Texture1DArray;
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && mip_range(a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp) &&
+               a.FirstArraySlice < slices && a.ArraySize > 0 && a.ArraySize <= slices - a.FirstArraySlice;
+    }
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+               mip_range(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels, v.Texture3D.ResourceMinLODClamp);
+    return false;
+}
+// Which description forms the linear and stand-in paths wrote, one counter each.
+enum LinearForm { lf_2d, lf_2d_array, lf_cube, lf_cube_array, lf_1d, lf_1d_array, lf_3d, lf_buffer_srv, lf_buffer_uav, lf_count };
+const char* const linear_form_names[lf_count] = {"2d", "2d-array", "cube", "cube-array", "1d", "1d-array", "3d", "buffer-srv", "buffer-uav"};
+LONG64 linear_forms[lf_count];
+int linear_form(D3D12_SRV_DIMENSION d)
+{
+    switch (d) {
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: return lf_2d_array;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: return lf_cube;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: return lf_cube_array;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: return lf_1d;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: return lf_1d_array;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: return lf_3d;
+    default: return lf_2d;
+    }
+}
+void note_linear_form(int form, u64 destination)
+{
+    const LONG64 n = InterlockedIncrement64(&linear_forms[form]);
+    if ((n & (n - 1)) == 0)
+        log("x2w-memsrv form %s: %lld views written (latest destination 0x%llx)", linear_form_names[form], n, destination);
+}
+bool linear_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    const bool sized = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        ? r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+        : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+        ? r.Width <= D3D12_REQ_TEXTURE1D_U_DIMENSION && r.Height == 1 && r.DepthOrArraySize <= D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION
+        : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+          r.Width <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION && r.Height <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION &&
+          r.DepthOrArraySize <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+    return sized && r.Width && r.Height &&
+           r.DepthOrArraySize >= 1 && r.MipLevels >= 1 && r.MipLevels <= 15 && r.SampleDesc.Count == 1 &&
+           static_cast<UINT>(r.Layout) == 0 && !tiled_bc_srv(r) && !x2w_startup::bc64::supports(r) &&
+           !(r.Flags & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
+           v.Format == r.Format && linear_view_in_range(r, v);
+}
+bool memory_srv_announced_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_ANNOUNCED");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_ANNOUNCED=1: console-swizzled memory SRVs at XG-announced addresses take the linear path");
+        return v;
+    }();
+    return on;
+}
+bool xg_announced(u64 address)
+{
+    AcquireSRWLockShared(&written_lock);
+    const auto found = written_textures().find(address);
+    const bool announced = found != written_textures().end() && !found->second.bc7_width;
+    ReleaseSRWLockShared(&written_lock);
+    return announced;
+}
+bool console_swizzle(const D3D12_RESOURCE_DESC& r)
+{
+    const UINT layout = static_cast<UINT>(r.Layout);
+    return layout >= 0x100 && layout <= 0x1ff;
+}
+bool announced_linear_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address)
+{
+    if (!console_swizzle(r) || tiled_bc_srv(r) || x2w_startup::bc64::supports(r) || !xg_announced(address)) return false;
+    D3D12_RESOURCE_DESC as_linear = r;
+    as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return linear_memory_srv(as_linear, v);
+}
+std::mutex linear_srv_mutex;
+std::unordered_multimap<u64, std::pair<D3D12_RESOURCE_DESC, Wrapper*>> linear_srv_textures;
+thread_local u64 thread_linear_allocations;
+u64 linear_srv_bytes;  // desktop allocation size of the textures above (GetResourceAllocationInfo)
+// detiled: the memory is console-swizzled (X2W_MEMORY_SRV_DETILE); a separate texture from a linear one with the
+// same description, so one desktop copy per (address, description, form).
+Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc, bool detiled = false,
+                                bool partial = false, UINT base = 0, bool allow_create = true)
+{
+    std::lock_guard lock(linear_srv_mutex);
+    const auto [first, last] = linear_srv_textures.equal_range(address);
+    Wrapper* best = nullptr;
+    UINT best_base = UINT_MAX;
+    for (auto it = first; it != last; ++it) {
+        auto* candidate = it->second.second;
+        if (!same_texture_description(it->second.first, desc) || candidate->own().detiled_memory_srv != detiled ||
+            candidate->own().partial_mip_srv != partial) continue;
+        if (!partial) return candidate;
+        auto* native = static_cast<ID3D12Resource*>(candidate->own().real);
+        const UINT existing = desc.MipLevels - native->GetDesc().MipLevels;
+        if (existing <= base && existing < best_base) { best = candidate; best_base = existing; }
+    }
+    if (best || !allow_create) return best;
+    const auto texture = x2w_resident_mips::host_desc(sanitized(desc), base);
+    const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+    ID3D12Resource* created = nullptr;
+    auto* desktop = device_of(device);
+    const auto standard = desktop->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes;
+    static x2w_startup::SmallTextureHeap pool;
+    const auto reserved_before = pool.reserved;
+    const bool placed = pool.place(desktop, texture, standard, &created);
+    const HRESULT hr = placed ? S_OK : desktop->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created));
+    static LONG shown, failures;
+    if (first_calls(shown, 16) || (FAILED(hr) && first_calls(failures, 16)))
+        log("x2w-memsrv linear texture at 0x%llx: %llux%ux%u mips %u fmt %d flags 0x%x -> 0x%08lx (%zu so far)", address, desc.Width,
+            desc.Height, desc.DepthOrArraySize, desc.MipLevels, desc.Format, static_cast<unsigned>(desc.Flags),
+            static_cast<unsigned long>(hr), linear_srv_textures.size() + 1);
+    if (FAILED(hr)) return nullptr;
+    x2w_startup::mark_packed_stand_in(created, desktop_format(desc.Format));
+    Wrapper* w = wrap(created, resource_kind);
+    w->own().title_memory = reinterpret_cast<void*>(address);
+    w->own().linear_memory_srv = true;
+    w->own().detiled_memory_srv = detiled;
+    w->own().partial_mip_srv = partial;
+    note_resource(w, &desc, 0);
+    const auto charge = placed ? pool.reserved - reserved_before : standard;
+    linear_srv_bytes += charge;
+    thread_linear_allocations += charge;
+    if (placed && !(pool.count & (pool.count - 1)))
+        log("x2w-gpu small texture placements=%llu baseline_bytes=%llu heap_bytes=%llu occupied_bytes=%llu latest=%llux%u fmt=%u",
+            pool.count, pool.committed_equivalent, pool.reserved, pool.occupied, texture.Width, texture.Height, texture.Format);
+    if (base) {
+        static u64 compact_count, saved_bytes;
+        const auto full = sanitized(desc);
+        const auto whole = device_of(device)->GetResourceAllocationInfo(0, 1, &full).SizeInBytes;
+        if (whole != UINT64_MAX && whole >= standard) saved_bytes += whole - standard;
+        ++compact_count;
+        if ((compact_count & (compact_count - 1)) == 0)
+            log("x2w-gpu held mip allocations=%llu saved_bytes=%llu latest_base=%u actual_bytes=%llu whole_bytes=%llu",
+                compact_count, saved_bytes, base, standard, whole);
+    }
+    linear_srv_textures.emplace(address, std::make_pair(desc, w));
+    return w;
+}
+
+bool memory_srv_detile_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_DETILE");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_DETILE=1: unannounced console-swizzled memory SRVs are detiled (GFX10 layout)");
+        return v;
+    }();
+    return on;
+}
+// Bytes per element (per 4x4 block for BC); 0 when the format is not detiled (not a power of two, depth, video).
+UINT detile_element_bytes(DXGI_FORMAT f, bool& bc)
+{
+    bc = true;
+    switch (f) {
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+        return 8;
+    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return 16;
+    default:
+        break;
+    }
+    bc = false;
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return 16;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS: return 8;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+        return 4;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM:
+        return 2;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_A8_UNORM: return 1;
+    default: {
+        const UINT n = x2w_startup::typed_buffer_format_bytes(f);
+        return n == 12 ? 0 : n;
+    }
+    }
+}
+x2w_startup::gfx10_local::Layout detile_layout(const D3D12_RESOURCE_DESC& r)
+{
+    bool bc = false;
+    const UINT bytes = detile_element_bytes(r.Format, bc);
+    const UINT layout = static_cast<UINT>(r.Layout);
+    const bool d_mode = layout == 0x106 || layout == 0x10a;
+    const bool known = layout == 0x100 || layout == 0x105 || layout == 0x109 || d_mode;
+    const bool row = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && layout == 0x100 && !bc &&
+        r.Height == 1 && r.DepthOrArraySize == 1 && r.MipLevels == 1;
+    const bool dim = row || r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (!bytes || !known || !dim || r.Width > 0xffffffffull)
+        return x2w_startup::gfx10_local::Layout(~0u, false, 0, 0, 0, 0, 0);  // invalid
+    const UINT w = static_cast<UINT>(r.Width), h = r.Height;
+    x2w_startup::gfx10_local::Layout result(layout - 0x100, r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, bytes,
+        bc ? (w + 3) / 4 : w, bc ? (h + 3) / 4 : h, r.DepthOrArraySize, r.MipLevels ? r.MipLevels : 1,
+        x2w_startup::gfx10_local::Layout::none, true);
+    if (row && result.valid) result.size = result.slice_size = r.Width * bytes;
+    return result;
+}
+// Why detile_srv does not take the call, as an index into detile_declines (d3d12_draw.inl); 0 when it does.
+// check_memory false (a null address): the description alone, 11 ("would detile") when it passes.
+unsigned detile_decline(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address, bool check_memory = true)
+{
+    if (!console_swizzle(r)) return 1;
+    if (supports_placed_memory_srv(r, v)) return 2;  // (not upstream's console-layout form: detile keeps those, local)
+    if (check_memory && xg_announced(address)) return 3;
+    D3D12_RESOURCE_DESC as_linear = r;
+    as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // (tiled_bc_srv / bc64 need a console layout: false here)
+    if (!linear_memory_srv(as_linear, v)) return 4;
+    const auto l = detile_layout(r);
+    if (!l.valid) return 5;
+    if (l.size > (1ull << 30)) return 7;
+    if (!check_memory) return 11;
+    if (!x2w_local::descriptor_memory_readable(address, static_cast<std::size_t>(l.size))) return 8;
+    return 0;
+}
+
+// Only a deferred descriptor can upgrade its mip clamp in place as title pages arrive.
+UINT deferred_host_base(const D3D12_RESOURCE_DESC& desc, const D3D12_SHADER_RESOURCE_VIEW_DESC& srv)
+{
+    if (srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || !srv.Texture2D.MostDetailedMip ||
+        desc.DepthOrArraySize != 1) return 0;
+    bool compressed = false;
+    detile_element_bytes(desc.Format, compressed);
+    return x2w_resident_mips::host_base(desc, srv, detile_layout(desc), compressed);
+}
+
+Wrapper* partial_mip_texture(const D3D12_RESOURCE_DESC& desc, D3D12_SHADER_RESOURCE_VIEW_DESC& srv, u64 address,
+                             bool& pending, bool allow_create)
+{
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels < 2 || !x2w_local::descriptor_memory_readable(address, 1) || xg_announced(address) ||
+        detile_decline(desc, srv, address, false) != 11) return nullptr;
+    const auto layout = detile_layout(desc);
+    const auto suffix = x2w_resident_mips::find(layout, address, [](u64 at, u64 bytes) {
+        return x2w_local::descriptor_memory_readable(at, static_cast<std::size_t>(bytes));
+    });
+    auto selected = srv;
+    if (!suffix.prefix || !x2w_resident_mips::limit_view(selected, desc.MipLevels, suffix.first)) return nullptr;
+    const auto base = deferred_host_base(desc, srv);
+    auto* texture = publish_linear_texture(the_device, address, desc, true, true, base, allow_create);
+    if (!texture) return nullptr;
+    if (base && suffix.first <= base) pending = false;
+    srv = selected;
+    return texture;
+}
+bool memory_srv_buffer_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_BUFFER");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_BUFFER=1: memory buffer SRVs/UAVs without a buffer resource get a stand-in at the address");
+        return v;
+    }();
+    return on;
+}
+std::mutex standin_buffer_mutex;
+std::unordered_map<u64, std::pair<u64, Wrapper*>> standin_buffers;  // address -> (bytes, wrapper)
+Wrapper* standin_memory_buffer(u64 address, const D3D12_RESOURCE_DESC& desc, u64 span)
+{
+    if (!address || !span || span > (u64{256} << 20) || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !x2w_local::descriptor_memory_readable(address, 1))
+        return nullptr;
+    const u64 bytes = desc.Width > span ? desc.Width : span;
+    std::lock_guard lock(standin_buffer_mutex);
+    if (const auto found = standin_buffers.find(address); found != standin_buffers.end() && found->second.first >= bytes)
+        return found->second.second;
+    D3D12_RESOURCE_DESC console = desc;
+    console.Width = bytes;
+    Wrapper* w = wrap(nullptr, resource_kind);
+    w->own().title_memory = reinterpret_cast<void*>(address);
+    note_resource(w, &console, bytes);
+    standin_buffers[address] = {bytes, w};
+    static LONG shown;
+    const std::size_t count = standin_buffers.size();
+    if (first_calls(shown, 16) || (count & (count - 1)) == 0)
+        log("x2w-memsrv stand-in buffer at 0x%llx: %llu bytes (%zu stand-ins)", address, bytes, count);
+    return w;
+}
+
+struct MemoryUnorderedAccessView {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view;
+    u64 address;
+};
+static_assert(offsetof(MemoryUnorderedAccessView, address) == 0x28);
+void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const MemoryUnorderedAccessView* input, u64 destination)
+{
+    static LONG refused;
+    const char* reason = nullptr;
+    if (!destination) reason = "null_destination";
+    else if (!x2w_local::readable(resource, sizeof(*resource))) reason = "unreadable_resource";
+    else if (!x2w_local::readable(input, sizeof(*input))) reason = "unreadable_view";
+    else if (!input->address) reason = "null_address";
+    else if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || input->view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+        reason = "not_a_buffer";
+    else if (!memory_srv_destination(destination)) reason = "destination_outside_view_heaps";
+    u64 span = 0;
+    if (!reason) {
+        const auto& b = input->view.Buffer;
+        const bool raw = (b.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+        const UINT element = b.StructureByteStride ? b.StructureByteStride : raw ? 4 : x2w_startup::typed_buffer_format_bytes(input->view.Format);
+        if (b.CounterOffsetInBytes) reason = "counter";
+        else if (raw && (input->view.Format != DXGI_FORMAT_R32_TYPELESS || b.StructureByteStride)) reason = "bad_raw_view";
+        else if (b.StructureByteStride && input->view.Format != DXGI_FORMAT_UNKNOWN) reason = "bad_structured_view";
+        else if (!element || !b.NumElements) reason = "bad_element";
+        else if ((span = (b.FirstElement + b.NumElements) * element) > resource->Width) reason = "view_past_resource";
+    }
+    Wrapper* standin = reason ? nullptr : standin_memory_buffer(input->address, *resource, span);
+    if (!reason && !standin) reason = "no_stand_in";
+    if (reason) {
+        if (first_calls(refused, noop_census_enabled() ? 512 : 8))
+            log("x2w-memsrv Device::slot71 memory UAV refused: reason=%s res{dim=%d width=%llu} view{dim=%d fmt=%d} dest=0x%llx", reason,
+                x2w_local::readable(resource, sizeof(*resource)) ? resource->Dimension : -1,
+                x2w_local::readable(resource, sizeof(*resource)) ? resource->Width : 0ull,
+                x2w_local::readable(input, sizeof(*input)) ? input->view.ViewDimension : -1,
+                x2w_local::readable(input, sizeof(*input)) ? input->view.Format : -1, destination);
+        return;
+    }
+    note_linear_form(lf_buffer_uav, destination);
+    view_slot<19, 3>(self, reinterpret_cast<u64>(standin), 0, reinterpret_cast<u64>(&input->view), destination);
+}
+
+// LOCAL (textures): X2W_TEXTURE_CENSUS=1 counts every slot-70 outcome, and every refusal by its class (reason,
+// resource dimension, layout, format, mip chain or not, XG-announced address or not, first 256 bytes non-zero or
+// not), past the 2048-line refusal cap (these lines have no cap of their own). Lines, all cumulative:
+// "x2w-texcensus slot70 calls N (...)" and "x2w-texcensus slot70 refusals N (...), top classes:" (up to 24 classes)
+// with every 300-frame draw census line, and also at powers of two (calls from 1024, refusals from 256).
+enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_detiled, mso_descriptor, mso_count };
+const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused", "detiled", "buffer descriptor"};
+LONG64 memory_srv_outcomes[mso_count];
+std::mutex refusal_census_mutex;
+std::unordered_map<u64, LONG64> refusal_census;
+LONG64 refusal_census_total;
+const char* const census_reasons[] = {"null_destination", "unreadable_resource", "unreadable_view", "null_address",
+    "unsupported_description", "destination_outside_view_heaps", "buffer_unavailable", "texture_unavailable"};
+bool census_every_event();
+bool texture_census_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_TEXTURE_CENSUS");
+        if (v) log("x2w-texcensus X2W_TEXTURE_CENSUS=1: slot-70 outcomes and refusal classes, draw texture bindings real/null; "
+                   "all cumulative, every 300 frames%s", census_every_event() ? " and after every event (X2W_TEXTURE_CENSUS_EVERY=1)" : "");
+        return v;
+    }();
+    return on;
+}
+// X2W_TEXTURE_CENSUS_EVERY=1 (tests): the cumulative lines after every counted event instead of at the thresholds.
+bool census_every_event()
+{
+    static const bool on = x2w_local::env_on("X2W_TEXTURE_CENSUS_EVERY");
+    return on;
+}
+void log_memory_srv_outcomes(const char* when)
+{
+    LONG64 total = 0;
+    for (LONG64 n : memory_srv_outcomes) total += n;
+    log("x2w-texcensus slot70 calls %lld (%s, cumulative): linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, "
+        "detiled %lld, refused %lld, buffer descriptor %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
+        memory_srv_outcomes[4], memory_srv_outcomes[6], memory_srv_outcomes[5], memory_srv_outcomes[7]);
+}
+void log_refusal_classes(const char* when)  // refusal_census_mutex held
+{
+    std::vector<std::pair<LONG64, u64>> sorted;
+    for (const auto& [k, n] : refusal_census) sorted.emplace_back(n, k);
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    log("x2w-texcensus slot70 refusals %lld (%s, cumulative), %zu classes, top classes:", refusal_census_total, when, sorted.size());
+    for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
+        const u64 k = sorted[i].second;
+        const u64 decline = (k >> 31) & 15;
+        char why[48] = "";
+        if (decline) std::snprintf(why, sizeof why, " detile: %s", decline < std::size(detile_declines) ? detile_declines[decline] : "?");
+        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s%s", sorted[i].first,
+            (k & 15) < std::size(census_reasons) ? census_reasons[k & 15] : "other", (k >> 4) & 15, (k >> 8) & 0x1ff, (k >> 20) & 0xff,
+            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced",
+            !((k >> 35) & 1) ? "unreadable" : (k >> 30) & 1 ? "nonzero" : "zero", why);
+    }
+}
+// Called with the 300-frame draw census line (d3d12_draw.inl), so a title run's scene window is the difference of
+// two reports.
+void report_memory_srv_census(long frame)
+{
+    if (!texture_census_on()) return;
+    char when[32];
+    std::snprintf(when, sizeof(when), "frame %ld", frame);
+    log_memory_srv_outcomes(when);
+    std::lock_guard lock(refusal_census_mutex);
+    log_refusal_classes(when);
+}
+void census_memory_srv_outcome(int outcome)
+{
+    if (!texture_census_on()) return;
+    InterlockedIncrement64(&memory_srv_outcomes[outcome]);
+    LONG64 total = 0;
+    for (LONG64 n : memory_srv_outcomes) total += n;
+    if (census_every_event() || (total >= 1024 && (total & (total - 1)) == 0)) log_memory_srv_outcomes("threshold");
+}
+// The memory at a refused call's address: its first 256 bytes readable, and any of them nonzero.
+struct RefusedMemory {
+    bool readable = false, nonzero = false;
+};
+RefusedMemory refused_memory(u64 address)
+{
+    RefusedMemory m;
+    if (address && x2w_local::descriptor_memory_readable(address, 256)) {
+        m.readable = true;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(address);
+        for (int i = 0; i < 256 && !m.nonzero; ++i) m.nonzero = bytes[i] != 0;
+    }
+    return m;
+}
+LONG64 detile_decline_counts[std::size(detile_declines)];
+// decline: detile_decline's verdict (detile_declines, d3d12_draw.inl; 0 = not asked). Key bits: reason 0-3, dimension
+// 4-7, layout 8-16, format 20-27, mips > 1 28, announced 29, nonzero 30, decline 31-34, first 256 bytes readable 35.
+// The memory of a refused call, read once for the census and the marker (and not at all when both are off).
+RefusedMemory refused_call_memory(const MemoryShaderResourceView* input)
+{
+    if (!texture_census_on() && !buffer_heap_index_on()) return {};
+    return x2w_local::readable(input, sizeof(*input)) ? refused_memory(input->address) : RefusedMemory{};
+}
+void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, unsigned decline,
+                    const RefusedMemory& memory)
+{
+    if (!texture_census_on()) return;
+    census_memory_srv_outcome(mso_refused);
+    u64 r = 0;
+    while (r < std::size(census_reasons) && std::strcmp(census_reasons[r], reason) != 0) ++r;
+    const bool resource_ok = x2w_local::readable(resource, sizeof(*resource));
+    const bool input_ok = x2w_local::readable(input, sizeof(*input));
+    const u64 address = input_ok ? input->address : 0;
+    if (decline >= std::size(detile_declines)) decline = 0;
+    const u64 dim = resource_ok && resource->Dimension >= 0 && resource->Dimension <= 4 ? resource->Dimension : 7;
+    const u64 layout = resource_ok ? (static_cast<UINT>(resource->Layout) & 0x1ff) : 0x1ff;
+    const u64 format = resource_ok ? (static_cast<UINT>(resource->Format) & 0xff) : 0xff;
+    const u64 chain = resource_ok && resource->MipLevels > 1;
+    const u64 key = r | dim << 4 | layout << 8 | format << 20 | chain << 28 | u64{address && xg_announced(address)} << 29 |
+                    u64{memory.nonzero} << 30 | u64{decline} << 31 | u64{memory.readable} << 35;
+    if (decline) {
+        InterlockedIncrement64(&detile_decline_counts[decline]);
+        LONG64 n = 0;
+        for (LONG64 c : detile_decline_counts) n += c;
+        if (census_every_event() || (n & (n - 1)) == 0) {
+            char parts[512];
+            int used = 0;
+            for (std::size_t i = 1; i < std::size(detile_declines); ++i)
+                used += std::snprintf(parts + used, sizeof(parts) - used, "%s%s %lld", i > 1 ? ", " : "", detile_declines[i], detile_decline_counts[i]);
+            log("x2w-texcensus detile declines of refused texture calls %lld (X2W_MEMORY_SRV_DETILE): %s", n, parts);
+        }
+    }
+    std::lock_guard lock(refusal_census_mutex);
+    const bool fresh = ++refusal_census[key] == 1;
+    const LONG64 total = ++refusal_census_total;
+    // The first call of each class (at most 96 classes): every field, the layout's size and how much of it is readable.
+    static LONG described_classes;
+    if (fresh && resource_ok && input_ok && first_calls(described_classes, 96)) {
+        char resource_text[224], view_text[256];
+        x2w_startup::report_resource(resource_text, sizeof(resource_text), resource);
+        x2w_startup::report_view(view_text, sizeof(view_text), &input->view);
+        const auto l = detile_layout(*resource);
+        const std::size_t want = l.valid ? static_cast<std::size_t>((std::min)(l.size, u64{1} << 30)) : 0;
+        log("x2w-texcensus new refusal class: %s res{%s} view{%s} address 0x%llx; detile: %s; memory %s; console layout %llu bytes, %zu "
+            "readable from the address", reason, resource_text, view_text, address, detile_declines[decline],
+            !memory.readable ? "unreadable" : memory.nonzero ? "nonzero" : "zero", l.valid ? l.size : 0ull,
+            want && address ? x2w_local::probe_descriptor_address(address, want) : 0);
+    }
+    if (census_every_event() || (total >= 256 && (total & (total - 1)) == 0)) log_refusal_classes("threshold");
+}
+
+u64 __stdcall device_slot61_census(Wrapper* self, u64 rdx, u64 r8, u64 r9)
+{
+    if (noop_census_enabled()) {  // what the no-op it replaces still reports
+        const u64 args[8] = {reinterpret_cast<u64>(self), rdx, r8, r9, 0, 0, 0, 0};
+        noop_census_note(device_kind, 61, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    }
+    static LONG calls;
+    if (first_calls(calls, 16)) {
+        char hex[200] = "unreadable";
+        if (x2w_local::readable(reinterpret_cast<const void*>(rdx), 64)) {
+            const auto* w = reinterpret_cast<const std::uint32_t*>(rdx);
+            int used = 0;
+            for (int i = 0; i < 16; ++i) used += std::snprintf(hex + used, sizeof(hex) - used, "%08x ", w[i]);
+        }
+        log("x2w-texcensus Device::slot61 (sampler?) rdx=0x%llx r8=0x%llx r9=0x%llx words %s", rdx, r8, r9, hex);
+    }
+    return 0;
 }
 
 // The first check that refuses a call, in the order the checks run; null when every check passes.
@@ -601,17 +1268,122 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     const u64 address = input_ok ? input->address : 0;
     char line[640];
     x2w_startup::report_refused_memory_srv(line, sizeof(line), what, reason, resource_ok ? resource : nullptr,
-        input_ok ? &input->view : nullptr, address, address && x2w_local::readable(reinterpret_cast<const void*>(address), 1),
+        input_ok ? &input->view : nullptr, address, address && x2w_local::descriptor_memory_readable(address, 1),
         destination, destination && memory_srv_destination(destination));
     log("%s", line);
 }
 
+// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1. A refused call writes {refused_view_magic, reason code, description}
+// into its title destination (describe_marker, d3d12_draw.inl, has the word layout) and clears the slot's shadow id.
+// That is what the slot would otherwise keep: the title's free-list link, or a stale token, which copies spread into
+// draw tables. The description travels with the title's copies, so a draw's null entry names the refused call.
+void mark_refused_destination(u64 destination, const char* reason, const D3D12_RESOURCE_DESC* resource,
+                              const MemoryShaderResourceView* input, unsigned decline, const RefusedMemory& memory)
+{
+    if (!buffer_heap_index_on() || !destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32))
+        return;
+    std::uint32_t marker[8] = {refused_view_magic, refusal_code(reason), 1u << 31, 0, 0, 0, 0, 0};
+    if (x2w_local::readable(resource, sizeof(*resource))) {
+        const auto& r = *resource;
+        marker[2] |= (static_cast<UINT>(r.Format) & 0xff) | (static_cast<UINT>(r.Layout) & 0x1ff) << 8 |
+                     (static_cast<UINT>(r.Dimension) & 7) << 17 | (r.MipLevels < 15 ? r.MipLevels : 15u) << 20 | (decline & 15) << 24;
+        marker[3] = r.Width > 0xffffffffull ? 0xffffffffu : static_cast<std::uint32_t>(r.Width);
+        marker[4] = r.Height;
+        marker[5] = r.DepthOrArraySize;
+    }
+    if (x2w_local::readable(input, sizeof(*input))) {
+        marker[5] |= std::uint32_t{memory.readable} << 16 | std::uint32_t{memory.nonzero} << 17;
+        marker[6] = static_cast<std::uint32_t>(input->address);
+        marker[7] = static_cast<std::uint32_t>(input->address >> 32);
+    }
+    // Preserve an otherwise valid placed SRV while DirectStorage pages are still absent. The descriptor mirror resolves
+    // these words at use time, including copies of this slot.
+    static const bool retry = x2w_gpu::gpu_abi_on() && x2w_local::env_on("X2W_GPU_LATE_TEXTURES");
+    if (retry && decline == 8 && resource && input && x2w_late_texture::encode(*resource, input->view, input->address, marker)) {
+        static LONG deferred;
+        const LONG n = InterlockedIncrement(&deferred);
+        if ((n & (n - 1)) == 0) log("x2w-gpu deferred texture descriptors written %ld", n);
+    }
+    std::memcpy(reinterpret_cast<void*>(destination), marker, sizeof(marker));
+    if (const u64 desktop = desktop_cpu_handle(destination)) {
+        AcquireSRWLockExclusive(&note_lock);
+        if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
+        ReleaseSRWLockExclusive(&note_lock);
+    }
+}
+LONG64 vdesc_no_buffer, vdesc_unaligned, vdesc_no_destination, vdesc_layout, vdesc_ticks[3], vdesc_lock_taken;
+void heap_raw_note(const std::uint32_t* words);  // LOCAL: d3d12_heap_raw.inl (`heapraw 1` compute: the V# by content)
+LONG64 qpc_now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input, bool found_buffer, LONG64 lookup_ticks)
+{
+    if (!buffer_heap_index_on()) return false;
+    const auto counted = [](LONG64& which) {
+        InterlockedIncrement64(&which);
+        const LONG64 n = vdesc_no_buffer + vdesc_unaligned + vdesc_no_destination + vdesc_layout;
+        if ((n & (n - 1)) == 0) {
+            static const double us_per_tick = [] {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                return 1e6 / static_cast<double>(f.QuadPart);
+            }();
+            const double written = static_cast<double>((std::max)(1ll, vdesc_no_buffer + vdesc_unaligned));
+            log("x2w-memsrv buffer descriptors: written %lld (no buffer %lld, buffer at an offset the view cannot name %lld), not written: "
+                "destination not title memory %lld, view not encodable %lld; per written call: buffer lookup %.2f us, destination checks "
+                "%.2f us, shadow clear %.2f us (lock taken %lld)", vdesc_no_buffer + vdesc_unaligned, vdesc_no_buffer, vdesc_unaligned,
+                vdesc_no_destination, vdesc_layout, vdesc_ticks[0] * us_per_tick / written, vdesc_ticks[1] * us_per_tick / written,
+                vdesc_ticks[2] * us_per_tick / written, vdesc_lock_taken);
+        }
+    };
+    const LONG64 t0 = qpc_now();
+    if (!destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32)) {
+        counted(vdesc_no_destination);
+        return false;
+    }
+    const LONG64 t1 = qpc_now();
+    x2w_startup::BufferViewLayout l;
+    if (!x2w_startup::buffer_view_layout_from_desc(false, reinterpret_cast<const unsigned char*>(&input->view), 40, l) ||
+        l.kind == x2w_startup::BufferViewKind::unknown || !l.num_records || ((input->address + l.offset) >> 48)) {
+        counted(vdesc_layout);
+        return false;
+    }
+    std::uint32_t words[8];
+    x2w_startup::gfx10_buffer_words(l, words);
+    const u64 base = input->address + l.offset;
+    words[0] = static_cast<std::uint32_t>(base);
+    words[1] |= static_cast<std::uint32_t>(base >> 32) & 0xffff;
+    std::memcpy(reinterpret_cast<void*>(destination), words, sizeof(words));
+    heap_raw_note(words);  // LOCAL: translated `heapraw 1` compute reads this V# wherever the title copies it
+    if (const u64 desktop = desktop_cpu_handle(destination)) {
+        // Most slots hold no id (the title rewrites the same slots with V#s): look under the shared lock first.
+        if (shadow_id(desktop)) {
+            InterlockedIncrement64(&vdesc_lock_taken);
+            AcquireSRWLockExclusive(&note_lock);
+            if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
+            ReleaseSRWLockExclusive(&note_lock);
+        }
+    }
+    const LONG64 t2 = qpc_now();
+    InterlockedAdd64(&vdesc_ticks[0], lookup_ticks);
+    InterlockedAdd64(&vdesc_ticks[1], t1 - t0);
+    InterlockedAdd64(&vdesc_ticks[2], t2 - t1);
+    counted(found_buffer ? vdesc_unaligned : vdesc_no_buffer);
+    static LONG shown;
+    if (first_calls(shown, 8))
+        log("x2w-memsrv buffer descriptor written at 0x%llx (X2W_BUFFER_HEAP_INDEX): base 0x%llx, stride %u, records %u, word 3 0x%08x%s", destination,
+            base, l.index_stride, l.num_records, words[3], found_buffer ? " (a buffer is there, at an offset the view cannot name)" : "");
+    return true;
+}
 // Counts a refusal (memory_srv_census) and logs its line while the first 8 refusals last, and also for
 // the first refusal of each of the first few distinct shapes (MemorySrvCensus::detail_shapes).
 void refuse_memory_srv(LONG& refused, const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
                        const MemoryShaderResourceView* input, u64 destination)
 {
-    const bool within_limit = first_calls(refused, 8);
+    const bool within_limit = first_calls(refused, noop_census_enabled() ? 2048 : 8);  // LOCAL: the census limit
     const bool new_shape = memory_srv_census.note(reason, x2w_local::readable(resource, sizeof(*resource)) ? resource : nullptr);
     if (within_limit || new_shape) log_refused_memory_srv(what, reason, resource, input, destination);
 }
@@ -658,26 +1430,170 @@ void publish_as_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const Me
     const u64 location = x2w_startup::as_srv_location(input->view, input->address);
     D3D12_SHADER_RESOURCE_VIEW_DESC resolved{};
     const auto refusal = x2w_startup::resolve_as_srv_desc(location, placed_as_buffer(self, location), input->view, resolved);
+    const u64 desktop = desktop_cpu_handle(destination);
+    const bool logical = x2w_gpu::gpu_abi_on() && desktop && desktop != destination && title_backed(destination, 32) &&
+        x2w_local::writable(reinterpret_cast<void*>(destination), 32);
     if (refusal != x2w_startup::AsSrvRefusal::none) {
+        if (logical) {
+            auto desc = input->view;
+            desc.RaytracingAccelerationStructure.Location = location;
+            note_view(18, 0, 0, &desc, sizeof(desc), destination, desktop, false);
+        }
         refuse_memory_srv(refused, "unavailable acceleration structure at the supplied address",
                           x2w_startup::as_srv_refusal_name(refusal), resource, input, destination);
         return;
     }
     view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&resolved), destination, 0);
+    if (logical)
+        x2w_as_address::annotate(reinterpret_cast<std::uint32_t*>(destination), location);
 }
 
+namespace gpu_detail_heap {
+u64 late_texture(const std::uint32_t* words, D3D12_SHADER_RESOURCE_VIEW_DESC& srv, bool& pending, bool allow_create = true);
+}
+
+void copy_lazy_native_srv(Wrapper* self, u64 source, u64 destination)
+{
+    static const bool enabled = x2w_local::env_on("X2W_GPU_LAZY_DETILE") && x2w_local::env_on("X2W_GPU_LATE_TEXTURES");
+    if (!enabled) return;
+    std::uint32_t words[8];
+    std::memcpy(words, reinterpret_cast<const void*>(source), sizeof(words));
+    if (words[0] != x2w_late_texture::lazy) return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    bool pending = false;
+    if (const u64 wrapper = gpu_detail_heap::late_texture(words, srv, pending))
+        view_slot<18, 2>(self, wrapper, reinterpret_cast<u64>(&srv), destination, 0);
+}
+bool lazy_detiled_srv(Wrapper* self, const D3D12_RESOURCE_DESC& resource, const MemoryShaderResourceView& input, u64 destination)
+{
+    static const bool enabled = x2w_gpu::gpu_abi_on() && x2w_local::env_on("X2W_GPU_LATE_TEXTURES") &&
+        x2w_local::env_on("X2W_GPU_LAZY_DETILE");
+    if (!enabled) return false;
+    std::uint32_t words[8]{};
+    if (!x2w_late_texture::encode(resource, input.view, input.address, words) || !title_backed(destination, sizeof(words)) ||
+        !x2w_local::writable(reinterpret_cast<void*>(destination), sizeof(words))) return false;
+
+    words[0] = x2w_late_texture::lazy;
+    auto desc = input.view;
+    desc.Format = desktop_format(desc.Format);
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = desktop_format(resource.Format);
+    // A CPU descriptor copied through D3D12 must be initialized even before the mirror has a texture.
+    view_slot<18, 2>(self, 0, reinterpret_cast<u64>(&desc), destination, 0);
+    std::memcpy(reinterpret_cast<void*>(destination), words, sizeof(words));
+    static LONG64 staged;
+    const auto n = InterlockedIncrement64(&staged);
+    if ((n & (n - 1)) == 0) log("x2w-gpu detiled texture descriptors staged %lld", n);
+    return true;
+}
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     X2W_ZONE("device_memory_srv");
     static LONG refused;
     check_resource_address_index();
+    if (noop_census_enabled()) {  // LOCAL (video): is the handler reached at all, and where does it write?
+        static LONG64 calls;
+        const LONG64 n = InterlockedIncrement64(&calls);
+        CensusHeap h{};
+        const bool in_heap = noop_census_heap_index(destination, &h);
+        if (n <= 8 || (n & (n - 1)) == 0)
+            log("x2w-noop-census memory SRV call %lld: destination 0x%llx = %s index 0x%llx of the heap at 0x%llx", n, destination,
+                in_heap ? (h.desktop ? "DESKTOP" : "title") : "no heap", h.index, h.base);
+    }
+    const bool described = destination && x2w_local::readable(resource, sizeof(*resource)) &&
+        x2w_local::readable(input, sizeof(*input)) && input->address;
+    if (described && !x2w_startup::is_as_srv(input->view) &&
+        (resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
+        !x2w_late_texture::valid_shape(*resource, true)) {
+        constexpr auto reason = "unsupported_description";
+        refuse_memory_srv(refused, "invalid texture shape", reason, resource, input, destination);
+        const auto memory = refused_call_memory(input);
+        census_refusal(reason, resource, input, 0, memory);
+        mark_refused_destination(destination, reason, resource, input, 0, memory);
+        return;
+    }
+    if (described && x2w_packed_light::color_bytes(resource->Format) && input->view.Format == resource->Format &&
+        linear_view_in_range(*resource, input->view) &&
+        packed_light_source(input->address, *resource) && memory_srv_destination(destination)) {
+        if (auto* proxy = publish_linear_texture(self, input->address, *resource, true)) {
+            view_slot<18, 2>(self, reinterpret_cast<u64>(proxy), reinterpret_cast<u64>(&input->view), destination, 0);
+            return;
+        }
+    }
+    // An encoded block copy writes the native texture. A CPU-derived proxy at
+    // the same base still contains the original title bytes.
+    if (described) {
+        if (auto* native = native_tiled_bc_texture(input->address, *resource, input->view); native && memory_srv_destination(destination)) {
+            view_slot<18, 2>(self, reinterpret_cast<u64>(native), reinterpret_cast<u64>(&input->view), destination, 0);
+            census_memory_srv_outcome(mso_tiled);
+            note_memory_srv_write(resource, input, destination);
+            return;
+        }
+    }
+    const bool plain = described && memory_srv_linear_on() && linear_memory_srv(*resource, input->view);
+    if ((plain || (described && memory_srv_announced_on() && announced_linear_srv(*resource, input->view, input->address))) &&
+        memory_srv_destination(destination)) {
+        Wrapper* texture = existing_memory_texture(input->address, *resource);
+        if (!texture) texture = publish_linear_texture(self, input->address, *resource);
+        if (texture) {
+            static LONG64 linear_views;
+            const LONG64 n = InterlockedIncrement64(&linear_views);
+            if ((n & (n - 1)) == 0) {
+                std::size_t textures;
+                u64 bytes;
+                {
+                    std::lock_guard lock(linear_srv_mutex);
+                    textures = linear_srv_textures.size();
+                    bytes = linear_srv_bytes;
+                }
+                log("x2w-memsrv linear memory SRVs written: %lld, %zu textures, %llu KiB (latest destination 0x%llx)", n, textures,
+                    bytes >> 10, destination);
+            }
+            note_linear_form(linear_form(input->view.ViewDimension), destination);
+            census_memory_srv_outcome(plain ? mso_linear : mso_announced);
+            view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+            return;
+        }
+    }
+    // LOCAL (textures): X2W_MEMORY_SRV_DETILE (detile_srv above); after the linear and announced forms, before the
+    // refusal checks, so every path that took a call before still takes it.
+    // decline: why it did not, for the refusal logs (detile_declines); 0 when not asked (switch off, a buffer).
+    unsigned decline = 0;
+    if (memory_srv_detile_on() && destination && x2w_local::readable(resource, sizeof(*resource)) &&
+        x2w_local::readable(input, sizeof(*input)) && resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        decline = detile_decline(*resource, input->view, input->address, input->address != 0);
+        if (!decline && !memory_srv_destination(destination)) decline = 9;
+    }
+    if (described && memory_srv_detile_on() && resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !decline) {
+        if (lazy_detiled_srv(self, *resource, *input, destination)) {
+            note_linear_form(linear_form(input->view.ViewDimension), destination);
+            census_memory_srv_outcome(mso_detiled);
+            return;
+        }
+        Wrapper* texture = existing_memory_texture(input->address, *resource);
+        if (!texture) texture = publish_linear_texture(self, input->address, *resource, true);
+        if (!texture) decline = 10;
+        if (texture) {
+            static LONG shown;
+            if (first_calls(shown, 16))
+                log("x2w-memsrv detiled memory SRV at 0x%llx: %llux%ux%u mips %u fmt %d layout 0x%x dim %d", input->address,
+                    resource->Width, resource->Height, resource->DepthOrArraySize, resource->MipLevels, resource->Format,
+                    static_cast<unsigned>(resource->Layout), resource->Dimension);
+            note_linear_form(linear_form(input->view.ViewDimension), destination);
+            census_memory_srv_outcome(mso_detiled);
+            view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+            return;
+        }
+    }
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         refuse_memory_srv(refused, "unsupported memory SRV arguments", reason, resource, input, destination);
+        const RefusedMemory memory = refused_call_memory(input);
+        census_refusal(reason, resource, input, decline, memory);
+        mark_refused_destination(destination, reason, resource, input, decline, memory);
         return;
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
-    if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
+    if (upstream_console_srv_on() && x2w_startup::supports_single_element_srv(*resource, input->view)) {
         if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
             refuse_memory_srv(refused, "GPU-written resource at the supplied address", "gpu_written_resource", resource, input,
                               destination);
@@ -697,19 +1613,36 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        const LONG64 lookup_start = buffer_heap_index_on() ? qpc_now() : 0;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
-        if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource);
-        }
+        const LONG64 lookup_ticks = buffer_heap_index_on() ? qpc_now() - lookup_start : 0;
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        if ((!buffer || !info) && memory_srv_buffer_on()) {
+            // LOCAL (video): no buffer resource covers the address; a stand-in whose title memory starts there.
+            if (Wrapper* standin = standin_memory_buffer(input->address, *resource, span_bytes)) {
+                note_linear_form(lf_buffer_srv, destination);
+                census_memory_srv_outcome(mso_standin);
+                view_slot<18, 2>(self, reinterpret_cast<u64>(standin), reinterpret_cast<u64>(&input->view), destination, 0);
+                return;
+            }
+        }
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
+            // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1: the console V# instead (write_buffer_descriptor).
+            if (write_buffer_descriptor(destination, input, buffer && info, lookup_ticks)) {
+                census_memory_srv_outcome(mso_descriptor);
+                return;
+            }
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
+            const RefusedMemory memory = refused_call_memory(input);
+            census_refusal("buffer_unavailable", resource, input, 0, memory);
+            mark_refused_destination(destination, "buffer_unavailable", resource, input, 0, memory);
             return;
         }
+        census_memory_srv_outcome(mso_buffer);
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         note_memory_srv_write(resource, input, destination);
         return;
@@ -751,8 +1684,12 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) {
         refuse_memory_srv(refused, "unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",
                           resource, input, destination);
+        const RefusedMemory memory = refused_call_memory(input);
+        census_refusal("texture_unavailable", resource, input, decline, memory);
+        mark_refused_destination(destination, "texture_unavailable", resource, input, decline, memory);
         return;
     }
+    census_memory_srv_outcome(mso_tiled);
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
     note_memory_srv_write(resource, input, destination);
 }

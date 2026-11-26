@@ -54,3 +54,16 @@ https://datatracker.ietf.org/ipr/1914/
 Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
+
+## Shader translator and GPU runtime
+
+Portions of the shader translator, GPU runtime, and corresponding tests use code
+from the upstream shader and GPU crates. The upstream workspace at revision
+`e9f435f9821ee8e03316367766c1551438aafec5` identifies its license as
+`GPL-3.0-or-later`. See [the license text](LICENSE-GPL-3.0.txt).
+File-specific notices, including the Valve notice in the GFX10 opcode table,
+also apply.
+
+The screen-probe light replacement and depth-based crease shading are credited
+to beloooo (06031237, 4f45ab88, cd9f78ce). Revisions 82ca134, 7da523a, and
+81ebb7b document the radiance estimate, air-light bounds, and probe filtering.

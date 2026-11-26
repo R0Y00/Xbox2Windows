@@ -5,9 +5,11 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <wrl/client.h>
 
 #include <array>
+#include <thread>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -87,6 +89,12 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
     pipeline = nullptr;
     return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[57])(device, desc, __uuidof(ID3D12PipelineState), &pipeline)) &&
            pipeline;
+}
+
+static UINT env_uint(const wchar_t* name)
+{
+    wchar_t value[16] = L"";
+    return GetEnvironmentVariableW(name, value, 16) ? static_cast<UINT>(std::wcstoul(value, nullptr, 10)) : 0u;
 }
 
 // Binds the pipeline on a guest list and records `calls` ExecuteIndirect calls (list slot 61) with a Draw or a
@@ -310,6 +318,35 @@ int main(int argc, char** argv)
         if (!MoveFileW((std::wstring(manifest) + L".pending").c_str(), manifest)) return 61;
         Sleep(1100);
     }
+    // LOCAL stall (X2W_DRAW_ASYNC): X2W_TEST_HOLD_RELEASE=first|<ms> with X2W_CX_TEST_HOLD_EVENT=<name>. The
+    // pipeline compile of the first draw waits for the named event: "first" sets it after the first draw
+    // (<output>.first) returns, <ms> from another thread that many ms after the first draw starts. Then, 1.5 s
+    // after the release, a second draw to <output>.
+    wchar_t hold_name[128], release[16];
+    const DWORD hold_length = GetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", hold_name, 128);
+    const DWORD release_length = GetEnvironmentVariableW(L"X2W_TEST_HOLD_RELEASE", release, 16);
+    if (hold_length && hold_length < 128 && release_length && release_length < 16) {
+        static HANDLE hold = CreateEventW(nullptr, TRUE, FALSE, hold_name);
+        static DWORD delay = 0;
+        if (!hold) return 62;
+        const bool after_first = std::wcscmp(release, L"first") == 0;
+        if (!after_first) {
+            delay = static_cast<DWORD>(std::wcstoul(release, nullptr, 10));
+            const auto later = [](void*) -> DWORD {
+                Sleep(delay);
+                SetEvent(hold);
+                return 0;
+            };
+            if (const HANDLE t = CreateThread(nullptr, 0, later, nullptr, 0, nullptr)) CloseHandle(t);
+            else return 62;
+        }
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        if (after_first) SetEvent(hold);
+        else WaitForSingleObject(hold, 30000);
+        Sleep(1500);
+        return check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
         extern void release_placed_vertices(bool);
         const std::string first = std::string(argv[5]) + ".first";
@@ -320,5 +357,38 @@ int main(int argc, char** argv)
         release_placed_vertices(true);
         return rc;
     }
-    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word, two_targets);
+    // LOCAL stall: X2W_TEST_THREADS=<n> (2-8) with X2W_TEST_REPEAT=<k>: n threads each record, submit and read back k
+    // frames on their own list and queue at the same time (one shared device and pipeline), pixels in <out>.t<thread>
+    // (the last frame); the first failing return code wins. With X2W_DRAW_LOCK_TIMES the lock-times report is
+    // written at the end (export x2w_draw_lock_times_test op 1).
+    if (const UINT threads = env_uint(L"X2W_TEST_THREADS"); threads >= 2 && threads <= 8 && !bc7.blocks) {
+        const UINT repeat = env_uint(L"X2W_TEST_REPEAT") ? env_uint(L"X2W_TEST_REPEAT") : 1;
+        std::vector<std::thread> workers;
+        std::vector<int> results(threads, 0);
+        for (UINT t = 0; t < threads; ++t)
+            workers.emplace_back([&, t] {
+                const std::string out = std::string(argv[5]) + ".t" + std::to_string(t);
+                for (UINT k = 0; k < repeat && !results[t]; ++k)
+                    results[t] = check_stream_draw(adapter.Get(), device, pso, out.c_str(), nullptr, format, export_word, two_targets);
+            });
+        for (auto& w : workers) w.join();
+        using LockTimes = std::uint64_t(WINAPI*)(int, std::uint64_t, std::uint64_t);
+        if (const HMODULE xs = GetModuleHandleW(L"d3d12_xs.dll"))
+            if (const auto report = reinterpret_cast<LockTimes>(GetProcAddress(xs, "x2w_draw_lock_times_test"))) report(1, 0, 0);
+        for (int r : results)
+            if (r) return r;
+        return 0;
+    }
+    const int rc = check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word, two_targets);
+    // LOCAL lt-lead probe: with X2W_DRAW_DUMP_INPUTS the dump of the (waited-for) draw is written now (export op 1),
+    // since this program never presents.
+    if (!rc && GetEnvironmentVariableW(L"X2W_DRAW_DUMP_INPUTS", nullptr, 0)) {
+        using Flush = int(WINAPI*)(int);
+        const HMODULE xs = GetModuleHandleW(L"d3d12_xs.dll");
+        const auto flush = xs ? reinterpret_cast<Flush>(GetProcAddress(xs, "x2w_draw_dump_inputs_test")) : nullptr;
+        const int written = flush ? flush(1) : -1;
+        std::printf("draw input dumps written: %d\n", written);
+        if (written < 1) return 63;
+    }
+    return rc;
 }

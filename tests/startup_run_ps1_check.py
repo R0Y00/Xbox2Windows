@@ -189,7 +189,9 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     elif [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] != STUB_LINES:
         found.append(f"stub exit {code}: {summary.name} does not hold the debugger's output")
     want = [str(exe), str(data), str(log), "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4", *passed]
+            "--trace-files", "1", "--continue-asserts", "4",
+            # LOCAL run.ps1 switches -FastExit (off) and -LogRepeats (default 200) are always forwarded
+            "--fast-exit", "0", "--log-repeats", "200", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
     expected = [want, "1" if "-TraceApi" in switches else trace_api_env]

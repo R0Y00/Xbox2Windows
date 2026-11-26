@@ -189,6 +189,11 @@ def rekey(src, dst, jobs=None, out=None):
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    # LOCAL merge: the local cache keeps revision 3, so re-keying is not part of the local workflow. The tool runs
+    # only with X2W_UPSTREAM_SHADER_CACHE_REKEY=1 (its CTest check sets it); it never writes the old cache.
+    if os.environ.get('X2W_UPSTREAM_SHADER_CACHE_REKEY') != '1':
+        print('shader_cache_rekey: disabled here; set X2W_UPSTREAM_SHADER_CACHE_REKEY=1 to run it', file=sys.stderr)
+        return 2
     if len(argv) != 2 or argv[0].startswith('-'):
         print(__doc__.split('\n\n')[1], file=sys.stderr)
         return 2

@@ -334,7 +334,29 @@ def refused(assembly):
     return False
 
 
+def check_scalar_flbit():
+    _, _, name, asm = G.decode(bytes.fromhex('001582be'))[0]
+    assert asm == 's_flbit_i32_b32 s2, s0'
+    stage = Probe()
+    stage.masks = set()
+    stage.one(name, asm)
+    assert len(stage.lines) == 1 and stage.lines[0].startswith('s2 = '), stage.lines
+    expr = Expr(stage.lines[0][5:-1])
+    for value in BITS:
+        expected = 32 - value.bit_length() if value else MASK
+        assert expr.run({'s0': value})[0] == expected, hex(value)
+    stage.masks.add(3)
+    for src in ('exec_lo', 'vcc', 's3', 'v1', 's[8:9]'):
+        try:
+            stage.one(name, name + ' s2, ' + src)
+        except G.Unsupported:
+            continue
+        raise AssertionError(src)
+    print('scalar flbit: unsigned leading zeros, zero sentinel, unchanged SCC and whole-word checks pass')
+
+
 def controls():
+    check_scalar_flbit()
     for op in OPS:
         pipe, text = translate(op)
         check('%s: %d inputs match the reference (e32 and e64 lanes)' % (op, len(GRID[op])),

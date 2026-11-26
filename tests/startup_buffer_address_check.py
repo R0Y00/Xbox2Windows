@@ -230,9 +230,7 @@ def formatted_mubuf_request_controls():
         assert classify_shader_reason('buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL') == 'buffer_* instruction'
 
 
-def controls():
-    formatted_mubuf_request_controls()
-
+def address_mode_controls():
     # 1. Existing single-mode forms keep their exact HLSL output.
     asm, st = translate_bytes(encode_mubuf(imm=12, soffset=128 + 16))
     assert asm == ['buffer_load_dword v4, off, s[16:19], 16 offset:12'], asm
@@ -261,6 +259,11 @@ def controls():
     assert st.lines[0] == 'a = v6 * ud2 + v7 + 5;', st.lines
     assert {6, 7}.issubset(st.used_v), st.used_v
 
+
+def controls():
+    address_mode_controls()
+    formatted_mubuf_request_controls()
+
     # 3. Scalar soffset from an SGPR (root constant, folded scalar constant, or runtime SGPR, up to s105).
     asm, st = translate_bytes(encode_mubuf(imm=12, idxen=1, offen=1, vaddr=2, soffset=8))
     assert asm == ['buffer_load_dword v4, v[2:3], s[16:19], s8 idxen offen offset:12'], asm
@@ -282,6 +285,8 @@ def controls():
     _, st = translate_bytes(encode_mubuf(imm=4, idxen=1, offen=1, vaddr=254))
     assert st.lines[0] == 'a = v254 * ud2 + v255 + 4;', st.lines
     must_refuse_bytes(encode_mubuf(imm=4, idxen=1, offen=1, vaddr=255), 'v[255:256]')
+
+    must_refuse_asm('buffer_load_dword v4, off, s[16:19], 0 lwe', 'buffer modifier lwe')
 
     # 6. Unmodeled modifiers (lds, tfe, unknown) are refused with Unsupported, never dropped or crashed.
     must_refuse_bytes(encode_mubuf(imm=8, offen=1, vaddr=2, lds=1), 'buffer modifier lds')

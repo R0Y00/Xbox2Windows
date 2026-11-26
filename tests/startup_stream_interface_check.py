@@ -7,7 +7,12 @@ and TEXCOORD but reads only TEXCOORD; its interface table lists TEXCOORD as attr
 writes to red.
 
 Without arguments only the translator cases run (no consumer, device or compiler):
-  linked:   attribute 0 reads vertex parameter 1; an interface whose order matches keeps parameter 0.
+  linked:   attribute 0 reads vertex parameter 1; an interface whose order matches keeps parameter 0; a kind-7
+            vertex record (the SV_ClipDistance register also exported as a parameter) links no attribute.
+  refused:  a kind-7 record on a non-clip register, twice, out of order or with packing bytes; a kind-8 record.
+  clip:     without a .vsout, pos1 is SV_ClipDistance0 when the output signature's system values are SV_Position
+            and SV_ClipDistance0 from x (CCDIST0 | CLIP_DIST_ENA = the mask); channels above the enabled distances
+            are not lowered; other signatures leave pos1 refused.
   refused:  a packed pixel record, a vertex record with packing bytes, components that differ between the stages,
             a semantic the vertex stage does not output, a pixel header of another size, and an attribute read that
             the pixel table does not list.
@@ -35,7 +40,7 @@ VS_RECORDS = [(6, 1, 0, 0, 0, 0), (6, 2, 1, 0, 0, 0)]  # COLOR -> param0, TEXCOO
 PS_RECORDS = [(6, 2, 3, 0, 0, 0, 2, 2)]                # TEXCOORD -> attr0, mask 3, linear
 
 
-def vertex_words():
+def vertex_words(clip=False):
     # x = 2 * ((2*i) & 2) - 1, y = 2 * (i & 2) - 1 (startup_stream_draw_check.vertex), v3 = 0, v4 = 1.0.
     words = [vop2(0x1a, 1, 129, 0), vop2(0x1b, 1, 130, 1), vop2(0x1b, 2, 130, 0)]
     for v in (1, 2):
@@ -44,6 +49,7 @@ def vertex_words():
                   vop2(3, 5, 242, 1), vop2(8, 5, 240, 5),   # v5 = (x + 1.0) * 0.5
                   vop1(1, 6, 240),                           # v6 = 0.5
                   0xf80000cf, 0x04030201,                    # exp pos0 v1, v2, v3, v4
+                  *((0xf80008df, 0x06060605) if clip else ()),  # exp pos1 v5, v6, v6, v6 done (clip distances)
                   0xf800020f, 0x06060606,                    # exp param0 v6, v6, v6, v6 (COLOR)
                   0xf8000a1f, 0x06060505,                    # exp param1 v5, v5, v6, v6 done (TEXCOORD)
                   0xbf810000])
@@ -90,9 +96,9 @@ def container(stage, words, base, sections, table):
     return b"DXBC" + bytes(16) + struct.pack("<3I", 1, at, len(parts)) + struct.pack("<%dI" % len(parts), *offsets) + b"".join(parts)
 
 
-def vertex(records=VS_RECORDS, outputs=(POSITION, COLOR, TEXCOORD), base=VS_BASE):
+def vertex(records=VS_RECORDS, outputs=(POSITION, COLOR, TEXCOORD), base=VS_BASE, clip=False):
     table = {0x1dc: b"".join(bytes(r) for r in records), 0x29c: struct.pack("<I", len(records))}
-    return container(1, vertex_words(), base, [signature(b"OSG1", outputs)], table)
+    return container(1, vertex_words(clip), base, [signature(b"OSG1", outputs)], table)
 
 
 def pixel(records=PS_RECORDS, inputs=(POSITION, COLOR, TEXCOORD), base=PS_BASE, attr=0, count=None):
@@ -128,7 +134,58 @@ def translate_cases(directory):
                            pixel(inputs=(POSITION, ("TEXCOORD", 0, 1, 0, 0x3), ("TEXCOORD", 1, 2, 0, 0x3))))
     assert status == "ok" and "U(i.param0.x)" in ps, (status, ps)
     print("translate: TEXCOORD1 links by semantic index, not by name alone")
+    # Kind 7: the SV_ClipDistance output (register 3) also exported as parameter 2. The pixel stage declares it as
+    # a system-value input and links only TEXCOORD, so attribute 0 still reads parameter 1.
+    clip = ("SV_CLIPDISTANCE", 0, 3, 2, 0x1)
+    clip_vs = dict(records=VS_RECORDS + [(7, 3, 2, 0, 0, 0)], outputs=(POSITION, COLOR, TEXCOORD, clip))
+    status, ps = translate(directory / "clip_param", vertex(**clip_vs), pixel(inputs=(POSITION, COLOR, TEXCOORD, clip)))
+    assert status == "ok" and "U(i.param1.x)" in ps and "i.param2" not in ps, (status, ps)
+    print("translate: a kind-7 record (SV_ClipDistance also exported as a parameter) links nothing")
+    # pos1 of a stream vertex stage without a .vsout: PA_CL_VS_OUT_CNTL from the output signature (one clip distance
+    # in x: CCDIST0 | CLIP_DIST_ENA_0); the export's y, z and w are not clip distances.
+    status, _ = translate(directory / "clip_export", vertex(clip=True, **clip_vs),
+                          pixel(inputs=(POSITION, COLOR, TEXCOORD, clip)))
+    vs = (directory / "clip_export").glob("*.vs.hlsl")
+    vs = next(vs).read_text()
+    assert status == "ok" and "    float clip0 : SV_ClipDistance0;" in vs and "o.clip0 = F(v5);" in vs, (status, vs)
+    print("translate: stream pos1 -> SV_ClipDistance0 from the output signature (x only)")
+    for outputs, want in ((clip_vs["outputs"], 0x400001),
+                          ((POSITION, ("SV_CLIPDISTANCE", 0, 3, 2, 0x3)), 0x400003),
+                          ((POSITION, ("SV_CLIPDISTANCE", 0, 3, 2, 0xf)), 0x40000f),
+                          ((POSITION, ("SV_CLIPDISTANCE", 0, 3, 2, 0x2)), None),      # not from x
+                          ((POSITION, ("SV_CLIPDISTANCE", 1, 3, 2, 0x1)), None),      # second distance vector
+                          ((POSITION, ("SV_CULLDISTANCE", 0, 3, 3, 0x1)), None),      # cull distances
+                          ((POSITION, ("SV_CLIPDISTANCE", 0, 3, 2, 0x1), ("SV_RENDERTARGETARRAYINDEX", 0, 4, 4, 0x1)),
+                           None),                                                     # a misc vector before it
+                          ((POSITION, COLOR), None)):
+        got = gfx2hlsl.stream_vs_out_cntl(vertex(outputs=outputs))
+        assert got == want, (outputs, got, want)
+    assert gfx2hlsl.clip_vector_width(0x400001, ["v5", "v6", "v6", "v6"]) == 1
+    assert gfx2hlsl.clip_vector_width(0x400003, ["v5", "v6", "off", "off"]) == 2
+    for cntl, vals in ((0x400003, ["v5", "off", "v6", "v6"]), (0x400007, ["v5", "v6", "off", "off"]),
+                       (0x400005, ["v5", "v6", "v6", "v6"])):
+        try:
+            gfx2hlsl.clip_vector_width(cntl, vals)
+        except gfx2hlsl.Unsupported:
+            continue
+        raise AssertionError("accepted pos1 %s with %#x" % (vals, cntl))
+    status, _ = translate(directory / "clip_without_signature", vertex(clip=True), pixel())
+    assert status == "unsupported: export target pos1", status
+    print("translate: signature forms other than SV_Position + SV_ClipDistance0 from x give no PA_CL_VS_OUT_CNTL;"
+          " an enabled distance not written is refused")
     for label, vs, ps, want in (
+            ("kind 7 on a plain output", vertex(records=VS_RECORDS + [(7, 2, 2, 0, 0, 0)]), pixel(),
+             "unverified vertex output record 070202000000"),
+            ("kind 7 twice", vertex(records=VS_RECORDS + [(7, 3, 2, 0, 0, 0), (7, 3, 3, 0, 0, 0)],
+                                   outputs=clip_vs["outputs"]), pixel(),
+             "unverified vertex output record 070303000000"),
+            ("kind 7 out of order", vertex(records=VS_RECORDS + [(7, 3, 3, 0, 0, 0)], outputs=clip_vs["outputs"]),
+             pixel(), "unverified vertex output record 070303000000"),
+            ("kind 7 packing", vertex(records=VS_RECORDS + [(7, 3, 2, 1, 0, 0)], outputs=clip_vs["outputs"]),
+             pixel(), "unverified vertex output record 070302010000"),
+            ("kind 8 cull distance", vertex(records=VS_RECORDS + [(8, 3, 2, 0, 0, 0)],
+                                            outputs=(POSITION, COLOR, TEXCOORD, ("SV_CULLDISTANCE", 0, 3, 3, 0x1))),
+             pixel(), "unverified vertex output record 080302000000"),
             ("packed pixel record", vertex(), pixel(records=[(6, 2, 3, 0, 0, 1, 2, 26)]),
              "unverified pixel input record 0602030000010" + "21a"),
             ("vertex record packing", vertex(records=[(6, 1, 0, 0, 0, 0), (6, 2, 1, 3, 0, 3)]), pixel(),

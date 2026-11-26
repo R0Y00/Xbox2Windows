@@ -2,10 +2,14 @@
 // permissive startup paths. Lines go to stderr and are appended to %X2W_TRAP_LOG% when set.
 #pragma once
 
+#include "startup_stubs/log_cap.h"
 #include "startup_stubs/trap.h"
 
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace x2w_local {
 
@@ -33,35 +37,167 @@ inline void logf(const char* format, ...) noexcept
     line[n++] = '\n';
     const DWORD error = GetLastError();
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
+    x2w_trap::append_trap_log(line, static_cast<DWORD>(n));  // one open handle per module (trap.h)
     SetLastError(error);
 }
 
-// True for the first `limit` calls on `counter`. The counter stops at the limit instead of counting
-// every call: a gate on a hot path would otherwise pass 2^31 calls, turn negative and pass again.
-inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
-{
-    LONG seen = counter;
-    while (seen < limit) {
-        const LONG previous = InterlockedCompareExchange(&counter, seen + 1, seen);
-        if (previous == seen) return true;
-        seen = previous;
-    }
-    return false;
-}
+// first_calls (a saturating log cap) is in startup_stubs/log_cap.h.
 
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
-// VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
+// By default VirtualQuery is avoided on the readable path: on the title's multi-gigabyte regions one query takes about a
 // millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so
 // callers on hot paths should pass values that normally are pointers. A guard page that the probe
 // trips is re-armed.
-inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexcept
+//
+// LOCAL stall: X2W_PROBE_CACHE=1 (default off) remembers the regions a probe faulted in. After a fault (not a guard
+// page) one VirtualQuery at the faulting page; a region that is free, reserved or no-access is kept for
+// X2W_PROBE_CACHE_MS (default 100 ms; each module has its own cache), and later probes return at its start without
+// touching it (no exception). Only UNREADABLE ranges are cached: a readable range is never assumed, because the title
+// and the other stub modules (xmem, the title's own VirtualAlloc / VirtualFree) change pages without any hook this
+// module sees, and a stale "readable" would turn a fault the probe catches into one the caller's memcpy does not. The
+// cost of a stale entry is the other way round: memory committed in that range inside the expiry reads as unreadable
+// (the caller binds null / skips, as for any unreadable range) until the entry expires or invalidate_probe_cache().
+struct ProbeCache {
+    struct Range { std::uintptr_t start, end, page; ULONGLONG until; };
+    static constexpr unsigned size = 64;
+    SRWLOCK lock = SRWLOCK_INIT;
+    Range ranges[size] = {};
+    unsigned next = 0;
+    volatile LONG64 hits = 0, faults = 0, cached = 0, queries = 0, query_ticks = 0, preflight_rejects = 0;
+    volatile LONG generation = 0;   // invalidate_probe_cache: entries of an older generation are ignored
+    LONG range_generation[size] = {};
+};
+inline ProbeCache& probe_cache() noexcept
+{
+    static ProbeCache cache;
+    return cache;
+}
+inline bool probe_cache_on() noexcept
+{
+    static const bool on = env_on("X2W_PROBE_CACHE");
+    return on;
+}
+inline ULONGLONG probe_cache_ms() noexcept
+{
+    static const ULONGLONG ms = [] {
+        const DWORD saved = GetLastError();
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_PROBE_CACHE_MS", value, sizeof(value));
+        SetLastError(saved);
+        const unsigned long parsed = n && n < sizeof(value) ? std::strtoul(value, nullptr, 10) : 100;
+        return static_cast<ULONGLONG>(parsed);
+    }();
+    return ms;
+}
+inline void invalidate_probe_cache() noexcept { InterlockedIncrement(&probe_cache().generation); }
+// The end of the part of [start, end) before the first cached unreadable range; start itself when start is in one.
+inline std::uintptr_t probe_cache_clamp(std::uintptr_t start, std::uintptr_t end, bool& recheck) noexcept
+{
+    ProbeCache& c = probe_cache();
+    const ULONGLONG now = GetTickCount64();
+    const LONG generation = c.generation;
+    AcquireSRWLockShared(&c.lock);
+    for (unsigned i = 0; i < ProbeCache::size; ++i) {
+        const ProbeCache::Range& r = c.ranges[i];
+        if (r.end <= start || r.start >= end || r.end <= r.start) continue;
+        if (now >= r.until || c.range_generation[i] != generation) {
+            // Recheck the actual failed page. A formerly free region may span unrelated allocations.
+            if (r.page < end && r.page + 4096 > start) recheck = true;
+            continue;
+        }
+        end = r.start <= start ? start : r.start;
+        if (end == start) break;
+    }
+    ReleaseSRWLockShared(&c.lock);
+    return end;
+}
+inline void probe_cache_remember(const MEMORY_BASIC_INFORMATION& info, std::uintptr_t at) noexcept
+{
+    ProbeCache& c = probe_cache();
+    const DWORD protect = info.Protect & 0xFF;
+    const bool unreadable = info.State != MEM_COMMIT || protect == PAGE_NOACCESS || protect == 0;
+    if (!unreadable || (info.Protect & PAGE_GUARD)) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+    AcquireSRWLockExclusive(&c.lock);
+    const unsigned slot = c.next++ % ProbeCache::size;
+    c.ranges[slot] = {begin, begin + info.RegionSize, at & ~std::uintptr_t{4095}, GetTickCount64() + probe_cache_ms()};
+    c.range_generation[slot] = c.generation;
+    ReleaseSRWLockExclusive(&c.lock);
+    InterlockedIncrement64(&c.cached);
+}
+inline void probe_cache_fault(std::uintptr_t at) noexcept
+{
+    ProbeCache& c = probe_cache();
+    InterlockedIncrement64(&c.faults);
+    MEMORY_BASIC_INFORMATION info{};
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    const SIZE_T got = VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info));
+    QueryPerformanceCounter(&t1);
+    InterlockedIncrement64(&c.queries);
+    InterlockedAdd64(&c.query_ticks, t1.QuadPart - t0.QuadPart);
+    if (got != sizeof(info) || !info.RegionSize) return;
+    probe_cache_remember(info, at);
+}
+// Speculative GPU addresses can refer to reserved or unmapped texture memory.
+// A positive hint only skips a repeated VirtualQuery: the SEH-protected page
+// reads below still verify every page in the returned prefix.
+inline bool probe_query_first() noexcept
+{
+    // The xmem fault handler can supply valid backing for an apparently reserved page.
+    static const bool on = env_on("X2W_PROBE_QUERY_FIRST") && !env_on("X2W_XMEM_LAZY_COMMIT");
+    return on;
+}
+struct ProbeRegionHint { std::uintptr_t begin, end; };
+inline ProbeRegionHint& probe_region_hint() noexcept
+{
+    static thread_local ProbeRegionHint hint{};
+    return hint;
+}
+inline std::uintptr_t probe_mapped_prefix(std::uintptr_t at, std::uintptr_t end, bool cache) noexcept
+{
+    auto& hint = probe_region_hint();
+    while (at < end) {
+        if (hint.begin <= at && at < hint.end) {
+            at = hint.end;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        const DWORD saved = GetLastError();
+        const SIZE_T got = VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info));
+        SetLastError(saved);
+        if (got != sizeof(info) || !info.RegionSize) return end; // defer to protected reads
+        const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        const auto limit = begin + info.RegionSize;
+        if (limit <= at) return end;
+        if (info.State != MEM_COMMIT || (info.Protect & 0xff) == PAGE_NOACCESS) {
+            if (cache) probe_cache_remember(info, at);
+            InterlockedIncrement64(&probe_cache().preflight_rejects);
+            return at;
+        }
+        if (info.Protect & PAGE_GUARD) return end; // preserve guard handling
+        hint = {begin, limit};
+        at = limit;
+    }
+    return end;
+}
+inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes, bool speculative = false) noexcept
 {
     if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return 0;
     std::size_t done = 0;
     DWORD code = 0;
     std::uintptr_t at = start;
-    const std::uintptr_t end = start + bytes;
+    std::uintptr_t end = start + bytes;
+    bool recheck = false;
+    const bool cache = probe_cache_on();
+    if (cache) {
+        const std::uintptr_t clamped = probe_cache_clamp(start, end, recheck);
+        if (clamped != end) InterlockedIncrement64(&probe_cache().hits);
+        end = clamped;
+        if (end == start) return 0;
+    }
+    const bool preflight = (speculative || recheck) && probe_query_first();
+    if (preflight) end = probe_mapped_prefix(start, end, cache);
     __try {
         volatile unsigned char sink = 0;
         while (at < end) {
@@ -72,14 +208,28 @@ inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexc
         }
         (void)sink;
     } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        if (preflight) probe_region_hint() = {};
         if (code == 0x80000001u) {  // STATUS_GUARD_PAGE_VIOLATION: the system dropped the guard bit
             MEMORY_BASIC_INFORMATION info{};
             DWORD old = 0;
             if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
                 VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
+        } else if (cache) {
+            probe_cache_fault(at);
         }
     }
     return done;
+}
+
+// Descriptor payloads can miss on their first probe. Other addresses use first-touch probing
+// unless the same page previously failed.
+inline std::size_t probe_descriptor_address(std::uintptr_t address, std::size_t bytes) noexcept
+{
+    return probe_readable(address, bytes, true);
+}
+inline bool descriptor_memory_readable(std::uintptr_t address, std::size_t bytes) noexcept
+{
+    return bytes && probe_descriptor_address(address, bytes) == bytes;
 }
 
 // With X2W_XMEM_LAZY_COMMIT, physical pages are committed on first touch (xmem_mapped_pages.cpp). A check of the

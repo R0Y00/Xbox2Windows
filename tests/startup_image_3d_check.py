@@ -103,10 +103,13 @@ def controls():
     assert 'srv 0 tex2d table 0 0' in manifest, manifest
     print('dim 2D (same words, dim field changed): Texture2D r0, float2(F(v0), F(v1)); manifest srv 0 tex2d')
 
+    # dim:SQ_RSRC_IMG_1D is a Texture1D sampled at u alone, never as 2D (2D arrays: startup_image_2d_array_check.py).
     pipe = translate(WORDS_1D)
-    assert 'Texture1D<float4> r0' in pipe.hlsl_ps()
-    assert 'r0.Sample(q0, F(v0))' in pipe.hlsl_ps()
-    assert 'srv 0 tex1d table 0 0' in pipe.manifest()
+    ps, manifest = pipe.hlsl_ps(), pipe.manifest()
+    assert 'Texture1D<float4> r0 : register(t0);' in ps and 'Texture2D' not in ps and 'Texture3D' not in ps, ps
+    assert 't = r0.Sample(q0, F(v0));' in ps, ps
+    assert 'srv 0 tex1d table 0 0' in manifest, manifest
+    print('dim 1D (same words, dim field changed): Texture1D r0, Sample(q0, F(v0)); manifest srv 0 tex1d')
     unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0'))
     try:
         translate(unsupported)

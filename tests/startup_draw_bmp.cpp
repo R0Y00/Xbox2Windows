@@ -92,6 +92,47 @@ void tight_rows()
     std::fclose(output);
 }
 
+void hdr_rows(DXGI_FORMAT format)
+{
+    std::array<unsigned char, 32> source{};
+    // Second pixel of the top row is RGB (1, 0, 3). Both source rows have 16 bytes.
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        const std::uint16_t half[4] = {0x3c00, 0, 0x4200, 0xffff};
+        std::memcpy(source.data() + 8, half, sizeof(half));
+    } else {
+        const std::uint32_t packed = format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+                ? (17u << 27) | (384u << 18) | 128u   // mantissas (128,0,384), scale 2^-7
+                : (528u << 22) | 960u;
+        std::memcpy(source.data() + 4, &packed, sizeof(packed));
+    }
+    FILE* output = std::tmpfile();
+    if (!output) return expect("tmpfile", false);
+    expect("HDR image written", x2w_draw_bmp::write(output, source.data(), 2, 2, 16, format));
+    std::rewind(output);
+    expect("HDR headers", headers(output, 2, 2));
+    unsigned char pixels[16]{};
+    const unsigned char expected[16] = {0,0,0,255, 0,0,0,255, 0,0,0,255, 191,0,128,255};
+    expect("HDR row pitch, channels and exposure", std::fread(pixels, 1, sizeof(pixels), output) == sizeof(pixels) &&
+            std::memcmp(pixels, expected, sizeof(pixels)) == 0);
+    std::fclose(output);
+}
+
+void signed_rg()
+{
+    // (+1,-1), (0,0), (-infinity,+infinity) in binary16.
+    const std::uint16_t source[] = {0x3c00, 0xbc00, 0, 0, 0xfc00, 0x7c00};
+    const unsigned char expected[] = {128,64,192,255, 128,128,128,255, 128,255,0,255};
+    FILE* output = std::tmpfile();
+    if (!output) return expect("tmpfile", false);
+    expect("signed RG preview", x2w_draw_bmp::write(output, reinterpret_cast<const unsigned char*>(source), 3, 1,
+                                                   sizeof(source), DXGI_FORMAT_R16G16_FLOAT));
+    std::rewind(output);
+    unsigned char pixels[sizeof(expected)]{};
+    expect("signed RG channels, neutral, endpoints", headers(output, 3, 1) &&
+           std::fread(pixels, 1, sizeof(pixels), output) == sizeof(pixels) && !std::memcmp(pixels, expected, sizeof(pixels)));
+    std::fclose(output);
+}
+
 // Calls the writer must refuse before it writes a byte. Each call gets its own empty file.
 // A writer that goes on reads past the four texel bytes, so some mutants fault here instead
 // of printing a FAIL line.
@@ -138,6 +179,10 @@ int main(int argc, char** argv)
     expect("R8G8B8A8_UNORM_SRGB", check(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false));
     expect("B8G8R8A8_UNORM_SRGB", check(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, true));
     tight_rows();
+    hdr_rows(DXGI_FORMAT_R16G16B16A16_FLOAT);
+    hdr_rows(DXGI_FORMAT_R11G11B10_FLOAT);
+    hdr_rows(DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+    signed_rg();
     refused();
     if (failures) return 1;
     std::printf("startup_draw_bmp: ok\n");

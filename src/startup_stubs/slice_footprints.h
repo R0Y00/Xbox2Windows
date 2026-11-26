@@ -17,6 +17,7 @@ inline bool recheck_cpu_texture(const D3D12_RESOURCE_DESC& desc, UINT64 bytes, U
 // GetCopyableFootprints orders a single NV12 image as Y followed by UV.
 // Keep this layout identical in the XG writer and the desktop draw uploader.
 struct SliceFootprints {
+    inline static thread_local UINT64 recorded_bytes = 0;
     static constexpr UINT max_mips = 15;
     UINT planes;
     UINT count;
@@ -68,6 +69,7 @@ struct SliceFootprints {
         D3D12_TEXTURE_COPY_LOCATION to{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         to.SubresourceIndex = static_cast<UINT>(subresource);
         list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        recorded_bytes += bytes(i);
     }
 };
 }  // namespace x2w_startup

@@ -130,7 +130,7 @@ inline End footprint_end(const Side& s, std::uint32_t w, std::uint32_t h, std::u
 }
 
 // box == nullptr copies the whole source (for a footprint source, the whole footprint).
-inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uint32_t z, const Side& src, const Box* box) noexcept
+inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uint32_t z, const Side& src, const Box* box, bool same_format_family = false) noexcept
 {
     if (dst.kind == Kind::placed_footprint && src.kind == Kind::placed_footprint) return Verdict::buffer_to_buffer;
     for (const Side* s : {&dst, &src}) {
@@ -139,7 +139,7 @@ inline Verdict check(const Side& dst, std::uint32_t x, std::uint32_t y, std::uin
             return Verdict::bad_subresource;
     }
     if (dst.samples != src.samples) return Verdict::sample_mismatch;
-    if (dst.format != src.format) return Verdict::format_mismatch;
+    if (dst.format != src.format && !same_format_family) return Verdict::format_mismatch;
     const Side& tex = dst.kind == Kind::subresource ? dst : src;  // the side that knows the block size
     // D3D12 measures a block-compressed region in whole blocks: a 2x2 or 1x1 mip spans one 4x4 block, and
     // GetCopyableFootprints describes it as a 4x4 footprint, so each side's extent rounds up to the block.

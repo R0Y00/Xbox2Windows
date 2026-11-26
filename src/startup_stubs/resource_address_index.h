@@ -76,6 +76,15 @@ public:
             }
         }
     }
+    template<class F>
+    void for_each_at(std::uint64_t base, F&& f) const
+    {
+        for (const Group& group : groups_) {
+            const auto [first, last] = group.by_base.equal_range(base);
+            for (auto it = first; it != last; ++it)
+                if (f(it->second.key)) return;
+        }
+    }
     bool contains(std::uint64_t base, Key key) const
     {
         for (const Group& group : groups_) {

@@ -176,8 +176,12 @@ def container_image(program, *, stage):
     return image
 
 
-def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
-    """Extract the stage-specific instruction stream from a DXIL program part."""
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b"", vertex_data=False):
+    """Extract the stage-specific instruction stream from a DXIL program part.
+
+    vertex_data: a vertex stage (1) whose bounded section holds more than one S_ENDPGM word is returned whole
+    instead of refused; the caller must prove its single reachable exit (gfx2hlsl.bound_vertex_code), the
+    words after it being data such as a PC-relative table."""
     image = container_image(program, stage=stage)
     start = struct.unpack_from("<I", image, 192)[0] + 40
     if start < 196 or start % 4 or start + 4 > len(image):
@@ -190,6 +194,8 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
         mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
         if (stage in (0, 5) or mesh) and markers == 2 and llvm is not None:
             _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh)
+            return code
+        if stage == 1 and vertex_data:
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.

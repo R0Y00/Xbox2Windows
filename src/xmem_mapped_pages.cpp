@@ -1,8 +1,18 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winioctl.h>
+#include <psapi.h>
 
 #include "era_physical.h"
+#include "xmem_low.h"
+#include "xmem_census.h"
+#include "xmem_gpu_pool.h"
+
+#include <cstring>
+#include "startup_stubs/local_log.h"
+
+#include <vector>
 #include "xmem_slab_slots.h"
 #include "xmem_section_lease.h"
 #include "xmem_page_batch.h"
@@ -15,12 +25,16 @@
 
 #include <vector>
 
+#include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -32,7 +46,9 @@ struct Backing {
     bool committed = true;  // false while a lazily mapped slot is untouched (X2W_XMEM_LAZY_COMMIT)
 };
 
-using Slot = std::pair<std::size_t, ULONG64>;
+// The slot a page holds: (slab section, byte offset). LOCAL (local merge): keyed by section handle, the local
+// allocator's slot identity (free_slots), not by an upstream SlabSlots index.
+using Slot = std::pair<HANDLE, ULONG64>;
 struct SlotPin { unsigned references{}; bool retired{}; };
 struct SectionLease {
     UINT version;
@@ -43,11 +59,19 @@ struct SectionLease {
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
 // views so its bytes survive unmapping. Its backing is released before reuse.
+struct LinearReservation {
+    SIZE_T bytes;
+    std::size_t slab = SIZE_MAX;
+    ULONG64 offset = 0;
+    bool attempted = false;
+};
+
 struct PhysicalMemory {
     std::mutex mutex;
     std::map<ULONG_PTR, Backing> backings;
     std::map<ULONG_PTR, ULONG_PTR> views;
     std::map<ULONG_PTR, SIZE_T> reservations;
+    std::map<ULONG_PTR, LinearReservation> linear_reservations;
     // A no-access graphics reservation (protection 0x801) made right after a
     // read-write one of the same size is that memory's GPU view on the console. Pages mapped into
     // the CPU view are mapped at the same offset into the GPU view too (the same section).
@@ -57,11 +81,18 @@ struct PhysicalMemory {
     SIZE_T mirror_bytes = 0;
     std::set<ULONG_PTR> explicit_mirror_pages;
     std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
-    // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
-    // are adjacent slots again.
-    x2w_xmem::SlabSlots<HANDLE> slots{era_physical::page_bytes};
+    std::vector<HANDLE> slabs;
+    ULONG64 slab_used = 0;
+    std::set<std::pair<HANDLE, ULONG64>> free_slots;  // ordered, so that pages reused together are adjacent slots again
+    std::set<HANDLE> file_slabs;  // LOCAL: slabs backed by a temporary file (X2W_XMEM_SLAB_DIR), not by the pagefile
+    ULONG64 migrations = 0, migration_failures = 0;
+    // LOCAL (X2W_XMEM_GPU_POOL=all, xmem_gpu_pool.h): slabs taken from the long-lived pool, each with a writable view
+    // of this process that zeroes a slot when it is first handed out (the section holds an earlier run's bytes).
+    std::map<HANDLE, unsigned char*> pool_views;
+    unsigned char* newest_pool_view = nullptr;  // pool_views of slabs.back(), or nullptr when it is not a pool slab
+    ULONG64 pool_slabs = 0;  // not counted against the slab budget: already charged by the holder
     // A grant may be freed after unmapping while a submitted GPU operation
-    // still uses the section. Keep those slots out of the reusable pool.
+    // still uses the section. Keep those slots out of the reusable pool (free_slots).
     std::map<Slot, SlotPin> pins;
     std::map<ULONG64, SectionLease> leases;
     ULONG64 next_lease = 1;
@@ -70,7 +101,7 @@ struct PhysicalMemory {
     {
         for (const auto& run : runs)
             UnmapViewOfFile(reinterpret_cast<void*>(run.first));
-        for (const HANDLE slab : slots.slabs())
+        for (const HANDLE slab : slabs)
             CloseHandle(slab);
     }
 };
@@ -78,7 +109,27 @@ struct PhysicalMemory {
 PhysicalMemory memory;
 constexpr SIZE_T page_bytes = era_physical::page_bytes;
 
-// Caller holds memory.mutex. A lease may only refer to committed pages whose
+// LOCAL accounting (runtime_work/NOTES.md): what the memory stand-in commits on the title's behalf,
+// by path. The slabs are pagefile-backed sections: their commit is charged to the system at
+// creation, not to this process, so neither the process commit counter nor a job memory limit sees
+// them. Counters only grow except where a free is visible here.
+volatile LONG64 startup_block_bytes = 0, startup_block_calls = 0;   // commit_startup_block
+volatile LONG64 permissive_commit_bytes = 0, permissive_commit_calls = 0;  // local_virtual_alloc commits
+volatile LONG slab_refusals = 0;
+
+// X2W_XMEM_SLAB_BUDGET_MIB=<n>: no new slab once the slabs would pass n MiB; the page mapping or
+// page write that needed it fails (ERROR_COMMITMENT_LIMIT), as on a host without memory, but
+// inside the title instead of exhausting the host. 0 or unset: no budget.
+ULONG64 slab_budget_bytes() noexcept
+{
+    static const ULONG64 value = [] {
+        char text[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_SLAB_BUDGET_MIB", text, sizeof(text));
+        return n && n < sizeof(text) ? std::strtoull(text, nullptr, 10) << 20 : 0ull;
+    }();
+    return value;
+}
+
 // CPU and GPU views still name the same grant.
 bool mirrored_range(ULONG_PTR address, SIZE_T length)
 {
@@ -104,7 +155,7 @@ void unpin_slot(const Slot& slot)
 {
     const auto found = memory.pins.find(slot);
     if (--found->second.references) return;
-    if (found->second.retired) memory.slots.release(slot.first, slot.second);
+    if (found->second.retired) memory.free_slots.insert(slot);  // LOCAL allocator (option a)
     memory.pins.erase(found);
 }
 
@@ -121,6 +172,123 @@ BOOL physical_result(era_physical::Status status) noexcept
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+}
+
+constexpr ULONG64 slab_bytes = 4096 * ULONG64{page_bytes};
+
+// LOCAL (runtime_work/NOTES.md): X2W_XMEM_SLAB_DIR=<absolute directory> backs new slabs with a
+// delete-on-close sparse temporary file there instead of the pagefile. A file-backed section carries
+// no commit charge, so the title's physical pages stop counting against the host commit limit; the
+// pages still use RAM and are written to the file only under memory pressure. D3D12 opens only
+// pagefile-backed sections as heaps (OpenExistingHeapFromFileMapping gives E_INVALIDARG for a file-
+// or SEC_RESERVE-backed one), so a slab the GPU needs is moved to the pagefile first (migrate_slab).
+// A relative path, or one on the process's current drive (the title runs from its data drive), is
+// refused and the pagefile is used.
+const wchar_t* slab_dir() noexcept
+{
+    static wchar_t dir[MAX_PATH]{};
+    static const bool usable = [] {
+        const DWORD n = GetEnvironmentVariableW(L"X2W_XMEM_SLAB_DIR", dir, MAX_PATH);
+        if (!n || n >= MAX_PATH - 40) return false;
+        const bool absolute = n >= 3 && dir[1] == L':' && (dir[2] == L'\\' || dir[2] == L'/');
+        wchar_t cwd[MAX_PATH]{};
+        GetCurrentDirectoryW(MAX_PATH, cwd);
+        const bool same_drive = absolute && (cwd[0] | 0x20) == (dir[0] | 0x20) && cwd[1] == L':';
+        const DWORD attributes = absolute ? GetFileAttributesW(dir) : INVALID_FILE_ATTRIBUTES;
+        const bool ok = absolute && !same_drive && attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
+        x2w_local::logf("x2w-xmem slab directory %ls: %s", dir,
+                        ok ? "file-backed slabs (no commit charge; GPU slabs move to the pagefile)"
+                           : "refused (must be an existing absolute directory off the current drive); pagefile slabs");
+        return ok;
+    }();
+    return usable ? dir : nullptr;
+}
+
+ULONG64 pagefile_slabs() noexcept { return memory.slabs.size() - memory.file_slabs.size() - memory.pool_slabs; }
+
+HANDLE pagefile_slab() noexcept
+{
+    const ULONG64 budget = slab_budget_bytes();
+    if (budget && (pagefile_slabs() + 1) * slab_bytes > budget) {
+        if (x2w_local::first_of(InterlockedIncrement(&slab_refusals), 4))
+            x2w_local::logf("x2w-xmem slab budget reached (X2W_XMEM_SLAB_BUDGET_MIB=%llu, %llu pagefile slabs of 256 MiB): refused",
+                            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(pagefile_slabs()));
+        SetLastError(ERROR_COMMITMENT_LIMIT);
+        return nullptr;
+    }
+    return CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(slab_bytes >> 32),
+                              static_cast<DWORD>(slab_bytes), nullptr);
+}
+
+// LOCAL (xmem_gpu_pool.h): a pagefile slab for the GPU, from the long-lived pool when it has one (same budget).
+HANDLE gpu_slab(bool* pooled) noexcept
+{
+    *pooled = false;
+    const ULONG64 budget = slab_budget_bytes();
+    if (!budget || (pagefile_slabs() + 1) * slab_bytes <= budget)
+        if (const HANDLE section = x2w_gpu_pool::take(slab_bytes)) {
+            *pooled = true;
+            return section;
+        }
+    return pagefile_slab();
+}
+
+// LOCAL (X2W_XMEM_GPU_POOL=all): the next pool section with a writable view of it, or nullptr (pool exhausted,
+// not running or owned elsewhere: logged once, then fresh sections as without the pool).
+HANDLE pool_slab(unsigned char** view) noexcept
+{
+    static bool exhausted = false;
+    if (exhausted) return nullptr;
+    const HANDLE section = x2w_gpu_pool::take(slab_bytes);
+    void* mapped = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+    if (!mapped) {
+        if (section) CloseHandle(section);
+        exhausted = true;
+        x2w_local::logf("x2w-xmem GPU slab pool (all): no further pool section after %llu (error %lu): fresh %s slabs from "
+                        "now on%s", static_cast<unsigned long long>(memory.pool_slabs), GetLastError(),
+                        slab_dir() ? "file-backed" : "pagefile",
+                        slab_dir() ? " (moved for the GPU as without the pool)" : " (under the slab budget)");
+        return nullptr;
+    }
+    *view = static_cast<unsigned char*>(mapped);
+    return section;
+}
+
+// A new slab: from the pool with X2W_XMEM_GPU_POOL=all, else file-backed when X2W_XMEM_SLAB_DIR allows it, else from
+// the pagefile. *file says whether it is file-backed, *pool_view is the pool section's view (or nullptr).
+HANDLE new_slab(bool* file, unsigned char** pool_view) noexcept
+{
+    *file = false;
+    *pool_view = nullptr;
+    if (x2w_gpu_pool::mode() == x2w_gpu_pool::Mode::all)
+        if (const HANDLE slab = pool_slab(pool_view)) return slab;
+    if (const wchar_t* dir = slab_dir()) {
+        static LONG serial;
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"%ls\\x2w-slab-%lu-%ld.tmp", dir, GetCurrentProcessId(), InterlockedIncrement(&serial));
+        const HANDLE backing = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (backing != INVALID_HANDLE_VALUE) {
+            DWORD returned = 0;
+            DeviceIoControl(backing, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+            const HANDLE slab = CreateFileMappingW(backing, nullptr, PAGE_READWRITE, static_cast<DWORD>(slab_bytes >> 32),
+                                                   static_cast<DWORD>(slab_bytes), nullptr);
+            const DWORD error = GetLastError();
+            CloseHandle(backing);  // the section keeps the file; it is deleted when the section goes
+            if (slab) {
+                *file = true;
+                return slab;
+            }
+            static LONG failed;
+            if (x2w_local::first_calls(failed, 4))
+                x2w_local::logf("x2w-xmem file-backed slab %ls failed (error %lu): pagefile slab instead", path, error);
+        } else {
+            static LONG failed;
+            if (x2w_local::first_calls(failed, 4))
+                x2w_local::logf("x2w-xmem slab file %ls could not be created (error %lu): pagefile slab instead", path, GetLastError());
+        }
+    }
+    return pagefile_slab();
 }
 
 // Pages are slots of 256 MiB pagefile-backed sections rather than one section each: one handle and
@@ -294,52 +462,111 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-HANDLE section_for(ULONG_PTR page, bool need_commit = true)
+// LOCAL allocator kept at the upstream merge (option a): file-backed slabs (X2W_XMEM_SLAB_DIR), the GPU pool
+// (X2W_XMEM_GPU_POOL) and slot reuse. Upstream's SlabSlots / commit-on-first-touch slots (X2W_XMEM_LAZY_COMMIT)
+// are not ported: every slot is committed when its slab is created, so need_commit has nothing to do here.
+bool ensure_fresh_slab()
+{
+    if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
+        bool file = false;
+        unsigned char* pool_view = nullptr;
+        const HANDLE slab = new_slab(&file, &pool_view);
+        if (!slab) return false;
+        try {
+            memory.slabs.push_back(slab);
+            if (file) memory.file_slabs.insert(slab);
+            if (pool_view) memory.pool_views.emplace(slab, pool_view), ++memory.pool_slabs;
+        } catch (const std::bad_alloc&) {
+            if (pool_view) UnmapViewOfFile(pool_view);
+            CloseHandle(slab);
+            throw;
+        }
+        memory.newest_pool_view = pool_view;
+        memory.slab_used = 0;
+    }
+    return true;
+}
+
+bool linear_placement()
+{
+    static const bool enabled = x2w_local::env_on("X2W_XMEM_LINEAR_PLACEMENT");
+    return enabled;
+}
+
+// A hint claims only a free slot or an unused offset. Existing grants and retired slots take precedence.
+std::optional<Slot> linear_slot(ULONG_PTR address)
+{
+    auto it = memory.linear_reservations.upper_bound(address);
+    if (it == memory.linear_reservations.begin()) return {};
+    --it;
+    const ULONG_PTR delta = address - it->first;
+    auto& region = it->second;
+    if (delta >= region.bytes) return {};
+    if (!region.attempted) {
+        region.attempted = true;
+        if (memory.free_slots.size() >= region.bytes / page_bytes) {
+            Slot previous{};
+            SIZE_T length = 0;
+            for (const Slot& slot : memory.free_slots) {
+                length = slot.first == previous.first && slot.second == previous.second + page_bytes ? length + page_bytes : page_bytes;
+                previous = slot;
+                if (length == region.bytes) {
+                    region.slab = std::find(memory.slabs.begin(), memory.slabs.end(), slot.first) - memory.slabs.begin();
+                    region.offset = slot.second + page_bytes - length;
+                    break;
+                }
+            }
+        }
+        if (region.slab == SIZE_MAX && !memory.slabs.empty() && region.bytes <= slab_bytes - memory.slab_used) {
+            region.slab = memory.slabs.size() - 1;
+            region.offset = memory.slab_used;
+        }
+    }
+    if (region.slab == SIZE_MAX) return {};
+    return Slot{memory.slabs[region.slab], region.offset + delta};
+}
+
+HANDLE section_for(ULONG_PTR page, ULONG_PTR address = 0)
 {
     const auto existing = memory.backings.find(page);
-    if (existing != memory.backings.end()) {
-        if (need_commit && !commit_backing(existing->second)) return nullptr;
-        return existing->second.section;
-    }
-    // A fresh slot (never used) of a SEC_RESERVE slab reads as zero once committed, so it can wait for its first
-    // touch. A reused slot is committed and zeroed now, as before.
-    const bool defer = !need_commit && lazy_commit();
-    x2w_xmem::SlabSlots<HANDLE>::Slot slot;
-    if (memory.slots.lowest_free(slot)) {
-        if (!commit_slot(slot.slab, slot.offset, true)) return nullptr;
-        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
-        memory.slots.take_lowest_free();
-        return slot.slab;
-    }
-    const ULONG64 slab_bytes = memory.slots.slab_bytes();
-    bool first_slot_committed = false;
-    const auto make_slab = [slab_bytes, &first_slot_committed, defer](HANDLE& slab) {
-        slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
-                                  static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
-        if (!slab) return false;
-        if (defer) return true;
-        first_slot_committed = commit_slot(slab, 0, false);
-        if (!first_slot_committed) {
-            const DWORD error = GetLastError();
-            CloseHandle(slab);
-            SetLastError(error);
+    if (existing != memory.backings.end()) return existing->second.section;
+    if (memory.free_slots.empty() && !ensure_fresh_slab()) return nullptr;
+    auto free = memory.free_slots.end();
+    bool use_tail = false;
+    if (address && linear_placement()) {
+        if (const auto slot = linear_slot(address)) {
+            free = memory.free_slots.find(*slot);
+            if (free == memory.free_slots.end() && slot->first == memory.slabs.back() && slot->second >= memory.slab_used) {
+                while (memory.slab_used < slot->second) {
+                    memory.free_slots.emplace(slot->first, memory.slab_used);
+                    memory.slab_used += page_bytes;
+                }
+                use_tail = true;
+            }
         }
-        return first_slot_committed;
-    };
-    if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
-    if (!defer && !first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
-        const DWORD error = GetLastError();
-        memory.slots.unwind_fresh(slot);
-        SetLastError(error);
-        return nullptr;
     }
-    try {
-        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index, !defer});
-    } catch (...) {
-        memory.slots.unwind_fresh(slot);
-        throw;
+    if (!use_tail && free == memory.free_slots.end()) free = memory.free_slots.begin();
+    if (free != memory.free_slots.end()) {
+        const auto [section, offset] = *free;
+        if (const auto pool = memory.pool_views.find(section); pool != memory.pool_views.end()) {
+            std::memset(pool->second + offset, 0, page_bytes);  // through the pool slab's own view
+        } else {
+            void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
+            if (!view) return nullptr;
+            std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
+            UnmapViewOfFile(view);
+        }
+        memory.backings.emplace(page, Backing{section, 0, offset});
+        memory.free_slots.erase(free);
+        return section;
     }
-    return slot.slab;
+    const HANDLE section = memory.slabs.back();
+    // LOCAL (X2W_XMEM_GPU_POOL=all): a pool slot holds an earlier run's bytes; zero it before anyone sees it, as the
+    // kernel's demand-zero fill does for a fresh section (cost: memleak_work/NOTES.md "zeroing").
+    if (memory.newest_pool_view) std::memset(memory.newest_pool_view + memory.slab_used, 0, page_bytes);
+    memory.backings.emplace(page, Backing{section, 0, memory.slab_used});
+    memory.slab_used += page_bytes;
+    return section;
 }
 
 auto owned_reservation(ULONG_PTR address)
@@ -350,32 +577,43 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
-// Only split a reservation owned by the shim. Caller-owned placeholders must already match the view.
-// Once a split succeeds, report the retry's result even if it fails for a different reason.
-template <class Map>
-bool map_split(void* target, SIZE_T bytes, Map map)
+// LOCAL (xmem_work/NOTES.md): the Windows errors of the last refused view on this thread, each call's own (the
+// error a caller sees is only the last one): the first MapViewOfFile3, the placeholder split (VirtualFree
+// MEM_PRESERVE_PLACEHOLDER; 0 = not tried because the address is in no recorded reservation), the second map.
+struct MapErrors {
+    DWORD map = 0, split = 0, retry = 0;
+    bool split_tried = false;
+};
+thread_local MapErrors map_errors;
+
+// One view of bytes at address: replace the placeholder, or split it out of a bigger recorded placeholder first.
+bool map_placeholder(ULONG_PTR address, HANDLE section, ULONG64 section_offset, SIZE_T bytes)
 {
+    auto* target = reinterpret_cast<void*>(address);
+    auto map = [&] {
+        return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset, bytes, MEM_REPLACE_PLACEHOLDER,
+                              PAGE_READWRITE, nullptr, 0) != nullptr;
+    };
+    map_errors = MapErrors{};
     if (map()) return true;
-    const DWORD error = GetLastError();
-    const auto address = reinterpret_cast<ULONG_PTR>(target);
-    const auto reservation = owned_reservation(address);
-    if (reservation != memory.reservations.end() && bytes <= reservation->second - (address - reservation->first) &&
-        VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-        return map();
-    SetLastError(error);
+    map_errors.map = GetLastError();
+    if (owned_reservation(address) == memory.reservations.end()) {
+        SetLastError(map_errors.map);
+        return false;
+    }
+    map_errors.split_tried = true;
+    if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        map_errors.split = GetLastError();
+        return false;
+    }
+    if (map()) return true;
+    map_errors.retry = GetLastError();
     return false;
 }
 
 bool map_view(ULONG_PTR address, const Backing& backing)
 {
-    const HANDLE section = backing.section;
-    const ULONG64 section_offset = backing.offset;
-    auto* target = reinterpret_cast<void*>(address);
-    auto map = [&] {
-        return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset,
-                              page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
-    };
-    return map_split(target, page_bytes, map);
+    return map_placeholder(address, backing.section, backing.offset, page_bytes);
 }
 
 // Maps bytes of one section at address as a single view; falls back to one view per page when the
@@ -383,12 +621,7 @@ bool map_view(ULONG_PTR address, const Backing& backing)
 bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
              std::vector<std::pair<ULONG_PTR, SIZE_T>>& made, ULONG_PTR& failed_address)
 {
-    auto* target = reinterpret_cast<void*>(address);
-    auto map = [&] {
-        return MapViewOfFile3(backing.section, GetCurrentProcess(), target, backing.offset, bytes,
-                              MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
-    };
-    if (map_split(target, bytes, map)) {
+    if (map_placeholder(address, backing.section, backing.offset, bytes)) {
         memory.runs[address] = bytes;
         made.emplace_back(address, bytes);
         return true;
@@ -438,6 +671,15 @@ struct RemapWindow {
     ULONG64 generation = 0;
 };
 RemapWindow remap_window;
+
+// The exception handler tracks only breaks in existing runs. GPU address caches also
+// depend on first maps. Writers hold memory.mutex throughout the native view changes
+// and registry publication, including recovery on an unsuccessful transaction.
+std::atomic<ULONG64> gpu_mapping_generation{2};
+struct ChangingGpuMappings {
+    ChangingGpuMappings() { gpu_mapping_generation.fetch_add(1, std::memory_order_acq_rel); }
+    ~ChangingGpuMappings() { gpu_mapping_generation.fetch_add(1, std::memory_order_release); }
+};
 
 void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
@@ -495,6 +737,125 @@ struct MappingThread {
     MappingThread() { mapping_thread = true; }
     ~MappingThread() { mapping_thread = false; }
 };
+
+struct MapFailure;
+ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failure = nullptr);  // defined below (upstream MapFailure)
+
+// LOCAL: the fault handler that retries an access to a page whose view is being replaced
+// (retry_remapped_page), registered once and kept with the module pinned, as for shared views.
+bool retry_handler_ready() noexcept
+{
+    static const bool ready = [] {
+        HMODULE pinned = nullptr;
+        return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                  reinterpret_cast<LPCWSTR>(&retry_remapped_page), &pinned) &&
+               AddVectoredExceptionHandler(1, retry_remapped_page) != nullptr;
+    }();
+    return ready;
+}
+
+// LOCAL (X2W_XMEM_SLAB_DIR): moves a file-backed slab to a new pagefile-backed section so that D3D12
+// can open it as a heap. Called with memory.mutex held. Every view of the slab's pages is unmapped
+// (a "break": a title thread that touches one meanwhile waits in retry_remapped_page for the mutex
+// and retries), the bytes are copied, the registry is pointed at the new section and the views are
+// mapped again at the same addresses. Returns the new section, or nullptr with everything as before.
+// Limitation: a kernel-mode access (a ReadFile into such a page) during the move fails instead of
+// waiting; the move happens once per slab the GPU uses.
+HANDLE migrate_slab(HANDLE old_slab)
+{
+    const ULONG64 began = GetTickCount64();
+    if (!retry_handler_ready()) {
+        ++memory.migrations, ++memory.migration_failures;
+        x2w_local::logf("x2w-xmem slab move refused: the fault handler could not be set up");
+        return nullptr;
+    }
+    // LOCAL (local merge): a section lease (x2w_xmem_lease_section) hands out this section's handle, so a GPU heap
+    // opened over it would keep the old bytes after a move; a slab with a pinned slot stays where it is.
+    for (const auto& [slot, pin] : memory.pins)
+        if (slot.first == old_slab) {
+            ++memory.migrations, ++memory.migration_failures;
+            x2w_local::logf("x2w-xmem slab move refused: a section lease pins one of its slots");
+            return nullptr;
+        }
+    std::map<ULONG_PTR, SIZE_T> broken;
+    for (const auto& [address, page] : memory.views) {
+        if (memory.backings.at(page).section != old_slab) continue;
+        auto run = memory.runs.upper_bound(address);
+        if (run == memory.runs.begin()) continue;
+        --run;
+        if (address - run->first < run->second) broken.insert(*run);
+    }
+    bool pooled = false;
+    const HANDLE moved = gpu_slab(&pooled);
+    if (!moved) {
+        ++memory.migration_failures;
+        x2w_local::logf("x2w-xmem slab move refused: no pagefile slab (error %lu)", GetLastError());
+        return nullptr;
+    }
+    const MappingThread marker;
+    const ChangingGpuMappings changing;
+    begin_break(broken);
+    DWORD error = ERROR_SUCCESS;
+    std::vector<std::pair<ULONG_PTR, SIZE_T>> unmapped;
+    for (const auto& [base, size] : broken) {
+        if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) {
+            error = GetLastError();
+            break;
+        }
+        memory.runs.erase(base);
+        unmapped.emplace_back(base, size);
+    }
+    bool copied = false;
+    if (error == ERROR_SUCCESS) {
+        void* from = MapViewOfFile(old_slab, FILE_MAP_READ, 0, 0, 0);
+        void* to = MapViewOfFile(moved, FILE_MAP_WRITE, 0, 0, 0);
+        if (from && to) {
+            // Only the used part of the newest slab holds pages.
+            const bool newest = !memory.slabs.empty() && memory.slabs.back() == old_slab;
+            std::memcpy(to, from, newest ? memory.slab_used : slab_bytes);
+            // A pool section holds an earlier run's bytes: the unused tail must read as zero, as a fresh one.
+            if (pooled && newest) std::memset(static_cast<char*>(to) + memory.slab_used, 0, slab_bytes - memory.slab_used);
+            copied = true;
+        } else {
+            error = GetLastError();
+        }
+        if (from) UnmapViewOfFile(from);
+        if (to) UnmapViewOfFile(to);
+    }
+    if (copied) {
+        for (auto& [page, backing] : memory.backings)
+            if (backing.section == old_slab) backing.section = moved;
+        std::vector<std::pair<HANDLE, ULONG64>> slots;
+        for (auto it = memory.free_slots.begin(); it != memory.free_slots.end();) {
+            if (it->first == old_slab) {
+                slots.emplace_back(moved, it->second);
+                it = memory.free_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        memory.free_slots.insert(slots.begin(), slots.end());
+        std::replace(memory.slabs.begin(), memory.slabs.end(), old_slab, moved);
+        memory.file_slabs.erase(old_slab);
+    }
+    ULONG_PTR lost = 0;
+    for (const auto& [base, size] : unmapped) lost += map_recorded(base, size, false);
+    end_break();
+    ++memory.migrations;
+    if (!copied) {
+        ++memory.migration_failures;
+        CloseHandle(moved);
+        x2w_local::logf("x2w-xmem slab move failed (error %lu); %llu page(s) could not be mapped again", error,
+                        static_cast<unsigned long long>(lost));
+        return nullptr;
+    }
+    CloseHandle(old_slab);
+    x2w_local::logf("x2w-xmem slab moved to the pagefile for the GPU (#%llu): %llu view(s) in %llu ms, %llu page(s) lost, "
+                    "%llu file-backed slab(s) left", static_cast<unsigned long long>(memory.migrations),
+                    static_cast<unsigned long long>(unmapped.size()), static_cast<unsigned long long>(GetTickCount64() - began),
+                    static_cast<unsigned long long>(lost), static_cast<unsigned long long>(memory.file_slabs.size()));
+    return moved;
+}
 
 // Shared views are opt-in: X2W_XMEM_SHARED_VIEWS=1, read once by the first mapping call. Without
 // it every page has a view of its own, as before: unmapping a page never takes a neighbour away,
@@ -677,11 +1038,69 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
     return lost;
 }
 
+struct PageEvent {
+    ULONG64 tick = 0, serial = 0;
+    ULONG_PTR page = 0;
+    DWORD thread = 0;
+    unsigned char kind = 0;  // 1 map, 2 unmap
+};
+std::unordered_map<ULONG_PTR, PageEvent> page_events;
+ULONG64 page_event_serial = 0;  // one per successful map or unmap step
+ULONG64 remap_gaps = 0;        // addresses unmapped and mapped again in one call (P -> Q): a VirtualQuery from another
+                               // thread inside that call sees them uncommitted
+
+void note_events(const std::map<ULONG_PTR, ULONG_PTR>& batch, unsigned char kind) noexcept
+{
+    const ULONG64 tick = GetTickCount64(), serial = ++page_event_serial;
+    const DWORD thread = GetCurrentThreadId();
+    try {
+        for (const auto& [address, page] : batch) page_events[address] = PageEvent{tick, serial, page, thread, kind};
+    } catch (const std::bad_alloc&) {
+    }
+}
+
+// LOCAL (xmem_work/NOTES.md): one line for a refused page mapping or unmapping, with everything needed to name the
+// cause: the check that refused it or each Windows call's own error, what Windows shows at the address, what the
+// registry holds there, and the state of the slabs. Called with memory.mutex held; error is left as the last error.
+void log_refusal(const char* what, bool mapping, ULONG_PTR count, ULONG_PTR index, ULONG_PTR address, ULONG_PTR page,
+                 const char* check, DWORD error, ULONG_PTR mapped_before, bool windows) noexcept
+{
+    MEMORY_BASIC_INFORMATION info{};
+    const bool queried = address && VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info);
+    const auto live = memory.views.find(address);
+    const auto reservation = owned_reservation(address);
+    char windows_text[160] = "";
+    if (windows)
+        std::snprintf(windows_text, sizeof(windows_text), " MapViewOfFile3 err %lu, split %s%lu, map again err %lu;",
+                      map_errors.map, map_errors.split_tried ? "err " : "not tried ", map_errors.split, map_errors.retry);
+    x2w_local::logf("x2w-xmem REFUSED %s (%s) thread %lu: entry %llu of %llu, address %p page 0x%llx (token 0x%llx, %s): %s, "
+                    "error %lu;%s %llu page(s) of the call mapped before it were taken back | Windows at the address: base %p "
+                    "allocation %p size 0x%llx state 0x%lx type 0x%lx protect 0x%lx%s | registry: %s 0x%llx, reservation %p+0x%llx | "
+                    "slabs %llu (%llu pool), %llu pages live, %llu free slots, budget %llu MiB",
+                    what, mapping ? "map" : "unmap", GetCurrentThreadId(), static_cast<unsigned long long>(index),
+                    static_cast<unsigned long long>(count), reinterpret_cast<void*>(address), static_cast<unsigned long long>(page),
+                    static_cast<unsigned long long>(page << 4), page && era_physical::owns(page) ? "granted" : "NOT granted",
+                    check, static_cast<unsigned long>(error), windows_text, static_cast<unsigned long long>(mapped_before),
+                    queried ? info.BaseAddress : nullptr, queried ? info.AllocationBase : nullptr,
+                    static_cast<unsigned long long>(queried ? info.RegionSize : 0), queried ? info.State : 0ul,
+                    queried ? info.Type : 0ul, queried ? info.Protect : 0ul, queried ? "" : " (VirtualQuery failed)",
+                    live != memory.views.end() ? "view of page" : "no view", static_cast<unsigned long long>(
+                        live != memory.views.end() ? live->second : 0),
+                    reservation != memory.reservations.end() ? reinterpret_cast<void*>(reservation->first) : nullptr,
+                    static_cast<unsigned long long>(reservation != memory.reservations.end() ? reservation->second : 0),
+                    static_cast<unsigned long long>(memory.slabs.size()), static_cast<unsigned long long>(memory.pool_slabs),
+                    static_cast<unsigned long long>(memory.backings.size()),
+                    static_cast<unsigned long long>(memory.free_slots.size()),
+                    static_cast<unsigned long long>(slab_budget_bytes() >> 20));
+    SetLastError(error);
+}
+
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
+// Called with memory.mutex held and a MappingThread marker on this thread (map_pages, local_apply).
 template <typename AddressAt>
-BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
-                      bool share_views, MapFailure* failure = nullptr) noexcept
+BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at, bool share_views,
+                      const char* what, MapFailure* failure = nullptr) noexcept
 {
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
@@ -690,26 +1109,42 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto address = address_at(i);
             const auto live = memory.views.find(address);
-            const ULONG_PTR page = tokens ? tokens[i] : (live != memory.views.end() ? live->second : 0);
-            const char* invalid = nullptr;
-            if (!address || address % page_bytes) invalid = "invalid-address";
-            else if (tokens && live != memory.views.end()) invalid = "already-mapped";
-            else if (tokens && !era_physical::owns(page)) invalid = "unowned-page";
-            else if (!tokens && live == memory.views.end()) invalid = "unmapped-address";
-            else if (!batch.emplace(address, page).second) invalid = "duplicate-address";
-            if (invalid) {
-                if (failure) failure->record(invalid, address, page, ERROR_INVALID_PARAMETER);
+            const char* check = !address || address % page_bytes ? "address is zero or not 64 KiB aligned"
+                                : tokens && live != memory.views.end() ? "a view is already recorded at the address"
+                                : tokens && !era_physical::owns(tokens[i]) ? "the page is not granted (era_physical::owns)"
+                                : !tokens && live == memory.views.end() ? "no view is recorded at the address"
+                                                                         : nullptr;
+            if (!check && !batch.emplace(address, tokens ? tokens[i] : live->second).second)
+                check = "the address is named twice in the call";
+            if (check) {
+                log_refusal(what, tokens != nullptr, count, i, address,
+                            tokens ? tokens[i] : live != memory.views.end() ? live->second : 0, check,
+                            ERROR_INVALID_PARAMETER, 0, false);
+                if (failure) {
+                    const ULONG_PTR page = tokens ? tokens[i] : live != memory.views.end() ? live->second : 0;
+                    const char* stage = !address || address % page_bytes ? "invalid-address"
+                                        : tokens && live != memory.views.end() ? "already-mapped"
+                                        : tokens && !era_physical::owns(page) ? "unowned-page"
+                                        : !tokens && live == memory.views.end() ? "unmapped-address"
+                                                                                 : "duplicate-address";
+                    failure->record(stage, address, page, ERROR_INVALID_PARAMETER);
+                }
                 return physical_result(era_physical::Status::invalid);
             }
         }
         // Adjacent pages that are adjacent slots of one section share a single view (a "run"): a
         // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
+            ULONG_PTR index = 0;
             for (const auto& [address, page] : batch) {
-                if (!section_for(page, false)) {  // committed on first touch with X2W_XMEM_LAZY_COMMIT
-                    if (failure) failure->record("section-backing", address, page, GetLastError());
+                if (!section_for(page, address)) {
+                    const DWORD section_error = GetLastError();
+                    log_refusal(what, true, count, index, address, page, "no backing section for the page (section_for)",
+                                section_error, 0, false);
+                    if (failure) failure->record("section-backing", address, page, section_error);
                     return FALSE;
                 }
+                ++index;
             }
             std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
             auto first = batch.begin();
@@ -724,9 +1159,20 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                 ULONG_PTR failed_address;
                 if (!map_run(first->first, head, bytes, made, failed_address)) {
                     const DWORD error = GetLastError();
+                    // The page map_run stopped at: the first page of the run that has no view.
+                    ULONG_PTR at = first->first;
+                    while (memory.runs.count(at) && at < first->first + bytes) at += page_bytes;
+                    const auto failed = batch.find(at);
+                    log_refusal(what, true, count, static_cast<ULONG_PTR>(std::distance(batch.begin(), failed)), at,
+                                failed != batch.end() ? failed->second : 0,
+                                "Windows refused the view (sorted entry; MapViewOfFile3 / placeholder split)", error,
+                                made.size(), true);
                     if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {
-                        UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER);
+                        if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER))
+                            x2w_local::logf("x2w-xmem REFUSED %s: taking back the view %p+0x%llx failed (error %lu): a view the "
+                                            "registry does not know stays there", what, reinterpret_cast<void*>(base),
+                                            static_cast<unsigned long long>(size), GetLastError());
                         memory.runs.erase(base);
                     }
                     coalesce_unused(batch);
@@ -737,6 +1183,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             }
             for (const auto& [address, page] : batch)
                 ++memory.backings.at(page).views;
+            note_events(batch, 1);
             memory.views.merge(batch);
         } else {
             // Unmap every run that holds a page of the batch, then map the surviving pages of those
@@ -769,6 +1216,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             }
             const bool refused = error != ERROR_SUCCESS;
             if (!refused) {
+                note_events(batch, 2);
                 for (const auto& [address, page] : batch) {
                     --memory.backings.at(page).views;
                     memory.views.erase(address);
@@ -795,14 +1243,17 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
 }
 
 template <typename AddressAt>
-BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
+BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at, const char* what,
                MapFailure* failure = nullptr) noexcept
 {
     X2W_ZONE("xmem map_pages");
+    if (!count || count > era_physical::capacity_pages)
+        return physical_result(era_physical::Status::invalid);
     const bool share_views = fault_retry.ready();
     const MappingThread marker;
     const std::lock_guard guard(memory.mutex);
-    return map_pages_locked(count, tokens, address_at, share_views, failure);
+    const ChangingGpuMappings changing;
+    return map_pages_locked(count, tokens, address_at, share_views, what, failure);
 }
 }
 
@@ -844,8 +1295,9 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         how = "placeholder kept for page mapping";
     } else if (type & MEM_COMMIT) {
         if (!address) {
-            result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, protect);
+            result = x2w_low::alloc(bytes, MEM_COMMIT | MEM_RESERVE, protect);
             how = "commit";
+            if (result) InterlockedAdd64(&permissive_commit_bytes, static_cast<LONG64>(bytes)), InterlockedIncrement64(&permissive_commit_calls);
         } else {
             result = VirtualAlloc(address, bytes, MEM_COMMIT, protect);
             if (!result) {
@@ -854,12 +1306,24 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
                                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
             }
             how = "commit at address";
+            if (result) InterlockedAdd64(&permissive_commit_bytes, static_cast<LONG64>(bytes)), InterlockedIncrement64(&permissive_commit_calls);
         }
     } else {
-        result = VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
-                               nullptr, 0);
+        result = address ? VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                                         nullptr, 0)
+                         : x2w_low::alloc(bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS);
         // A caller that asks for a placeholder splits it itself; other reservations are split here on mapping.
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
+        if (result && (type & MEM_RESERVE_PLACEHOLDER) && linear_placement()) {
+            const std::lock_guard guard(memory.mutex);
+            const auto start = reinterpret_cast<ULONG_PTR>(result);
+            auto& regions = memory.linear_reservations;
+            auto next = regions.lower_bound(start);
+            if (next != regions.begin() && start - std::prev(next)->first < std::prev(next)->second.bytes)
+                regions.erase(std::prev(next));
+            while (next != regions.end() && next->first - start < bytes) next = regions.erase(next);
+            if (bytes && bytes <= slab_bytes && bytes % page_bytes == 0) regions.emplace(start, LinearReservation{bytes});
+        }
         how = "placeholder reserve";
     }
     const DWORD error = result ? 0 : GetLastError();
@@ -924,9 +1388,29 @@ void log_failed_ranges(const char* what, const char* operation, const std::vecto
 BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages,
                         const char* what, bool share_views)
 {
-    std::map<ULONG_PTR, ULONG_PTR> want;
-    for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
+    // The pairs in ascending address order, the last pair for a repeated address winning, as an
+    // ordered map assigned in call order would give; but one allocation instead of a tree node per
+    // page (a single call can carry ~100,000 pages).
+    std::vector<std::pair<ULONG_PTR, ULONG_PTR>> want;
+    want.reserve(count);
+    bool ascending = true;
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        ascending = ascending && (!i || addresses[i] > addresses[i - 1]);
+        want.emplace_back(addresses[i], pages[i]);
+    }
+    if (!ascending) {
+        std::stable_sort(want.begin(), want.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            if (i + 1 < want.size() && want[i + 1].first == want[i].first) continue;  // a later pair names it again
+            want[kept++] = want[i];
+        }
+        want.resize(kept);
+    }
     std::vector<ULONG_PTR> unmap, map_at, map_page;
+    // The plan (which addresses to unmap, which to map) and both steps run under ONE hold of the mutex (the
+    // caller's, local_apply): a call from another thread naming the same addresses in between would make the plan
+    // wrong and the call fail, where the console applies both calls one after the other.
     for (const auto& [address, page] : want) {
         const auto live = memory.views.find(address);
         if (!page) {
@@ -936,6 +1420,7 @@ BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG
         if (live != memory.views.end()) {
             if (live->second == page) continue;
             unmap.push_back(address);
+            ++remap_gaps;
         }
         map_at.push_back(address);
         map_page.push_back(page);
@@ -943,14 +1428,16 @@ BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG
     BOOL ok = TRUE;
     DWORD error = 0;
     MapFailure failure;
+    std::optional<ChangingGpuMappings> changing;
+    if (!unmap.empty() || !map_at.empty()) changing.emplace();
     if (!unmap.empty() && !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; },
-                                            share_views, &failure)) {
+                                            share_views, what, &failure)) {
         ok = FALSE;
         error = GetLastError();
     }
     if (ok && !map_at.empty() &&
         !map_pages_locked(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; },
-                          share_views, &failure)) {
+                          share_views, what, &failure)) {
         ok = FALSE;
         error = GetLastError();
     }
@@ -961,10 +1448,14 @@ BOOL local_apply_locked(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG
     }
     static LONG calls;
     if (!ok || x2w_local::first_calls(calls, 16))
-        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu)", what,
-                        static_cast<unsigned long long>(count), count ? reinterpret_cast<void*>(addresses[0]) : nullptr,
-                        static_cast<unsigned long long>(map_at.size()), static_cast<unsigned long long>(unmap.size()), ok,
-                        static_cast<unsigned long>(error));
+        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu) thread %lu, %s, lowest %p "
+                        "highest %p%s", what, static_cast<unsigned long long>(count),
+                        count ? reinterpret_cast<void*>(addresses[0]) : nullptr, static_cast<unsigned long long>(map_at.size()),
+                        static_cast<unsigned long long>(unmap.size()), ok, static_cast<unsigned long>(error),
+                        GetCurrentThreadId(), ascending ? "ascending" : "unsorted",
+                        want.empty() ? nullptr : reinterpret_cast<void*>(want.front().first),
+                        want.empty() ? nullptr : reinterpret_cast<void*>(want.back().first),
+                        ok ? "" : " (the x2w-xmem REFUSED line above names the entry and the cause; no page of the refused step is mapped)");
     SetLastError(error);
     return ok;
 }
@@ -1015,6 +1506,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages);
 
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
 {
+    x2w_census::start();
     static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
     if (local_permissive()) {
         const ULONG_PTR requested = count ? *count : 0;
@@ -1062,11 +1554,12 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                const Slot slot{backing->second.slab, backing->second.offset};
+                // LOCAL allocator (option a): the slot returns to free_slots, unless a section lease still pins it.
+                const Slot slot{backing->second.section, backing->second.offset};
                 if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
                     pin->second.retired = true;
                 else
-                    memory.slots.release(slot.first, slot.second);
+                    memory.free_slots.insert(slot);
                 memory.backings.erase(backing);
             }
         }
@@ -1235,6 +1728,7 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
             it->second.actual = 0;
     };
 
+    const ChangingGpuMappings changing;
     begin_break(broken);
     const EndBreak end;
     DWORD error = ERROR_SUCCESS;
@@ -1373,6 +1867,19 @@ extern "C" HRESULT WINAPI X2WMapPageBatch(UINT count, const X2WPageBatch* batche
             memory.explicit_mirror_pages.merge(explicit_pages);
             if (stats) *stats = result;
         }
+        static const bool trace = x2w_local::env_on("X2W_GPU_DROP_TRACE");
+        if (trace) {
+            static UINT64 calls, changed, unchanged;
+            ++calls;
+            changed += SUCCEEDED(hr) ? result.pagesChanged : 0;
+            unchanged += SUCCEEDED(hr) ? result.pagesSkipped : 0;
+            if (calls <= 8 || !(calls & (calls - 1))) {
+                const auto& r = ranges.front();
+                x2w_local::logf("x2w-xmem queue page batch %llu: hr=0x%08lx pool=0x%llx poolPages=%u ranges=%zu pages=%u firstDest=0x%llx kind=%u start=%u count=%u changed=%llu skipped=%llu",
+                    calls, hr, pool, poolPages, ranges.size(), total, r.address, r.source.kind, r.source.start, r.source.count,
+                    changed, unchanged);
+            }
+        }
         return hr;
     } catch (const std::bad_alloc&) {
         return E_OUTOFMEMORY;
@@ -1405,10 +1912,10 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
             if (!slot) return FALSE;
             if (selected.empty())
                 section = slot->section;
-            else if (slot->section != section || slot->slab != selected.front().first ||
+            else if (slot->section != section ||
                      slot->offset != selected.front().second + i * page_bytes)
                 return FALSE;
-            selected.emplace_back(slot->slab, slot->offset);
+            selected.emplace_back(slot->section, slot->offset);
         }
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE,
                              DUPLICATE_SAME_ACCESS))
@@ -1445,7 +1952,7 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
     const auto first_page = address & ~(page_bytes - 1);
     for (SIZE_T slot = first_slot; slot <= last_slot; ++slot) {
         const auto* backing = lease_backing(version, first_page + (slot - first_slot) * page_bytes);
-        if (!backing || pin.slots[slot] != Slot{backing->slab, backing->offset}) return FALSE;
+        if (!backing || pin.slots[slot] != Slot{backing->section, backing->offset}) return FALSE;
     }
     return TRUE;
 }
@@ -1471,6 +1978,41 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
     return TRUE;
 }
 
+// LOCAL accounting exports (xmem_census.h).
+extern "C" BOOL WINAPI x2w_xmem_memory_stats(X2wXmemStats* stats)
+{
+    if (!stats) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    stats->slabs = memory.slabs.size();
+    stats->slab_bytes = memory.slabs.size() * slab_bytes;
+    stats->live_pages = memory.backings.size();
+    stats->free_slots = memory.free_slots.size();
+    stats->slab_budget_bytes = slab_budget_bytes();
+    stats->slab_refusals = static_cast<ULONGLONG>(slab_refusals);
+    stats->startup_block_bytes = static_cast<ULONGLONG>(startup_block_bytes);
+    stats->startup_block_calls = static_cast<ULONGLONG>(startup_block_calls);
+    stats->permissive_commit_bytes = static_cast<ULONGLONG>(permissive_commit_bytes);
+    stats->permissive_commit_calls = static_cast<ULONGLONG>(permissive_commit_calls);
+    stats->reservations = memory.reservations.size();
+    stats->file_slabs = memory.file_slabs.size();
+    stats->migrations = memory.migrations;
+    stats->migration_failures = memory.migration_failures;
+    return TRUE;
+}
+
+extern "C" SIZE_T WINAPI x2w_xmem_reserved_ranges(ULONG_PTR* pairs, SIZE_T capacity)
+{
+    const std::lock_guard guard(memory.mutex);
+    SIZE_T i = 0;
+    for (const auto& [base, bytes] : memory.reservations) {
+        if (pairs && i < capacity) {
+            pairs[2 * i] = base;
+            pairs[2 * i + 1] = bytes;
+        }
+        ++i;
+    }
+    return i;
+}
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
 // in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and it is closed only at process end, so
 // a slot freed by a grant stays committed and these numbers do not show the commit held.
@@ -1478,12 +2020,16 @@ extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
     const std::lock_guard guard(memory.mutex);
-    *slabs = memory.slots.slab_count();
-    *slots_in_use = memory.slots.slots_in_use();
-    *slots_free = memory.slots.slots_free();
+    // LOCAL allocator (option a at the upstream merge): slabs of memory.slabs (pagefile, file-backed and GPU-pool
+    // slabs alike), slots that back a granted page, and free slots: released ones plus the unused tail of the newest slab.
+    *slabs = memory.slabs.size();
+    *slots_in_use = memory.backings.size();
+    *slots_free = memory.free_slots.size() + (memory.slabs.empty() ? 0 : (slab_bytes - memory.slab_used) / page_bytes);
     return TRUE;
 }
 
+// LOCAL note: commit-on-first-touch of slots is not ported onto the local allocator, so no slot is lazy and this
+// only acts on lazy startup blocks (X2W_XMEM_LAZY_STARTUP); for mapped pages it reports already committed.
 // Experimental export (X2W_XMEM_LAZY_COMMIT): commits the lazily mapped slots behind [address, address + bytes)
 // before a writer that cannot fault one in uses the range: kernel-mode I/O into mapped pages fails with
 // STATUS_ACCESS_VIOLATION instead of faulting, and the GPU reads and writes placed resources without the CPU.
@@ -1637,14 +2183,12 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
     ULONG_PTR index = 0;
     while (bytes) {
         if (index >= count || (tokens[index] & 0xF)) return FALSE;
-        HANDLE section = nullptr;
-        ULONG64 section_offset = 0;
-        {
-            const std::lock_guard guard(memory.mutex);
-            section = section_for(tokens[index] >> 4);
-            if (section) section_offset = memory.backings.at(tokens[index] >> 4).offset;
-        }
+        // The lock is held across the write: a slab move (migrate_slab) must not happen between
+        // finding the section and writing into it.
+        const std::lock_guard guard(memory.mutex);
+        const HANDLE section = section_for(tokens[index] >> 4);
         if (!section) return FALSE;
+        const ULONG64 section_offset = memory.backings.at(tokens[index] >> 4).offset;
         void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(section_offset >> 32),
                                    static_cast<DWORD>(section_offset), page_bytes);
         if (!view) return FALSE;
@@ -1682,7 +2226,7 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         if (!local_apply(count, addresses.data(), pages.data(), "XMemMapPhysicalPages")) return nullptr;
         return base;
     }
-    return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }) ? base : nullptr;
+    return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }, "XMemMapPhysicalPages") ? base : nullptr;
 }
 
 extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG_PTR count,
@@ -1696,7 +2240,7 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
             return FALSE;
         return TRUE;
     }
-    return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
+    return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); }, "XMemMapPhysicalPagesScatter");
 }
 
 // Startup compatibility configuration (#1758, under #874): X2W_XMEM_STARTUP_BELOW_40=1 places the
@@ -1762,8 +2306,8 @@ static void* keep_startup_block_below_40(void* block, SIZE_T bytes, ULONGLONG at
 // granularity. Large pages themselves and the console protection bits above PAGE_READWRITE
 // are not reproduced. A host failure returns NULL with the host error. X2W_XMEM_STARTUP_BELOW_40
 // adds an address limit for the 0x283 blocks (keep_startup_block_below_40).
-static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
-                                  DWORD protection) noexcept
+static void* commit_startup_block_raw(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
+                                      DWORD protection) noexcept
 {
     constexpr SIZE_T granularity = SIZE_T{64} << 10;
     const bool large_pages = allocation_type == 0x20003000;
@@ -1781,10 +2325,14 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     const DWORD type = lazy ? MEM_RESERVE : MEM_RESERVE | MEM_COMMIT;
     void* block = nullptr;
     if (!large_pages) {
-        block = VirtualAlloc(nullptr, bytes, type, PAGE_READWRITE);
+        block = x2w_low::alloc(bytes, type, PAGE_READWRITE);  // LOCAL: X2W_XMEM_LOW40 (xmem_low.h)
     } else {
         MEM_ADDRESS_REQUIREMENTS requirements{};
         requirements.Alignment = SIZE_T{2} << 20;
+        if (x2w_low::on()) {  // LOCAL: X2W_XMEM_LOW40 (xmem_low.h)
+            requirements.LowestStartingAddress = reinterpret_cast<void*>(ULONG_PTR{1} << 32);
+            requirements.HighestEndingAddress = reinterpret_cast<void*>((ULONG_PTR{1} << 40) - 1);
+        }
         // supported already limits attribute 0x283 to protection 0x2004 or 0x2404.
         if (below_40 && !startup_below_40_mutant("no_limit"))
             requirements.HighestEndingAddress = reinterpret_cast<void*>(startup_low_limit - 1);
@@ -1813,11 +2361,33 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     return block;
 }
 
+// LOCAL accounting: the startup blocks are counted and their first calls logged (the path was
+// silent before); the ranges go to the census (xmem_census.cpp).
+static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
+                                  DWORD protection) noexcept
+{
+    void* block = commit_startup_block_raw(bytes, allocation_type, attributes, protection);
+    const DWORD error = GetLastError();
+    if (block) {
+        InterlockedAdd64(&startup_block_bytes, static_cast<LONG64>(bytes));
+        x2w_census::note_block(block, bytes);
+    }
+    const LONG64 n = InterlockedIncrement64(&startup_block_calls);
+    if (n <= 64 || !block)
+        x2w_local::logf("x2w-xmem startup block #%lld size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (err %lu), %lld MiB so far",
+                        static_cast<long long>(n), static_cast<unsigned long long>(bytes), static_cast<unsigned long>(allocation_type),
+                        attributes, static_cast<unsigned long>(protection), block, block ? 0ul : static_cast<unsigned long>(error),
+                        static_cast<long long>(startup_block_bytes >> 20));
+    SetLastError(error);
+    return block;
+}
+
 // The startup commit profile above, and the reserve-only desktop profile from the source-built
 // #888 comparison.
 extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
                                         ULONGLONG attributes, DWORD protection)
 {
+    x2w_census::start();
     constexpr DWORD startup_reserve = 0x20402000;
     constexpr SIZE_T gib = SIZE_T{1} << 30;
     if (!address && (allocation_type == 0x20003000 || allocation_type == (startup_reserve | MEM_COMMIT)))
@@ -1839,8 +2409,7 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
         else
             ++it;
     }
-    auto* reservation = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                      PAGE_NOACCESS, nullptr, 0);
+    auto* reservation = x2w_low::alloc(bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS);
     if (!reservation) return nullptr;
     try {
         memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(reservation), bytes);
@@ -1863,4 +2432,199 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
         return nullptr;
     }
     return reservation;
+}
+
+extern "C" BOOL WINAPI x2w_xmem_page_event(const void* address, ULONG* event_kind, ULONG64* page, ULONG* thread,
+                                           ULONG64* age_ms, ULONG64* serial, ULONG64* remaps)
+{
+    const auto at = reinterpret_cast<ULONG_PTR>(address) & ~(ULONG_PTR{page_bytes} - 1);
+    const std::lock_guard guard(memory.mutex);
+    const auto event = page_events.find(at);
+    const PageEvent e = event != page_events.end() ? event->second : PageEvent{};
+    if (event_kind) *event_kind = e.kind;
+    if (page) *page = e.page;
+    if (thread) *thread = e.thread;
+    if (age_ms) *age_ms = e.tick ? GetTickCount64() - e.tick : 0;
+    if (serial) *serial = e.serial;
+    if (remaps) *remaps = remap_gaps;
+    return memory.views.count(at) != 0;
+}
+
+bool writable_protection(DWORD protection) noexcept
+{
+    if (protection & PAGE_GUARD) return false;
+    const DWORD base = protection & 0xff;
+    return base == PAGE_READWRITE || base == PAGE_WRITECOPY || base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool resident_writable(ULONG_PTR start, SIZE_T bytes) noexcept
+{
+    if (!bytes) return true;
+    static const ULONG_PTR os_page = [] {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        return static_cast<ULONG_PTR>(info.dwPageSize);
+    }();
+    const ULONG_PTR first = start - start % os_page;
+    const SIZE_T count = (start + bytes - 1 - first) / os_page + 1;
+    constexpr SIZE_T max_pages = 32;
+    if (count > max_pages) return false;
+    PSAPI_WORKING_SET_EX_INFORMATION pages[max_pages];
+    for (SIZE_T i = 0; i < count; ++i) {
+        pages[i].VirtualAddress = reinterpret_cast<void*>(first + i * os_page);
+        pages[i].VirtualAttributes.Flags = 0;
+    }
+    if (!QueryWorkingSetEx(GetCurrentProcess(), pages, static_cast<DWORD>(count * sizeof(pages[0])))) return false;
+    for (SIZE_T i = 0; i < count; ++i) {
+        const auto attrs = pages[i].VirtualAttributes;
+        if (!attrs.Valid || attrs.Bad || !writable_protection(static_cast<DWORD>(attrs.Win32Protection))) return false;
+    }
+    return true;
+}
+
+// True when every byte of [start, start + bytes) is committed read-write.
+bool range_writable(ULONG_PTR start, SIZE_T bytes) noexcept
+{
+    if (resident_writable(start, bytes)) return true;
+    for (ULONG_PTR cursor = start; cursor < start + bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            !writable_protection(info.Protect))
+            return false;
+        const ULONG_PTR end = reinterpret_cast<ULONG_PTR>(info.BaseAddress) + info.RegionSize;
+        if (end <= cursor) return false;
+        cursor = end;
+    }
+    return true;
+}
+
+extern "C" BOOL WINAPI x2w_xmem_write_settled(void* destination, const void* data, SIZE_T bytes, SIZE_T capacity)
+{
+    if (!destination || (bytes && !data) || bytes > capacity) return FALSE;
+    const auto start = reinterpret_cast<ULONG_PTR>(destination);
+    if (capacity > std::numeric_limits<ULONG_PTR>::max() - start) return FALSE;
+    const MappingThread marker;  // a fault in the copy is never retried by retry_remapped_page (it takes the mutex)
+    static const bool timing = x2w_local::env_on("X2W_DSTORAGE_TIMING");
+    LARGE_INTEGER began{}, locked{}, checked{}, copied{};
+    if (timing) QueryPerformanceCounter(&began);
+    std::unique_lock guard(memory.mutex);
+    // Inside a recorded reservation, or one starts inside the destination.
+    const auto next = memory.reservations.upper_bound(start);
+    const bool ours = owned_reservation(start) != memory.reservations.end() ||
+                      (next != memory.reservations.end() && next->first < start + capacity);
+    if (!ours) guard.unlock();
+    if (timing) QueryPerformanceCounter(&locked);
+    const bool writable = range_writable(start, capacity);
+    if (timing) QueryPerformanceCounter(&checked);
+    if (writable) std::memcpy(destination, data, bytes);
+    if (timing) {
+        if (guard.owns_lock()) guard.unlock();
+        QueryPerformanceCounter(&copied);
+        struct Times {
+            unsigned requests{}, owned{}, refused{};
+            ULONG_PTR first{};
+            UINT64 bytes{};
+            LONG64 lock{}, check{}, copy{};
+        };
+        thread_local Times batch;
+        if (!batch.requests) batch.first = start;
+        batch.lock += locked.QuadPart - began.QuadPart;
+        batch.check += checked.QuadPart - locked.QuadPart;
+        batch.copy += copied.QuadPart - checked.QuadPart;
+        batch.bytes += bytes;
+        batch.owned += unsigned(ours);
+        batch.refused += unsigned(!writable);
+        if (++batch.requests == 256) {
+            static const double to_ms = [] {
+                LARGE_INTEGER frequency{};
+                QueryPerformanceFrequency(&frequency);
+                return 1000.0 / frequency.QuadPart;
+            }();
+            x2w_local::logf("x2w-xmem storage writes tid=%lu first=0x%llx last=0x%llx requests=%u owned=%u refused=%u "
+                            "bytes=%llu total ms: lock=%.2f writable=%.2f copy=%.2f",
+                            GetCurrentThreadId(), static_cast<UINT64>(batch.first), static_cast<UINT64>(start), batch.requests,
+                            batch.owned, batch.refused, batch.bytes, batch.lock * to_ms, batch.check * to_ms, batch.copy * to_ms);
+            batch = {};
+        }
+    }
+    return writable;
+}
+
+extern "C" BOOL WINAPI x2w_xmem_write_settled_wait(void* destination, const void* data, SIZE_T bytes, SIZE_T capacity,
+                                                   ULONG wait_ms, ULONG* waited_ms)
+{
+    const ULONG64 began = GetTickCount64();
+    for (;;) {
+        const BOOL ok = x2w_xmem_write_settled(destination, data, bytes, capacity);
+        const ULONG64 spent = GetTickCount64() - began;
+        if (ok || spent >= wait_ms) {
+            if (waited_ms) *waited_ms = static_cast<ULONG>(spent);
+            return ok;
+        }
+        Sleep(5);
+    }
+}
+
+extern "C" ULONG64 WINAPI x2w_xmem_gpu_mapping_generation()
+{
+    const auto observed = gpu_mapping_generation.load(std::memory_order_acquire);
+    if ((observed & 1) == 0) return observed;
+    const std::lock_guard guard(memory.mutex);
+    return gpu_mapping_generation.load(std::memory_order_acquire);
+}
+
+// LOCAL export: the section (a 256 MiB slab, see section_for) and byte offset behind a mapped title
+// address, so that a desktop GPU heap opened over the slab reads and writes the pages the title maps.
+// FALSE when the address is not in a mapped page.
+extern "C" BOOL WINAPI x2w_xmem_gpu_location(const void* address, HANDLE* section, ULONG64* offset)
+{
+    if (!section || !offset) return FALSE;
+    const auto at = reinterpret_cast<ULONG_PTR>(address);
+    const std::lock_guard guard(memory.mutex);
+    const auto view = memory.views.find(at - at % page_bytes);
+    if (view == memory.views.end()) return FALSE;
+    const auto backing = memory.backings.find(view->second);
+    if (backing == memory.backings.end()) return FALSE;
+    if (memory.file_slabs.count(backing->second.section) && !migrate_slab(backing->second.section)) return FALSE;
+    *section = backing->second.section;  // the pagefile slab after a move
+    *offset = backing->second.offset + at % page_bytes;
+    return TRUE;
+}
+
+// LOCAL memcut (X2W_MEMCUT_ALIAS_SLABS in d3d12_xs): the pool section and byte offset behind [address, address +
+// bytes) when that whole range is mapped pages of ONE long-lived pool section (X2W_XMEM_GPU_POOL=all) at consecutive
+// offsets, so that one buffer placed on a heap over the section covers exactly the title's pages. Never moves a slab
+// (file-backed and fresh pagefile slabs answer FALSE: a fresh section opened as a heap would stay charged after the
+// run). address must be page aligned.
+extern "C" BOOL WINAPI x2w_xmem_pool_run(const void* address, SIZE_T bytes, HANDLE* section, ULONG64* offset)
+{
+    if (!section || !offset || !bytes) return FALSE;
+    const auto at = reinterpret_cast<ULONG_PTR>(address);
+    if (at % page_bytes) return FALSE;
+#ifdef X2W_XMEM_TEST_CONTROLS
+    // Test build only: any slab counts as a pool section (a fixture must not claim the real pool).
+    static const bool any_slab = x2w_local::env_on("X2W_XMEM_TEST_POOL_ANY");
+#else
+    constexpr bool any_slab = false;
+#endif
+    const std::lock_guard guard(memory.mutex);
+    HANDLE first_section = nullptr;
+    ULONG64 first_offset = 0;
+    for (SIZE_T done = 0; done < bytes; done += page_bytes) {
+        const auto view = memory.views.find(at + done);
+        if (view == memory.views.end()) return FALSE;
+        const auto backing = memory.backings.find(view->second);
+        if (backing == memory.backings.end()) return FALSE;
+        const HANDLE s = backing->second.section;
+        if (!done) {
+            if (!memory.pool_views.count(s) && !any_slab) return FALSE;  // not a pool section
+            first_section = s;
+            first_offset = backing->second.offset;
+        } else if (s != first_section || backing->second.offset != first_offset + done) {
+            return FALSE;  // the pages are not consecutive in one section
+        }
+    }
+    *section = first_section;
+    *offset = first_offset;
+    return TRUE;
 }

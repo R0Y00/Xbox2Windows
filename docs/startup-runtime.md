@@ -37,8 +37,8 @@ Render-mode slot 26 forwards unflagged UAV barriers on an open direct or compute
 resource orders UAV accesses across resources. A named resource must be a wrapper around a local
 desktop resource with UAV access. Transition and aliasing records are skipped because desktop
 resource states and heap aliases are managed by the shim. The slot returns zero console actions.
-The console slot and record layout are also documented by the
-[ztrx command-list implementation](https://github.com/Zettrox/ztrx/blob/90b529f878a470fec9bf07b7be316bc769a12232/crates/victory-gpu/src/list.rs).
+The upstream command-list implementation documents the console slot and record layout in
+`src/list.rs` at commit `90b529f878a470fec9bf07b7be316bc769a12232`.
 
 Build `startup_present_producer` and run
 `ctest --preset release --no-tests=error -R '^startup_list_uav_barriers_(warp|hardware)$' -V`.
@@ -255,6 +255,11 @@ windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
 The same run raises each of two guests in turn and checks that the raised one is
 selected.
+The launcher defaults to `X2W_PRESENT_IN_TITLE_WINDOW=1` in render mode. DirectComposition
+attaches the GPU swap chain to the executable's existing client area and scales the picture
+on resize. The original window opens with a 1280 ? 720 client area and handles input. The launcher appends the runtime name, frame number, and recent frame rate to its caption. Setting the switch
+to `0` selects the separate output window.
+
 With `X2W_HIDE_TITLE_WINDOW=1` (exactly `1`), a 500 ms timer on the output window's thread hides the
 title's own visible, unowned windows while presents reach the output window, and hides them again when
 the title shows them. The hide is asynchronous (`ShowWindowAsync`), so a busy title thread does not
@@ -1409,6 +1414,18 @@ stay live until their desktop references are released. The diagnostic leaves
 those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
+
+With `X2W_D3D12_COLD_TEXTURE_PRIORITY=1`, the runtime asks Windows for low residency
+priority when the guest releases its last reference to a committed slot 133 sampled
+2D texture with title memory, one sample and no resource flags. A guest AddRef,
+direct view or copy, or translated sample that resolves the wrapper restores normal
+priority. The texture then keeps normal priority for the rest of the process.
+Already-recorded commands and persistent shader-visible descriptors can still
+access a low-priority texture without another CPU-side lookup. Windows controls
+physical placement. The hint preserves resource contents and committed allocation
+size. The memory heartbeat reports the bytes and count currently at low priority,
+the cumulative restored bytes and count, and failed priority changes. The hint
+is disabled when `X2W_D3D12_RELEASE_RETIRED` or `X2W_MEMCUT_RELEASE` is enabled.
 
 `X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for committed
 2D textures that have one sample, no render-target, depth-stencil or
@@ -3059,3 +3076,30 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+### Compare a compute output with its presented frame
+
+With busy-frame tracing and `X2W_CX_TRACE_UAV=<16-hex-key>,<slot>` enabled, set
+`X2W_CX_TRACE_PAIR=1` to sample the selected compute output and the final
+presented surface. The producer command must be recorded and submitted in the
+same frame on the presenting queue. Look for matching submit frame numbers in
+`x2w-frame-pair` lines. A busy presentation readback can skip the second
+sample. A frame with only one image is an incomplete comparison.
+
+The runtime writes 96-by-54 RGB PFM images beside `X2W_TRAP_LOG`. Lighting
+values retain their half-float numeric values. Presentation bytes are normalized
+to [0,1] in the surface's encoding. Compare spatial features and zero regions;
+a tone-mapping pass can change magnitudes. Six horizontal bands in the log
+report sample counts with finite nonzero RGB, alpha alone, and nonfinite values.
+
+### Local shader profiles
+
+Set these options before starting the process. Leave a selector unset to disable its match.
+
+| Setting | Local input |
+| --- | --- |
+| X2W_MATERIAL_FIELDS_PROFILE | Path to the text output of the shader_material_fields.mjs tool. Each row holds a shader key, two DXBC checksum halves and a field mask in hexadecimal. |
+| X2W_EXPOSURE_RESET_KEY | Lowercase 16-digit hexadecimal pixel shader key for resetting exposure history. |
+| X2W_LIGHT_RESOLVE_MARKER, X2W_LIGHT_RADIANCE_MARKER, X2W_LIGHT_AIR_MARKER | Case-sensitive strings in compute containers that identify each lighting role. |
+| X2W_CULL_HEAP_PROBE_KEY | 16-digit hexadecimal compute shader key for the optional X2W_CULL_HEAP_PROBE diagnostic. |
+| X2W_CULL_INPUT_CAPTURE | Comma-separated key:occurrence selections. Keys are 16 hexadecimal digits. Occurrences start at zero. An asterisk selects every occurrence. |

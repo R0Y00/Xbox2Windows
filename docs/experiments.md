@@ -609,8 +609,8 @@ python -B tests/host_commit_check.py -v
 
 This is independently written from public Windows PSAPI behavior and the
 reported Windows commit-limit failure mode in
-[VIctory's README at `ffe310e`](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md).
-No VIctory (GPL-3.0-or-later) source code is copied into this MIT project.
+the upstream `README.md` at commit `ffe310eb2098e52169f4c44db5ffdabf43a72622`.
+The commit-headroom check uses the Windows API directly. Its implementation contains no code from that GPL-3.0-or-later project.
 The source-built Linux tests mock the Windows API and check limits, underflow,
 API errors, low-commit failure **before** package inspection, and preservation
 of the prior JSON output when the option is absent. The native Windows test
@@ -7741,6 +7741,60 @@ modifier the emitted text is unchanged. `op_sel` and source modifiers are still 
 rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f32` keeps refusing output
 modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
 
+**f32 lg and nlg compares with a NaN source (#1920).** `V_CMP_LG_F32` is less or greater: ordered and not equal,
+false when either source is NaN, and `V_CMP_NLG_F32` is its negation. `compare()` lowered them as `a != b` and
+`!(a != b)`, and HLSL `!=` is unordered, so both gave the opposite result on every NaN pair. They now read
+`(ORDERED && (a < b || a > b))` and its negation, where ORDERED tests both source words for NaN on their bits
+(`(w & 0x7fffffff) <= 0x7f800000`, before the neg/abs modifiers). The bit test is needed on hardware: DXC without
+`-Gis` marks the float compares `fast`, and on an RX 9070 XT (driver 32.0.31044.16) the DXC build of the plain
+less-or-greater in the `cmp` fixture below returned 1 for both lg and nlg on all 156 NaN pairs (its `v_cmpx`
+fixtures matched); FXC on both backends and DXC on WARP gave the ordered result.
+`startup_gfx2hlsl_f32_lg` decodes every f32 condition of the table (v_cmp and v_cmpx, e32 and e64 under every
+neg/abs combination, 510 forms), translates it and evaluates the HLSL over all 256 pairs of +-0, +-min denormal,
++-1.0, +-max finite, +-inf, +-quiet, signalling and payload NaN against a reference built from the ISA
+definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms, and the f32 SDWA forms stay refused.
+The draws `startup_gfx2hlsl_f32_lg_{warp,hardware}` build one of those words from the pixel's x and one from its
+y, so 16 x 16 pixels cover every pair, and write `v_cmp_lg_f32_e32`, `v_cmp_nlg_f32_e64`, `v_cmp_lg_f32_e64` and
+`v_cmp_nlg_f32_e32` results or keep a pixel through `v_cmpx_lg/nlg_f32_e32/e64`, compiled with FXC `ps_5_1` and
+DXC `ps_6_0`. Every pixel matched on WARP and on the RX 9070 XT with both compilers: lg is 1 on unequal pairs and
+0 on equal and NaN pairs, nlg the opposite. Both backends flushed denormal compare sources to signed zero, which
+D3D allows; the draw accepts the image with denormals kept or flushed, the same choice for every fixture, and
+reports which. The old `!=` text fails each draw against both images (156 pixels differ against the flushed one)
+and matches its own image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_lg' -V`;
+`tests/startup_gfx2hlsl_f32_lg_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the forms and the
+fixtures through LLVM 15.
+
+**f32 nlt, nle, ngt, nge, o and u under compilers without `-Gis` (#1936).** The startup cache compiles every
+`gfx2hlsl` pair with FXC and no flags, and neither compiler keeps float compares IEEE-strict unless asked. FXC
+compiled `!(a < b)` to `ge a, b` (and likewise for `<=`, `>`, `>=`), so nlt, nle, ngt and nge gave 0 on every NaN
+pair where the ISA gives 1; DXC folded `a != a` and `a == a`, so u was constant 0 and o constant 1. WARP and an
+RX 9070 XT (driver 32.0.31044.16) agreed in every case, and `/Gis` or `-Gis` restored the ISA result, so the
+bytecode decides it. The n-forms now read `!(ORDERED && a OP b)` and o and u read ORDERED and `!ORDERED`, with
+ORDERED the bit test of both source words that lg uses; neq is unchanged, as both compilers keep `!(a == b)` true
+on NaN. `startup_gfx2hlsl_f32_nan` evaluates the HLSL of all 510 f32 forms over the 256 source pairs under IEEE
+compares and under models of the two rewrites (a negation pushed into the opposite relation; reflexive float
+relations folded, and less-or-greater read as unordered not-equal, #1920); each equals the ISA reference, and the
+text before #1936 fails all 204 forms of the six conditions under the model of the compiler that broke it. The
+draws `startup_gfx2hlsl_f32_nan_{warp,hardware}` write four results of each of the 13 conditions other than lg
+and nlg (e32, and e64 with `(-a, |b|)`, `(-|a|, -b)`, `(|a|, b)`) and keep pixels through `v_cmpx_*_e64` for the
+six, compiled with FXC `ps_5_1` and DXC `ps_6_0`. Every pixel matched on WARP and the RX 9070 XT with both
+compilers (denormal sources flushed where they matter). The text before #1936 fails each draw on the compiler that
+rewrote it (156 NaN pixels against the flushed image) and matches that rewrite's image; on the other compiler it
+is recorded, and it matched. Also recorded, not checked: with `/Gis` and `-Gis` the old and the new text of the six
+both matched every pixel. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_nan' -V`;
+`tests/startup_gfx2hlsl_f32_nan_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the fixtures through
+LLVM 15.
+The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
+restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
+conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
+**An `op_sel` the lowering does not model is refused.** `set_vf()` used to accept an `op_sel` modifier and emit
+the same text as without it. `op_sel` selects which half of a packed source the operation reads, so dropping
+it silently changes the operand; the float path now refuses it (#1754). The same test pins the exact shift,
+mask and conversion expressions of the byte-extracting conversions, whose shift amounts escaped mutation
+checks before.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
 uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). `sdwa()` now
 also applies output modifiers (`clamp`, `mul:2`, `mul:4` and `div:2`) on `VEC_U_TO_F` conversions before `U(...)`
@@ -15545,6 +15599,39 @@ The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequenc
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
 
+## Local runtime switches for upstream paths (local merge)
+
+Where the local runtime and upstream implement the same device or list slot, the local path stays the default and the upstream one is kept behind its own switch. Each is off unless set to `1`.
+
+| Switch | Upstream behaviour it enables |
+|---|---|
+| `X2W_DEFER_HEAP_ROOTS` | Deferred descriptor-heap root arguments in `list_graphics_root` (`root_heap_flags`); real draws that need them are refused. |
+| `X2W_UPSTREAM_EXECUTE_INDIRECT` | The upstream list slot 61 handler (`list_execute_indirect_upstream`) in place of the local `d3d12_indirect.inl` one. Its Dispatch forwarding also needs `X2W_UPSTREAM_COMPUTE_ROOT`, because the local slot 33 handler does not record the desktop compute root. |
+| `X2W_UPSTREAM_COMPUTE_ROOT` | The upstream compute root signature and upload SRV handlers on list slots 33 and 43 (`list_compute_root_desktop`, `list_compute_upload_srv`). |
+| `X2W_LIST_UPLOAD_PAGES` | The upstream upload-page allocator on list slot 148 (`list_allocate_upload_pages`); without it `list_upload_gpu` finds no pages and its callers fall through to the local paths. |
+| `X2W_UPSTREAM_CONSOLE_SRV` | The upstream by-address memory SRV forms on device slot 70: textures in a console layout of `gfx10_layout.h` (`console_layout_srv`) and single-element textures (`single_element_srv.h`). Without it slot 70 refuses those calls as the local runtime did; `X2W_MEMORY_SRV_DETILE` and `X2W_MEMORY_SRV_ANNOUNCED` keep their own forms. |
+| `X2W_UPSTREAM_STENCIL_REF` | List slot 24 (`OMSetStencilRef` forwarding) alone, without the depth group. |
+| `X2W_UPSTREAM_STREAM_LAYOUT` | A stream pipeline's `INPUT_LAYOUT` subobject read into the draw request: it is published as `req_<key>.ia` and folded into the key, so `gfx2hlsl.py` can translate a vertex shader that calls the fetch routine. Without it the request carries no layout and the key is the one the stream pipeline had before the merge. |
+| `X2W_UPSTREAM_MESH86_CACHE` | The upstream slot-86 mesh stage cache (`try_cached_mesh86`, `req_<key>.m86`, key revision `x2w-startup-mesh-86-1`). It takes mesh streams before `stream_translation`, so without it slot 86 keeps the local mesh path. |
+
+Slot 24 (depth state) is registered when the local depth switch, upstream `X2W_DEPTH_STATE` or `X2W_UPSTREAM_STENCIL_REF` is set. The upstream tests of these paths set the switch in their CTest `ENVIRONMENT`. These rows describe switch wiring only; no title run has measured the upstream paths in this tree.
+
+### Shader cache revision (local merge)
+
+The draw and mesh key revision stays `x2w-startup-shader-3` (`pipeline_key` in `src/startup_stubs/d3d12_draw.inl` and `tools/startup/gfx2hlsl.py`), the value before the merge, so the published shader cache keeps resolving. Upstream advanced it to drop its own older translator output:
+
+| Revision | Upstream commit | Reason | Runtime contract of an existing entry |
+|---|---|---|---|
+| 4 | f7b7297d | non-fused multiply-add rounding | translator output only |
+| 5 | 56bd3bd1 | A16 coordinates of image loads | translator output only |
+| 6 | c3c3ab3c, 7f502437 | A16 `image_sample`/`_lz`; slot-86 pixel attributes linked to vertex parameters by semantic | translator output only |
+| 7 | 27f32934 | partial export masks (`wmask` manifest lines) | unchanged: a manifest without `wmask` lines keeps the full write mask, as before |
+| 8 | 5b4b1070 | moves past 7 because of the slot-86 linking | translator output only |
+| `8cs` | f8cfa76b (#2195) | slot 67 compute requests `req_<key>.c67` | a separate key space; this tree uses `x2w-startup-shader-3cs` (the graphics revision plus `cs`, as `tests/startup_compute_request_check.py` requires). No `.c67` file existed in the cache. The local `req_c67_<key>` key has no revision and is unchanged |
+
+Merge 2 (origin/main b976e8bc) takes upstream for every conflict outside the shader translator, the mesh path, the shader and manifest loading path and the cache keys, which keep the local side. Upstream moved the revision on to 14 (9 #2299, 10 #2305, 11 #2292, 12 #2308, 13 #2319, 14 #2059); this tree stays at 3 and `3cs`, and its translator keeps the local lowerings where both sides changed the same lines, so `buffer_store_dwordx3` is still refused. Retranslating 60 cached draw requests and 10 RTV variants gives the same manifests as before the merge; the HLSL differs only by two unused helper functions (`bfe32`, `bfe64`, upstream #2088) in every preamble. Upstream's early refusal of `uav` manifest lines is not taken, because the local cache's version-1 manifests carry them.
+
+The upstream stream input layout key (a8f581c4) changes a stream request's key without a revision; it is behind `X2W_UPSTREAM_STREAM_LAYOUT` above. Entries written before the merge were translated by the pre-merge translator and keep that output; a key the merged translator writes for the first time gets the merged lowerings. No switch selects another revision, because both use the one merged translator.
 ## Non-constant scalar symbols at branch targets in the startup translator
 
 Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between

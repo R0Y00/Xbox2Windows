@@ -108,8 +108,16 @@ bool agree(const Index& index, const Model& model, std::uint64_t address, std::u
 // Every record is in the index and the index holds nothing else (the table is never pruned).
 bool synced(const Index& index, const Model& model)
 {
-    for (const auto& [key, r] : model)
+    for (const auto& [key, r] : model) {
         if (!index.contains(r.base, key)) return false;
+        bool found = false, wrong_base = false;
+        index.for_each_at(r.base, [&](auto candidate) {
+            found |= candidate == key;
+            wrong_base |= model.at(candidate).base != r.base;
+            return false;
+        });
+        if (!found || wrong_base) return false;
+    }
     return index.size() == model.size();
 }
 bool mutated(const char* name, int argc, char** argv) { return argc > 2 && !std::strcmp(argv[1], "--mutate") && !std::strcmp(argv[2], name); }

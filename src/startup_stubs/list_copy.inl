@@ -123,6 +123,7 @@ bool list_wrote(Wrapper* list, ID3D12Resource* resource)
 
 void discard_list_gpu_writes(Wrapper* self)
 {
+    if (bc_bind_trace::enabled()) bc_bind_trace::close_recording(self, false);
     AcquireSRWLockExclusive(&pending_writes_lock);
     pending_gpu_writes().erase(self);
     ReleaseSRWLockExclusive(&pending_writes_lock);
@@ -130,6 +131,7 @@ void discard_list_gpu_writes(Wrapper* self)
 
 void commit_list_gpu_writes(Wrapper* self)
 {
+    if (bc_bind_trace::enabled()) bc_bind_trace::close_recording(self, true);
     AcquireSRWLockShared(&pending_writes_lock);
     if (const auto it = pending_gpu_writes().find(self); it != pending_gpu_writes().end()) {
         for (ID3D12Resource* resource : it->second) {
@@ -150,6 +152,11 @@ void mark_gpu_written(Wrapper* self, const CopyEndpoint& destination)
     auto& writes = pending_gpu_writes()[self];
     if (std::find(writes.begin(), writes.end(), destination.resource) == writes.end()) writes.push_back(destination.resource);
     ReleaseSRWLockExclusive(&pending_writes_lock);
+}
+
+void mark_copied_texture(Wrapper* list, Wrapper* wrapper, ID3D12Resource* texture)
+{
+    mark_gpu_written(list, {texture, wrapper});
 }
 
 // Refusal shared by the three handlers once the descriptions passed, or none.

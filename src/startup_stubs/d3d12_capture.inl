@@ -176,6 +176,23 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+// LOCAL (textures): every buffer record that is not a placement (note_resource, or retire_placement turning one into
+// a plain record), by title-memory range. existing_memory_buffer queries it under note_lock shared instead of walking
+// resource_infos() when X2W_BUFFER_ADDRESS_INDEX=1. It is maintained whether or not the switch is on (one map
+// insert per buffer creation, under the exclusive lock already held), so the switch only picks the reader.
+x2w_startup::BufferAddressIndex<const Wrapper*>& buffer_address_index()
+{
+    static x2w_startup::BufferAddressIndex<const Wrapper*> index;
+    return index;
+}
+void index_buffer_record(const Wrapper* w, const ResourceInfo& info)  // note_lock exclusive held
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (info.placement == Placement::none && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && base)
+        buffer_address_index().insert(w, base, info.console.Width);
+    else
+        buffer_address_index().erase(w);
+}
 // Resources by the title memory they start at (note_lock held), for the memory SRV lookups. An entry stays
 // as long as the resource's record in resource_infos does (never pruned); every lookup applies its own
 // live-reference filter, so a released resource is skipped there and found again if it is referenced again.
@@ -211,6 +228,7 @@ void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
     // Record and index change together or not at all (store_indexed); mode 2 leaves the index out.
     x2w_startup::store_indexed(resource_address_index(), resource_infos(), static_cast<const Wrapper*>(w),
         resource_index_check_mode() == 2 ? 0 : reinterpret_cast<u64>(w->own().title_memory), resource_index_extent(info), info);
+    index_buffer_record(w, resource_infos().at(w));  // LOCAL (textures): X2W_BUFFER_ADDRESS_INDEX
 }
 void retire_placement(Wrapper* w)
 {
@@ -227,6 +245,7 @@ void retire_placement(Wrapper* w)
             }
         }
         found->second.placement = Placement::none;
+        index_buffer_record(w, found->second);  // LOCAL (textures): now a plain record, as the walk sees it
     }
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -282,6 +301,7 @@ void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT incre
 void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop,
                bool materialized = true)
 {
+    if (const Wrapper* r = as_wrapper(reinterpret_cast<const void*>(resource)); r && r->own().refs <= 0) x2w_memcut::note_after_release(false);  // LOCAL memcut
     ViewRecord record{};
     record.slot = static_cast<std::uint32_t>(slot);
     record.resource = resource;
@@ -302,7 +322,8 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     AcquireSRWLockExclusive(&note_lock);
     ++views_noted;
     const auto found = view_ids().find(hash);
-    if (found != view_ids().end()) {
+    const bool distinct = found == view_ids().end();
+    if (!distinct) {
         record.id = found->second;
     } else {
         record.id = static_cast<std::uint32_t>(view_records().size());
@@ -323,6 +344,12 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         retire_leave_class(reinterpret_cast<const void*>(resource), RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
+    static const bool trace_views = x2w_local::env_on("X2W_GPU_DROP_TRACE");
+    if (trace_views && distinct && record.id < 256 && !resource && (slot == 18 || slot == 19) && record.desc_bytes >= 8) {
+        UINT fields[2];
+        std::memcpy(fields, record.desc, sizeof(fields));
+        log("x2w-gpu captured null view: id=%x slot=%d created=%d format=%u dimension=%u", record.id, slot, int(created), fields[0], fields[1]);
+    }
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
         x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {
