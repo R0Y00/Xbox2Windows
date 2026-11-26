@@ -941,6 +941,10 @@ endforeach()
 add_executable(startup_command_list_slot_names tests/startup_command_list_slot_names.cpp)
 target_compile_features(startup_command_list_slot_names PRIVATE cxx_std_17)
 add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_names)
+# Root constants kept per recorded list (src/startup_stubs/root_constant_store.h, compute list slots 37 and 39, #870; slot 40 keeps its own graphics words).
+add_executable(startup_root_constant_store tests/startup_root_constant_store.cpp)
+target_compile_features(startup_root_constant_store PRIVATE cxx_std_17)
+add_test(NAME startup_root_constant_store COMMAND startup_root_constant_store)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
