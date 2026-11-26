@@ -189,9 +189,9 @@ jobs:
       # lavapipe flushes subnormals, so the run uses --allow-denorm-mismatch and
       # must still match every reference bit for bit. It is a diagnostic run,
       # not a conformance result. The tools are standard library Python only.
+      # lavapipe is the only Vulkan driver installed, so the loader finds it
+      # without VK_DRIVER_FILES (its manifest name differs between distributions).
       - name: Draw the core pixel shaders with Vulkan
-        env:
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
         run: python3 -B tests/pixel_aot_check.py draw-core-vulkan out/dxc-ci/bin/dxc llvmpipe --allow-denorm-mismatch
   python-linux:
     name: Run platform-independent Python checks on Linux
