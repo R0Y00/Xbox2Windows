@@ -198,6 +198,8 @@ The second argument is a substring of the Vulkan device name. The mode builds `t
 
 The shaders are compiled with `-denorm preserve`. A device without `shaderDenormPreserveFloat32` therefore exits 77, a capability skip. `--allow-denorm-mismatch` draws anyway. Such a run is a diagnostic: a pass shows that the device produced the expected bits for these shaders, not that it preserves subnormals, and a failure may come from the missing guarantee instead of from the shader. It is not a conformance result. `X2W_VK_ALLOW_NO_DENORM`, `X2W_VK_HOST`, `X2W_VK_VS`, `X2W_VK_DEVICE` and `X2W_VK_WORK` are the variables the mode sets for `vk_offscreen.py`; you do not need to set them. Run without arguments, `python3 -B tests/vk_offscreen.py` needs no device or DXC: it checks the case parser, the comparison, the batch status lines and the refusals against synthetic readbacks, and the Linux Python checks job runs it.
 
+The `pixel-vulkan-lavapipe` job of the [CI workflow](../.github/workflows/windows.yml) runs the second command on lavapipe, Mesa's CPU Vulkan driver, with DXC v1.9.2609 from the Microsoft release page (pinned by SHA-256). Only that driver is installed, so `llvmpipe` matches no other device. It needs `mesa-vulkan-drivers`, `libvulkan-dev` and `spirv-tools`, and takes about 10 seconds of run time after the setup.
+
 ## Expected CMake failure and no-stub policy
 
 `CMakePresets.json` sets `CMAKE_CXX_COMPILER` to `cl` for the `dev` preset. Running `cmake --preset dev` on macOS or Linux is expected to fail:

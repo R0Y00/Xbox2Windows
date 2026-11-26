@@ -167,6 +167,32 @@ jobs:
           sys.exit(runpy.run_path("tools/run_checks_parallel.py",
                                   run_name="run_checks_parallel")["run_checks"](CHECKS))
           PY
+  pixel-vulkan-lavapipe:
+    name: Draw the core pixel shaders on lavapipe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install lavapipe, the Vulkan loader headers and SPIRV-Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan-dev spirv-tools
+      - name: Install DXC v1.9.2609
+        run: |
+          mkdir -p out/dxc-ci
+          curl -fsSL -o out/dxc-ci/dxc.tar.gz \
+            https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz
+          echo "96faadc7f5c282d2ffda49804beb4c3ee38127bc252b723234e3c5cdf7aa39a1  out/dxc-ci/dxc.tar.gz" | sha256sum -c -
+          tar -xzf out/dxc-ci/dxc.tar.gz -C out/dxc-ci
+      # lavapipe flushes subnormals, so the run uses --allow-denorm-mismatch and
+      # must still match every reference bit for bit. It is a diagnostic run,
+      # not a conformance result. The tools are standard library Python only.
+      - name: Draw the core pixel shaders with Vulkan
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: python3 -B tests/pixel_aot_check.py draw-core-vulkan out/dxc-ci/bin/dxc llvmpipe --allow-denorm-mismatch
   python-linux:
     name: Run platform-independent Python checks on Linux
     runs-on: ubuntu-24.04
