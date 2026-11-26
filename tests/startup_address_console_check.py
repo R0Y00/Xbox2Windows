@@ -1,7 +1,7 @@
 """Draw textures published by address (device slot 70) whose texels are in a console layout.
 
-  <consumer> <backend>               fourteen textures, each drawn once; every pixel of the 512x128 target is
-                                     compared with the texel the view names; then two held descriptions
+  <consumer> <backend>               fourteen textures and three cubes, each drawn once; every pixel of the
+                                     512x128 target is compared with the texel the view names; then two held descriptions
                                      and one texture whose address is announced as XG rows after it
                                      was published
   <consumer> <backend> gate          the upload lifetime control described at check_gate
@@ -18,6 +18,7 @@
                                      would read reused chunks, so it is refused before the execute: the target, read
                                      back after that submit, still holds payload 32 on the right (not A's payload 31)
   <consumer> <backend> linear-unpadded  the control described at check_linear_unpadded
+  <consumer> <backend> cube-order    the control described at check_cube_order
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
 equations of AMD addrlib's GFX10 pattern tables, written out below, and for the linear mode (0x100) from
@@ -276,6 +277,105 @@ GATE_PAYLOADS = 18
 KEEP_PAYLOADS = 32  # tests/startup_stream_draw.cpp, X2W_TEST_CONSOLE_KEEP
 
 
+# Cube views: a two-dimensional array of six in a console layout, each slice one face (+X, -X, +Y, -Y, +Z,
+# -Z) and the slices one slice size apart (the whole mip chain of a slice). TextureCube has no Load, so the
+# shader point-samples the centre of every texel of every face of the viewed mip: target column x picks face
+# (x mod 6w) div w and column x mod w, row y picks row y mod w. The directions are the D3D cube face rules.
+# name, side, mips, format, layout, viewed mip
+CUBES = [
+    ("RGBA8 64x64 cube 4 KiB standard", 64, 1, RGBA8, 0x105, 0),
+    ("RGBA8 64x64 cube 4 KiB standard chain, mip 1", 64, 4, RGBA8, 0x105, 1),
+    ("BC1 64x64 cube 4 KiB standard", 64, 1, BC1, 0x105, 0),
+]
+
+
+def cube_texel(face, mip, x, y):
+    texel = bytearray(rgba_texel(mip, x, y))
+    texel[2] = (texel[2] + 37 * face) & 255
+    return bytes(texel)
+
+
+def build_cube(side, mips, fmt, layout, reversed_faces=False):
+    """Backing bytes and images[face][mip]. reversed_faces writes face f into slice 5 - f (the control)."""
+    texels = 4 if fmt == BC1 else 1
+    element = 8 if fmt == BC1 else 4
+    console = Console(side, side, mips, element, texels, layout)
+    backing = bytearray(6 * console.bytes)
+    images = [[None] * mips for _ in range(6)]
+    for face in range(6):
+        base = (5 - face if reversed_faces else face) * console.bytes
+        for mip in range(mips):
+            w = max(1, side >> mip)
+            image = bytearray(w * w * 4)
+            for y in range(console.rows(mip)):
+                for x in range(console.columns(mip)):
+                    at = base + console.address(mip, x, y)
+                    if fmt == BC1:
+                        block, colour = bc1_block(mip + 3 * face, x, y)
+                        backing[at:at + 8] = block
+                        for row in range(4 * y, min(4 * y + 4, w)):
+                            for column in range(4 * x, min(4 * x + 4, w)):
+                                image[4 * (row * w + column):4 * (row * w + column) + 4] = colour
+                    else:
+                        texel = cube_texel(face, mip, x, y)
+                        backing[at:at + 4] = texel
+                        image[4 * (y * w + x):4 * (y * w + x) + 4] = texel
+            images[face][mip] = image
+    return backing, images
+
+
+def check_cube(directory, consumer, backend, case, reversed_faces=False):
+    name, side, mips, fmt, layout, viewed = case
+    backing, images = build_cube(side, mips, fmt, layout, reversed_faces)
+    source = directory / "texels.bin"
+    source.write_bytes(backing)
+    w = max(1, side >> viewed)
+    hlsl = ("TextureCube<float4> t : register(t0);\n"
+            "SamplerState s : register(s0);\n"
+            "float4 main(float4 p : SV_Position) : SV_Target {\n"
+            f"  uint x = uint(p.x) % {6 * w}, y = uint(p.y) % {w}, face = x / {w};\n"
+            f"  float a = (float(x % {w}) + 0.5) / {w} * 2 - 1, b = (float(y) + 0.5) / {w} * 2 - 1;\n"
+            "  float3 d = face == 0 ? float3(1, -b, -a) : face == 1 ? float3(-1, -b, a) :\n"
+            "             face == 2 ? float3(a, 1, b) : face == 3 ? float3(a, -1, -b) :\n"
+            "             face == 4 ? float3(a, -b, 1) : float3(-a, -b, -1);\n"
+            "  return t.SampleLevel(s, d, 0);\n}\n")
+    trap_log = directory / "trap.log"
+    modes = {"X2W_TEST_CONSOLE_VIEW": str(source), "X2W_TRAP_LOG": str(trap_log),
+             "X2W_TEST_CONSOLE_DESC": f"{side},{side},{mips},{fmt},{layout},{viewed},cube"}
+    actual = draw_texture(directory, consumer, backend, hlsl, modes,
+                          binding="srv 0 texcube table 0 0\nsmp 0 0 0 0 0")
+    if actual is None:
+        return 77
+    if len(actual) != TARGET_W * TARGET_H * 4:
+        raise AssertionError(f"{name}: readback length {len(actual)}")
+    wrong = 0
+    for y in range(TARGET_H):
+        for x in range(TARGET_W):
+            pixel = actual[4 * (y * TARGET_W + x):4 * (y * TARGET_W + x) + 4]
+            column = x % (6 * w)
+            image = images[column // w][viewed]
+            expect = image[4 * ((y % w) * w + column % w):4 * ((y % w) * w + column % w) + 4]
+            if pixel != expect and not reversed_faces:
+                raise AssertionError(f"{name}: pixel ({x},{y}) actual {pixel.hex()} expected {expect.hex()}")
+            wrong += pixel != expect
+    if "slot70 texture kind 1: published console layout" not in trap_log.read_text(errors="replace"):
+        raise AssertionError(f"{name}: no 'published console layout' line in the log")
+    if reversed_faces:
+        if not wrong:
+            raise AssertionError(f"{name}: faces written in reverse slice order drew exactly; the face order is not checked")
+        print(f"{backend} {name}, faces in reverse slice order: published, {wrong} of {TARGET_W * TARGET_H} pixels differ")
+        return 0
+    print(f"{backend} {name}: {TARGET_W * TARGET_H} RGBA pixels exact over 6 faces")
+    return 0
+
+
+def check_cube_order(consumer, backend):
+    """The cube cases' negative control: the first cube with face f written into slice 5 - f. The runtime
+    reads slice f as face f, so the draw must differ from the texels."""
+    with tempfile.TemporaryDirectory() as temporary:
+        return check_cube(Path(temporary), consumer, backend, CUBES[0], reversed_faces=True)
+
+
 def gate_colour(payload):
     """The colour of every texel of a payload; tests/startup_address_srv.cpp writes the same bytes."""
     return bytes(((17 * payload + 3) & 255, (255 - 9 * payload) & 255, payload ^ 0x5a, 255))
@@ -384,18 +484,25 @@ def check_gate(directory, consumer, backend, mode):
 GATES = ("gate", "gate-ring", "gate-ring-reuse", "gate-ring-keep", "gate-ring-keep-release")
 
 if __name__ == "__main__":
-    modes = GATES + ("linear-unpadded",)
+    modes = GATES + ("linear-unpadded", "cube-order")
     if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in modes):
         usage = "usage: startup_address_console_check.py <consumer> <backend> [" + " | ".join(modes) + "]\n"
         sys.exit(usage + "\n\n".join(__doc__.split("\n\n")[:2]))
     if len(sys.argv) == 4 and sys.argv[3] == "linear-unpadded":
         sys.exit(check_linear_unpadded(None, sys.argv[1], sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[3] == "cube-order":
+        sys.exit(check_cube_order(sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 4:
         with tempfile.TemporaryDirectory() as temporary:
             sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3]))
     for case in CASES:
         with tempfile.TemporaryDirectory() as temporary:
             result = check(Path(temporary), *sys.argv[1:3], case)
+            if result:
+                sys.exit(result)
+    for case in CUBES:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = check_cube(Path(temporary), *sys.argv[1:3], case)
             if result:
                 sys.exit(result)
     for case, extra, held in HELD:

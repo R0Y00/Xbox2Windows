@@ -74,7 +74,7 @@ inline bool address_component_mapping(UINT mapping)
     return true;
 }
 
-// A one-dimensional, two-dimensional or array view that stays inside the texture and reads its texels
+// A one-dimensional, two-dimensional, array or cube view that stays inside the texture and reads its texels
 // as stored.
 inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
@@ -98,6 +98,10 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
                mips_fit(v.Texture2DArray.MostDetailedMip, v.Texture2DArray.MipLevels) &&
                inside(v.Texture2DArray.FirstArraySlice, v.Texture2DArray.ArraySize, r.DepthOrArraySize) &&
                !v.Texture2DArray.PlaneSlice && v.Texture2DArray.ResourceMinLODClamp == 0.0f;
+    // A cube view reads the six slices of a two-dimensional array of six as its faces (+X, -X, +Y, -Y, +Z, -Z).
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 6 &&
+               mips_fit(v.TextureCube.MostDetailedMip, v.TextureCube.MipLevels) && v.TextureCube.ResourceMinLODClamp == 0.0f;
     if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
         return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                mips_fit(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels) &&

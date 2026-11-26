@@ -384,6 +384,28 @@ void check_address_textures()
     v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     v.Texture2D.MipLevels = 1;
     if (x2w_startup::address_view_fits(row, v)) fail("2D view on a 1D texture");
+
+    const D3D12_RESOURCE_DESC faces = texture(64, 64, 4, 6, DXGI_FORMAT_BC1_UNORM, 0x105);
+    v = {};
+    v.Format = DXGI_FORMAT_BC1_UNORM;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    v.TextureCube.MipLevels = 4;
+    if (!x2w_startup::address_view_fits(faces, v)) fail("whole cube chain view");
+    v.TextureCube.MostDetailedMip = 3;
+    v.TextureCube.MipLevels = 1;
+    if (!x2w_startup::address_view_fits(faces, v)) fail("last cube mip view");
+    v.TextureCube.MipLevels = 2;
+    if (x2w_startup::address_view_fits(faces, v)) fail("cube view past the chain");
+    v.TextureCube.MostDetailedMip = 0;
+    v.TextureCube.MipLevels = 1;
+    v.TextureCube.ResourceMinLODClamp = 1.0f;
+    if (x2w_startup::address_view_fits(faces, v)) fail("cube view explicit LOD clamp");
+    v.TextureCube.ResourceMinLODClamp = 0.0f;
+    if (x2w_startup::address_view_fits(texture(64, 64, 4, 1, DXGI_FORMAT_BC1_UNORM, 0x105), v))
+        fail("cube view on a single slice");
+    if (x2w_startup::address_view_fits(texture(64, 64, 4, 12, DXGI_FORMAT_BC1_UNORM, 0x105), v))
+        fail("cube view on an array of twelve");
 }
 } // namespace
 
@@ -526,6 +548,6 @@ int main(int argc, char** argv)
         std::printf("startup_gfx10_layout: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 15 round trips, 1 linear chain, 15 refusals, 22 address descriptions, 33 views)\n");
+    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 15 round trips, 1 linear chain, 15 refusals, 22 address descriptions, 39 views)\n");
     return 0;
 }

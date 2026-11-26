@@ -119,6 +119,7 @@ bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& 
                      : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
                                                                          : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
     return (storage.Support1 & req) &&
+           (v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE || (storage.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE)) &&
            (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
 }
 
