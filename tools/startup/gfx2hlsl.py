@@ -10957,9 +10957,12 @@ class Pipeline:
             lines.append('udsrc %d %s' % (i, ' '.join(str(x) for x in source)))
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             source, off = key
-            where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0), 'vbtab': 'vb %d' % ((off or 0) // 16),
-                     'bvhbase': 'base 0x%x size 0x%x' % (source[1], source[2]),
-                     'root': 'root %d' % (source[1] if len(source) > 1 else 0)}.get(source[0])
+            if source[0] == 'bvhbase':
+                where = 'base 0x%x size 0x%x' % (source[1], source[2])
+            else:
+                where = {'table': 'table %d %d' % (source[1] if len(source) > 1 else 0, off or 0),
+                         'vbtab': 'vb %d' % ((off or 0) // 16),
+                         'root': 'root %d' % (source[1] if len(source) > 1 else 0)}.get(source[0])
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
