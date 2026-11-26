@@ -853,6 +853,34 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, bits));
             return true;
         }
+        if (n == "v_pack_b32_f16") {
+            // VOP3 only: D[15:0] = S0.f16, D[31:16] = S1.f16. Every step is an
+            // integer bit operation so signed zeros and NaN payloads survive.
+            // Unsupported forms: clamp, omod, a destination or third-source
+            // op_sel bit, third-source abs/neg, inline constants, literals,
+            // SDWA and DPP. They are refused rather than approximated.
+            if (!i.wide || i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted)
+                refuse(i.pc, "v_pack_b32_f16 requires the VOP3 encoding");
+            if (i.clamp || i.scale)
+                refuse(i.pc, "unsupported v_pack_b32_f16 clamp or omod");
+            if ((i.a & 0x6000) || ((i.abs | i.neg) & 4))
+                refuse(i.pc, "unsupported v_pack_b32_f16 destination or third-source modifier");
+            auto half = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                if (r >= 128 && r < 256)
+                    refuse(i.pc, "unsupported v_pack_b32_f16 constant source");
+                auto bits = operand32(i, r);
+                if ((i.a >> (11 + j)) & 1) bits = ir.binary("lshr", bits, "16");
+                bits = ir.binary("and", bits, "65535");
+                // Clear the sign for abs first, then toggle it for neg.
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto low = half(0), high = half(1);
+            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            return true;
+        }
         if (n == "v_cvt_pkrtz_f16_f32") {
             if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported packed half conversion modifier");
