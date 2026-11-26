@@ -33,9 +33,17 @@ class Rig:
     def __init__(self, root):
         self.root = Path(root)
         self.cache = str(self.root / "cache")
-        self.compiler = str(self.root / "fakedxc")
-        Path(self.compiler).write_text(FAKE)
-        os.chmod(self.compiler, os.stat(self.compiler).st_mode | stat.S_IEXEC)
+        if os.name == "nt":
+            # Windows cannot execute a shebang script: the compiler is a .cmd wrapper
+            # that runs the fake script with this interpreter.
+            script = self.root / "fakedxc_impl.py"
+            script.write_text(FAKE)
+            self.compiler = str(self.root / "fakedxc.cmd")
+            Path(self.compiler).write_text('@"%s" "%s" %%*\n' % (sys.executable, script))
+        else:
+            self.compiler = str(self.root / "fakedxc")
+            Path(self.compiler).write_text(FAKE)
+            os.chmod(self.compiler, os.stat(self.compiler).st_mode | stat.S_IEXEC)
         self.n = 0
 
     def compile(self, source, extra=(), cache=True, check=False, out=None):

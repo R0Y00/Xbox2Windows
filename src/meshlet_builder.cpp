@@ -196,8 +196,8 @@ MeshletBufferData build_meshlets(
     if (indices.size() % 3 != 0) {
         throw std::invalid_argument("Meshlet index buffer length must be a multiple of 3");
     }
-    if (max_vertices == 0 || max_vertices > kHardwareMaxMeshletVertices) {
-        throw std::invalid_argument("Meshlet max_vertices must be in [1, 256]");
+    if (max_vertices < 3 || max_vertices > kHardwareMaxMeshletVertices) {
+        throw std::invalid_argument("Meshlet max_vertices must be in [3, 256]");
     }
     if (max_primitives == 0 || max_primitives > kHardwareMaxMeshletPrimitives) {
         throw std::invalid_argument("Meshlet max_primitives must be in [1, 256]");

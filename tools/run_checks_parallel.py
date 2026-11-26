@@ -85,7 +85,8 @@ def read_check_files(directory):
     """Return the check commands listed in `directory/*.txt`, files in name order.
 
     One command per line: a script path, optionally followed by its arguments (split like a
-    shell would). Blank lines and lines starting with `#` are ignored. A missing directory, an
+    shell would). Blank lines and lines starting with `#` are ignored. A leading UTF-8
+    byte-order mark is skipped. A missing directory, an
     unreadable file, a script that does not exist, or the same command listed twice all raise,
     so a typo cannot silently drop a check.
     """
@@ -95,7 +96,7 @@ def read_check_files(directory):
     commands = []
     seen = {}
     for listing in sorted(root.glob("*.txt")):
-        for number, line in enumerate(listing.read_text(encoding="utf-8").splitlines(), 1):
+        for number, line in enumerate(listing.read_text(encoding="utf-8-sig").splitlines(), 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -183,6 +184,9 @@ def main(argv=None) -> int:
         parser.error("the following arguments are required: scripts (or --from-dir)")
     try:
         scripts = [_validate_script_path(script) for script in args.scripts]
+        for number, script in enumerate(scripts):
+            if script in scripts[:number]:
+                raise ValueError(f"duplicate command-line script: {script}")
         checks = [([script], None) for script in scripts]
         if args.from_dir:
             checks = merge_checks(checks, args.from_dir)

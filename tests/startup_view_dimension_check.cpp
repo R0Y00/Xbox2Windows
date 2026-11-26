@@ -71,6 +71,7 @@ int main(int argc, char** argv)
     check("default RTV of an RGBA8 2D texture", default_view_allowed(20, texture2d, 28, all));
     check("default DSV of a D32 2D texture", default_view_allowed(21, texture2d, 40, all));
     check("default SRV of a 3D texture", default_view_allowed(18, texture3d, 10, all));
+    check("default SRV of an R16_SINT 2D texture", default_view_allowed(18, texture2d, 59, all));
     const auto no_default = [all](int slot, unsigned dimension, unsigned format) {
         if (control) dimension = texture2d, format = 28;  // a texture that has a default view
         return !default_view_allowed(slot, dimension, format, all);
@@ -78,6 +79,7 @@ int main(int argc, char** argv)
     check("no default view of a buffer", no_default(18, buffer, 28));
     check("no default view of a typeless texture", no_default(18, texture2d, 27));
     check("no default view of a typeless BC7 texture", no_default(19, texture2d, 97));
+    check("no default view of a typeless R8 texture", no_default(18, texture2d, 60));
     check("no default SRV of a depth texture", no_default(18, texture2d, 40));
     check("no default view of an unknown format", no_default(18, texture2d, 0));
     check("no default view on the constant-buffer slot", !default_view_allowed(17, texture2d, 28, all));

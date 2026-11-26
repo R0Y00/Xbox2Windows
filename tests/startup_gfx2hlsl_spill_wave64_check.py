@@ -216,7 +216,7 @@ def controls():
             ('lanes 8 and 40 of one VGPR', ['v_writelane_b32 v10, s0, 8', 'v_writelane_b32 v10, s1, 40'], 'ps'),
             ('lanes 63 and 31 of one VGPR in a vertex stage',
              ['v_writelane_b32 v10, s0, 63', 'v_readlane_b32 s1, v10, 31'], 'vs'),
-            ('a compute stage', ['v_writelane_b32 v10, s0, 40'], 'cs'),
+            ('a lane of a stage outside pixel, vertex, mesh and compute', ['v_writelane_b32 v10, s0, 40'], 'gs'),
             ('a lane chosen by an SGPR', ['v_writelane_b32 v10, s0, s2'], 'vs')):
         reason = refused(program, kind)
         check('refused: %s (%s)' % (label, reason), reason is not None)
