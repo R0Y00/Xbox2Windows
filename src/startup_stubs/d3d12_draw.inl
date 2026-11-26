@@ -1842,14 +1842,7 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
 
     // The clamp changes the native compute root and invalidates its arguments.
     // In render mode slot 43 is the forwarded compute parameter setter.
-    const auto& pass = pass_of(self);
-    if (pass.desktop_compute_root) {
-        list->SetComputeRootSignature(pass.desktop_compute_root.Get());
-        for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter) {
-            const auto address = pass.desktop_compute_upload_srvs[parameter];
-            if (address) list->SetComputeRootShaderResourceView(parameter, address);
-        }
-    }
+    restore_compute_root(pass_of(self), list);
     return scratch.Get();
 }
 

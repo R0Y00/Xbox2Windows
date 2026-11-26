@@ -326,6 +326,7 @@ jobs:
             tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_s_abs_check.py \
+            tests/startup_gfx2hlsl_s_ff0_check.py \
             tests/startup_gfx2hlsl_s_bitset_check.py \
             tests/startup_gfx2hlsl_s_flbit_check.py \
             tests/startup_gfx2hlsl_s_ff1_check.py \
