@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 
 import pefile
@@ -284,7 +285,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
         return result
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mapper", type=Path)
     parser.add_argument("package", type=Path)
@@ -302,7 +303,7 @@ def main():
                       help="diagnostic: bind this unresolved external, which the caller must call rather than "
                            "read as data, to a trap that names it on stderr and terminates the process with "
                            f"{TRAP_EXIT_BASE:#x} | trap number; any unlisted unresolved external is still refused")
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
     try:
         # Perform the opt-in check before parsing the package or loading providers.
         # A successful check does not reserve memory and cannot promise startup.
@@ -312,22 +313,35 @@ def main():
                 raise ValueError("--min-commit-mib must be between 0 and 1048576")
             commit_report = require_commit_budget(options.min_commit_mib, read_host_commit())
         root = options.package.resolve(strict=True)
-        shims = {name.casefold(): Path(path).resolve(strict=True) for name, path in options.shim}
+        if not root.is_dir():
+            raise NotADirectoryError(f"package path is not a directory: {root}")
+        mapper = options.mapper
+        if mapper.is_dir():
+            raise IsADirectoryError(f"mapper path is a directory: {mapper}")
+        shims = {}
+        for name, raw_path in options.shim:
+            shim_path = Path(raw_path).resolve(strict=True)
+            if shim_path.is_dir():
+                raise IsADirectoryError(f"--shim {name} path is a directory: {shim_path}")
+            if not shim_path.is_file():
+                raise ValueError(f"--shim {name} path is not a regular file: {shim_path}")
+            shims[name.casefold()] = shim_path
         system = {name.casefold() for name in options.system}
         if any(not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name
                for name in system):
             raise ValueError("System providers must be DLL basenames")
         report = inspect(root, options.entry)
-        result = run(root, report, options.mapper.resolve(), shims, system,
+        result = run(root, report, mapper.resolve(), shims, system,
                      preflight_only=options.preflight_only,
                      pin_shims={name.casefold() for name in options.pin_shim},
                      trap_callable=options.trap_callable)
         if commit_report is not None:
             result = {**result, "host_commit": commit_report}
-    except (ValueError, OSError, pefile.PEFormatError) as exc:
+    except (ValueError, OSError, pefile.PEFormatError, struct.error) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

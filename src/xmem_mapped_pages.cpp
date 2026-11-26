@@ -11,11 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/profile_zone.h"
 
 #include <vector>
 
 #include <iterator>
 #include <limits>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <new>
@@ -34,6 +36,7 @@ struct Backing {
 using Slot = std::pair<std::size_t, ULONG64>;
 struct SlotPin { unsigned references{}; bool retired{}; };
 struct SectionLease {
+    UINT version;
     SIZE_T first_byte;
     SIZE_T length;
     std::vector<Slot> slots;
@@ -69,7 +72,7 @@ struct PhysicalMemory {
         for (const auto& run : runs)
             UnmapViewOfFile(reinterpret_cast<void*>(run.first));
         for (const HANDLE slab : slots.slabs())
-            CloseHandle(slab);
+            if (slab) CloseHandle(slab);
     }
 };
 
@@ -98,12 +101,26 @@ const Backing* mirrored_backing(ULONG_PTR page)
 }
 
 // Caller holds memory.mutex.
-void unpin_slot(const Slot& slot)
+void collect_empty_slabs(std::vector<HANDLE>& closed) noexcept
+{
+    memory.slots.reclaim_empty_slabs([&](HANDLE slab) noexcept {
+        try {
+            closed.push_back(slab);
+        } catch (...) {
+            CloseHandle(slab);
+        }
+    });
+}
+
+// Caller holds memory.mutex.
+void unpin_slot(const Slot& slot, std::vector<HANDLE>* closed = nullptr)
 {
     const auto found = memory.pins.find(slot);
     if (--found->second.references) return;
-    if (found->second.retired) memory.slots.release(slot.first, slot.second);
+    const bool retired = found->second.retired;
     memory.pins.erase(found);
+    if (retired && memory.slots.release(slot.first, slot.second) && closed)
+        collect_empty_slabs(*closed);
 }
 
 BOOL physical_result(era_physical::Status status) noexcept
@@ -228,6 +245,21 @@ Backing* backing_at(ULONG_PTR address)
     if (view == memory.views.end()) return nullptr;
     const auto backing = memory.backings.find(view->second);
     return backing == memory.backings.end() ? nullptr : &backing->second;
+}
+
+bool valid_lease_range(UINT version, ULONG_PTR address, SIZE_T length)
+{
+    if (version == x2w_xmem_section_lease_version) return mirrored_range(address, length);
+    return version == x2w_xmem_single_page_lease_version && length &&
+           length <= page_bytes - (address % page_bytes) && address <= UINTPTR_MAX - (length - 1);
+}
+
+const Backing* lease_backing(UINT version, ULONG_PTR page)
+{
+    if (version == x2w_xmem_section_lease_version || mirrored_range(page, page_bytes))
+        return mirrored_backing(page);
+    const auto* backing = backing_at(page);
+    return backing && backing->committed ? backing : nullptr;
 }
 
 LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
@@ -781,6 +813,7 @@ template <typename AddressAt>
 BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
                MapFailure* failure = nullptr) noexcept
 {
+    X2W_ZONE("xmem map_pages");
     const bool share_views = fault_retry.ready();
     const MappingThread marker;
     const std::lock_guard guard(memory.mutex);
@@ -844,6 +877,13 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
         how = "placeholder reserve";
     }
+#if X2W_TRACY
+    if (result && (type & MEM_COMMIT)) {
+        // A plot, not a pool: the title releases these ranges with Win32 calls that are not seen here.
+        static std::atomic<long long> committed;
+        X2W_PLOT("XMemVirtualAlloc commits (bytes, cumulative)", static_cast<std::int64_t>(committed += bytes));
+    }
+#endif
     const DWORD error = result ? 0 : GetLastError();
     x2w_local::logf("x2w-xmem XMemVirtualAlloc addr=%p size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (%s, err %lu)",
                     address, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(type),
@@ -1033,26 +1073,32 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 {
     if (!pages || !count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
-    const std::lock_guard guard(memory.mutex);
-    for (ULONG_PTR i = 0; i < count; ++i) {
-        const auto backing = memory.backings.find(pages[i]);
-        if (backing != memory.backings.end() && backing->second.views)
-            return physical_result(era_physical::Status::invalid);
-    }
-    const auto status = era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages));
-    if (status == era_physical::Status::ok) {
+    std::vector<HANDLE> closed;
+    era_physical::Status status;
+    {
+        const std::lock_guard guard(memory.mutex);
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
-            if (backing != memory.backings.end()) {
-                const Slot slot{backing->second.slab, backing->second.offset};
-                if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
-                    pin->second.retired = true;
-                else
-                    memory.slots.release(slot.first, slot.second);
-                memory.backings.erase(backing);
+            if (backing != memory.backings.end() && backing->second.views)
+                return physical_result(era_physical::Status::invalid);
+        }
+        status = era_physical::release(count, reinterpret_cast<const std::uint64_t*>(pages));
+        if (status == era_physical::Status::ok) {
+            for (ULONG_PTR i = 0; i < count; ++i) {
+                const auto backing = memory.backings.find(pages[i]);
+                if (backing != memory.backings.end()) {
+                    const Slot slot{backing->second.slab, backing->second.offset};
+                    if (const auto pin = memory.pins.find(slot); pin != memory.pins.end())
+                        pin->second.retired = true;
+                    else
+                        memory.slots.release(slot.first, slot.second);
+                    memory.backings.erase(backing);
+                }
             }
+            collect_empty_slabs(closed);
         }
     }
+    for (const HANDLE slab : closed) CloseHandle(slab);
     return physical_result(status);
 }
 }  // namespace
@@ -1368,11 +1414,10 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
 {
     if (!out || bytes != sizeof(*out)) return FALSE;
     *out = {};
-    if (version != x2w_xmem_section_lease_version) return FALSE;
     constexpr SIZE_T max_pages = 64;
     if (length > max_pages * page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
-    if (!memory.next_lease || !mirrored_range(address, length)) return FALSE;
+    if (!memory.next_lease || !valid_lease_range(version, address, length)) return FALSE;
     const auto first = address & ~(page_bytes - 1);
     const auto first_byte = address - first;
     const auto count = (first_byte + length + page_bytes - 1) / page_bytes;
@@ -1384,7 +1429,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
         selected.reserve(count);
         for (SIZE_T i = 0; i < count; ++i) {
             const auto page = first + i * page_bytes;
-            const auto* slot = mirrored_backing(page);
+            const auto* slot = lease_backing(version, page);
             if (!slot) return FALSE;
             if (selected.empty())
                 section = slot->section;
@@ -1401,7 +1446,7 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
             ++pinned;
         }
         const auto lease = memory.next_lease;
-        memory.leases.emplace(lease, SectionLease{first_byte, length, selected});
+        memory.leases.emplace(lease, SectionLease{version, first_byte, length, selected});
         ++memory.next_lease;
         *out = {duplicate, lease, selected.front().second, count * page_bytes, first_byte};
         return TRUE;
@@ -1415,11 +1460,11 @@ extern "C" BOOL WINAPI x2w_xmem_lease_section(UINT version, ULONG_PTR address, S
 extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_T byte_offset,
                                               ULONG_PTR address, SIZE_T length)
 {
-    if (version != x2w_xmem_section_lease_version || byte_offset % page_bytes != address % page_bytes)
-        return FALSE;
+    if (byte_offset % page_bytes != address % page_bytes) return FALSE;
     const std::lock_guard guard(memory.mutex);
     const auto found = memory.leases.find(lease);
-    if (found == memory.leases.end() || !mirrored_range(address, length)) return FALSE;
+    if (found == memory.leases.end() || found->second.version != version ||
+        !valid_lease_range(version, address, length)) return FALSE;
     const auto& pin = found->second;
     if (byte_offset < pin.first_byte || byte_offset - pin.first_byte >= pin.length ||
         length > pin.length - (byte_offset - pin.first_byte)) return FALSE;
@@ -1427,7 +1472,7 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
     const SIZE_T last_slot = (byte_offset + length - 1) / page_bytes;
     const auto first_page = address & ~(page_bytes - 1);
     for (SIZE_T slot = first_slot; slot <= last_slot; ++slot) {
-        const auto* backing = mirrored_backing(first_page + (slot - first_slot) * page_bytes);
+        const auto* backing = lease_backing(version, first_page + (slot - first_slot) * page_bytes);
         if (!backing || pin.slots[slot] != Slot{backing->slab, backing->offset}) return FALSE;
     }
     return TRUE;
@@ -1435,12 +1480,15 @@ extern "C" BOOL WINAPI x2w_xmem_match_section(UINT version, ULONG64 lease, SIZE_
 
 extern "C" BOOL WINAPI x2w_xmem_release_section(UINT version, ULONG64 lease)
 {
-    if (version != x2w_xmem_section_lease_version) return FALSE;
-    const std::lock_guard guard(memory.mutex);
-    const auto found = memory.leases.find(lease);
-    if (found == memory.leases.end()) return FALSE;
-    for (const auto& slot : found->second.slots) unpin_slot(slot);
-    memory.leases.erase(found);
+    std::vector<HANDLE> closed;
+    {
+        const std::lock_guard guard(memory.mutex);
+        const auto found = memory.leases.find(lease);
+        if (found == memory.leases.end() || found->second.version != version) return FALSE;
+        for (const auto& slot : found->second.slots) unpin_slot(slot, &closed);
+        memory.leases.erase(found);
+    }
+    for (const HANDLE slab : closed) CloseHandle(slab);
     return TRUE;
 }
 
@@ -1456,8 +1504,8 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 }
 
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
-// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and it is closed only at process end, so
-// a slot freed by a grant stays committed and these numbers do not show the commit held.
+// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
+// are closed when all of their slots are freed and unpinned.
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
@@ -1615,6 +1663,7 @@ const bool lazy_commit_installed = [] {
 // first page. DirectStorage requests can name such pages as their destination.
 extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PTR count, SIZE_T offset, const void* data, SIZE_T bytes)
 {
+    X2W_ZONE("x2w_xmem_write_physical");
     if (!tokens || !data || offset >= page_bytes) return FALSE;
     const auto* source = static_cast<const unsigned char*>(data);
     ULONG_PTR index = 0;
@@ -1760,7 +1809,7 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
     }
     const bool below_40 = large_pages && attributes == 0x283 && x2w_local::env_on("X2W_XMEM_STARTUP_BELOW_40");
     // X2W_XMEM_LAZY_STARTUP: a large block is reserved and committed on first touch (lazy_startup).
-    const bool lazy = lazy_startup() && bytes >= lazy_block_min && !below_40;
+    const bool lazy = lazy_startup() && bytes >= lazy_block_min;
     const DWORD type = lazy ? MEM_RESERVE : MEM_RESERVE | MEM_COMMIT;
     void* block = nullptr;
     if (!large_pages) {
@@ -1775,7 +1824,7 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
         block = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, type, PAGE_READWRITE, &parameter, 1);
-        if (below_40) return keep_startup_block_below_40(block, bytes, attributes, protection);
+        if (below_40) block = keep_startup_block_below_40(block, bytes, attributes, protection);
     }
     if (block && lazy) {
         bool listed = false;

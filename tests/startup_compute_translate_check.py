@@ -120,7 +120,7 @@ def check_requests(directory):
 
 def check_e2e(directory, consumer, dxc, runner, adapter, wrong_group):
     cache, env = prepare(directory)
-    (directory / 'compute_root').write_bytes(C.root_blob())
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))  # the consumer creates it on a device
     env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
     _, words, rsrc2, group, groups = C.CASES['A']
     if wrong_group:
