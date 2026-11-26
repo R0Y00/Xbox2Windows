@@ -290,6 +290,10 @@ class DxcCompileTimeCliNegativeAndMutationTests(unittest.TestCase):
             cases = [
                 (["--dxc", str(fake_dxc)], "--timeout"),
                 (["--dxc", str(fake_dxc), "--timeout", "0"], "positive"),
+                (["--dxc", str(fake_dxc), "--timeout", "nan"], "finite positive"),
+                (["--dxc", str(fake_dxc), "--timeout", "inf"], "finite positive"),
+                (["--dxc", str(fake_dxc), "--timeout=-inf"], "finite positive"),
+                (["--dxc", str(fake_dxc), "--timeout", "1e999"], "finite positive"),
                 (["--dxc", str(fake_dxc), "--timeout", "10", "--repeat", "0"], "--repeat"),
                 (["--timeout", "10"], "--dxc"),
                 (["--dxc", str(missing_dxc), "--timeout", "10"], "DXC executable not found"),

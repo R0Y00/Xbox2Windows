@@ -29,8 +29,10 @@ namespace x2w_startup {
 // tools/startup/triage_run.py keeps the same list (SLOT70_REASONS).
 constexpr const char* memory_srv_reasons[] = {
     "null_destination", "unreadable_resource", "unreadable_view", "null_address",
-    "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource", "buffer_unavailable",
-    "texture_unavailable",
+    "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource",
+    // the acceleration-structure holds of publish_as_srv (memory_srv_as.h, as_srv_refusal_name)
+    "as_unaligned", "as_not_placed", "as_wrong_state",
+    "buffer_unavailable", "texture_unavailable",
     // the partial-tile holds of device_memory_srv (upstream #2105)
     "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
     // the console-layout holds of device_memory_srv (#2015)
@@ -47,10 +49,13 @@ inline int memory_srv_reason_index(const char* reason)
 }
 
 // The reasons that depend on the resource description: their shapes are kept. The others (no
-// destination, unreadable arguments, no address, a destination outside the view heaps) do not.
+// destination, unreadable arguments, no address, a destination outside the view heaps, and the
+// acceleration-structure holds, which read only the view's address) do not.
 inline bool memory_srv_reason_has_shape(int reason)
 {
     return reason < memory_srv_reason_count && reason != memory_srv_reason_index("null_destination") &&
+           reason != memory_srv_reason_index("as_unaligned") && reason != memory_srv_reason_index("as_not_placed") &&
+           reason != memory_srv_reason_index("as_wrong_state") &&
            reason != memory_srv_reason_index("unreadable_resource") && reason != memory_srv_reason_index("unreadable_view") &&
            reason != memory_srv_reason_index("null_address") && reason != memory_srv_reason_index("destination_outside_view_heaps");
 }
