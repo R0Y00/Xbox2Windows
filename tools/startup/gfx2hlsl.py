@@ -2116,6 +2116,17 @@ class Stage:
                         self.sym.pop(107, None)
         self.lines.append(text)
 
+    def divergent_exit_loop(self, at):
+        """True when the offset sits in a loop (a backward branch of any kind, also an unconditional one) that holds a
+        wave-divergent branch: lanes of one quad can leave through the forward exit at different passes, so the next pass
+        runs the sample on uneven quads."""
+        for _o, _n, name, asm in self.ins:
+            if name == 's_branch' or name.startswith('s_cbranch_'):
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+                if target <= _o and target <= at <= _o and any(target <= d <= _o for d in self.divergent_branches):
+                    return True
+        return False
+
     def resolve_plain_samples(self):
         """Writes each plain image_sample past a join into the blocks: the implicit-LOD Sample unless a divergent back
         edge spans it (the same proof as image_sample_b / image_get_lod), else the level-0 call as before. It never
@@ -2124,7 +2135,7 @@ class Stage:
             return
         choice = {}
         for at, (level0, implicit) in self.plain_samples.items():
-            spanned = any(target <= at <= branch for target, branch in self.divergent_back_edges)
+            spanned = any(target <= at <= branch for target, branch in self.divergent_back_edges) or self.divergent_exit_loop(at)
             choice['X2W_PLAIN_SAMPLE<%x>' % at] = level0 if spanned else implicit
 
         def text(line):
@@ -2715,6 +2726,7 @@ class Stage:
             self.uniform_cf = True
             self.derivative_sites = []      # (offset, name) of image_sample_b / image_get_lod, for the back-edge proof
             self.divergent_back_edges = []  # (target, branch offset) of divergent backward branches
+            self.divergent_branches = []    # offsets of every wave-divergent conditional branch (forward exits too)
             self.plain_samples = {}         # offset -> (level-0 call, implicit-LOD call) of a plain image_sample past a join
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
@@ -2899,6 +2911,7 @@ class Stage:
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
+                            self.divergent_branches.append(off)
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}

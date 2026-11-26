@@ -13,6 +13,7 @@ Fixture (synthetic): the recorded c_lz stage of startup_image_sample_c_check wit
   divergent   s_mov_b32 exec_lo, 0 before the sample            -> SampleLevel 0 (as before)
   cf_<op>     s_cbranch_vccz / vccnz / execz / execnz before it -> SampleLevel 0 (as before)
   back_<op>   a divergent back edge over the sample             -> SampleLevel 0 (as before)
+  exit_<op>   a divergent forward exit, loop closed by s_branch -> SampleLevel 0 (as before)
 
   (no arguments)   translation controls, pure Python
 """
@@ -32,7 +33,7 @@ from startup_sampler_heap_check import VS_WORDS, root_blob  # noqa: E402
 IMAGE_SAMPLE = 0x20
 
 
-def stage(branch=False, divergent=False, join=False, cf_op=None, back_op=None):
+def stage(branch=False, divergent=False, join=False, cf_op=None, back_op=None, exit_op=None):
     w = bytearray(C.WORDS['lz'])
     w[W2_AT:W2_AT + 4] = struct.pack('<II', 0xbe9a03ff, MIP_POINT)  # s_mov_b32 s26, literal (mip filter point)
     w0, w1 = struct.unpack_from('<II', w, AT)
@@ -41,6 +42,8 @@ def stage(branch=False, divergent=False, join=False, cf_op=None, back_op=None):
     code = bytes(w)
     if back_op is not None:  # a backward branch right after the sample, to it
         code = code[:AT + 8] + sopp(back_op, -3) + code[AT + 8:]
+    if exit_op is not None:  # a forward exit right after the sample, then an unconditional branch back to it
+        code = code[:AT + 8] + sopp(exit_op, 1) + sopp(2, -4) + code[AT + 8:]
     insert = b''
     if branch:
         insert += sopp(4, 0)
@@ -65,6 +68,7 @@ def main():
     cases = [('divergent', {'divergent': True})]
     cases += [('cf_%d' % op, {'cf_op': op}) for op in (6, 7, 8, 9)]   # vccz, vccnz, execz, execnz
     cases += [('back_%d' % op, {'back_op': op}) for op in (7, 9)]      # vccnz, execnz back edge over the sample
+    cases += [('exit_%d' % op, {'exit_op': op}) for op in (7, 9)]      # a divergent forward exit of a loop closed by s_branch
     for name, kwargs in cases:
         got = calls(**kwargs)
         assert len(got) == 1 and 'SampleLevel(' in got[0] and got[0].rstrip(';').endswith(', 0)'), (name, got)
