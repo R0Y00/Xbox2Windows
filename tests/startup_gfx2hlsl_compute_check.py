@@ -1784,6 +1784,16 @@ def check_controls():
     refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, exec_lo', blend[3]], cnd_s)))
     refused(live('s20'), lambda: phi_text(phi(z20, [blend[0], 's_and_b32 s22, s7, s7', blend[3]], cnd_s)))
     refused(live('s20'), lambda: phi_text(phi(z20, ['s_andn2_b32 s20, s7, exec_lo'], cnd_s)))
+    # A compare-derived operand does not make the classes mixable: a zero write (s_mov M, exec_lo) and a ones write
+    # (s_orn2 with exec) in one block are refused after either setting. `s_andn2 M, M, X` keeps M's skipped bits only for
+    # X == exec_lo; with a compare mask it clears bits of lanes the model skips.
+    SPLICE.update({'s_andn2_b32 s20, s20, vcc_lo': '146a148a'})
+    mixed_cmp = ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 s20, exec_lo', 's_orn2_b32 s20, vcc_lo, exec_lo']
+    for setting in (z20, ['s_mov_b32 s20, -1']):
+        refused(live('s20'), lambda setting=setting: phi_text(phi(setting, mixed_cmp, cnd_s)))
+    for setting in (z20, [], ['s_mov_b32 s20, -1']):
+        refused(live('s20'), lambda setting=setting: phi_text(
+            phi(setting, ['v_cmp_gt_u32 vcc_lo, 3, v0', 's_andn2_b32 s20, s20, vcc_lo'], cnd_s)))
     refused(live('s20'), lambda: phi_text(phi([], blend, cnd_s)))                       # M unknown before the block
     refused(live('s20'), lambda: phi_text(phi(['s_mov_b32 s20, 16'], blend, cnd_s)))    # M holds data, not lane bits
     for read in (['s_cmp_eq_u32 s20, 0'] + cnd_s, ['s_mov_b32 s7, s20'] + cnd_s):
