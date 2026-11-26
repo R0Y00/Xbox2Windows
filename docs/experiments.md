@@ -15449,6 +15449,14 @@ Measured at `741ff02c` plus the dispatch mode, `dev` preset, Windows 11 26300.99
 ctest --preset dev --no-tests=error -j1 -R '^startup_gfx2hlsl_fma_mix(_fxc|_dispatch_(warp|hardware))?$' -V
 ```
 
+### Signed zero: a `precise` `mad` (cache revision 28)
+
+On an AMD Radeon RX 5700 XT (#2729) and an RX 9070 XT (#2746), the `-0` case read back `00000000` instead of `80000000`; WARP kept the sign. Their probes lost it only when a binary16 operand widened by `f16tof32` fed a non-`precise` multiply or `mad`, and kept it under `precise`. Non-`precise` HLSL arithmetic does not have to keep a zero's sign.
+
+All three forms now call `mix32(a, b, c)`, whose body is `precise float result = mad(a, b, c); return result;`. Operand order, half selection and modifiers are unchanged, and `saturate` stays outside the call. DXC 1.9.2602.17 emits it as `FMad` with `!dx.precise` on the `FMad` and on the `legacyF16ToF32` that feeds it. `mad` still lets a backend fuse or round the product, so the 1 ULP note above still applies. The dispatch mode prints `mad(4097, 4097, -16785408)` per adapter as information: `3f800000` means fused and `00000000` unfused. A second control shader uses a helper that clears the sign of a `-0` result. It must fail only the `-0` case.
+
+Measured on this branch, `dev` preset, Windows 11 26300, DXC 1.9.2602.17, D3D12 debug layer on with 0 errors and 0 warnings. WARP (1414:008c, 10.0.26100.9818): 17 of 17 words, `-0` kept, unfused. NVIDIA GeForce RTX 4090 (10de:2684, 32.0.16.1088): 17 of 17, fused. Both controls behaved as described. The RTX 4090 also passed before this change, so these runs do not show the fix on RDNA. The RX 5700 XT and RX 9070 XT retests are still pending.
+
 ## Non-fused multiply-add in the startup translator
 
 The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32` and
@@ -16439,7 +16447,9 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 The `VEC_F` table of `tools/startup/gfx2hlsl.py` lowers six operations to HLSL with no check that ran them before: `v_rcp_f32` and `v_rcp_iflag_f32` to `1.0 / x`, `v_sqrt_f32` to `sqrt`, `v_rsq_f32` to `rsqrt`, `v_exp_f32` to `exp2` and `v_log_f32` to `log2`. `tests/startup_gfx2hlsl_float_transcendental_check.py` draws them with the shared runner `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation per lane on flat inputs, alternates the `_e32` and `_e64` spellings, and compares the four result words exactly.
 
-Every input is a power of two, or 0 and 9 for the square root, so every result is exact. The check therefore tests which function each operation is lowered to and the base 2 of `v_exp_f32` and `v_log_f32`. It does not test how many ulps an adapter's approximation may be off.
+Every input is a power of two, or 0 and 9 for the square root, so every result is exactly representable. The check therefore tests which function each operation is lowered to and the base 2 of `v_exp_f32` and `v_log_f32`. It does not test how many ulps an adapter's approximation may be off.
+
+Adapters need not return these results exactly. `v_log_f32` accepts 4 ulps per lane, and the other operations stay exact. The Direct3D 11.3 functional specification (section 22.10.8) bounds `log` to 2^-21 relative error, or 2^-21 absolute error for inputs in [0.5, 2]. In this fixture, either bound is at least 4 ulps of the binary32 result. The DXIL documentation gives no accuracy for `Log`. The renderer still compares exactly. The runner accepts a mismatch only when every lane it reports as `actual=` is within the bound. The mutated draw must read words within the bound of the mutation and outside the bound of the reference. A run whose debug layer reports an error still fails. A ulp bound is effectively exact where the result is 0, as for `log2(1)`: this is much tighter than the absolute 2^-21 the specification allows, and all three adapters return 0 there.
 
 Each operation has a wrong lowering whose first draw must read its own mutated words:
 - `2.0 / x` for the reciprocals;
@@ -16447,7 +16457,7 @@ Each operation has a wrong lowering whose first draw must read its own mutated w
 - the exponent off by one;
 - the logarithm plus one.
 
-On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 24 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 12 mutated draws read their mutated words. `v_sin_f32` and `v_cos_f32` are not covered: their results at the few exact points depend on the approximation. Tests: `startup_gfx2hlsl_float_transcendental_controls`, `startup_gfx2hlsl_float_transcendental_warp` and `startup_gfx2hlsl_float_transcendental_hardware`.
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 24 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 12 mutated draws read their mutated words. On an NVIDIA GeForce RTX 4090 (driver 32.0.16.1088, debug layer enabled, 0 errors), the same 24 and 12 pass with the bound, through both compilers (#2797). Three `v_log_f32` lanes are not exact: `0.125` reads `c03fffff` (1 ulp above -3.0), `2^-20` reads `c19fffff` (1 ulp above -20.0) and `0.5` reads `bf7ffffe` (2 ulps above -1.0). With the bound at 0, the first FXC draw fails on `c03fffff`, as reported. With the bound at 1, the FXC mutated draw fails: it reads `bffffffe` for `log2(0.125) + 1`, 2 ulps above -2.0. `v_sin_f32` and `v_cos_f32` are not covered: their results at the few exact points depend on the approximation. Tests: `startup_gfx2hlsl_float_transcendental_controls`, `startup_gfx2hlsl_float_transcendental_warp` and `startup_gfx2hlsl_float_transcendental_hardware`.
 ### gfx1013 pixel DPP16 quad broadcast
 
 The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted in the entry straight-line prefix of a pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. A later uniform loop or forward branch elsewhere in the same stage does not drop that proof (the M200-01/003 shape). Without the proof the instruction is refused, as are a broadcast after a branch target, after EXEC changed, or with divergent EXEC before the broadcast, swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `bound_ctrl:0`, non-VGPR sources and vertex stages. `fi:1` is accepted with the proof and changes nothing, since no source lane is disabled. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
