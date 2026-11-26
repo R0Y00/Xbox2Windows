@@ -3876,7 +3876,13 @@ out-of-range cases. A separate mesh program with one changed compare operand
 adds two controls. Windows WARP with the D3D12 debug layer enabled matched
 all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
-[Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
+
+The bounded mesh lowerers reuse the concrete scalar bit tests described below.
+They also accept a 32-bit test of a constant-buffer word immediately followed
+by an SCC branch that forms a verified descriptor join. Both branch polarities
+and constant-buffer bit indices have readback controls. Descriptor words,
+unwritten operands and 64-bit dynamic predicates remain refused.
+Reproduce with `mesh_bitcmp_cpu` and `mesh_bitcmp_draw_{warp,hardware}`.
 
 ### Sampler heap samplers in bounded runtime mesh
 
@@ -9153,6 +9159,51 @@ Windows SDK 10.0.26100 headers for these capability queries. CTest reports an
 unsupported profile, SDK header set or device capability as a skip (77).
 Intel Arc B390 and WARP passed the Level tests. WARP passed the Bias tests.
 Arc B390 reported the Bias capability unavailable and skipped those tests.
+
+### gfx1030 2D comparison sample gradients
+
+`image_sample_c_d`, `image_sample_c_d_o`, `image_sample_c_d_g16`, and
+`image_sample_c_d_o_g16` lower to `SampleCmpGrad` for a 2D `R32_FLOAT` view
+with two visible mips and `dmask:0x1`. The contiguous address starts with the
+optional packed signed XY offset, then the comparison reference, the explicit
+gradients in `(du/dx, dv/dx, du/dy, dv/dy)` order, and the full-width UV pair.
+G16 packs each gradient vector as two binary16 components with U in the low
+half and V in the high half. The gradient inputs must be statically known
+normal values or zero in their input precision. The explicit gradients do not
+require whole-quad UV provenance. The comparison sampler uses point XY and
+mip filtering, clamp-to-edge addressing, `MIN_LOD = 0`, `MAX_LOD = 1`, and no
+sampler LOD bias. Bind the same range on the desktop comparison sampler.
+
+The depth fixture compares every RGBA pixel at 8×8 and 16×16 against the CPU
+reference. A horizontal V slope of −1/4 at 8×8 and a vertical U slope of +1/4
+at 16×16 each select mip one. Zeroing the active slope selects mip zero. In
+the offset forms, replacing `(1, -2)` with `(0, 0)` changes the taps in mip one.
+Each mutation must match its complete CPU reference and first differ from the
+original at the predicted pixel and values. The fixture measures these whole
+mip choices and leaves fractional LOD transitions unmeasured.
+
+LLVM 15 code generation checks the comparison reference, optional offset and
+gradient order for all four encodings, including the two distinct G16 packed
+words. LLVM MC, the disassembler and the container CLI check the end-to-end
+machine-code path. The GLSL `sampler2DShadow` check validates the explicit
+reference and `Grad` or `Grad|ConstOffset` operands in SPIR-V. The DXC compile
+check verifies four distinct gradient components in the emitted DXIL call.
+
+```sh
+python3 -B tests/pixel_compare_grad_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+python3 -B tests/pixel_compare_grad_check.py glsl glslangValidator spirv-val spirv-dis
+```
+
+```powershell
+python -B tests/pixel_compare_grad_check.py compile dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_grad_(warp|hardware)$' -V
+```
+
+The draw requires PS 6.8 and `D3D12_OPTIONS21.SampleCmpGradientAndBiasSupported`.
+An unsupported shader profile or missing SDK or device capability produces a
+capability skip (77). WARP passed readback for all four forms. Intel Arc B390
+reported the comparison gradient capability unavailable and skipped the test.
+Physical GPU readback requires an adapter that reports this capability.
 
 ### Desktop xmem.dll
 
@@ -15508,13 +15559,24 @@ be the lane select of `v_cndmask`, the carry-in of `v_addc`, `v_subb`, `v_add_co
 `s_and_saveexec_b32` / `s_and_b32` with exec. `s_cbranch_vccz`, `s_cbranch_vccnz`, `s_cmp`, a copy of M and M
 as a data operand see the other lanes' bits, which the one-lane model does not have, and keep the refusal.
 
+The same lane mask is accepted with three more block writes, each exact only under a condition. All of them need
+every mask the write uses to hold lane bits (bit 0 is the lane's own bit: a `v_cmp`, an `s_and` with exec, a copy
+of exec, or 0 / -1), not data such as a group id or `s_mov_b32 M, 16`, whose lane bit sits at bit `lane` in the wave:
+- preserving: `s_andn2_b32 M, M, exec_lo` and `s_or_b32 M, M, T`, with T written in the block by a `v_cmp` or an
+  `s_and` of exec and a lane mask. A skipped lane keeps its bit, so M needs no zeroing, but M's last write before the
+  branch must itself hold lane bits (no branch or branch target after it);
+- compare: a `v_cmp` (not `v_cmpx`) into M, only when `s_mov_b32 M, 0` (or `s_movk_i32 M, 0`) is the last write before the branch;
+- all ones: `s_orn2_b32 M, X, exec_lo`, X a lane mask, only when `s_mov_b32 M, -1` is the last write before the branch.
+Zeroing and all-ones writes do not mix, and any other write of M that no later zeroing or all-ones write overwrites
+keeps the refusal.
+
 The block is still refused in these cases:
 - a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves every read of it
   or it is the lane mask above; a lane mask with a failed condition stays refused (zeroing with a value other
   than 0 or missing, a branch or a branch target between the zeroing and the branch, a write of M that is not
-  from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
+  one of the forms above, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
-  some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
+  some of the paths, written by a form the pass does not follow (`s_orn2` into exec, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
   calculated `s_setpc_b64` jump counts), or restored from a copy of the other exec half;
 - an effect outside scalar registers, such as a scalar store or atomic, a barrier, `s_endpgm` or `v_writelane`;
@@ -15886,6 +15948,8 @@ python -B tests/startup_gfx2hlsl_scalar_m0_check.py binary llvm-mc-15
 
 ## Startup translator: uniform sources of v_readfirstlane_b32
 
+In a compute entry block, the translator can bound the bits of an untouched X thread ID by the local group size. For `((tid.x & mask) | scalar) >> n`, the result is `scalar >> n` if every possible thread-ID bit selected by the mask is shifted away. For `v_bfe_u32` with literal offset and width, the translator applies the extraction to the possible thread-ID bits first. If the following shift clears them all, the result is zero. The `masked-tid` and `extracted-tid` compute fixtures read both results after a branch and store one word per thread. Their controls retain a bit in the mask or enlarge the group enough to populate a previously zero bit in the field.
+
 The startup shaders are compiled with FXC (shader model 5), which has no wave intrinsics. The translator lowers `v_readfirstlane_b32 sD, vS` to `sD = vS` only when it proves that `vS` holds the same value in every lane. The previous proof covered only a `v_cvt_i32_f32` of a fixed buffer word. An unproven source still produces `v_readfirstlane_b32 requires a proven uniform source` (see [issue #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)).
 
 In straight-line code with a known `exec`, the proof follows `v_cvt_u32_f32`, `v_cvt_i32_f32`, `v_cvt_f32_u32`, `v_cvt_f32_ubyte0`, `v_mul_f32`, `v_fma_f32`, `v_fmaak_f32`, `v_rcp_f32`, `v_med3_f32`, and `v_mov_b32`, including e32 and e64 forms. Every source must be uniform. The float operations that lower operands as floats accept negation and absolute-value source modifiers. The float-result forms accept the modeled output modifiers `clamp`, `mul:2`, `mul:4`, and `div:2`.
@@ -15905,7 +15969,7 @@ Past the entry block of a program with branches, the read does not copy the VGPR
 
 A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms (including one-path scalars and uniform loop counters both inside and after loops) and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge, a divergent `else`-arm write before a join, a non-uniform loop back-edge and a join where two definitions reach.
 
-A compute buffer load through a read-only descriptor and uniform address is also accepted past the entry block when the entry EXEC mask is still known. The lowering saves the uniform value in a function-scope temporary so the read uses the value held when the load ran, even if the offset scalar later changes. A narrowed mask may be empty. In that case RDNA 2 reads the previous lane-zero VGPR, which an unguarded reload cannot reproduce. Branch targets, EXEC writes and VGPR overwrites invalidate the proof between the load and read. The source-built controls cover scalar and vector addresses, the second dword, formatted loads, and a lane-zero sentinel followed by empty EXEC.
+A compute buffer load through a read-only descriptor and uniform address is also accepted past the entry block when the entry EXEC mask is still known. The lowering saves the uniform value in a function-scope temporary so the read uses the value held when the load ran, even if the offset scalar later changes. A narrowed mask may be empty. In that case RDNA 2 reads the previous lane-zero VGPR, which an unguarded reload cannot reproduce. Branch targets, EXEC writes and VGPR overwrites invalidate the proof between the load and read. A loop may revisit the load after changing EXEC. The lowering follows control-flow edges from EXEC writers to catch this case, including detours outside the loop's instruction range. A loop that changes EXEC only after it exits still qualifies. The source-built controls cover scalar and vector addresses, the second dword, formatted loads, and a lane-zero sentinel followed by empty EXEC.
 
 [`tests/startup_compute_readfirstlane_check.py`](../tests/startup_compute_readfirstlane_check.py) pairs that unit coverage with a source-built gfx1013 compute fixture (`(4, 1, 1)` local threads x `(2, 1, 1)` groups) containing both a one-path SGPR across a uniform forward branch join and a four-iteration uniform loop counter read via `v_readfirstlane_b32` inside the loop and after exit, machine-code refusal patches (non-uniform `s_cbranch_vccnz` back-edge, divergent `else`/`then` write before a join, lane-mask loop update) and 320-word GPU readback with pinned `dropped-one-path`, `dropped-loop-read` and `dropped-post-loop` negative controls. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 25H2 (build 26200.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 7900 XTX (driver 32.0.32029.2010).
 
@@ -16695,6 +16759,25 @@ Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^sta
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```
+
+### GPU-written indirect Dispatch
+
+For a translated slot 67 pipeline with fixed-table raw buffers, command-list slot 61 accepts one rootless
+Dispatch record in a placed argument buffer. It binds the same translated pipeline and descriptors as direct
+Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
+
+The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
+After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
+Counts of 2 and 5 write exactly that many words. Direct Dispatch with the same bindings and counts must produce
+the same outputs. Omitting the producer leaves the zero record and the output sentinel intact. Omitting the
+translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
+buffer, an out-of-range record and an argument buffer also bound as shader output.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer
+ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
+python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
 
 ### Entry values from a buffer descriptor

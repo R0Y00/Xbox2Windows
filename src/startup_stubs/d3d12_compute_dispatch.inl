@@ -165,14 +165,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
     return nullptr;
 }
 
-// True when the bound pipeline is a slot 67 placeholder with a request key: the call is then settled here
-// (dispatched, or refused and logged). False leaves it to the desktop-pipeline decision of list_dispatch.
-bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
+// Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.
+const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& dispatch)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const u64 key = list && pass.pipeline ? pass.pipeline->own().compute_request_key : 0;
-    if (!key) return false;
+    const u64 key = pass.pipeline->own().compute_request_key;
+    const auto [x, y, z] = dispatch.groups;
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View {
@@ -216,6 +215,10 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
+        if (dispatch.signature && (slot.heap || slot.texture)) {
+            reason = "translated indirect Dispatch requires fixed-table raw buffers";
+            break;
+        }
         std::uint32_t index = slot.a < 0 || slot.b < 0 ? 0 : pass.compute_constants.word(slot.a, slot.b);
         std::memset(words, 0, sizeof(words));
         if (slot.word_param >= 0) {
@@ -339,6 +342,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         views[i] = {placed.alias, offset, bytes, true};
         std::memcpy(views[i].words, words, sizeof(views[i].words));
     }
+    if (dispatch.argument)
+        for (std::size_t i = 0; i < count && !reason; ++i)
+            if (views[i].resource == dispatch.argument) reason = "the indirect argument buffer is also a bound shader resource";
     // An entry value from a descriptor comes from the words its view was bound from in the loop above.
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i) {
@@ -377,8 +383,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
-        if (first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
-        return true;
+        if (!dispatch.signature && first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16))
+            log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
+        return reason;
     }
     const UINT n = static_cast<UINT>(count);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
@@ -425,7 +432,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     list->SetComputeRootSignature(tr->root.Get());
     if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
-    list->Dispatch(x, y, z);
+    if (dispatch.signature) {
+        require_state(self, dispatch.argument, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ExecuteIndirect(dispatch.signature, 1, dispatch.argument, dispatch.offset, nullptr, 0);
+    } else {
+        list->Dispatch(x, y, z);
+    }
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -441,13 +453,13 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     ++tr->translated;
     ReleaseSRWLockExclusive(&draw_lock);
     static LONG checks;  // as translated draws do: the queue's execute drains the rest
-    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", 14);
+    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", dispatch.signature ? 61 : 14);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
-    if (first_calls(logged, 8))
+    if (!dispatch.signature && first_calls(logged, 8))
         log("x2w-draw compute %016llx Dispatch(%u, %u, %u) translated: entry [%x %x %x %x], %zu inputs, %zu outputs", key, x, y, z,
             values[0], values[1], values[2], values[3], inputs, count - inputs);
-    return true;
+    return nullptr;
 }
 
 // With the periodic totals: refused dispatches by the first refusal reason of their key, then every key by
