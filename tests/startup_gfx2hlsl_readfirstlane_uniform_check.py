@@ -182,6 +182,9 @@ check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 
 # These instructions refuse before v_readfirstlane_b32 is reached.
 EARLIER = {
     'op_sel overwrite': 'modifier op_sel:[0,0]',
+    # The high word of a copied wave64 mask carries the mask tag: its numeric read is refused where it is lowered.
+    'overlapping 64-bit move high word': 'v_mov_b32 reads lane mask s4 as numeric data',
+    'high word of saved exec': 'v_mov_b32 reads lane mask s3 as numeric data',
     'modified move overwrite': "v_mov_b32 with ['clamp']",
     'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
     'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',

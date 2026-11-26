@@ -1410,6 +1410,8 @@ MASK_AWARE_VALU_RE = re.compile(r'_co(_ci)?_|addc|subb|_co$|^v_mad_[iu]64_[iu]32
 MASK_AWARE_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|cselect|wqm|cbranch|and_saveexec|or_saveexec|'
                                 r'xor_saveexec|andn2_saveexec|orn2_saveexec|nand_saveexec|nor_saveexec|xnor_saveexec|'
                                 r'ff1|bitset[01]|setpc|getpc|swappc|branch|waitcnt|endpgm|nop)(_|$)')
+# Scalar ops whose result is a lane mask when a source is one (a copy or a bitwise combination), unlike s_ff1 or s_bitset.
+MASK_COPY_SALU_RE = re.compile(r'^s_(mov|and|or|xor|andn2|orn2|nand|nor|xnor|not|wqm)_b(32|64)$')
 VCC_KEYS = {'vcc', 'vcc_hi'}
 
 
@@ -3501,11 +3503,48 @@ class Stage:
             del self.uniform_expr[v]
         return regs
 
-    def mark_mask_high(self, reg):
-        """A wave64 lane mask was written into the SGPR pair reg (reg_range): the one-lane model holds only the low word's
-        bit, the high word is the other lanes' bits, so no numeric read of it is lowered (see lower())."""
-        if reg and reg[0] == 's' and reg[2] == reg[1] + 1:
-            self.mask_high = getattr(self, 'mask_high', set()) | {reg[1] + 1}
+    MASK_NAMES_LOW = ('vcc', 'vcc_lo', 'exec', 'exec_lo')
+    MASK_NAMES_HIGH = ('vcc', 'vcc_hi', 'exec', 'exec_hi')
+
+    def mask_source_tags(self, base, ops):
+        """(low, high): whether a source operand of the instruction carries a lane-mask word. low = a mask's low word
+        (vcc/exec, an SGPR in self.masks, a pair that starts in one); high = the high word of a wave64 mask (vcc_hi,
+        exec_hi, a pair holding one, an SGPR in self.mask_high). Read before the instruction runs: it may overwrite
+        its own source."""
+        dests = destinations(base, ops)
+        srcs = ops[len(dests):] if dests and ops[:len(dests)] == dests else list(ops)
+        masks, high_regs = getattr(self, 'masks', ()), getattr(self, 'mask_high', ())
+        low = high = False
+        for tok in (t.strip().lstrip('-|').rstrip('|') for t in srcs):
+            low |= tok in self.MASK_NAMES_LOW
+            high |= tok in self.MASK_NAMES_HIGH and tok not in ('vcc_lo', 'exec_lo')
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                start_tagged = r[1] in masks
+                low |= start_tagged
+                high |= any(n in high_regs for n in range(r[1], r[2] + 1)) or (start_tagged and r[2] > r[1])
+        return low, high
+
+    def propagate_mask_tags(self, base, ops, tags):
+        """After an instruction ran: the SGPRs it wrote carry the lane-mask tag of what they were made from. This is the one
+        place the tag moves. A compare or carry writes its single-word mask itself (the decoder
+        names a wave64 compare destination s0, not s[0:1]); a mask-only scalar op (mov, bitwise, cselect, saveexec)
+        copies the tag of its sources to its destination, both words of a b64 pair; any other write cleared the tag
+        already (set_s). self.masks holds the low word, self.mask_high the high word of a wave64 pair: no numeric read of
+        either is lowered (lower())."""
+        low, high = tags
+        saveexec = base.startswith('s_') and 'saveexec' in base
+        scalar = bool(MASK_COPY_SALU_RE.match(base)) and (low or high)
+        pair_select = base.startswith('s_cselect') and base.endswith('b64')
+        if not (saveexec or scalar or pair_select):
+            return
+        for tok in destinations(base, ops):
+            r = reg_range(tok)
+            if not r or r[0] != 's':
+                continue
+            self.masks.add(r[1])
+            if r[2] > r[1]:
+                self.mask_high = getattr(self, 'mask_high', set()) | {r[1] + 1}
 
     def reads_mask_high(self, toks):
         """First single-register operand that is the high word of a wave64 lane mask, else None."""
@@ -3531,9 +3570,11 @@ class Stage:
         if base.startswith(('v_', 's_')) and not masks:   # the high word of a wave64 mask has no one-lane value
             high = self.reads_mask_high(ops if base.startswith(('s_cmp', 's_bitcmp')) else ops[1:])
             masks = [high] if high else []
+        tags = self.mask_source_tags(base, ops)
         result = self._lower(base, asm, ops, mods)
         if masks:
             raise Unsupported('%s reads lane mask %s as numeric data' % (base, masks[0]))
+        self.propagate_mask_tags(base, ops, tags)
         return result
 
     def _lower(self, base, asm, ops, mods):
@@ -4379,9 +4420,6 @@ class Stage:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
-            if is_mask:
-                # The modelled high word is 0, but the hardware's holds the other lanes' bits: no numeric read of it.
-                self.mask_high = getattr(self, 'mask_high', set()) | {d + 1}
         elif pair:
             self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
@@ -4614,7 +4652,6 @@ class Stage:
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
-            self.mark_mask_high(r if r[2] > r[1] else (r[0], d, d + 1))
 
     def smem_soffset(self, tok, record_use=True):
         """Runtime expression for an SMEM scalar offset operand (s0..s105 or m0)."""
@@ -7214,7 +7251,6 @@ class Stage:
             # The carry is a per-lane bit: never a uniform scalar, whatever the scratch name hides.
             self.set_s(sdst[1], predicate, uniform=False)
             self.masks.add(sdst[1])
-            self.mark_mask_high(sdst)
 
     def op_v_add_co_u32(self, ops, mods):
         self.carry_out_op(ops, mods, 'add')
@@ -7274,7 +7310,6 @@ class Stage:
         else:
             self.set_s(sdst[1], predicate, uniform=False)
             self.masks.add(sdst[1])
-            self.mark_mask_high(sdst)
 
     def op_v_add_co_ci_u32(self, ops, mods):
         self.carry_in_out_op(ops, mods, 'add')
@@ -7447,7 +7482,6 @@ class Stage:
                 d = reg[1]
                 self.set_s(d, predicate)
                 self.masks.add(d)
-                self.mark_mask_high(reg)
             return None
 
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|i16|u16)(_sdwa)?', base)
@@ -7517,7 +7551,6 @@ class Stage:
             d = reg[1]
             self.set_s(d, expr)
             self.masks.add(d)
-            self.mark_mask_high(reg)
 
     def export(self, asm):
         # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as

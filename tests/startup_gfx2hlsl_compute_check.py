@@ -862,6 +862,49 @@ def check_lane_mask_high_word():
     assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
 
 
+LANE_MASK_TAG = {
+    'zero_s1': '800381be',           # s_mov_b32 s1, 0: the high word the one-lane model holds as 0
+    'cmp_pair': '000084d491000200',  # v_cmp_gt_i32 s[0:1], 17, v0 (writes only the low word of the pair)
+    'cselect_pair': 'c1808085',      # s_cselect_b64 s[0:1], -1, 0
+    'cmp_vcc': '8004027d',           # v_cmp_lt_i32 vcc, 0, v2
+    'saveexec': '6a2480be',          # s_and_saveexec_b64 s[0:1], vcc
+    'copy_pair': '000488be',         # s_mov_b64 s[8:9], s[0:1]
+    'copy_vcc': '6a0488be',          # s_mov_b64 s[8:9], vcc
+    'copy_copy': '08048abe',         # s_mov_b64 s[10:11], s[8:9]
+    'xor_pair': '6a008089',          # s_xor_b64 s[0:1], vcc, s[0:1]
+    'clear_s9': '800389be',          # s_mov_b32 s9, 0: a plain write ends the tag
+    'read_s1': '01020a7e',           # v_mov_b32 v5, s1
+    'read_s9': '09020a7e',           # v_mov_b32 v5, s9
+    'read_s11': '0b020a7e',          # v_mov_b32 v5, s11
+    'add_s9': '09810780',            # s_add_u32 s7, s9, 1
+}
+
+
+def check_lane_mask_tag_propagation():
+    """The mask tag is set where a mask is written and moves with every copy: one case per way a tagged word is made, each
+    read back through a numeric use (a no-op tag at any of them lets a case translate)."""
+    w = {k: bytes.fromhex(v) for k, v in LANE_MASK_TAG.items()}
+    cases = [
+        ('cselect writes a pair', ['zero_s1', 'cselect_pair', 'read_s1']),
+        ('saveexec writes a pair', ['zero_s1', 'cmp_vcc', 'saveexec', 'read_s1']),
+        ('bitwise op writes a pair', ['zero_s1', 'cmp_pair', 'cmp_vcc', 'xor_pair', 'read_s1']),
+        ('b64 copy of a pair', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'read_s9']),
+        ('b64 copy of vcc', ['cmp_vcc', 'copy_vcc', 'read_s9']),
+        ('copy of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'copy_copy', 'read_s11']),
+        ('scalar use of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'add_s9']),
+    ]
+    for label, steps in cases:
+        try:
+            translate('A', code=splice_words(*[w[s] for s in steps]))
+        except G.Unsupported as reason:
+            assert 'as numeric data' in str(reason), (label, str(reason))
+        else:
+            raise AssertionError("%s accepted, expected a refusal naming as numeric data" % label)
+    # A plain write ends the tag: the copy is overwritten with a constant before the read.
+    assert 'v5 = ' in translate('A', code=splice_words(*[w[s] for s in (
+        'cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'clear_s9', 'read_s9')])).hlsl_cs()
+
+
 def splice_words(*chunks, at=STORE_A):
     return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
 
@@ -1130,6 +1173,7 @@ def check_controls():
     check_lane_mask_high_word()
     check_lane_mask_derived_word()
     check_lane_mask_scalar_data()
+    check_lane_mask_tag_propagation()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
