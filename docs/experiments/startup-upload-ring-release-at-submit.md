@@ -70,6 +70,9 @@ One build; only the switch differs. Aggregates only; logs stay local.
   `upload_from_title` copies for a graphics root SRV without an existing upload mapping.
 - The title never submitted a closed list again without a Reset: 0 of more than 500,000 submits over five runs.
   A title that does resubmit after a reuse gets the refusal described above: that list does not run.
-- The larger ring costs about 1 GiB of process commit at peak in this run.
+- The larger ring cost about 1 GiB of process commit at peak in this run.
+- Repeated after the stale-resubmit refusal, on a later `main`, same settings: buffer null bindings 50,665 →
+  0, reservation refusals logged → none, stale resubmits refused 0 → 0, commit peak 17.9 → 18.0 GiB, black
+  frames → none seen.
 
 Not established: other titles' resubmit behaviour, and whether 512 MiB is enough on other workloads.
