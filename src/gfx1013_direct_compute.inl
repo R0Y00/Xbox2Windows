@@ -1398,7 +1398,8 @@ struct DirectCompute {
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
                     n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
-                    n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" || n == "s_xor_b32";
+                    n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
+                    n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32";
                 const bool preserves_pair = n == "s_mul_i32" || n == "s_mul_hi_i32" || n == "s_mul_hi_u32" ||
                     n == "s_bfm_b32" || n == "s_bfm_b64" || n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" ||
                     n == "s_pack_hh_b32_b16";
@@ -1706,6 +1707,39 @@ struct DirectCompute {
             }
             write(i.dst, lo);
             write(i.dst + 1, hi);
+            return;
+        }
+        if (compute && (n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64")) {
+            // gfx2hlsl.py scalar_wide_op (#3062): D = f(S0, S1 & 63); SCC = (D != 0). Read all sources before
+            // writing the destination pair so an overlapping destination cannot observe a half-written input.
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0], s1 = i.src[1];
+            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_int = s0 >= 128 && s0 <= 208;
+            const bool s1_ok = s1 <= 105 || (s1 >= 128 && s1 <= 208) || s1 == 255;
+            if (!(s0_pair || s0_int || s0 == 255) || !s1_ok)
+                refuse(i.pc, "invalid " + string(n) + " source");
+            const bool arithmetic = n == "s_ashr_i64";
+            auto lo = operand32(i, s0);
+            string hi = "0";
+            if (s0_pair)
+                hi = operand32(i, s0 + 1);
+            else if (s0 >= 193 && s0 <= 208)
+                hi = "4294967295";
+            else if (s0 == 255 && arithmetic && (i.literal & 0x80000000u))
+                hi = "4294967295";
+            auto amt = ir.value("zext i32 " + ir.binary("and", operand32(i, s1), "63") + " to i64");
+            auto wide = ir.value("or i64 " + ir.value("shl i64 " + ir.value("zext i32 " + hi + " to i64") + ", 32") +
+                                 ", " + ir.value("zext i32 " + lo + " to i64"));
+            auto shifted = ir.value(string(arithmetic ? "ashr" : n == "s_lshr_b64" ? "lshr" : "shl") +
+                                    " i64 " + wide + ", " + amt);
+            auto out_lo = ir.value("trunc i64 " + shifted + " to i32");
+            auto out_hi = ir.value("trunc i64 " + ir.value("lshr i64 " + shifted + ", 32") + " to i32");
+            ir.features |= 1048576;
+            write(i.dst, out_lo);
+            write(i.dst + 1, out_hi);
+            write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", out_lo, out_hi), "0") + " to i32"));
             return;
         }
         auto a = val(0);
