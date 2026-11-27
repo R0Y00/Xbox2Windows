@@ -301,7 +301,7 @@ IndirectBufferView compute_root_srv_buffer(Wrapper* self, const Pass& pass, int 
         if (bytes < 4)
             return refuse("a compute root SRV has fewer than 4 aligned bytes in its upload allocation");
         words[2] = static_cast<std::uint32_t>(bytes);
-        return {allocation.resource, allocation.offset, bytes, 0, true};
+        return indirect_buffer_view(allocation.resource, allocation.offset, bytes, 0, 0, true);
     }
     Wrapper* device = self->own().list_device;
     const auto first = placed_buffer_range(device, address, 4);
@@ -336,7 +336,7 @@ IndirectBufferView compute_root_srv_buffer(Wrapper* self, const Pass& pass, int 
         offset > desc.Width || bytes > desc.Width - offset)
         return refuse("a compute root SRV range is outside its desktop buffer");
     words[2] = static_cast<std::uint32_t>(bytes);
-    return {native, offset, bytes, 0, false};
+    return indirect_buffer_view(native, offset, bytes, 0, 0, false);
 }
 
 // Both callers have an open list and a slot 67 request. The indirect caller has checked the signature and argument range.

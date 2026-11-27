@@ -2259,6 +2259,19 @@ struct IndirectBufferView {
     bool upload = false;
 };
 
+// Named members: a brace initializer put the bool in records and narrowed records into upload (MSVC C2397).
+IndirectBufferView indirect_buffer_view(ID3D12Resource* resource, u64 offset, u64 bytes, UINT stride, UINT records, bool upload)
+{
+    IndirectBufferView view;
+    view.resource = resource;
+    view.offset = offset;
+    view.bytes = bytes;
+    view.stride = stride;
+    view.records = records;
+    view.upload = upload;
+    return view;
+}
+
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
@@ -2332,7 +2345,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
-            if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true, records};
+            if (!owner) return indirect_buffer_view(allocation.resource, allocation.offset, bytes, stride, records, true);
             return refuse("an input buffer view token names the list's upload memory");
         }
         const auto placed = placed_buffer_range(device, address, bytes);
@@ -2344,7 +2357,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             if (!alias.resource)
                 return refuse(in_upload ? "an input range crosses the end of its upload allocation"
                                         : "an input is in title memory outside any placed buffer");
-            return {alias.resource, alias.offset, bytes, stride, false, records};
+            return indirect_buffer_view(alias.resource, alias.offset, bytes, stride, records, false);
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
@@ -2374,7 +2387,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload, records};
+    return indirect_buffer_view(native, offset, bytes, stride, records, upload);
 }
 
 struct FormattedBufferDescriptor {

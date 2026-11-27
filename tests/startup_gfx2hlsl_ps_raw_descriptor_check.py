@@ -375,6 +375,11 @@ def check_udsrc():
     assert 'record_counts[i] = words[2];' in draw
     assert 'records = words[2];' in draw
     assert 'record_counts[i] = view.records;' in draw
+    # records is a UINT and upload is a bool after it. Assigning by name avoids narrowing the count into the bool.
+    assert 'view.records = records;' in draw and 'view.upload = upload;' in draw
+    assert 'return {allocation.resource' not in draw and 'return {native, offset, bytes, stride' not in draw
+    compute = (root / 'src/startup_stubs/d3d12_compute_dispatch.inl').read_text(encoding='utf-8')
+    assert 'return {allocation.resource' not in compute and 'return {native, offset, bytes, 0, false}' not in compute
     assert 'ud.kind == Translation::num_records && ud.a >= 0 && ud.a < 32 ? record_counts[ud.a]' in draw
     assert 'x2w-draw unsupported udsrc' in draw
     driver = r"""
