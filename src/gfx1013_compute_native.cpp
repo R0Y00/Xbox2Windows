@@ -939,7 +939,7 @@ struct Emit {
     void image(const Inst &i, const State &state) {
         unsigned mask = (i.a >> 8) & 15, base = ((i.b >> 16) & 31) * 4, addr = i.b & 255;
         const bool half_store = i.op == 8 && (i.b & 0x80000000u);
-        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3e000000u))
+        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3c000000u))
             refuse(i.pc, "unsupported image flags");
         bool store = i.op == 8, lod = i.op == 39, gather = i.op == 71;
         if (i.op != 0 && !store && !lod && !gather)
