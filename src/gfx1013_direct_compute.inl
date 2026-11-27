@@ -1655,6 +1655,38 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
             return;
         }
+        if (n == "v_mad_u64_u32" || n == "v_mad_i64_i32") {
+            // D = S0 * S1 + S2 modulo 2^64 with 32-bit factors and a 64-bit S2 (#3000, gfx2hlsl.py mad64). The
+            // unsigned form writes the carry-out of the 64-bit add as a lane mask; the signed carry-out is not
+            // established, so the signed form is lowered only with the discarding null SDST. In VOP3B the ABS field
+            // holds SDST, so only NEG, clamp and the output modifier are refused here.
+            const bool sign = n == "v_mad_i64_i32";
+            const unsigned sdst = (i.a >> 8) & 127, addend = i.src[2];
+            if (pixel_stage || graphics_input || i.subword || i.dpp_control || i.neg || i.clamp || i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " stage or operand modifiers");
+            if (sign ? sdst != 125 : (sdst > 105 && sdst != 106))
+                refuse(i.pc, string(n) + " carry-out destination");
+            const bool vgpr_pair = addend >= 256 && addend < 511, sgpr_pair = addend <= 104 && !(addend & 1);
+            if (!(vgpr_pair || sgpr_pair) || i.dst >= 511)
+                refuse(i.pc, string(n) + " addend or destination operand");
+            for (unsigned j = 0; j < 2; ++j)  // gfx2hlsl.py refuses an inline float as a factor
+                if (i.src[j] >= 240 && i.src[j] <= 248)
+                    refuse(i.pc, string(n) + " with an inline float factor");
+            const char *extend = sign ? "sext" : "zext";
+            auto wide = [&](const char *how, const string &x) { return ir.value(string(how) + " i32 " + x + " to i64"); };
+            auto c = ir.value("or i64 " + ir.value("shl i64 " + wide("zext", operand32(i, addend + 1)) + ", 32") + ", " +
+                              wide("zext", operand32(i, addend)));
+            auto product = ir.value("mul i64 " + wide(extend, operand32(i, i.src[0])) + ", " +
+                                    wide(extend, operand32(i, i.src[1])));
+            auto sum = ir.value("add i64 " + product + ", " + c);
+            auto carry = ir.value("icmp ult i64 " + sum + ", " + c);
+            ir.features |= 1048576;
+            vector_write(i.dst, ir.value("trunc i64 " + sum + " to i32"));
+            vector_write(i.dst + 1, ir.value("trunc i64 " + ir.value("lshr i64 " + sum + ", 32") + " to i32"));
+            if (!sign)
+                write_ballot(sdst, carry);
+            return;
+        }
         if (auto dst = carry_destination(i)) {
             if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.subword || i.dpp_control || i.clamp || i.neg || i.scale)
                 refuse(i.pc, "unsupported carry instruction stage or operand modifiers");
