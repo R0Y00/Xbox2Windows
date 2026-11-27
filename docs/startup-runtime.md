@@ -1437,7 +1437,7 @@ the two recovery checks are its sole failures),
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
 `PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
 A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
-copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first ask `VirtualQuery` (one entry per
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when a debugger is attached or `X2W_PROBE_PRECHECK` is set to anything but `0` (read once; otherwise the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
 region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
 Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
 a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render

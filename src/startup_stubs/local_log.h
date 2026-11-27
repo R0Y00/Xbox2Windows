@@ -74,9 +74,22 @@ inline thread_local MappedCache mapped_cache;
 // Forgets the spans this thread has found (a span can be freed later; a failed touch or copy calls this).
 inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
 
+// The pre-check is a debugging aid: it only pays off while a debugger would stop on every first-chance fault.
+// It runs when a debugger is attached or X2W_PROBE_PRECHECK is set to anything but 0 (read once, cached);
+// otherwise probes and copies keep the plain touch / __try path at no extra cost.
+inline bool precheck_enabled() noexcept
+{
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD n = GetEnvironmentVariableA("X2W_PROBE_PRECHECK", value, sizeof(value));
+        return IsDebuggerPresent() != FALSE || (n != 0 && n < sizeof(value) && value[0] != '0');
+    }();
+    return enabled;
+}
+
 inline std::size_t mapped_prefix(std::uintptr_t start, std::size_t bytes) noexcept
 {
-    if (bytes == 0 || start + bytes < start) return bytes;
+    if (bytes == 0 || start + bytes < start || !precheck_enabled()) return bytes;
     const std::uintptr_t end = start + bytes;
     std::uintptr_t at = start;
     while (at < end) {
