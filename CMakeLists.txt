@@ -1025,6 +1025,17 @@ if(X2W_WITH_OPUS)
     add_dependencies(startup_xapu_opus_check startup_stub_xapu)
     add_test(NAME startup_xapu_opus COMMAND startup_xapu_opus_check "$<TARGET_FILE:startup_stub_xapu>")
     set_tests_properties(startup_xapu_opus PROPERTIES TIMEOUT 60)
+
+    # Bounded telemetry for the same optional decode path: decoded packets, dequeued completions and
+    # refusals by reason. Generates its tones with libopus; no captured packet is stored.
+    add_executable(startup_xapu_opus_count_check tests/startup_xapu_opus_count_check.cpp)
+    target_compile_features(startup_xapu_opus_count_check PRIVATE cxx_std_17)
+    target_include_directories(startup_xapu_opus_count_check PRIVATE src)
+    target_link_libraries(startup_xapu_opus_count_check PRIVATE Opus::opus)
+    set_target_properties(startup_xapu_opus_count_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_dependencies(startup_xapu_opus_count_check startup_stub_xapu)
+    add_test(NAME startup_xapu_opus_count COMMAND startup_xapu_opus_count_check "$<TARGET_FILE:startup_stub_xapu>")
+    set_tests_properties(startup_xapu_opus_count PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(startup_chad_check tests/startup_chad_check.cpp)
@@ -1032,6 +1043,15 @@ target_compile_features(startup_chad_check PRIVATE cxx_std_17)
 add_dependencies(startup_chad_check startup_stub_chad)
 add_test(NAME startup_chad_check COMMAND startup_chad_check "$<TARGET_FILE:startup_stub_chad>")
 set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
+# Activity counter of the AcpHal and XApu stand-ins (X2W_AUDIO_ACTIVITY=1): exact counts, a zero-write control, the
+# same results with the counter on and off, and a caller that unloads both DLLs and must exit cleanly
+# (docs/startup-runtime.md).
+add_executable(startup_acphal_xma_activity tests/startup_acphal_xma_activity.cpp)
+target_compile_features(startup_acphal_xma_activity PRIVATE cxx_std_17)
+add_dependencies(startup_acphal_xma_activity startup_stub_acphal startup_stub_xapu)
+add_test(NAME startup_acphal_xma_activity COMMAND startup_acphal_xma_activity "$<TARGET_FILE:startup_stub_acphal>"
+    "$<TARGET_FILE:startup_stub_xapu>")
+set_tests_properties(startup_acphal_xma_activity PROPERTIES TIMEOUT 60)
 
 # BMP writer of the draw dumps (src/startup_stubs/draw_bmp.h); the mutated runs are negative controls.
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
@@ -1241,6 +1261,10 @@ target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 # The DLL the probe calls for the debugger's call-hook case (--trace-calls).
 add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
 add_dependencies(startup_debug_probe startup_debug_calls)
+# Input for the launcher's --map-drive check (tests/startup_map_drive_check.py): the consumer opens its
+# package through a mapped letter, and the launcher rewrites that open.
+add_executable(startup_map_drive_consumer tests/startup_map_drive_consumer.cpp)
+target_compile_features(startup_map_drive_consumer PRIVATE cxx_std_17)
 # A visible window that changes its picture at a known time: input for the --capture-every check (tests/startup_debug_window_check.py).
 add_executable(startup_window_probe tests/startup_window_probe.cpp)
 target_compile_features(startup_window_probe PRIVATE cxx_std_17)
@@ -1355,7 +1379,16 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
+target_sources(startup_stream_consumer PRIVATE tests/startup_rect_gap.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
+
+# The shared indexed rectangle-expansion stage (startup_stubs/indexed_rect_geometry.h) drawn on its own, with
+# back-face culling on: the axis order, a swung order of the same corners and a rotated rectangle (#3131).
+# tests/cmake/startup_rect_gap.cmake registers its tests and the runtime draw.
+add_executable(startup_rect_geometry tests/startup_rect_geometry.cpp)
+target_compile_features(startup_rect_geometry PRIVATE cxx_std_17)
+target_include_directories(startup_rect_geometry PRIVATE src)
+target_link_libraries(startup_rect_geometry PRIVATE d3d12 dxgi d3dcompiler)
 
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
@@ -1934,9 +1967,33 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_native_graphics_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_native_graphics_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" ${adapter})
+        set_tests_properties(startup_native_graphics_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    foreach(backend IN ITEMS hardware warp)
+        add_test(NAME native_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(native_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_test(NAME startup_compute_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" runtime "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(startup_compute_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endforeach()
     add_test(NAME native_direct_container
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(adapter IN ITEMS warp hardware)
+        foreach(case IN ITEMS r rg rgb array volume rgba sparse)
+            add_test(NAME native_image_store_exact_width_${adapter}_${case}
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_image_store_exact_width_check.py"
+                "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:startup_stream_consumer>" ${adapter} ${case})
+            set_tests_properties(native_image_store_exact_width_${adapter}_${case} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
+    endforeach()
     add_test(NAME native_dpp_mirror_hardware COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_dpp_mirror_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:native_store_replay>" "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
@@ -1981,6 +2038,11 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --rect-pso
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
     set_tests_properties(native_rectangle_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME native_rectangle_geometry_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --rect-pso
+        "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>"
+        "$<TARGET_FILE:startup_rect_geometry>")
+    set_tests_properties(native_rectangle_geometry_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_test(NAME native_pixel_dxil
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_pixel_dxil_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
@@ -2055,6 +2117,7 @@ if(OFFSCREEN_AGILITY_620_DIR)
     endforeach()
     target_compile_definitions(offscreen_check PRIVATE OFFSCREEN_AGILITY_620)
     target_compile_definitions(startup_indirect_draw_indexed PRIVATE OFFSCREEN_AGILITY_620)
+    target_compile_definitions(startup_stream_consumer PRIVATE OFFSCREEN_AGILITY_620)
 endif()
 set(OFFSCREEN_WARP_DIR "" CACHE PATH "Directory containing an app-local x64 d3d10warp.dll (Microsoft.Direct3D.WARP)")
 if(OFFSCREEN_WARP_DIR)
@@ -2516,6 +2579,10 @@ add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
 target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
+add_test(NAME startup_local_log_precheck_off COMMAND startup_local_log_check --phase precheck-off)
+set_tests_properties(startup_local_log_precheck_off PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
+add_test(NAME startup_local_log_precheck_off_debugger COMMAND startup_local_log_check --phase precheck-off-debugger)
+set_tests_properties(startup_local_log_precheck_off_debugger PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
@@ -4494,7 +4561,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_compute_mbcnt_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast f-second-fill g-swapped-offsets g-overlap
-                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept
+                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept o-subset-remask-dropped
                 n-dropped-broadcast p-dropped-andn2 p-dropped-or p-block-entered q-block-entered q-not-all-ones
                 s-min-strict s-borrow-flipped)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
@@ -4778,6 +4845,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
     set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+    # tools/startup/debug_launch.py --map-drive: a console package on another volume is opened through
+    # a mapped letter, and the launcher rewrites that open in the caller's own name.
+    add_test(NAME startup_map_drive COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+        "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(startup_map_drive PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Two threads with their own caller-owned names in flight at once: all 64 opens are rewritten, succeed
+    # and restore their caller strings while the debugger holds the other threads for each step; the
+    # control without holding them (--suspend-others 0) must lose opens. Needs the step window (#1281).
+    add_test(NAME startup_map_drive_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+        "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+        "${CMAKE_CURRENT_BINARY_DIR}" overlap)
+    set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
@@ -5128,6 +5210,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_check.py")
     add_test(NAME runtime_shader_cache_rekey_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_cli_check.py")
+    # The launchers' warning when the shader cache and the translator come from different revisions (#2815).
+    add_test(NAME startup_shader_cache_revision COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_revision_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")

@@ -5,6 +5,15 @@
 
 // Preserve the guest view window. The HLSL resource type determines the desktop component type.
 namespace x2w {
+inline DXGI_FORMAT native_half_buffer_format(unsigned bytes) {
+    switch (bytes) {
+    case 2: return DXGI_FORMAT_R16_FLOAT;
+    case 4: return DXGI_FORMAT_R16G16_FLOAT;
+    case 8: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 inline bool native_buffer_store_view(const ComputeViewBinding &binding, D3D12_UNORDERED_ACCESS_VIEW_DESC &view,
                                      UINT64 resource_bytes, IndexedAtomicView *atomic = nullptr) {
     if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || view.Buffer.CounterOffsetInBytes ||
@@ -46,15 +55,15 @@ inline bool native_buffer_store_view(const ComputeViewBinding &binding, D3D12_UN
     if (view.Buffer.StructureByteStride) return false;
     UINT stride = binding.required_bytes;
     if (binding.kind == ComputeViewKind::raw_buffer_uav) {
-        if (view.Format != DXGI_FORMAT_R32_TYPELESS || view.Buffer.Flags != D3D12_BUFFER_UAV_FLAG_RAW)
+        if (view.Format != DXGI_FORMAT_R32_TYPELESS || view.Buffer.Flags != D3D12_BUFFER_UAV_FLAG_RAW ||
+            view.Buffer.FirstElement % (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / 4))
             return false;
         stride = 4;
     } else if (view.Buffer.Flags) {
         return false;
     } else if (binding.kind == ComputeViewKind::half_buffer_uav) {
-        if (!((stride == 2 && view.Format == DXGI_FORMAT_R16_FLOAT) ||
-              (stride == 4 && view.Format == DXGI_FORMAT_R16G16_FLOAT) ||
-              (stride == 8 && view.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)))
+        const auto format = native_half_buffer_format(stride);
+        if (format == DXGI_FORMAT_UNKNOWN || view.Format != format)
             return false;
     } else if (binding.kind == ComputeViewKind::typed_buffer_uav) {
         const DXGI_FORMAT formats[][3] = {
