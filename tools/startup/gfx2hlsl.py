@@ -8120,18 +8120,18 @@ class Stage:
         return (('bvhbase', base, values[2]), None), words, values
 
     def op_image_bvh_intersect_ray(self, ops, mods):
-        """Ray/box intersection for the 128-byte FP32 box node (kind 5).
+        """Ray/box intersection for the 128-byte FP32 (kind 5) and 64-byte binary16 (kind 4) box nodes.
 
         RDNA 2 ISA section 8.2.10 and Table 48: VDATA is four result dwords, VADDR is 11 dwords
         (node pointer, extent, origin xyz, direction xyz, inverse direction xyz) and SRSRC is the
         four-word BVH T# of Table 49. This first slice accepts only a straight-line compute program
-        with a constant node base, a constant inline T# and a node whose kind bits are 5.
-        The descriptor base binds a ByteAddressBuffer at the 256-byte-aligned allocation; the node
-        pointer is an offset in 8-byte units from that base. The emitted helper performs the four
-        slab tests, clips against extent, replaces misses with 0xffffffff in their original slots,
-        and sorts by entry distance only when the descriptor's box-sorting enable bit is set.
-        Triangle nodes, 16-bit box nodes, the 64-bit form, A16, non-sequential addresses and every
-        other node kind are refused by name.
+        with a constant node base, a constant inline T# and a node whose kind bits are 4 or 5.
+        The descriptor base encodes address bits 47:8 in 256-byte units and binds a
+        ByteAddressBuffer at that byte address; the node pointer is an offset in 8-byte units from
+        that base. The emitted helper performs the four slab tests, clips against extent, replaces
+        misses with 0xffffffff in their original slots, and sorts by entry distance only when the
+        descriptor's box-sorting enable bit is set. Triangle nodes, the 64-bit form, A16,
+        non-sequential addresses and every other node kind are refused by name.
         """
         name = 'image_bvh_intersect_ray'
         if self.kind != 'cs':
@@ -8156,15 +8156,15 @@ class Stage:
         if node is None:
             raise Unsupported('%s non-constant node base %s' % (name, cs[0]))
         kind = node & 7
-        if kind == 4:
-            raise Unsupported('%s 16-bit box node (kind 4) is not lowered' % name)
-        if kind == 0:
-            raise Unsupported('%s triangle node (kind 0) is not lowered' % name)
-        if kind != 5:
+        if 0 <= kind <= 3:
+            raise Unsupported('%s triangle node (kind %d) is not lowered' % (name, kind))
+        if kind not in (4, 5):
             raise Unsupported('%s node kind %d is not lowered' % (name, kind))
+        half_box = kind == 4
+        node_bytes = 64 if half_box else 128
         node_offset = (node & 0xfffffff8) << 3
-        if node_offset > 0xffffff80 or node_offset & 0x7f:
-            raise Unsupported('%s node base %#x is not an aligned 128-byte node' % (name, node_offset))
+        if node_offset > (0xffffffc0 if half_box else 0xffffff80) or node_offset & (0x3f if half_box else 0x7f):
+            raise Unsupported('%s node base %#x is not an aligned %u-byte node' % (name, node_offset, node_bytes))
         key, words, vals = self.bvh_descriptor(ops[2])
         if vals[1] is not None:
             if vals[1] & 0x7f800000:
@@ -8180,11 +8180,12 @@ class Stage:
         if base == 0:
             raise Unsupported('%s absolute node base is not lowered' % name)
         if vals[2] is not None:
-            if vals[2] < 1 or vals[2] >= 0x04000000:
-                raise Unsupported('%s descriptor size %d does not cover a 128-byte node' % (name, vals[2]))
-            if (node_offset >> 6) + 1 > vals[2]:
+            if vals[2] >= 0x04000000:
+                raise Unsupported('%s descriptor size %d is above 4 GiB' % (name, vals[2]))
+            # Size is a count minus one in 64-byte units, so size=0 is a one-unit span.
+            if (node_offset >> 6) + (node_bytes >> 6) - 1 > vals[2]:
                 raise Unsupported('%s node base %#x is outside descriptor size %d' % (name, node_offset, vals[2]))
-        if base + node_offset + 128 > 1 << 48:
+        if base + node_offset + node_bytes > 1 << 48:
             raise Unsupported('%s node address wraps the 48-bit address space' % name)
         extent = self.f(cs[1])
         origin = [self.f(cs[2 + i]) for i in range(3)]
@@ -8192,7 +8193,8 @@ class Stage:
         inv_dir = [self.f(cs[8 + i]) for i in range(3)]
         res = self.pipe.resource(key, 'bvh')
         self.pipe.uses_bvh = True
-        call = 'x2w_bvh_intersect_box32(%s, 0x%08xu, %s, %s, %s, %s, %s, float3(%s, %s, %s), float3(%s, %s, %s))' % (
+        call = '%s(%s, 0x%08xu, %s, %s, %s, %s, %s, float3(%s, %s, %s), float3(%s, %s, %s))' % (
+            'x2w_bvh_intersect_box16' if half_box else 'x2w_bvh_intersect_box32',
             res, node, words[0], words[1], words[2], words[3], extent,
             origin[0], origin[1], origin[2], inv_dir[0], inv_dir[1], inv_dir[2])
         self.emit('uint4 bt%x = %s;' % (self.pc or 0, call))
@@ -11166,7 +11168,7 @@ BVH_HELPERS = (
     # slice does not bind, so it is refused here as a miss rather than read at address zero.
     'bool x2w_bvh_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
     '    return (word1 & 0x7fffff00u) == 0u &&',
-    '        word3 == 0x80000000u && word2 >= 1u && word2 < 0x04000000u &&',
+    '        word3 == 0x80000000u && word2 < 0x04000000u &&',
     '        (word0 != 0u || (word1 & 0x000000ffu) != 0u);',
     '}',
     # One FP32 box from a radv_bvh_box32_node (Mesa 25.1.0 bvh/bvh.h, MIT): children[4] at
@@ -11185,6 +11187,24 @@ BVH_HELPERS = (
     '    float tmax = min(min(max(bound0.x, bound1.x), max(bound0.y, bound1.y)),',
     '                     max(bound0.z, bound1.z));',
     # A NaN in min.x marks an inactive box (Vulkan inactive primitive rule; Mesa tests NaN != NaN).
+    '    bool active = (asuint(lo.x) & 0x7fffffffu) <= 0x7f800000u;',
+    '    hit = active && tmax >= max(0.0, tmin) && tmin < extent;',
+    '    return hit ? tmin : asfloat(0x7f800000u);',
+    '}',
+    # One binary16 box from a radv_bvh_box16_node: children[4] at 0..15, coords[4][2][3] at
+    # 16..63, six binary16 values per child. The half values widen exactly to binary32.
+    'float x2w_bvh_box16_slot(ByteAddressBuffer nodes, uint node_offset, uint index, float extent,',
+    '                         float3 origin, float3 inv_dir, out bool hit) {',
+    '    uint at = node_offset + 16u + 12u * index;',
+    '    uint h0 = nodes.Load(at), h1 = nodes.Load(at + 4u), h2 = nodes.Load(at + 8u);',
+    '    float3 lo = float3(f16tof32(h0), f16tof32(h0 >> 16u), f16tof32(h1));',
+    '    float3 hi = float3(f16tof32(h1 >> 16u), f16tof32(h2), f16tof32(h2 >> 16u));',
+    '    float3 bound0 = (lo - origin) * inv_dir;',
+    '    float3 bound1 = (hi - origin) * inv_dir;',
+    '    float tmin = max(max(min(bound0.x, bound1.x), min(bound0.y, bound1.y)),',
+    '                     min(bound0.z, bound1.z));',
+    '    float tmax = min(min(max(bound0.x, bound1.x), max(bound0.y, bound1.y)),',
+    '                     max(bound0.z, bound1.z));',
     '    bool active = (asuint(lo.x) & 0x7fffffffu) <= 0x7f800000u;',
     '    hit = active && tmax >= max(0.0, tmin) && tmin < extent;',
     '    return hit ? tmin : asfloat(0x7f800000u);',
@@ -11215,6 +11235,45 @@ BVH_HELPERS = (
     '    uint c2 = nodes.Load(offset + 8u);',
     '    uint c3 = nodes.Load(offset + 12u);',
     # A disabled child stores 0xffffffff and must not enter the hit list even if its box is valid.
+    '    h0 = h0 && c0 != X2W_BVH_MISS;',
+    '    h1 = h1 && c1 != X2W_BVH_MISS;',
+    '    h2 = h2 && c2 != X2W_BVH_MISS;',
+    '    h3 = h3 && c3 != X2W_BVH_MISS;',
+    '    c0 = h0 ? c0 : X2W_BVH_MISS;',
+    '    c1 = h1 ? c1 : X2W_BVH_MISS;',
+    '    c2 = h2 ? c2 : X2W_BVH_MISS;',
+    '    c3 = h3 ? c3 : X2W_BVH_MISS;',
+    # With sorting disabled, each result remains in its original child slot.
+    '    if (!sort_boxes) return uint4(c0, c1, c2, c3);',
+    '    float k0 = h0 ? d0 : asfloat(0x7f800000u);',
+    '    float k1 = h1 ? d1 : asfloat(0x7f800000u);',
+    '    float k2 = h2 ? d2 : asfloat(0x7f800000u);',
+    '    float k3 = h3 ? d3 : asfloat(0x7f800000u);',
+    '    x2w_bvh_sort_pair(c0, c1, k0, k1);',
+    '    x2w_bvh_sort_pair(c2, c3, k2, k3);',
+    '    x2w_bvh_sort_pair(c0, c2, k0, k2);',
+    '    x2w_bvh_sort_pair(c1, c3, k1, k3);',
+    '    x2w_bvh_sort_pair(c1, c2, k1, k2);',
+    '    return uint4(c0, c1, c2, c3);',
+    '}',
+    'uint4 x2w_bvh_intersect_box16(ByteAddressBuffer nodes, uint node, uint word0, uint word1,',
+    '                              uint word2, uint word3, float extent, float3 origin,',
+    '                              float3 inv_dir) {',
+    '    uint4 miss = uint4(X2W_BVH_MISS, X2W_BVH_MISS, X2W_BVH_MISS, X2W_BVH_MISS);',
+    '    if ((node & 7u) != 4u || !x2w_bvh_descriptor_ok(word0, word1, word2, word3)) return miss;',
+    '    uint offset = (node & 0xfffffff8u) << 3u;',
+    '    if ((offset >> 6u) > word2) return miss;',
+    '    inv_dir = clamp(inv_dir, -3.402823466e+38, 3.402823466e+38);',
+    '    bool h0, h1, h2, h3;',
+    '    float d0 = x2w_bvh_box16_slot(nodes, offset, 0u, extent, origin, inv_dir, h0);',
+    '    float d1 = x2w_bvh_box16_slot(nodes, offset, 1u, extent, origin, inv_dir, h1);',
+    '    float d2 = x2w_bvh_box16_slot(nodes, offset, 2u, extent, origin, inv_dir, h2);',
+    '    float d3 = x2w_bvh_box16_slot(nodes, offset, 3u, extent, origin, inv_dir, h3);',
+    '    bool sort_boxes = (word1 & 0x80000000u) != 0u;',
+    '    uint c0 = nodes.Load(offset);',
+    '    uint c1 = nodes.Load(offset + 4u);',
+    '    uint c2 = nodes.Load(offset + 8u);',
+    '    uint c3 = nodes.Load(offset + 12u);',
     '    h0 = h0 && c0 != X2W_BVH_MISS;',
     '    h1 = h1 && c1 != X2W_BVH_MISS;',
     '    h2 = h2 && c2 != X2W_BVH_MISS;',
