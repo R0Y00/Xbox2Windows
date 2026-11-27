@@ -17178,7 +17178,8 @@ Dispatch record in a placed argument buffer. It binds the same translated pipeli
 Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
 
 The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
-After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
+After the queue fence it checks the leading guard, the neighboring three-word guard record, all three argument words,
+the input and all 320 output words.
 Counts of 2 and 5 write exactly that many words. Direct Dispatch with the same bindings and counts must produce
 the same outputs. Omitting the producer leaves the zero record and the output sentinel intact. Omitting the
 translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
@@ -17189,6 +17190,40 @@ cmake --build --preset release --target startup_stream_consumer
 ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
 python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
+
+#### GPU-written indirect Dispatch to an offscreen pixel (#3209)
+
+The same fixture also records the GPU writer on a first guest DIRECT list submission, waits for guest
+fence value 1, and checks the seven DWORDs (leading guard, 12-byte Dispatch at byte interval [4,16),
+neighboring three-DWORD guard at [16,28)). A second recording on that queue copies the same placed
+resource immediately before guest list slot 61, then submits and waits for value 2 before checking the
+second snapshot. The native resource pointer and GPU virtual address must agree across both boundaries.
+The translated slot 67 shader reads its normal raw-buffer table and XORs one input word per group into
+the aliased output UAV. The check requires a translated dispatch in the census, not just an untouched buffer.
+
+A source-built desktop vertex/pixel shader draws a fullscreen triangle to an 8x4 RGBA8 offscreen target.
+The pixel shader reads the actual output buffer via a root SRV, discards the sentinel, and writes the
+low three bytes of the compute word as RGB. The graphics recording uses the same underlying DIRECT
+queue after the guest consumer fence; no CPU readback is copied into the graphics input. The native
+queue and output resource identities are checked. Separate clear and post-draw copies are checked
+after the graphics fence. The input and all 320 output words are also checked.
+
+| Case | Both argument snapshots | Changed pixels / 32 |
+| --- | --- | ---: |
+| GPU writer, X=2 | (2,1,1) | 8 |
+| GPU writer, X=5 | (5,1,1) | 20 |
+| GPU writer, X=0 | (0,1,1) | 0 |
+| Writer omitted | (0,0,0) | 0 |
+
+The unchanged pixels must match the clear value, and all changed pixels must match their exact RGB
+reference. The stale-SRV control binds the original input instead of the compute output; the unchanged
+positive pixel oracle rejects it, while the independently predicted stale colours match the GPU readback.
+The device-free mutation mode also detects individual changed pixel words and short readbacks.
+The existing outside-record, multi-command, count-buffer, output-alias and manifest refusal controls
+remain in the same test. The observer checks native D3D12 debug errors when the info queue is available.
+The commands above run both the original and extended fixtures; use dev instead of release for Debug.
+This is a synthetic producer-to-pixel proof through translated indirect Compute, with a desktop graphics
+observer; it does not establish a translated graphics shader, a retail-scene producer, or a performance gain.
 
 ### Entry values from a buffer descriptor
 
