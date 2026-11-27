@@ -47,7 +47,10 @@ parser rejects a 65th). `startup_stream_draw_warp` runs the two-process replay: 
 translated stream draw writes a recipe, a second process with the same directory loads and
 precreates it, and all 32 RGBA bytes match. It also holds the recipe file exclusively during a
 draw and checks that the draw still renders with exact pixels while the file size stays unchanged.
-That test covers the unused depth-stencil normalisation as well.
+It then seeds 63 valid records for another translation key, checks that the next draw appends the
+matching record as number 64 and the following process logs `precreated 1`, and seeds 64 records to
+check that the draw still renders while the file stays at 64. That test covers the unused
+depth-stencil normalisation as well.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_pso_recipe$' -V
