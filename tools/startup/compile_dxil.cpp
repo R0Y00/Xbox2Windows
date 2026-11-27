@@ -124,6 +124,10 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
               <<" request_and_translation_ms="<<elapsed_ms(start)<<"\n";
         for (const auto &b : program.bindings) {
             using Table = x2w::ComputeViewBinding::ScalarTable;
+            if (b.kind == x2w::ComputeViewKind::heap_sampler) {
+                report << "sampler_heap span=" << b.required_bytes << '\n';
+                continue;
+            }
             report << (x2w::compute_uav(b.kind) ? "u" : "t") << b.shader_register << " root=" << b.root_parameter
                    << " bytes=" << b.byte_offset << " min_size=" << b.required_bytes;
             if (b.scalar_table == Table::reflected_cbv) report << " table_view=reflected-cbv";

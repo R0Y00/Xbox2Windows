@@ -137,6 +137,47 @@ def hardware(replay, sdk, work, root):
     return 0
 
 
+def ir(dumper):
+    """No GPU and no DXC: evaluate lane 0 of the module the direct frontend builds.
+
+    An inline float source (240-248) is a binary16 operand here, so it must read the binary16 value
+    of the constant (as v_add_f16 does), not the low half of its f32 pattern.
+    """
+    from native_direct_container_check import words
+    from native_f16_alu_check import INLINE_F16, SHIFT, compute_container, interpret, store
+    from native_scalar_lds_check import scalar, sop1, vmove
+
+    # Pinned rows, independent of the lowering: 1.0 = 0.5 * 2^1 and 1/(2pi) = 0x3118 = 0.6367 * 2^-2.
+    assert frexp_f16(0x3C00) == (1, 0x3800) and frexp_f16(0x3118) == (0xFFFE, 0x3918)
+    cases = []
+    for src, half in INLINE_F16.items():
+        cases.append(([vop1(0x59, 3, src)], frexp_f16(half)[1]))
+        cases.append(([vop1(0x5A, 3, src)], frexp_f16(half)[0]))
+    cases.append((vop3_unary(0x1D9, 3, 245, abs0=1, clamp=1), frexp_f16(0x4000, clamp=True)[1]))  # |-2.0| clamp
+    cases.append((vop3_unary(0x1D9, 3, 242, neg0=1), frexp_f16(0xBC00)[1]))                         # -1.0
+    cases.append((vop3_unary(0x1DA, 3, 248, neg0=1), frexp_f16(0xB118)[0]))                         # -1/(2pi)
+    cases.append((v_mov_lit(1, 0x12343C00) + [vop1(0x59, 3, 257)], 0x3800))                         # VGPR source
+    code = [sop1(3, 20, 4), sop1(3, 21, 128), 0xF408080A, 0xFA000020,
+            scalar(0x1E, 7, 5, 128 + SHIFT), vmove(8, 7), sop1(3, 126, 129)]
+    want = []
+    for k, (op, result) in enumerate(cases):
+        code += v_mov_lit(3, HIGH_SEED | (0x1000 + k)) + op + store(4 * k, 3)
+        want.append(HIGH_SEED | result)
+    code.append(0xBF810000)
+    with tempfile.TemporaryDirectory(prefix='x2w_native_frexp_f16_ir_') as temp:
+        path = Path(temp) / 'frexp.cdx'
+        path.write_bytes(compute_container(words(*code)))
+        run = subprocess.run([dumper, str(path)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    stores = sorted(interpret(run.stdout))
+    assert [address for address, _ in stores] == [4 * k for k in range(len(want))], stores[:4]
+    bad = [(k, f'{got:08x}', f'{expected:08x}') for k, ((_, got), expected) in enumerate(zip(stores, want))
+           if got != expected]
+    assert not bad, bad
+    print(f'v_frexp_mant_f16/exp_i16_f16 IR: {len(want)} results matched, inline floats read as binary16')
+    return 0
+
+
 def main(mode, executable, sdk):
     with tempfile.TemporaryDirectory(prefix='x2w_native_frexp_f16_') as temp:
         work = Path(temp)
@@ -148,4 +189,6 @@ def main(mode, executable, sdk):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == 'ir':
+        raise SystemExit(ir(sys.argv[2]))
     raise SystemExit(main(sys.argv[1], sys.argv[2], sys.argv[3]))

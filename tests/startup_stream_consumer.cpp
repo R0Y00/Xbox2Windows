@@ -220,6 +220,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool shared_uav = mode == "dispatch-read-write-uav";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
@@ -241,6 +242,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         !from_file("X2W_TEST_DISPATCH_FIELDS", fields, sizeof(fields))) return 2;
     UINT input[words];
     std::memcpy(input, buffers[0], sizeof(input));
+    if (shared_uav) std::memcpy(buffers[1], input, sizeof(input));
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     void* placed[2]{};
     UINT descriptors[2][4]{};
@@ -318,7 +320,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     }
-    if (mode == "dispatch-records32") {  // the output's descriptor at table byte 32, none at byte 16
+    if (mode == "dispatch-records32" || shared_uav) {  // the output's descriptor at table byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
@@ -739,9 +741,11 @@ int main(int argc, char** argv)
                std::strcmp(argv[9], "tiled") == 0};
         bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
         if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
-                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69) &&
+                          (bc7.width != 512 || bc7.height != 256)) return 2;
         if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
         else if (bc7.small4k) {}
+        else if (std::strcmp(argv[9], "display64k") == 0) bc7.display64k = true;
         else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;
