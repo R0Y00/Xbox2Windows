@@ -1886,7 +1886,11 @@ struct DirectCompute {
             z = select(cmp("ne", ir.binary("and", wave64 ? select(upper_half, pair_high(i, i.src[2]), val(2)) : val(2), lane_bit), "0"), b, a);
         } else if (n == "v_mov_b32")
             z = a;
-        else if (n == "s_mul_i32" || n == "v_mul_lo_u32" || n == "v_mul_lo_i32")
+        else if (n == "s_absdiff_i32") {
+            // D = S0 - S1 wrapped to 32 bits, negated when negative, so 0x80000000 stays; SCC = D != 0 below.
+            auto difference = ir.binary("sub", a, b);
+            z = select(cmp("slt", difference, "0"), ir.binary("sub", "0", difference), difference);
+        } else if (n == "s_mul_i32" || n == "v_mul_lo_u32" || n == "v_mul_lo_i32")
             z = ir.binary("mul", a, b);
         else if (n == "v_mul_hi_u32" || n == "v_mul_hi_i32" || n == "s_mul_hi_u32" || n == "s_mul_hi_i32") {
             // Accumulate 16-bit partial products without requiring Int64ShaderOps.
