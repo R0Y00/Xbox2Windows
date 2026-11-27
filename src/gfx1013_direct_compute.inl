@@ -1531,6 +1531,58 @@ struct DirectCompute {
                                                       ir.binary("and", rounded, "65535")));
             return true;
         }
+        if (n == "v_fma_f16" || n == "v_fmac_f16" || n == "v_fmamk_f16" || n == "v_fmaak_f16") {
+            if (graphics_input)
+                return false;
+            if (i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " DPP form");
+            if (i.subword)
+                refuse(i.pc, "unsupported " + string(n) + " SDWA form");
+            if (i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " omod");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            if (n == "v_fmac_f16" && i.wide && (((i.abs | i.neg) & 4) || i.src[2]))
+                refuse(i.pc, "unsupported v_fmac_f16 third-source modifier");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto half_bits = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                string bits;
+                if (r >= 240 && r <= 248) {
+                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                                0xc000, 0x4400, 0xc400, 0x3118};
+                    bits = to_string(halves[r - 240]);
+                } else if (r == 255)
+                    bits = to_string(i.literal & 65535u);
+                else if (r >= 128 && r <= 192)
+                    bits = to_string((r - 128) & 65535u);
+                else if (r >= 193 && r <= 208)
+                    bits = to_string((192u - r) & 65535u);
+                else
+                    bits = ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j))
+                    bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j))
+                    bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto a = half_bits(0);
+            auto b = n == "v_fmamk_f16" ? to_string(i.literal & 65535u) : half_bits(1);
+            auto c = n == "v_fma_f16"   ? half_bits(2)
+                   : n == "v_fmac_f16"  ? ir.binary("and", read(i.dst), "65535")
+                   : n == "v_fmamk_f16" ? half_bits(1)
+                                        : to_string(i.literal & 65535u);
+            auto result = fused_half_rne(a, b, c);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
@@ -3362,7 +3414,11 @@ struct DirectCompute {
             op.name == "v_cvt_f16_u16" ||
             op.name == "v_cvt_f16_i16" ||
             op.name == "v_cvt_u16_f16" ||
-            op.name == "v_cvt_i16_f16")
+            op.name == "v_cvt_i16_f16" ||
+            op.name == "v_fma_f16" ||
+            op.name == "v_fmac_f16" ||
+            op.name == "v_fmamk_f16" ||
+            op.name == "v_fmaak_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")

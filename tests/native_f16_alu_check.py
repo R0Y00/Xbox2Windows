@@ -274,7 +274,7 @@ def refusal_programs():
     programs.append(([0xb98005c1] + add + [0xbf810000], 'unsupported binary16 rounding or denormal mode'))
     programs.append(([0xbfa40001] + add + [0xbf810000], 'unsupported compute control instruction s_round_mode'))
     programs.append(([0xbfa5000c] + add + [0xbf810000], 'unsupported compute control instruction s_denorm_mode'))
-    programs.append((vop2(0x36, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_fmac_f16'))
+    programs.append((vop2(0x3c, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_pk_fmac_f16'))
     programs.append((vop2(0x3a, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_min_f16'))
     return programs
 
@@ -458,6 +458,10 @@ def _exec(line, values, memory, stores):
         elif 'legacyF16ToF32' in rhs:
             argument = re.search(r'i32 (\S+)\)$', rhs)
             values[name] = ('float', _widen(_i32(argument.group(1), values)))
+        elif 'unaryBits.i32(i32 33,' in rhs:
+            argument = re.search(r'i32 33,\s*i32 ([^,\s\)]+)\)', rhs)
+            x = _i32(argument.group(1), values) & 0xffffffff
+            values[name] = ('i32', (32 - x.bit_length()) if x else 0xffffffff)
         elif 'createHandleFromBinding' in rhs or 'annotateHandle' in rhs:
             values[name] = ('handle', 0)
         else:
