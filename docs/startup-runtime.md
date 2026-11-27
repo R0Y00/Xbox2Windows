@@ -2993,8 +2993,8 @@ are copied from scratch only after the result is queued.
 
 ```powershell
 cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
-cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
-ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check startup_xapu_opus_count_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus|opus_count)$' -V
 ```
 
 `startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
@@ -3003,6 +3003,12 @@ a reference decoder, untouched guard floats past the decoded frames, a malformed
 an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
 starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
 off. It is registered only in the optional build.
+
+`startup_xapu_opus_count` uses the same libopus tones to check the bounded telemetry: decoded
+packets, dequeued completions and each refusal reason. The stand-in writes one
+`x2w-audio XApu opus summary:` line at the last disconnect or at process exit, and the audio sink
+reports `accepted` and `not_open` submissions. See
+[the completion-count note](experiments/startup-opus-completion-count.md).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
