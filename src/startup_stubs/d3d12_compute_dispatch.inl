@@ -86,6 +86,13 @@ int adapter_32_lane_waves()
     return waves.WaveOps && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 32;
 }
 
+bool adapter_reports_shader_model_below_6_6()
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+    return SUCCEEDED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) &&
+           model.HighestShaderModel < D3D_SHADER_MODEL_6_6;
+}
+
 // The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
 // unavailable, or null when it is ready.
 const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, std::size_t bytes)
@@ -208,6 +215,8 @@ const char* load_compute_translation(ComputeTranslation& tr)
             const int waves = adapter_32_lane_waves();
             if (waves < 0) return "pipeline creation failed (adapter wave capability query failed)";
             if (!waves) return "pipeline creation failed (adapter has no 32-lane waves)";
+            if (adapter_reports_shader_model_below_6_6())
+                return "pipeline creation failed (adapter shader model below 6.6)";
         }
         return failure;
     }
@@ -266,9 +275,11 @@ bool translate_compute_natively(ComputeTranslation& tr)
         }
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
-        // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
+        // Direct modules use shader model 6.6 with WaveSize(32).
         if (adapter_32_lane_waves() != 1)
             throw std::runtime_error("the adapter has no 32-lane waves");
+        if (adapter_reports_shader_model_below_6_6())
+            throw std::runtime_error("the adapter reports shader model below 6.6");
         // Never released: a static destructor would release DXC after its module may have detached.
         static x2w::ShaderDxilCompiler* const compiler =
             new x2w::ShaderDxilCompiler(x2w::ShaderDxilCompiler::runtime_worker(sdk));

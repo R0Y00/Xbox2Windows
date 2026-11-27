@@ -14,9 +14,10 @@ cache and no offline translator, and compares all 320 output words with a CPU re
 3. The entry values and views fill the same `ComputeTranslation` a published `<key>.txt` fills. The existing
    dispatch path then resolves the table descriptors, sets the resource states and records the Dispatch.
 
-Accepted: root constants, a raw table buffer loaded per lane and a raw table buffer stored to. These are the
-bindings the fixture runs. Refused: every other view kind (a scalar buffer load included), a sampler, more than
-32 entry values or inputs or 8 outputs, an adapter without 32-lane waves, and whatever the frontend refuses. The
+Accepted bindings include root constants, scalar and per-lane raw table buffer inputs, raw buffer outputs,
+2D texture inputs, and four-channel float 1D, 2D, 2D array and 3D texture outputs. The stand-in refuses other
+view kinds, samplers, more than 32 entry values or inputs or 8 outputs, and adapters that lack wave32 or report
+a shader model below 6.6. The
 stand-in logs the first 16 refusals of a process with their reason. A refused key is left to a published
 translation. The in-process translation is tried once per key and before a published `<key>.txt`.
 
@@ -44,7 +45,7 @@ decoder, and the consumer's `dispatch-records32` mode writes the table with the 
 5. Order: the first program runs again with its published translation in the cache. The log still names the
    native translation, and all 320 words match.
 
-Without 32-lane waves, step 1 instead checks that the native translation is refused by that name with every word
+Without wave32 or shader model 6.6, step 1 instead checks the named capability refusal with every word
 untouched. Step 2 is left out, steps 3 and 4 run, step 5 runs the first program through its published
 translation, and the check exits 77.
 

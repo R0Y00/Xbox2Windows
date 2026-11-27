@@ -192,12 +192,14 @@ def store_3d1d(directory, consumer, dxc, env, form, compiler=None, sdk=None):
     dim = '3d' if volume else '1d'
     assert f'uav 0 tex{dim} float table 1 64 channels 4' in manifest, manifest
     got, result = run(directory, consumer, env, mode, layout)
-    no_waves = 'pipeline creation failed (adapter has no 32-lane waves)'
-    if compiler is not None and lines(result, f'not translated: {no_waves}'):
-        assert got == initial and len(lines(result, f'Dispatch(2, 1, 1) refused: {no_waves}')) == 1, (
-            result.stderr[-3000:])
-        print(f'{form}: native DXIL and manifest verified, dispatch skipped because the adapter has no wave32')
-        return False
+    if compiler is not None:
+        for capability in ('adapter has no 32-lane waves', 'adapter shader model below 6.6'):
+            reason = f'pipeline creation failed ({capability})'
+            if lines(result, f'not translated: {reason}'):
+                assert got == initial and len(lines(result, f'Dispatch(2, 1, 1) refused: {reason}')) == 1, (
+                    result.stderr[-3000:])
+                print(f'{form}: native DXIL and manifest verified; dispatch skipped ({capability})')
+                return False
     assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
     assert got == expected, (form, sum(a != b for a, b in zip(got, expected, strict=True)))
     clean(result)

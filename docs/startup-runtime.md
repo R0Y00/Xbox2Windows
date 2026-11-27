@@ -949,8 +949,8 @@ UAVs. Texture views include 2D SRVs and four-channel float 1D, 2D, 2D array, and
 (`texture_uav` and `half4_texture_uav`). Samplers, typed or indexed buffer views, and instructions
 outside the compiler's supported set are refused. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
-published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
-wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
+published translations, so `-Translate` can run beside it for those pipelines. A direct module requires
+shader model 6.6 and wave32. The in-process
 translation is tried once per key and before a published `<key>.txt`. It covers compute only; graphics
 pipelines still need a published translation.
 
@@ -964,7 +964,7 @@ natively, be refused at Dispatch, and leave all 6,144 volume words untouched.
 Targeted in-process readbacks also check a mip-one 1D float store, a 2D-array float store into
 relative slice 1 (physical slice 2), and a packed D16 store into an RGBA16_FLOAT texture with
 round-to-nearest-even input conversion. Each case checks every output value, including sentinels
-outside the store region. On adapters without 32-lane waves the cases check the named refusal
+outside the store region. On adapters without wave32 or shader model 6.6 the cases check the named refusal
 and untouched output before the test returns 77.
 
 ### Compute pipeline requests
@@ -3625,12 +3625,14 @@ all eight block bytes with the next byte unchanged. Reproduce the portable and w
 
 ### Offline compute manifests for 3D and 1D UAVs
 
-The runtime half of #2902 is ported to `cpp-migration`. For offline compute
-requests, the C++ formatter emits `uav N tex3d float table P OFF channels 4` and
+For offline compute requests, the C++ formatter emits `uav N tex3d float table P OFF channels 4` and
 `uav N tex1d float table P OFF channels 4`. The stand-in validates UAV view
 dimensions and mip levels, including the W-slice range within the selected 3D mip.
 
-Results: on an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100) the 3D, 3D NSA and 1D
-store cases matched their mip-one words after `compile_dxil` published the request, and the mismatched view, 3D W
-range and 1D mip controls were refused with the sentinels intact; on WARP the PSO was refused, so only the manifests were checked there. Writing a 3D UAV as
-`tex2d`, or dropping the W range check, each fail it.
+The native offline fixture compiles 1D, 3D and 3D NSA programs, checks the published DXIL and
+manifest, and compares every mip-one word after Dispatch. It also checks that mismatched views,
+an invalid 3D W range and an invalid 1D mip leave the output unchanged. An adapter without
+wave32 or shader model 6.6 can verify the native manifests before returning a capability skip for Dispatch.
+The separate texture dispatch fixture exercises the existing Python-published path.
+
+`ctest --preset dev --no-tests=error -R '^startup_compute_dispatch_texture_(native_)?(warp|hardware)$' -V`
