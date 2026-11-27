@@ -490,7 +490,7 @@ def main():
         if len(args) not in (2, 3):
             raise SystemExit(__doc__)
         return check_binary(args[1], args[2] if len(args) == 3 else None)
-    library = None
+    library = LIBRARY
     if args and args[0] == 'controls':
         # The explicit selection drives the extraction half of every control below; it is not
         # captured globally, so check_binary and the no-argument auto-discovery keep their own.
