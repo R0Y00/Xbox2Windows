@@ -1948,6 +1948,19 @@ struct DirectCompute {
             auto pad = ir.binary("sub", "32", width);
             auto field = shift("ashr", a, b);
             z = select(cmp("eq", width, "0"), "0", shift("ashr", shift("shl", field, pad), pad));
+        } else if (n == "v_cvt_pk_u8_f32") {
+            // (S2 & ~(0xff << 8 * S1[1:0])) | (flt32_to_uint8(S0) << 8 * S1[1:0]) (#2997), with the conversion
+            // gfx2hlsl.py measured on RDNA 2: round to nearest even, saturate to [0, 255], zero for NaN, both zeros
+            // and negatives. (bits - 1) < 0x7f800000 holds exactly from the smallest subnormal to +inf, as an integer
+            // test that fast-math cannot fold.
+            auto amount = ir.binary("shl", ir.binary("and", b, "3"), "3");
+            auto positive = cmp("ult", ir.binary("sub", a, "1"), "2139095040");
+            auto bounded = ir.invoke("float", "binary.f32", 36, {{"float", ir.value("bitcast i32 " + a + " to float")},
+                                     {"float", "2.550000e+02"}}, "nounwind readnone");
+            auto rounded = ir.invoke("float", "unary.f32", 26, {{"float", bounded}}, "nounwind readnone");
+            auto byte = select(positive, ir.binary("and", ir.value("fptoui float " + rounded + " to i32"), "255"), "0");
+            auto keep = ir.binary("xor", ir.binary("shl", "255", amount), "4294967295");
+            z = ir.binary("or", ir.binary("and", val(2), keep), ir.binary("shl", byte, amount));
         } else if (n == "s_orn2_b32")
             z = ir.binary("or", a, ir.binary("xor", b, "4294967295"));
         else if (n == "s_nand_b32" || n == "s_xnor_b32")
