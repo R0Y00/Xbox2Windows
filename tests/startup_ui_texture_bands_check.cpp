@@ -94,9 +94,13 @@ std::uint64_t shader_key(const void* vs, std::size_t vs_bytes, const void* ps, s
 bool write_file_bytes(const wchar_t* path, const void* data, std::size_t bytes)
 {
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
+    if (f == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr, "CreateFileW(%ls) failed err=%lu\n", path, GetLastError());
+        return false;
+    }
     DWORD written = 0;
     const bool done = WriteFile(f, data, static_cast<DWORD>(bytes), &written, nullptr) && written == bytes;
+    if (!done) std::fprintf(stderr, "WriteFile(%ls) failed err=%lu written=%lu/%zu\n", path, GetLastError(), written, bytes);
     CloseHandle(f);
     return done;
 }
@@ -116,8 +120,9 @@ bool compile_hlsl(const char* source, const char* target, ComPtr<ID3DBlob>& blob
 
 bool publish_translated_pso(void* device, const wchar_t* cache_dir, const char* vs_hlsl, const char* ps_hlsl,
                             const char* manifest, void* root, const void* root_blob, std::size_t root_bytes,
-                            void*& out_pso)
+                            void*& out_pso, HRESULT* out_hr = nullptr)
 {
+    if (out_hr) *out_hr = E_FAIL;
     ComPtr<ID3DBlob> vs, ps;
     if (!compile_hlsl(vs_hlsl, "vs_5_1", vs) || !compile_hlsl(ps_hlsl, "ps_5_1", ps)) return false;
 
@@ -142,7 +147,14 @@ bool publish_translated_pso(void* device, const wchar_t* cache_dir, const char* 
         {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs->GetBufferPointer(), vs->GetBufferSize()}},
     };
     const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
-    return ok(invoke(device, 86, arg(&stream_desc), arg(&__uuidof(ID3D12PipelineState)), arg(&out_pso))) && out_pso;
+    const HRESULT hr = static_cast<HRESULT>(invoke(device, 86, arg(&stream_desc), arg(&__uuidof(ID3D12PipelineState)), arg(&out_pso)));
+    if (out_hr) *out_hr = hr;
+    if (FAILED(hr) || !out_pso) {
+        std::fprintf(stderr, "CreatePipelineState(slot 86) failed hr=0x%08lx out_pso=%p\n",
+                     static_cast<unsigned long>(hr), out_pso);
+        return false;
+    }
+    return true;
 }
 
 // Clean-room GFX10 thin non-XOR tiler for 32-bit texels (modes 0x105 = 4K_S, 0x10a = 64K_D)
@@ -250,19 +262,44 @@ void print_platform_header(IDXGIAdapter* adapter)
 int pick_adapter(const char* backend, ComPtr<IDXGIAdapter>& adapter)
 {
     ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
-    if (std::strcmp(backend, "warp") == 0) {
-        return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) ? 0 : 77;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        std::fprintf(stderr, "FAIL CreateDXGIFactory1: hr=0x%08lx\n", static_cast<unsigned long>(hr));
+        return 3;
     }
-    if (std::strcmp(backend, "hardware") != 0) return 2;
+    if (std::strcmp(backend, "warp") == 0) {
+        hr = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+        if (FAILED(hr)) {
+            std::printf("skip: EnumWarpAdapter unavailable hr=0x%08lx (rc=77)\n", static_cast<unsigned long>(hr));
+            return 77;
+        }
+        return 0;
+    }
+    if (std::strcmp(backend, "hardware") != 0) {
+        std::fprintf(stderr, "FAIL invalid backend '%s'\n", backend);
+        return 2;
+    }
     ComPtr<IDXGIFactory6> factory6;
-    if (FAILED(factory.As(&factory6))) return 77;
+    hr = factory.As(&factory6);
+    if (FAILED(hr)) {
+        std::printf("skip: IDXGIFactory6 unavailable hr=0x%08lx (rc=77)\n", static_cast<unsigned long>(hr));
+        return 77;
+    }
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> cand;
-        if (factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&cand)) == DXGI_ERROR_NOT_FOUND)
+        hr = factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&cand));
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            std::printf("skip: no physical D3D12 FL12_0 adapter found (rc=77)\n");
             return 77;
+        }
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "FAIL EnumAdapterByGpuPreference(%u): hr=0x%08lx\n", i, static_cast<unsigned long>(hr));
+            return 3;
+        }
         DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(cand->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+        if (FAILED(cand->GetDesc1(&desc))) continue;
+        const bool is_basic_render = desc.VendorId == 0x1414 && desc.DeviceId == 0x008c;
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || is_basic_render) continue;
         if (SUCCEEDED(D3D12CreateDevice(cand.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
             adapter = cand;
             return 0;
@@ -283,13 +320,15 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes)
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
 }
 
-void* make_committed(void* device, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state)
+void* make_committed(void* device, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
+                     HRESULT* out_hr = nullptr)
 {
     const D3D12_HEAP_PROPERTIES props{heap_type};
     void* out = nullptr;
-    if (FAILED(static_cast<HRESULT>(invoke(device, 127, arg(&props), D3D12_HEAP_FLAG_NONE, arg(&desc), state,
-                                            0, 0, 0, 0, arg(&__uuidof(ID3D12Resource)), arg(&out)))))
-        return nullptr;
+    const HRESULT hr = static_cast<HRESULT>(invoke(device, 127, arg(&props), D3D12_HEAP_FLAG_NONE, arg(&desc), state,
+                                                     0, 0, 0, 0, arg(&__uuidof(ID3D12Resource)), arg(&out)));
+    if (out_hr) *out_hr = hr;
+    if (FAILED(hr) || !out) return nullptr;
     return out;
 }
 
@@ -331,6 +370,202 @@ bool has_alternating_black_bands(const Rgba* rows, UINT pitch_texels, UINT h)
     }
     return even_nz && odd_black;
 }
+bool check_xg_mip0_layout(ID3D12Device* desktop)
+{
+    std::printf("[Path 2c] Pin XG MipLevels==0 layout against desktop GetCopyableFootprints\n");
+    using LayoutFn = HRESULT(WINAPI*)(void*, unsigned char*);
+    using CopyIntoFn = HRESULT(WINAPI*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    using ReleaseFn = UINT64(WINAPI*)(void*);
+    auto read64 = [](const unsigned char* p) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+    auto read32 = [](const unsigned char* p) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+
+    struct Case {
+        const char* name;
+        D3D12_RESOURCE_DIMENSION dim;
+        UINT width;
+        UINT height;
+        UINT16 depth_or_array;
+        UINT expected_mips;
+        bool verify_copy_into;
+    };
+    const Case cases[] = {
+        {"32x32 2D MipLevels=0 (6 mips)", D3D12_RESOURCE_DIMENSION_TEXTURE2D, 32, 32, 1, 6, true},
+        {"32x32x2 2D-Array MipLevels=0 (12 subresources)", D3D12_RESOURCE_DIMENSION_TEXTURE2D, 32, 32, 2, 6, true},
+        {"32x8 2D MipLevels=0 (6 mips)", D3D12_RESOURCE_DIMENSION_TEXTURE2D, 32, 8, 1, 6, false},
+        {"16x1x4 1D-Array MipLevels=0 (5 mips)", D3D12_RESOURCE_DIMENSION_TEXTURE1D, 16, 1, 4, 5, false},
+        {"8x4x16 3D MipLevels=0 (5 mips)", D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 4, 16, 5, false},
+    };
+
+    for (const auto& c : cases) {
+        const D3D12_RESOURCE_DESC xg_desc{c.dim, 0, c.width, c.height, c.depth_or_array, 0,
+                                          DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+                                          D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+        D3D12_RESOURCE_DESC ref_desc = xg_desc;
+        ref_desc.MipLevels = static_cast<UINT16>(c.expected_mips);
+
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 15> fp{};
+        std::array<UINT, 15> rows{};
+        std::array<UINT64, 15> row_bytes{};
+        UINT64 slice_total = 0;
+        desktop->GetCopyableFootprints(&ref_desc, 0, c.expected_mips, 0, fp.data(), rows.data(), row_bytes.data(), &slice_total);
+        const UINT64 expected_stride = (slice_total + 0xFFFFull) & ~0xFFFFull;
+        const bool volume = c.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const UINT expected_slices = volume ? 1u : c.depth_or_array;
+        const UINT64 expected_total = expected_stride * expected_slices;
+
+        void** computer = nullptr;
+        const HRESULT create_hr = XGCreateTextureComputer(&xg_desc, &computer, 0, 0);
+        if (FAILED(create_hr) || !computer) {
+            std::fprintf(stderr, "  FAIL Path 2c (%s): XGCreateTextureComputer hr=0x%08lx\n",
+                         c.name, static_cast<unsigned long>(create_hr));
+            return false;
+        }
+        auto* tbl = static_cast<void**>(computer[0]);
+        std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+        const HRESULT layout_hr = reinterpret_cast<LayoutFn>(tbl[2])(computer, layout.data());
+        if (FAILED(layout_hr)) {
+            std::fprintf(stderr, "  FAIL Path 2c (%s): computer_layout hr=0x%08lx\n",
+                         c.name, static_cast<unsigned long>(layout_hr));
+            reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+            return false;
+        }
+
+        const UINT64 got_total = read64(layout.data() + 0x00);
+        const UINT64 got_align = read64(layout.data() + 0x08);
+        const UINT32 got_mips = read32(layout.data() + 0x10);
+        const UINT32 got_planes = read32(layout.data() + 0x14);
+        const unsigned char* plane0 = layout.data() + 0x18;
+        const UINT64 got_plane_size = read64(plane0 + 0x08);
+        const UINT64 got_slice_stride = read64(plane0 + 0x10);
+        const UINT64 got_plane_align = read64(plane0 + 0x18);
+        const UINT64 expected_slice_stride = expected_slices > 1 ? expected_stride : 0;
+
+        if (got_total != expected_total || got_align != 0x10000 || got_mips != c.expected_mips || got_planes != 1 ||
+            got_plane_size != expected_total || got_slice_stride != expected_slice_stride || got_plane_align != 0x10000) {
+            std::fprintf(stderr,
+                         "  FAIL Path 2c (%s): header/plane mismatch total=0x%llx(exp 0x%llx) align=0x%llx mips=%u(exp %u) "
+                         "planes=%u plane_size=0x%llx stride=0x%llx(exp 0x%llx)\n",
+                         c.name, static_cast<unsigned long long>(got_total), static_cast<unsigned long long>(expected_total),
+                         static_cast<unsigned long long>(got_align), got_mips, c.expected_mips, got_planes,
+                         static_cast<unsigned long long>(got_plane_size), static_cast<unsigned long long>(got_slice_stride),
+                         static_cast<unsigned long long>(expected_slice_stride));
+            reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+            return false;
+        }
+
+        for (UINT m = 0; m < c.expected_mips; ++m) {
+            const unsigned char* mip = plane0 + 0x38 + m * 0x70;
+            const UINT64 exp_slice_size = UINT64{fp[m].Footprint.RowPitch} * rows[m];
+            const UINT64 exp_size = exp_slice_size * fp[m].Footprint.Depth;
+            const UINT32 exp_depth = volume ? fp[m].Footprint.Depth : expected_slices;
+            if (read64(mip + 0x00) != exp_size || read64(mip + 0x08) != fp[m].Offset ||
+                read64(mip + 0x10) != exp_slice_size || read32(mip + 0x18) != fp[m].Footprint.Width ||
+                read32(mip + 0x1c) != fp[m].Footprint.RowPitch ||
+                read32(mip + 0x20) != D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT ||
+                read32(mip + 0x24) != fp[m].Footprint.Width || read32(mip + 0x28) != fp[m].Footprint.Height ||
+                read32(mip + 0x2c) != exp_depth || read32(mip + 0x30) != fp[m].Footprint.Width ||
+                read32(mip + 0x34) != fp[m].Footprint.Height || read32(mip + 0x38) != exp_depth ||
+                read32(mip + 0x3c) != 1) {
+                std::fprintf(stderr,
+                             "  FAIL Path 2c (%s): mip %u mismatch off=0x%llx(exp 0x%llx) pitch=%u(exp %u) "
+                             "size=0x%llx(exp 0x%llx) dims=%ux%ux%u(exp %ux%ux%u)\n",
+                             c.name, m, static_cast<unsigned long long>(read64(mip + 0x08)),
+                             static_cast<unsigned long long>(fp[m].Offset), read32(mip + 0x1c), fp[m].Footprint.RowPitch,
+                             static_cast<unsigned long long>(read64(mip + 0x00)), static_cast<unsigned long long>(exp_size),
+                             read32(mip + 0x18), read32(mip + 0x28), read32(mip + 0x2c),
+                             fp[m].Footprint.Width, fp[m].Footprint.Height, exp_depth);
+                reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+                return false;
+            }
+        }
+
+        if (c.verify_copy_into) {
+            auto* mem = static_cast<unsigned char*>(VirtualAlloc(nullptr, static_cast<SIZE_T>(got_total),
+                                                                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!mem) {
+                std::fprintf(stderr, "  FAIL Path 2c (%s): VirtualAlloc(%llu) failed\n",
+                             c.name, static_cast<unsigned long long>(got_total));
+                reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+                return false;
+            }
+            std::memset(mem, 0, static_cast<std::size_t>(got_total));
+            for (UINT s = 0; s < expected_slices; ++s) {
+                for (UINT m = 0; m < c.expected_mips; ++m) {
+                    const UINT w = fp[m].Footprint.Width;
+                    const UINT h = fp[m].Footprint.Height;
+                    const UINT sub = s * c.expected_mips + m;
+                    std::vector<Rgba> lin(w * h);
+                    for (UINT y = 0; y < h; ++y) {
+                        for (UINT x = 0; x < w; ++x) {
+                            lin[y * w + x] = {static_cast<std::uint8_t>(1 + x),
+                                              static_cast<std::uint8_t>(17 + y),
+                                              static_cast<std::uint8_t>(33 + m * 20),
+                                              static_cast<std::uint8_t>(100 + s * 50)};
+                        }
+                    }
+                    const HRESULT copy_hr = reinterpret_cast<CopyIntoFn>(tbl[8])(
+                        computer, mem, 0, sub, reinterpret_cast<const unsigned char*>(lin.data()), w * 4, 0);
+                    if (FAILED(copy_hr)) {
+                        std::fprintf(stderr, "  FAIL Path 2c (%s): CopyIntoSubresource(sub=%u) hr=0x%08lx\n",
+                                     c.name, sub, static_cast<unsigned long>(copy_hr));
+                        VirtualFree(mem, 0, MEM_RELEASE);
+                        reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+                        return false;
+                    }
+                }
+            }
+            const UINT total_subs = expected_slices * c.expected_mips;
+            std::array<unsigned char, 16> dummy{};
+            const HRESULT oob_hr = reinterpret_cast<CopyIntoFn>(tbl[8])(
+                computer, mem, 0, total_subs, dummy.data(), 4, 0);
+            if (oob_hr != E_INVALIDARG) {
+                std::fprintf(stderr, "  FAIL Path 2c (%s): out-of-range subresource %u returned 0x%08lx instead of E_INVALIDARG\n",
+                             c.name, total_subs, static_cast<unsigned long>(oob_hr));
+                VirtualFree(mem, 0, MEM_RELEASE);
+                reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+                return false;
+            }
+            for (UINT s = 0; s < expected_slices; ++s) {
+                const UINT64 slice_base = UINT64{s} * expected_stride;
+                for (UINT m = 0; m < c.expected_mips; ++m) {
+                    const UINT w = fp[m].Footprint.Width;
+                    const UINT h = fp[m].Footprint.Height;
+                    for (UINT y = 0; y < h; ++y) {
+                        for (UINT x = 0; x < w; ++x) {
+                            Rgba got{};
+                            std::memcpy(&got, mem + slice_base + fp[m].Offset + UINT64{y} * fp[m].Footprint.RowPitch + x * 4, 4);
+                            const Rgba exp{static_cast<std::uint8_t>(1 + x),
+                                           static_cast<std::uint8_t>(17 + y),
+                                           static_cast<std::uint8_t>(33 + m * 20),
+                                           static_cast<std::uint8_t>(100 + s * 50)};
+                            if (got != exp) {
+                                std::fprintf(stderr, "  FAIL Path 2c (%s): slice=%u mip=%u (%u,%u) layout mismatch\n",
+                                             c.name, s, m, x, y);
+                                VirtualFree(mem, 0, MEM_RELEASE);
+                                reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            VirtualFree(mem, 0, MEM_RELEASE);
+        }
+        reinterpret_cast<ReleaseFn>(tbl[1])(computer);
+        std::printf("  Path 2c (%s): PASS (mips=%u, total=0x%llx, stride=0x%llx)\n",
+                    c.name, got_mips, static_cast<unsigned long long>(got_total),
+                    static_cast<unsigned long long>(got_slice_stride));
+    }
+    return true;
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -346,9 +581,17 @@ int main(int argc, char** argv)
         SetEnvironmentVariableA("X2W_D3D12_DEBUG", "1");
 
     wchar_t temp_root[MAX_PATH]{}, cache_dir[MAX_PATH]{};
-    if (!GetTempPathW(MAX_PATH, temp_root)) return 3;
-    std::swprintf(cache_dir, MAX_PATH, L"%sx2w_ui_bands_%lu", temp_root, GetCurrentProcessId());
-    CreateDirectoryW(cache_dir, nullptr);
+    const DWORD temp_len = GetTempPathW(MAX_PATH, temp_root);
+    if (!temp_len || temp_len >= MAX_PATH) {
+        std::fprintf(stderr, "FAIL GetTempPathW: err=%lu (rc=3)\n", GetLastError());
+        return 3;
+    }
+    const bool has_sep = temp_root[temp_len - 1] == L'\\' || temp_root[temp_len - 1] == L'/';
+    std::swprintf(cache_dir, MAX_PATH, L"%s%sx2w_ui_bands_%lu", temp_root, has_sep ? L"" : L"\\", GetCurrentProcessId());
+    if (!CreateDirectoryW(cache_dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        std::fprintf(stderr, "FAIL CreateDirectoryW(%ls): err=%lu (rc=3)\n", cache_dir, GetLastError());
+        return 3;
+    }
     SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache_dir);
 
     auto cleanup_cache = [&] {
@@ -368,6 +611,12 @@ int main(int argc, char** argv)
         }
         RemoveDirectoryW(cache_dir);
     };
+    auto fail_step = [&](const char* step, HRESULT hr, int rc) {
+        std::fflush(stdout);
+        std::fprintf(stderr, "FAIL %s: hr=0x%08lx (rc=%d)\n", step, static_cast<unsigned long>(hr), rc);
+        cleanup_cache();
+        return rc;
+    };
 
     ComPtr<IDXGIAdapter> adapter;
     const int adapter_rc = pick_adapter(argv[1], adapter);
@@ -377,17 +626,19 @@ int main(int argc, char** argv)
     }
     print_platform_header(adapter.Get());
 
-    ComPtr<ID3D12Device> desktop;
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) {
-        cleanup_cache();
-        return 77;
-    }
-
+    // Create the stand-in device first so X2W_D3D12_DEBUG=1 enables the debug layer before any ID3D12Device exists.
     std::array<unsigned char, 64> params{};
     void* device = nullptr;
-    if (FAILED(D3D12XboxCreateDevice(adapter.Get(), params.data(), __uuidof(ID3D12Device), &device)) || !device) {
-        cleanup_cache();
-        return 5;
+    HRESULT hr = D3D12XboxCreateDevice(adapter.Get(), params.data(), __uuidof(ID3D12Device), &device);
+    if (FAILED(hr) || !device) {
+        return fail_step("D3D12XboxCreateDevice", hr, 5);
+    }
+
+    ComPtr<ID3D12Device> desktop;
+    hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop));
+    if (FAILED(hr)) {
+        invoke(device, 2);
+        return fail_step("D3D12CreateDevice(desktop)", hr, 77);
     }
 
     // Guest root signature: [0] SRV descriptor table (1 entry at t1 for PS), matching runtime manifests.
@@ -399,15 +650,15 @@ int main(int argc, char** argv)
     root_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     const D3D12_ROOT_SIGNATURE_DESC root_desc{1, &root_param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> root_blob;
-    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &root_blob, nullptr))) {
-        cleanup_cache();
-        return 6;
+    hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &root_blob, nullptr);
+    if (FAILED(hr)) {
+        return fail_step("D3D12SerializeRootSignature", hr, 6);
     }
     void* guest_root = nullptr;
-    if (!ok(invoke(device, 16, 0, arg(root_blob->GetBufferPointer()), root_blob->GetBufferSize(),
-                   arg(&__uuidof(ID3D12RootSignature)), arg(&guest_root))) || !guest_root) {
-        cleanup_cache();
-        return 7;
+    hr = static_cast<HRESULT>(invoke(device, 16, 0, arg(root_blob->GetBufferPointer()), root_blob->GetBufferSize(),
+                                     arg(&__uuidof(ID3D12RootSignature)), arg(&guest_root)));
+    if (FAILED(hr) || !guest_root) {
+        return fail_step("CreateRootSignature(slot 16)", hr, 7);
     }
 
     // 1) Preceding gradient draw PSO (indexed quad, no texture)
@@ -442,32 +693,36 @@ float4 main(In i) : SV_Target {
     const char* tex_manifest = "x2w-manifest 1\nud 2\nudsrc 0 basevertex\nudsrc 1 stride 0\nsrv 0 buf vb 0\nsrv 1 tex2d table 0 0\nsmp 0 00000092 00000000 00000000 00000000\n";
 
     void *grad_pso = nullptr, *tex_pso = nullptr;
+    HRESULT pso_hr = S_OK;
     if (!publish_translated_pso(device, cache_dir, grad_vs, grad_ps, grad_manifest, guest_root,
-                                root_blob->GetBufferPointer(), root_blob->GetBufferSize(), grad_pso) ||
-        !publish_translated_pso(device, cache_dir, grad_vs, tex_ps, tex_manifest, guest_root,
-                                root_blob->GetBufferPointer(), root_blob->GetBufferSize(), tex_pso)) {
-        cleanup_cache();
-        return 8;
+                                root_blob->GetBufferPointer(), root_blob->GetBufferSize(), grad_pso, &pso_hr)) {
+        return fail_step("publish_translated_pso(grad_pso)", pso_hr, 8);
+    }
+    if (!publish_translated_pso(device, cache_dir, grad_vs, tex_ps, tex_manifest, guest_root,
+                                root_blob->GetBufferPointer(), root_blob->GetBufferSize(), tex_pso, &pso_hr)) {
+        return fail_step("publish_translated_pso(tex_pso)", pso_hr, 8);
     }
 
     // Render target & readbacks (using desktop resources for RT via wrapped RTV + guest resources for upload/readback)
     const D3D12_RESOURCE_DESC rt_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, kWidth, kHeight, 1, 1,
                                       DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                                       D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-    void* rt = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, rt_desc, D3D12_RESOURCE_STATE_COMMON);
-    if (!rt) { cleanup_cache(); return 9; }
+    HRESULT res_hr = S_OK;
+    void* rt = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, rt_desc, D3D12_RESOURCE_STATE_COMMON, &res_hr);
+    if (!rt) return fail_step("make_committed(rt)", res_hr, 9);
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT rt_fp{};
     UINT rt_rows = 0;
     UINT64 rt_row_bytes = 0, rt_total = 0;
     desktop->GetCopyableFootprints(&rt_desc, 0, 1, 0, &rt_fp, &rt_rows, &rt_row_bytes, &rt_total);
-    void* rt_readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, buffer_desc(rt_total), D3D12_RESOURCE_STATE_COPY_DEST);
+    void* rt_readback = make_committed(device, D3D12_HEAP_TYPE_READBACK, buffer_desc(rt_total),
+                                       D3D12_RESOURCE_STATE_COPY_DEST, &res_hr);
+    if (!rt_readback) return fail_step("make_committed(rt_readback)", res_hr, 10);
 
     const struct { D3D12_DESCRIPTOR_HEAP_DESC d; Word b, s; } rtv_hdesc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
     void* rtv_heap = nullptr;
-    if (!ok(invoke(device, 14, arg(&rtv_hdesc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&rtv_heap))) || !rt_readback) {
-        cleanup_cache(); return 10;
-    }
+    hr = static_cast<HRESULT>(invoke(device, 14, arg(&rtv_hdesc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&rtv_heap)));
+    if (FAILED(hr) || !rtv_heap) return fail_step("CreateDescriptorHeap(rtv)", hr, 10);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(rtv_heap, 9))};
     const D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
     invoke(device, 20, arg(rt), arg(&rtv_desc), rtv.ptr);
@@ -478,21 +733,22 @@ float4 main(In i) : SV_Target {
         {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
         arg(view_shadow.data()), view_shadow.size()};
     void* srv_heap = nullptr;
-    if (!ok(invoke(device, 14, arg(&srv_hdesc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&srv_heap)))) {
-        cleanup_cache(); return 11;
-    }
+    hr = static_cast<HRESULT>(invoke(device, 14, arg(&srv_hdesc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&srv_heap)));
+    if (FAILED(hr) || !srv_heap) return fail_step("CreateDescriptorHeap(srv)", hr, 11);
     const Word srv_cpu0 = invoke(srv_heap, 9);
     const Word srv_gpu0 = invoke(srv_heap, 10);
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
     void *queue = nullptr, *alloc = nullptr, *list = nullptr, *fence = nullptr;
-    if (!ok(invoke(device, 8, arg(&qd), arg(&__uuidof(ID3D12CommandQueue)), arg(&queue))) ||
-        !ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&alloc))) ||
-        !ok(invoke(device, 73, arg(list_desc), arg(alloc), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))) ||
-        !ok(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence)))) {
-        cleanup_cache(); return 12;
-    }
+    hr = static_cast<HRESULT>(invoke(device, 8, arg(&qd), arg(&__uuidof(ID3D12CommandQueue)), arg(&queue)));
+    if (FAILED(hr) || !queue) return fail_step("CreateCommandQueue(slot 8)", hr, 12);
+    hr = static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&alloc)));
+    if (FAILED(hr) || !alloc) return fail_step("CreateCommandAllocator(slot 9)", hr, 12);
+    hr = static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(alloc), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list)));
+    if (FAILED(hr) || !list) return fail_step("CreateCommandList(slot 73)", hr, 12);
+    hr = static_cast<HRESULT>(invoke(device, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence)));
+    if (FAILED(hr) || !fence) return fail_step("CreateFence(slot 36)", hr, 12);
     Word fence_val = 0;
 
     // Indexed quad vertices (full 32x32 target, top-down UV [0,1]x[0,1])
@@ -702,16 +958,22 @@ float4 main(In i) : SV_Target {
 
     std::printf("[Path 1] Linear Reference (CopyTextureRegion slot 16 -> committed & placed DEFAULT textures)\n");
     {
-        void* tex = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, mip_desc_3, D3D12_RESOURCE_STATE_COMMON);
-        void* up = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer_desc(mip_total), D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!tex || !up) { cleanup_cache(); return 20; }
+        HRESULT step_hr = S_OK;
+        void* tex = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, mip_desc_3, D3D12_RESOURCE_STATE_COMMON, &step_hr);
+        if (!tex) return fail_step("Path 1 make_committed(tex)", step_hr, 20);
+        void* up = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer_desc(mip_total), D3D12_RESOURCE_STATE_GENERIC_READ, &step_hr);
+        if (!up) return fail_step("Path 1 make_committed(up)", step_hr, 20);
         void* mapped = nullptr;
-        if (!ok(invoke(up, 8, 0, 0, arg(&mapped))) || !mapped) { cleanup_cache(); return 21; }
+        step_hr = static_cast<HRESULT>(invoke(up, 8, 0, 0, arg(&mapped)));
+        if (FAILED(step_hr) || !mapped) return fail_step("Path 1 Map(up)", step_hr, 21);
         std::memset(mapped, 0, static_cast<std::size_t>(mip_total));
         fill_linear_footprints(static_cast<unsigned char*>(mapped));
         invoke(up, 9, 0, 0);
 
-        if (!ok(invoke(alloc, 8)) || !ok(invoke(list, 139, arg(alloc), 0))) { cleanup_cache(); return 22; }
+        step_hr = static_cast<HRESULT>(invoke(alloc, 8));
+        if (FAILED(step_hr)) return fail_step("Path 1 CommandAllocator::Reset", step_hr, 22);
+        step_hr = static_cast<HRESULT>(invoke(list, 139, arg(alloc), 0));
+        if (FAILED(step_hr)) return fail_step("Path 1 CommandList::Reset", step_hr, 22);
         for (UINT m = 0; m < kMips; ++m) {
             D3D12_TEXTURE_COPY_LOCATION to{static_cast<ID3D12Resource*>(tex), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             to.SubresourceIndex = m;
@@ -719,13 +981,15 @@ float4 main(In i) : SV_Target {
             from.PlacedFootprint = mip_fp[m];
             invoke(list, 16, arg(&to), 0, 0, 0, arg(&from), 0);
         }
-        if (!ok(invoke(list, 9))) { cleanup_cache(); return 23; }
+        step_hr = static_cast<HRESULT>(invoke(list, 9));
+        if (FAILED(step_hr)) return fail_step("Path 1 CommandList::Close", step_hr, 23);
         void* lists[] = {list};
         invoke(queue, 10, 1, arg(lists));
-        if (!ok(invoke(queue, 14, arg(fence), ++fence_val)) || !wait_fence(fence, fence_val)) { cleanup_cache(); return 24; }
+        step_hr = static_cast<HRESULT>(invoke(queue, 14, arg(fence), ++fence_val));
+        if (FAILED(step_hr) || !wait_fence(fence, fence_val)) return fail_step("Path 1 Signal/Wait", step_hr, 24);
 
         std::vector<std::vector<Rgba>> rb_mips;
-        if (!readback_texture_mips(tex, rb_mips)) { cleanup_cache(); return 25; }
+        if (!readback_texture_mips(tex, rb_mips)) return fail_step("Path 1 readback_texture_mips", E_FAIL, 25);
         print_rows_summary("gpu texels mip0", rb_mips[0].data(), mip_fp[0].Footprint.RowPitch / 4, kWidth, kHeight);
         for (UINT m = 0; m < kMips; ++m) {
             UINT bx = 0, by = 0; Rgba g{}, e{};
@@ -751,18 +1015,33 @@ float4 main(In i) : SV_Target {
         auto* backing = static_cast<unsigned char*>(VirtualAlloc(nullptr, static_cast<SIZE_T>(mip_total),
                                                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         std::memset(backing, 0, static_cast<std::size_t>(mip_total));
+        HRESULT step_hr = S_OK;
         void* tex = nullptr;
-        if (!ok(invoke(device, 133, arg(backing), arg(&mip_desc_3), D3D12_RESOURCE_STATE_COMMON,
-                       0, arg(&__uuidof(ID3D12Resource)), arg(&tex))) || !tex) {
-            cleanup_cache(); return 28;
+        step_hr = static_cast<HRESULT>(invoke(device, 133, arg(backing), arg(&mip_desc_3), D3D12_RESOURCE_STATE_COMMON,
+                                              0, arg(&__uuidof(ID3D12Resource)), arg(&tex)));
+        if (FAILED(step_hr) || !tex) {
+            VirtualFree(backing, 0, MEM_RELEASE);
+            return fail_step("Path 1b place_resource_x(slot 133)", step_hr, 28);
         }
-        void* up = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer_desc(mip_total), D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* up = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, buffer_desc(mip_total), D3D12_RESOURCE_STATE_GENERIC_READ, &step_hr);
+        if (!up) {
+            invoke(tex, 2);
+            VirtualFree(backing, 0, MEM_RELEASE);
+            return fail_step("Path 1b make_committed(up)", step_hr, 28);
+        }
         void* mapped = nullptr;
-        if (!up || !ok(invoke(up, 8, 0, 0, arg(&mapped))) || !mapped) { cleanup_cache(); return 28; }
+        step_hr = static_cast<HRESULT>(invoke(up, 8, 0, 0, arg(&mapped)));
+        if (FAILED(step_hr) || !mapped) {
+            invoke(up, 2); invoke(tex, 2); VirtualFree(backing, 0, MEM_RELEASE);
+            return fail_step("Path 1b Map(up)", step_hr, 28);
+        }
         fill_linear_footprints(static_cast<unsigned char*>(mapped));
         invoke(up, 9, 0, 0);
 
-        if (!ok(invoke(alloc, 8)) || !ok(invoke(list, 139, arg(alloc), 0))) { cleanup_cache(); return 28; }
+        step_hr = static_cast<HRESULT>(invoke(alloc, 8));
+        if (FAILED(step_hr)) { invoke(up, 2); invoke(tex, 2); VirtualFree(backing, 0, MEM_RELEASE); return fail_step("Path 1b CommandAllocator::Reset", step_hr, 28); }
+        step_hr = static_cast<HRESULT>(invoke(list, 139, arg(alloc), 0));
+        if (FAILED(step_hr)) { invoke(up, 2); invoke(tex, 2); VirtualFree(backing, 0, MEM_RELEASE); return fail_step("Path 1b CommandList::Reset", step_hr, 28); }
         for (UINT m = 0; m < kMips; ++m) {
             D3D12_TEXTURE_COPY_LOCATION to{static_cast<ID3D12Resource*>(tex), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
             to.SubresourceIndex = m;
@@ -770,10 +1049,15 @@ float4 main(In i) : SV_Target {
             from.PlacedFootprint = mip_fp[m];
             invoke(list, 16, arg(&to), 0, 0, 0, arg(&from), 0);
         }
-        if (!ok(invoke(list, 9))) { cleanup_cache(); return 28; }
+        step_hr = static_cast<HRESULT>(invoke(list, 9));
+        if (FAILED(step_hr)) { invoke(up, 2); invoke(tex, 2); VirtualFree(backing, 0, MEM_RELEASE); return fail_step("Path 1b CommandList::Close", step_hr, 28); }
         void* lists[] = {list};
         invoke(queue, 10, 1, arg(lists));
-        if (!ok(invoke(queue, 14, arg(fence), ++fence_val)) || !wait_fence(fence, fence_val)) { cleanup_cache(); return 28; }
+        step_hr = static_cast<HRESULT>(invoke(queue, 14, arg(fence), ++fence_val));
+        if (FAILED(step_hr) || !wait_fence(fence, fence_val)) {
+            invoke(up, 2); invoke(tex, 2); VirtualFree(backing, 0, MEM_RELEASE);
+            return fail_step("Path 1b Signal/Wait", step_hr, 28);
+        }
 
         // Mutate backing memory with distinct non-zero bytes and advance >15 frames so CPU recheck would
         // overwrite the CopyTextureRegion result unless list_copy_texture marked the texture GPU-written.
@@ -864,6 +1148,7 @@ float4 main(In i) : SV_Target {
 
     if (!run_xg_footprint_path("[Path 2a] XG footprint path (Alignment=0, MipLevels=3)", 3)) record_fail(30);
     if (!run_xg_footprint_path("[Path 2b] XG footprint path (Alignment=0, MipLevels=0 full chain)", 0)) record_fail(31);
+    if (!check_xg_mip0_layout(desktop.Get())) record_fail(32);
 
     // =========================================================================
     // PATH 3: small_texture_4k compact path (Alignment = 0x1000, MipLevels = 3)
@@ -1105,6 +1390,7 @@ float4 main(In i) : SV_Target {
     invoke(tex_pso, 2);
     invoke(grad_pso, 2);
     invoke(guest_root, 2);
+    desktop.Reset();
     invoke(device, 2);
     cleanup_cache();
     if (!all_ok) {
