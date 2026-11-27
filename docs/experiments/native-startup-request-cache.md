@@ -22,6 +22,10 @@ the startup runtime cache loaders on WARP and hardware without manual renaming o
      `<key>.ps.cso`, `<key>.gs.cso` for `gfx1013-container-rect`, and `<key>.cs.cso` for compute), withdraws any
      prior `<key>.txt` before rewriting stages or on refusal, records `<key>.psdep` when `.psin` was used, and
      atomically publishes `<key>.txt` after all stage `.cso` files are in place.
+   - The watch and batch writers also publish `<key>.psinh`, an FNV-1a digest of the base `.psin`/`.ps57in`
+     extension, length and bytes. A `.rtv` variant resolves its base sidecars, so the digest and mtime checks
+     invalidate the variant with its base. The digest is computed before and after translation; a sidecar that
+     changes during the compile refuses the manifest write.
 
 ## Verification and negative controls
 

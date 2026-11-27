@@ -29,6 +29,13 @@ COMPUTE_GROUP = (2, 3, 4)
 COMPUTE_RSRC2 = C.USER7 | C.TGID_X | C.TGID_Y | C.TGID_Z | C.tidig(3)
 
 
+def put_variant(cache: Path, base: int, formats: tuple[int, ...]) -> int:
+    line = "rtv1 " + " ".join(map(str, (base, *formats)))
+    key = G.fnv(line.encode("ascii"))
+    (cache / f"req_{key:016x}.rtv").write_text(line, encoding="ascii")
+    return key
+
+
 def fullscreen_vs_words() -> bytes:
     vop1 = lambda op, dst, src: 0x7E000000 | dst << 17 | op << 9 | src
     vop2 = lambda op, dst, src0, vsrc1: op << 25 | dst << 17 | vsrc1 << 9 | src0
@@ -311,6 +318,9 @@ def check_controls(cli: Path, sdk: Path) -> int:
         watch_fail = watch_cache / f"{watch_key:016x}.fail"
         watch_digest = watch_cache / f"{watch_key:016x}.psinh"
 
+        variant_key = put_variant(watch_cache, watch_key, (28,))
+        variant_manifest = watch_cache / f"{variant_key:016x}.txt"
+
         def run_watch() -> list[str]:
             result = subprocess.run(
                 [cli, "--watch", sdk, frontend, watch_cache, "--once"],
@@ -322,12 +332,16 @@ def check_controls(cli: Path, sdk: Path) -> int:
         first_lines = run_watch()
         assert any(line.endswith(": compiled graphics") for line in first_lines), first_lines
         assert watch_manifest.is_file() and watch_digest.is_file()
+        assert f"{variant_key:016x}: compiled graphics" in first_lines, first_lines
+        assert variant_manifest.is_file(), variant_manifest
         published_ns = watch_manifest.stat().st_mtime_ns
+        variant_ns = variant_manifest.stat().st_mtime_ns
 
         # Unchanged sidecar bytes: the published manifest is a cache hit and is not rewritten.
         second_lines = run_watch()
         assert not any("compiled graphics" in line for line in second_lines), second_lines
         assert watch_manifest.stat().st_mtime_ns == published_ns
+        assert variant_manifest.stat().st_mtime_ns == variant_ns
 
         # A contradictory slot-57 sidecar with an older mtime must withdraw the stale manifest.
         conflicting = b"PSI1" + struct.pack("<II", 0x8002, 0x8002)
@@ -337,6 +351,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
         older_lines = run_watch()
         assert any("conflicting stream and slot-57 pixel entry records" in line for line in older_lines), older_lines
         assert not watch_manifest.exists(), "an older-mtime sidecar kept its stale manifest"
+        assert not variant_manifest.exists(), "an older-mtime base sidecar kept the RTV variant"
         older_fail = watch_fail.read_bytes()
 
         # The same bytes with a newer mtime, from a fresh publication, must withdraw it identically.
@@ -345,11 +360,13 @@ def check_controls(cli: Path, sdk: Path) -> int:
         republished = run_watch()
         assert any(line.endswith(": compiled graphics") for line in republished), republished
         assert watch_manifest.is_file()
+        assert variant_manifest.is_file(), variant_manifest
         watch_sidecar.write_bytes(conflicting)
         os.utime(watch_sidecar, None)
         newer_lines = run_watch()
         assert any("conflicting stream and slot-57 pixel entry records" in line for line in newer_lines), newer_lines
         assert not watch_manifest.exists()
+        assert not variant_manifest.exists(), "a newer-mtime base sidecar kept the RTV variant"
         assert watch_fail.read_bytes() == older_fail
 
         # A changed .psin with a preserved mtime is invalidated instead of served from cache.
@@ -357,12 +374,14 @@ def check_controls(cli: Path, sdk: Path) -> int:
         watch_fail.unlink()
         restored = run_watch()
         assert any(line.endswith(": compiled graphics") for line in restored), restored
+        assert variant_manifest.is_file(), variant_manifest
         preserved_ns = watch_psin.stat().st_mtime_ns
         watch_psin.write_text(describe_psin(watch_key, DECOY_MASKS), encoding="ascii")
         os.utime(watch_psin, ns=(preserved_ns, preserved_ns))
         changed_lines = run_watch()
         assert any("pixel input description" in line for line in changed_lines), changed_lines
         assert not watch_manifest.exists(), "a changed sidecar with a preserved mtime kept its stale manifest"
+        assert not variant_manifest.exists(), "a changed sidecar with a preserved mtime kept the RTV variant"
 
     print("native_startup_request_cache controls: current and archived graphics (.psin) + compute (.c67) cache entries, 8 refusal controls and watch-sidecar invalidation passed")
     return 0

@@ -11,6 +11,10 @@
   containers are skipped, truncated or missing stage `.cso` files are resumed, `.psin` additions/updates/removals
   trigger rechecks, pre-existing `.fail` entries are retried once on the first pass, and unchanged `.fail` entries
   are skipped on subsequent passes until the marker or `.psin` is rewritten.
+- The published `<key>.psinh` digest is taken from the base `.psin`/`.ps57in` pair. An `.rtv` variant resolves the
+  same base sidecars as its mtime check, so a deliberate or preserved-mtime base sidecar change withdraws the
+  variant too. The digest is computed before and after the graphic translation; a change during compilation
+  refuses the publish instead of pairing new bytes with DXIL made from the old ones.
 
 ## Verification
 
@@ -19,6 +23,7 @@
 cmake --preset release
 cmake --build --preset release --target compile_dxil
 ctest --preset release --no-tests=error -V -R "^native_compile_dxil_watch$"
+ctest --preset release --no-tests=error -j 1 -R "^(native_startup_request_cache_controls|native_rtv_variant_controls)$"
 ```
 
 ## Limits

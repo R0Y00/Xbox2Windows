@@ -44,11 +44,21 @@ static void sidecar_hash_bytes(uint64_t& hash, const void* data, size_t size) {
     }
 }
 
+static std::optional<fs::path> graphics_psin_path(const fs::path& marker);
+
 static bool pixel_sidecar_hash(const fs::path& marker, std::string& digest) {
     uint64_t hash = 1469598103934665603ull;
     bool any = false;
-    for (const auto& path : {fs::path(marker).replace_extension(L".psin"),
-                             fs::path(marker).replace_extension(L".ps57in")}) {
+    fs::path psin = marker;
+    if (marker.extension() == L".rtv") {
+        const auto base = graphics_psin_path(marker);
+        if (!base)
+            return false;
+        psin = *base;
+    } else {
+        psin.replace_extension(L".psin");
+    }
+    for (const auto& path : {psin, fs::path(psin).replace_extension(L".ps57in")}) {
         std::error_code ec;
         if (!fs::is_regular_file(path, ec))
             continue;
@@ -851,6 +861,8 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         fs::remove(fail_path, ignored);
         return "compiled compute";
     }
+    std::string sidecar_before;
+    const bool sidecar_present_before = pixel_sidecar_hash(req.marker, sidecar_before);
     auto input = x2w::read_graphics_request(req.marker);
     bool hit = false;
     auto pair = x2w::prepare_direct_graphics(input.a, input.b, cache_dir, hit, input.root, input.input_layout,
@@ -863,6 +875,12 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
                 : "RTV variant has no runtime manifest: its vertex inputs, target types or bindings are not described");
     auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", cache_dir, true, sink);
     auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", cache_dir, true, sink);
+    std::string sidecar_after;
+    const bool sidecar_present_after = pixel_sidecar_hash(req.marker, sidecar_after);
+    if (sidecar_present_before != sidecar_present_after || sidecar_before != sidecar_after) {
+        fs::remove(manifest_path, ignored);
+        throw std::runtime_error("pixel input sidecar changed during compilation");
+    }
     publish_atomic(fs::path(stem) += L".vs.cso", vs_dxil.data(), vs_dxil.size());
     publish_atomic(fs::path(stem) += L".ps.cso", ps_dxil.data(), ps_dxil.size());
     const fs::path psdep_path = fs::path(stem) += L".psdep";
@@ -870,9 +888,8 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
     else
         fs::remove(psdep_path, ignored);
-    std::string sidecar_digest;
-    if (pixel_sidecar_hash(req.marker, sidecar_digest))
-        publish_atomic(fs::path(stem) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+    if (sidecar_present_before)
+        publish_atomic(fs::path(stem) += L".psinh", sidecar_before.data(), sidecar_before.size());
     else
         fs::remove(fs::path(stem) += L".psinh", ignored);
     publish_atomic(manifest_path, manifest->data(), manifest->size());
@@ -1167,6 +1184,8 @@ int wmain(int argc, wchar_t** argv) {
             const fs::path psdep_path = fs::path(stems[i]) += L".psdep";
             std::error_code ignored;
             fs::remove(manifest_path, ignored);
+            std::string sidecar_before;
+            const bool sidecar_present_before = pixel_sidecar_hash(inputs[i], sidecar_before);
             auto input = x2w::read_graphics_request(inputs[i]);
             bool hit = false;
             auto pair = x2w::prepare_direct_graphics(input.a, input.b, argv[2], hit, input.root, input.input_layout, input.pixel_entry,
@@ -1194,6 +1213,10 @@ int wmain(int argc, wchar_t** argv) {
             }
             auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", argv[2], true, report);
             auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", argv[2], true, report);
+            std::string sidecar_after;
+            const bool sidecar_present_after = pixel_sidecar_hash(inputs[i], sidecar_after);
+            if (sidecar_present_before != sidecar_present_after || sidecar_before != sidecar_after)
+                throw std::runtime_error("pixel input sidecar changed during compilation");
             if (!gs_dxil.empty())
                 publish_atomic(fs::path(stems[i]) += L".gs.cso", gs_dxil.data(), gs_dxil.size());
             publish_atomic(outputs[i], vs_dxil.data(), vs_dxil.size());
@@ -1201,9 +1224,8 @@ int wmain(int argc, wchar_t** argv) {
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
-                std::string sidecar_digest;
-                if (pixel_sidecar_hash(inputs[i], sidecar_digest))
-                    publish_atomic(fs::path(stems[i]) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+                if (sidecar_present_before)
+                    publish_atomic(fs::path(stems[i]) += L".psinh", sidecar_before.data(), sidecar_before.size());
                 else
                     fs::remove(fs::path(stems[i]) += L".psinh", ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
