@@ -77,6 +77,15 @@ bool float_output_format(DXGI_FORMAT format)
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 
+// Whether the adapter runs 32-lane waves: 1 yes, 0 no, -1 the capability query failed.
+int adapter_32_lane_waves()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+    if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))))
+        return -1;
+    return waves.WaveOps && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 32;
+}
+
 // The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
 // unavailable, or null when it is ready.
 const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, std::size_t bytes)
@@ -193,7 +202,15 @@ const char* load_compute_translation(ComputeTranslation& tr)
     }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
-    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) return failure;
+    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) {
+        // The manifest does not declare a wave size. Report the adapter capability alongside the PSO failure.
+        if (!std::strcmp(failure, "pipeline creation failed")) {
+            const int waves = adapter_32_lane_waves();
+            if (waves < 0) return "pipeline creation failed (adapter wave capability query failed)";
+            if (!waves) return "pipeline creation failed (adapter has no 32-lane waves)";
+        }
+        return failure;
+    }
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
@@ -233,9 +250,7 @@ bool translate_compute_natively(ComputeTranslation& tr)
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
         // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
-        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
-        if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))) ||
-            !waves.WaveOps || waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32)
+        if (adapter_32_lane_waves() != 1)
             throw std::runtime_error("the adapter has no 32-lane waves");
         // Never released: a static destructor would release DXC after its module may have detached.
         static x2w::ShaderDxilCompiler* const compiler =

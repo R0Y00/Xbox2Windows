@@ -1,6 +1,6 @@
 """Translated compute programs with 2D texture views, dispatched through the stand-in's command list (slot 14).
 
-usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware>
+usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware> [compile_dxil SDK]
 
 Texture output: the consumer creates the image store program of startup_compute_image_store_d16_check.py as a
 device slot 67 pipeline, fills a 32x8 RGBA16_FLOAT texture with sentinel halves, creates an unordered access view of
@@ -14,6 +14,7 @@ runs share one cache:
    with one logged reason, every half keeps its sentinel.
 A fifth run binds the same program under a manifest edited to declare no entry values.
 The 1D and 3D float texture cases check mip-one readback, a mismatched view, and an invalid 3D W range.
+With compile_dxil, run only the 1D and 3D cases using native offline manifests and bytecode.
 
 Texture input: case A of startup_gfx2hlsl_compute_check.py with a level-zero sample of a 2D texture XORed into the
 stored word (a static sampler, a texture view at table byte 64). The consumer adds a 1x1 RGBA8 texture whose red
@@ -150,11 +151,17 @@ def store(directory, consumer, dxc, env):
           f'untouched before translation, without a Dispatch and for a refused view; debug layer: {layer}')
 
 
-def store_3d1d(directory, consumer, dxc, env, form):
+def store_3d1d(directory, consumer, dxc, env, form, compiler=None, sdk=None):
     cache, base = prepare(directory)
     env = dict(base, **env)
-    (directory / 'compute_root').write_bytes(C.root_blob(3, table_range=True))
-    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    env.pop('X2W_NATIVE_SHADERS', None)
+    root = directory / 'compute_root'
+    root_blob = C.root_blob(3, table_range=True)
+    if compiler is not None:
+        # Use an explicit UAV(u0) range at guest offset 2 for the native frontend.
+        root_blob = root_blob[:-24] + struct.pack('<6I', 1, 1, 0, 0, 0, 2)
+    root.write_bytes(root_blob)
+    env['X2W_TEST_COMPUTE_ROOT'] = str(root)
     (directory / 'program').write_bytes(V.program(form))
     (directory / 'data').write_bytes(DATA)
     (directory / 'state').write_bytes(state_a(V.group(form), V.A.RSRC2))
@@ -173,11 +180,24 @@ def store_3d1d(directory, consumer, dxc, env, form):
     got, result = run(directory, consumer, env, mode, layout)
     assert got == initial and len(lines(result, 'Dispatch(2, 1, 1) refused: no translation')) == 1
     key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
-    translate(cache, dxc, key)
+    if compiler is None:
+        translate(cache, dxc, key)
+    else:
+        compiled = subprocess.run([compiler, sdk, directory / 'frontend', 'gfx1013-direct-cs@0', '--requests',
+                                   cache, cache], capture_output=True, text=True)
+        assert compiled.returncode == 0 and 'requests=1 compiled=1 refused=0' in compiled.stdout, (
+            compiled.stdout, compiled.stderr)
+        assert (cache / f'{key:016x}.cs.cso').read_bytes().startswith(b'DXBC')
     manifest = (cache / f'{key:016x}.txt').read_text().splitlines()
     dim = '3d' if volume else '1d'
     assert f'uav 0 tex{dim} float table 1 64 channels 4' in manifest, manifest
     got, result = run(directory, consumer, env, mode, layout)
+    no_waves = 'pipeline creation failed (adapter has no 32-lane waves)'
+    if compiler is not None and lines(result, f'not translated: {no_waves}'):
+        assert got == initial and len(lines(result, f'Dispatch(2, 1, 1) refused: {no_waves}')) == 1, (
+            result.stderr[-3000:])
+        print(f'{form}: native DXIL and manifest verified, dispatch skipped because the adapter has no wave32')
+        return False
     assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
     assert got == expected, (form, sum(a != b for a, b in zip(got, expected, strict=True)))
     clean(result)
@@ -196,6 +216,7 @@ def store_3d1d(directory, consumer, dxc, env, form):
         assert len(refusal) == 1 and refusal[0].endswith(reason), result.stderr[-3000:]
         assert got == untouched and not lines(result, 'Dispatch(2, 1, 1) translated')
     print(f'{form}: {len(expected)} mip-one words match; incompatible views refused with sentinels intact')
+    return True
 
 
 # v_xor_b32 v5, v5, v12: the assembled `v_xor_b32 v5, v5, v6` of case A with its second source register changed
@@ -391,11 +412,19 @@ def uniform_image_load_mip(directory, consumer, dxc, env):
           f'x=0 and mip=1 controls each differ at {written} words; debug layer: {layer}')
 
 
-def main(consumer, dxc, adapter):
+def main(consumer, dxc, adapter, compiler=None, sdk=None):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
+        if compiler is not None:
+            dispatched = [store_3d1d(Path(temporary) / form, consumer, dxc, env, form, compiler, sdk)
+                          for form in V.FORMS]
+            if not any(dispatched):
+                return 77
+            assert all(dispatched), dispatched
+            print(f'startup_compute_dispatch_texture: native manifests and dispatch passed on {adapter}')
+            return 0
         store(Path(temporary) / 'store', consumer, dxc, env)
         for form in V.FORMS:
             store_3d1d(Path(temporary) / form, consumer, dxc, env, form)
@@ -406,6 +435,6 @@ def main(consumer, dxc, adapter):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
+    if len(sys.argv) not in (4, 6) or sys.argv[3] not in ('warp', 'hardware'):
         sys.exit(__doc__)
-    main(*sys.argv[1:])
+    sys.exit(main(*sys.argv[1:]))

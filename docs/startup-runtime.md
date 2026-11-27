@@ -3613,3 +3613,15 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+### Offline compute manifests for 3D and 1D UAVs
+
+The runtime half of #2902 is ported to `cpp-migration`. For offline compute
+requests, the C++ formatter emits `uav N tex3d float table P OFF channels 4` and
+`uav N tex1d float table P OFF channels 4`. The stand-in validates UAV view
+dimensions and mip levels, including the W-slice range within the selected 3D mip.
+
+Results: on an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100) the 3D, 3D NSA and 1D
+store cases matched their mip-one words after `compile_dxil` published the request, and the mismatched view, 3D W
+range and 1D mip controls were refused with the sentinels intact; on WARP the PSO was refused, so only the manifests were checked there. Writing a 3D UAV as
+`tex2d`, or dropping the W range check, each fail it.
