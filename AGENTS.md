@@ -174,6 +174,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_check.py
 ./out/pe-env/bin/python -B tests/startup_pixel_image_store_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_store_3d1d_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_heap_record_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_store_format_xyzw_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_heap_word_check.py

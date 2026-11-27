@@ -4826,14 +4826,14 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     };
     const char* skip = nullptr;
     bool default_view = false;
-    bool uav_denied = false;  // a UAV of a resource without unordered access: recorded as not created, as before #2649
+    bool record_refused_uav = false;
     if (N == 17) skip = "constant buffer view (title GPU address)";
     if (N >= 18 && N <= 21 && args[0]) {
         const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
         if (N == 18 && (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) skip = "resource denies shader resource views";
         if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             skip = "resource lacks unordered access";
-            uav_denied = true;
+            record_refused_uav = true;
         }
         if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
         if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
@@ -4868,6 +4868,20 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 if (first_calls(mismatched, 6))
                     log("x2w-d3d12 Device::slot%d view dimension %u needs resource dimension %u, resource has %u", N, view_dimension,
                         x2w_view_dimension::needed(N, view_dimension), dimension);
+            } else if constexpr (N == 19) {
+                if (view_dimension == D3D12_UAV_DIMENSION_TEXTURE3D &&
+                    x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    std::memcpy(&view, reinterpret_cast<const void*>(described), sizeof(view));
+                    skip = volume_uav_range_error(resource_desc, view.Texture3D);
+                    record_refused_uav = skip != nullptr;
+                } else if (view_dimension == D3D12_UAV_DIMENSION_TEXTURE1D &&
+                           x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    std::memcpy(&view, reinterpret_cast<const void*>(described), sizeof(view));
+                    if (view.Texture1D.MipSlice >= resource_desc.MipLevels) skip = "an output 1D texture mip is outside the resource";
+                    record_refused_uav = skip != nullptr;
+                }
             }
         }
     }
@@ -4886,7 +4900,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         } else if constexpr (N == 19) {
             // A translated compute Dispatch tells this refusal from a descriptor that holds no view by the record.
             // A refused creation leaves a descriptor that still holds a live view as it is.
-            if (uav_denied && !descriptor_has_live_view(args[D], title_dest)) record_view(false);
+            if (record_refused_uav && !descriptor_has_live_view(args[D], title_dest)) record_view(false);
         }
     };
     if (skip) {

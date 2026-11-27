@@ -1958,7 +1958,9 @@ reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resour
 sampler holds its own reference to the presented surface until the copy's fence has passed; a title
 may release the surface right after the present. If `Signal` fails after the copy was submitted,
 sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
-process. It publishes them in a named block,
+process. A removed device (the fence reporting `UINT64_MAX`) is never treated as a completion:
+the readback is not mapped, no sample is published, sampling stops, and the surface stays referenced
+for the rest of the process. It publishes them in a named block,
 `Local\x2w_present_signature_<process id>`, so other tools can read it too
 (`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
 formats are read; for others it logs
@@ -2401,6 +2403,10 @@ These are measured on one executable; treat them as hypotheses for others.
   z must fail. The desktop draw reads all 16 texels of a 4x4 image back; deleting the store or
   exchanging x and y must fail. Run
   `ctest --preset release --no-tests=error -R '^startup_pixel_image_store_' -V`.
+- **Compute stores to 3D and 1D images.** A compute `image_store` with `dmask:0xf` on a 3D or 1D image
+  becomes a store to `RWTexture3D<float4>` or `RWTexture1D<float4>`, and Dispatch binds the title's
+  3D or 1D view after checking its mip and, for 3D, its W range. See
+  [Startup compute stores to 3D and 1D UAVs](experiments/startup-compute-volume-line-uav.md).
 - **Binding pixel-stage image stores.** A translated draw binds each `uav N tex2d|tex2da table P O` line
   as a UAV range `u0..` placed after the SRVs in the translated root signature's view table. The view is made from the unordered-access
   view the title created at that table entry (`resolve_pixel_uavs` in `d3d12_draw.inl`), on
