@@ -34,9 +34,29 @@ def captured(logdir, name):
     return path.read_text(encoding="utf-8") if path.exists() else None
 
 
+def child_env(extra):
+    """The environment of a probe child: ours without X2W_LOW_ADDRESSES (a caller that has it set must not turn the
+    default runs into low-address runs), plus `extra`."""
+    env = {k: v for k, v in os.environ.items() if k != "X2W_LOW_ADDRESSES"}
+    env.update(extra)
+    return env
+
+
 def run_unit_tests():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
+
+        # 0. The control children never inherit X2W_LOW_ADDRESSES; the switch-on children get it only from the test.
+        saved = os.environ.get("X2W_LOW_ADDRESSES")
+        os.environ["X2W_LOW_ADDRESSES"] = "1"
+        try:
+            assert "X2W_LOW_ADDRESSES" not in child_env({}), "the control environment kept X2W_LOW_ADDRESSES"
+            assert child_env({"X2W_LOW_ADDRESSES": "1"})["X2W_LOW_ADDRESSES"] == "1"
+        finally:
+            if saved is None:
+                del os.environ["X2W_LOW_ADDRESSES"]
+            else:
+                os.environ["X2W_LOW_ADDRESSES"] = saved
 
         # 1. X2W_STORAGE_PATH fallback creation when unset/empty and default missing.
         logdir = root / "run_unset"
@@ -221,6 +241,26 @@ def main(probe):
         result, logdir, _ = launch(probe, work, "two-processes", ["--timeout", "10", "--max-processes", "2"], ["spawn"])
         assert result.returncode == 0, result.stderr
         assert captured(logdir, "stdout.txt") == "spawn ok\n", captured(logdir, "stdout.txt")
+
+        # X2W_LOW_ADDRESSES=1 starts the child with bottom-up ASLR off, so its blocks stay below 2^40 (the package
+        # acceleration-structure builder refuses a destination with bits set above bit 39, #1758).
+        limit = 1 << 40
+
+        def highest(env_extra, name):
+            env = child_env(env_extra)
+            result, logdir, _ = launch(probe, work, name, ["--timeout", "20"], ["addresses"], env=env)
+            assert result.returncode == 0, result.stderr
+            text = captured(logdir, "stdout.txt")
+            assert text and text.startswith("addresses highest=0x"), (text, result.stdout)
+            return int(text.split("=")[1], 16), result.stdout
+
+        for attempt in range(4):
+            top, out = highest({"X2W_LOW_ADDRESSES": "1"}, f"low-{attempt}")
+            assert top < limit, f"with X2W_LOW_ADDRESSES=1 a block ends at 0x{top:x}, above 2^40"
+            assert "bottom-up ASLR off" in out, out
+        # Control: without the switch, the same child gets blocks above 2^40 on some runs (the default ASLR picks a random start).
+        above = [highest({}, f"default-{attempt}")[0] >= limit for attempt in range(8)]
+        assert any(above), "the control never saw a block above 2^40, so the check above proves nothing on this host"
 
         # A missing executable is reported instead of looking like a finished run.
         logdir = work / "missing"
