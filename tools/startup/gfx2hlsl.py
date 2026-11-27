@@ -6288,6 +6288,68 @@ class Stage:
             self.set_s(d + 1, 'reversebits(%s)' % lo)
         return None
 
+    def op_s_bitreplicate_b64_b32(self, ops, mods):
+        """s_bitreplicate_b64_b32: replicate each bit of 32-bit S0 twice into 64-bit pair D; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x3b: D[2*i] = D[2*i+1] = S0[i] for i in 0..31.
+        When S0 aliases the low word of D (s[D:D+1], sD), the high word is written first so S0 stays intact.
+        """
+        name = 's_bitreplicate_b64_b32'
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[1] % 2 != 0 or dst[2] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        masks = getattr(self, 'masks', ())
+        mask_high = getattr(self, 'mask_high', ())
+        if self.is_lane_mask(ops[0]) or any(w in masks or w in mask_high for w in (d, d + 1)):
+            raise Unsupported('%s on a lane mask' % name)
+        if self.is_lane_mask(ops[1]):
+            raise Unsupported('%s on a lane mask' % name)
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        src_reg = None
+        if ops[1] == 'null':
+            const_val = 0
+        elif imm:
+            const_val = int(ops[1], 0) & 0xffffffff
+        else:
+            src = reg_range(ops[1])
+            if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            src_reg = src[1]
+            if src_reg in masks or src_reg in mask_high:
+                raise Unsupported('%s on a lane mask' % name)
+            sym = self.sym.get(src_reg)
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('%s on %s data' % (name, sym[0]))
+            const_val = sym[1] & 0xffffffff if sym and sym[0] == 'const' else None
+        if const_val is not None:
+            def _rep16(x):
+                x &= 0xffff
+                x = (x | (x << 8)) & 0x00ff00ff
+                x = (x | (x << 4)) & 0x0f0f0f0f
+                x = (x | (x << 2)) & 0x33333333
+                x = (x | (x << 1)) & 0x55555555
+                return x | (x << 1)
+            lo_val, hi_val = _rep16(const_val), _rep16(const_val >> 16)
+            self.set_s(d, '0x%08xu' % lo_val, ('const', lo_val))
+            self.set_s(d + 1, '0x%08xu' % hi_val, ('const', hi_val))
+            return None
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None and hasattr(pipe, 'uses_bitreplicate'):
+            pipe.uses_bitreplicate = True
+        src_expr = self.u(ops[1])
+        lo_expr = 'bitreplicate16(%s)' % src_expr
+        hi_expr = 'bitreplicate16(%s >> 16u)' % src_expr
+        if src_reg == d:
+            self.set_s(d + 1, hi_expr)
+            self.set_s(d, lo_expr)
+        else:
+            self.set_s(d, lo_expr)
+            self.set_s(d + 1, hi_expr)
+        return None
+
     def scalar_cmov(self, ops, mods, pair, name=None):
         """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
         name = name or 's_cmov_b%d' % (64 if pair else 32)
@@ -11177,6 +11239,7 @@ class Pipeline:
     uses_lerp_u8 = False
     uses_perm_b32 = False
     uses_add_sub_sat_i32 = ()
+    uses_bitreplicate = False
     uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -11220,6 +11283,7 @@ class Pipeline:
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.uses_add_sub_sat_i32 = set()
+        self.uses_bitreplicate = False
         self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
@@ -11623,6 +11687,16 @@ class Pipeline:
                 '    }',
                 '}',
             ))
+        if self.uses_bitreplicate:
+            # RDNA 2 ISA S_BITREPLICATE_B64_B32: replicate each of the low 16 bits twice into 32 bits.
+            out.append(
+                'uint bitreplicate16(uint x) {'
+                ' x &= 0xffffu;'
+                ' x = (x | (x << 8u)) & 0x00ff00ffu;'
+                ' x = (x | (x << 4u)) & 0x0f0f0f0fu;'
+                ' x = (x | (x << 2u)) & 0x33333333u;'
+                ' x = (x | (x << 1u)) & 0x55555555u;'
+                ' return x | (x << 1u); }')
         if self.uses_lerp_u8:
             # RDNA 2 ISA V_LERP_U8: for each byte lane i, D_i = (S0_i + S1_i + (S2_i & 1)) >> 1.
             out.append(
@@ -11920,6 +11994,7 @@ class ComputePipeline(Pipeline):
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.uses_add_sub_sat_i32 = set()
+        self.uses_bitreplicate = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
