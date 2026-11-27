@@ -140,6 +140,13 @@ inline DXGI_FORMAT typed_choice(DXGI_FORMAT typeless)
     }
 }
 
+// Depth-stencil resource families with a separate stencil plane (plane 1).
+inline bool is_planar_depth_stencil(DXGI_FORMAT format)
+{
+    const auto family = format_family(format);
+    return family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
 inline bool is_typeless(DXGI_FORMAT format)
 {
     switch (format) {

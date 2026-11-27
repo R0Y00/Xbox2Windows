@@ -1512,7 +1512,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
     desc.Buffer.FirstElement = buffer ? offset / 4 : 0;
     desc.Buffer.NumElements = buffer ? static_cast<UINT>((bytes + 3) / 4) : 1;
     desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    device_of(the_device)->CreateShaderResourceView(buffer, &desc, dest);
+    x2w_create_srv(device_of(the_device), buffer, &desc, dest, "raw-buffer", log);
 }
 
 // Texture contents. Linear backing uses desktop copyable footprints; an announced BC7 4 KiB
@@ -2650,9 +2650,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.Texture2D.MipLevels = 1;  // shared MostDetailedMip and MipLevels in all supported texture views
             if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
             ID3D12Resource* texture = sampled_address_texture(resource);
-            if (texture && record.desc_bytes >= 40) {
-                std::memcpy(&desc, record.desc, 40);
+            // A token of an unordered access view (slot 19) holds a UAV description: it is read as the SRV of its mip.
+            D3D12_SHADER_RESOURCE_VIEW_DESC title_view{};
+            const bool described =
+                x2w_startup::view_desc::recorded_srv(record.slot, record.desc, record.desc_bytes, title_view);
+            if (texture && described) {
+                desc = title_view;
                 desc.Format = desktop_format(desc.Format);
+                // A single-slice array view and its plain form name the same texels: take the type the shader declares.
+                if (desc.ViewDimension != dimension) x2w_startup::view_desc::as_dimension(desc, dimension, desc);
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,
@@ -2699,7 +2705,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             const bool wrong_1d_resource = texture && srv.kind == 4 &&
                 (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
-            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
+            if (texture && ((described && desc.ViewDimension != dimension) || wrong_1d_resource)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
                 texture = nullptr;
@@ -2730,7 +2736,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 x2w_startup::report_token_entry(line, sizeof(line), tr->key, i, entry, words);
                 log("%s", line);
             }
-            device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            x2w_create_srv(device_of(the_device), texture, texture && !described ? nullptr : &desc, dest, "draw-texture", log);
             continue;
         }
         if (indirect) {

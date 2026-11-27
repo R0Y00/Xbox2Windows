@@ -423,6 +423,21 @@ for UAV, RTV and DSV is checked without a device by `startup_view_dimension`.
 so it fails on the missing default view and not on setup or a removed device. Both return 77
 without WARP.
 
+Every SRV the stand-in writes (title slot 18, translated draw and compute textures, raw buffer views)
+goes through `x2w_create_srv` (`src/startup_stubs/create_srv.h`, rules in `view_desc_check.h`). A
+field D3D12 would reject is repaired when the intent is clear: `MipLevels` 0 becomes -1 (every level
+from `MostDetailedMip`), a mip or array count past the resource is clipped, an invalid
+`Shader4ComponentMapping` becomes the default, a typed view of another numeric family falls back to the
+resource format, and a depth-stencil SRV gets the plane its format names (stencil formats plane 1,
+depth formats plane 0). Anything else (mip or slice start past the resource, wrong dimension or sample
+count, a format the device cannot sample, an out-of-range buffer window) is refused, and the slot gets
+a null view of the same dimension, so it never keeps an older view. The first 64 repairs and refusals
+are logged as `x2w-d3d12 SRV repaired|refused (writing null): site=<site> field/reason=...`. A draw
+texture token made by slot 19 holds a UAV description: it is read as the SRV of that UAV's mip, not as
+SRV bytes. `ctest --preset dev --no-tests=error -R '^startup_view_desc(_warp)?$'` runs the rules on
+synthetic descriptions and, on WARP with the debug layer, creates the repaired and null views and samples
+every mip through a `MipLevels` 0 view and a UAV-token view.
+
 ## 16-bit packed targets
 
 A description that asks for a B5G5R5A1_UNORM, B4G4R4A4_UNORM or B5G6R5_UNORM render target is created as

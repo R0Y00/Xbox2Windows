@@ -39,6 +39,7 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
+#include "startup_stubs/create_srv.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/upload_reservation.h"
@@ -257,6 +258,7 @@ std::vector<DescriptorRange> descriptor_ranges;
 constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
+using x2w_startup::x2w_create_srv;
 bool first_calls(LONG& counter, LONG limit);
 void request_translation(Wrapper* pipeline);
 struct RootParameter;
@@ -5120,7 +5122,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             if (args[1] && x2w_local::readable(reinterpret_cast<const void*>(args[1]), 8))
                 std::memcpy(&requested, reinterpret_cast<const unsigned char*>(args[1]) + 4, sizeof(requested));
             const D3D12_SHADER_RESOURCE_VIEW_DESC null_view = null_srv_desc(requested);
-            device_of(self)->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])});
+            x2w_create_srv(device_of(self), nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])},
+                           "slot18-refused", log);
             record_view(false);
         } else if constexpr (N == 17) {
             record_view(false);  // Translated constant-buffer views use only the descriptor record.
@@ -5183,14 +5186,24 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     }
     if (default_view) args[desc_index] = 0;
     const LONG removed_before = removal_reported;
-    const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    u64 result = 0;
+    bool srv_written = true;
+    if constexpr (N == 18) {
+        // Repaired, or refused with a null view of the same shape (create_srv.h), before it reaches the desktop.
+        const auto* view = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(args[1]);
+        if (view && !x2w_local::readable(view, sizeof(*view))) view = nullptr;
+        srv_written = x2w_create_srv(device_of(self), reinterpret_cast<ID3D12Resource*>(args[0]), view,
+                                     D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(args[D])}, "slot18", log);
+    } else {
+        result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    }
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
-    // may keep the resource: on failure the slot is recorded unmaterialized, which releases the slot's previous view
-    // reference and adds none.
+    // may keep the resource: a refused SRV or a removed device leaves the slot unmaterialized, which releases the
+    // slot's previous view reference and adds none.
     const HRESULT removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
-    const bool created = SUCCEEDED(removed);
+    const bool created = srv_written && SUCCEEDED(removed);
     record_view(created);
-    if (!created) {
+    if (FAILED(removed)) {
         static LONG failed;
         if (first_calls(failed, 6))
             log("x2w-d3d12 Device::slot%d view not created: device removed, reason 0x%08lx", N,
