@@ -418,6 +418,8 @@ static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
         return i.wide ? (i.a >> 8) & 127 : 106;
+    if (i.name == "v_mad_u64_u32")  // VOP3B: the carry-out of the 64-bit add (#3000)
+        return (i.a >> 8) & 127;
     return {};
 }
 struct Symbol {
@@ -568,8 +570,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
-             i.name.substr(i.name.size() - 4) == "_u64")) ||
-            i.name == "s_bitreplicate_b64_b32")
+             i.name.substr(i.name.size() - 4) == "_u64") &&
+            i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
             set(i.dst + 1, {});
     }
     return s;
