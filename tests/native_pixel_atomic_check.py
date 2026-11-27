@@ -34,7 +34,13 @@ def shader(stride, glc=True, threshold=None, offset=0, delta=1, wqm=False, bad=N
     if wqm:
         # Horizontal quad swap of integer SV_Position.x. At x=2 on the
         # odd edge this consumes the helper at x=3, not a constant.
-        code += [0x7e0802fa, 0xff0cb100, 0xbefe0418]  # v4 = quadSwapX(v0); restore exact EXEC.
+        code += [0x7e0802fa, 0xff0cb100]  # v4 = quadSwapX(v0).
+        if glc:
+            # Preserve v0/v1 for the quad read; form the private output offset
+            # in WQM before restoring exact EXEC. v6 = 4*(4*y+x).
+            code += [vop2(0x1a, 1, 130, 1), vop2(0x1c, 6, 257, 0),
+                     vop2(0x1a, 6, 130, 6)]
+        code += [0xbefe0418]  # Restore exact EXEC.
     op = 0xe0c80000 | (0x4000 if glc else 0) | offset
     if bad == "other":
         op = 0xe0cc0000
@@ -45,7 +51,11 @@ def shader(stride, glc=True, threshold=None, offset=0, delta=1, wqm=False, bad=N
     code += [op, 0x80020405 if dynamic else 0x80020400]  # v4 is both addend and GLC destination.
     if threshold is not None:
         code += [0xbefe0404]  # Restore the proven original EXEC.
-    if not wqm and bad != "wqm":
+    if wqm and glc:
+        # A second already-supported exact atomic add records the returned old
+        # value into a disjoint lane slot; no extra exact-mask ALU/store allowed.
+        code += [0xe0c81004, 0x80020406]
+    elif not wqm and bad != "wqm":
         # Store returned VGPR (or unchanged addend) after reconvergence.
         code += [vop2(0x1a, 1, 130, 1), vop2(0x1c, 0, 257, 0),
                  vop2(0x1a, 0, 130, 0), 0xe0701004, 0x80020400]
@@ -122,19 +132,34 @@ def main(cli, consumer, sdk, backend):
                 if in_view:
                     increment = sum(x ^ 1 for x,y in lanes) if wqm else delta*len(lanes)
                     expected[target] = (seed + increment) & MASK
-                if not wqm:
+                if not wqm or glc:
                     returned = []
                     for x,y in coverage:
                         if dynamic and x%2 != group:
                             continue
                         pos = base + 1 + 4*y+x
                         if glc and (x,y) in lanes:
-                            returned.append(words[pos])
+                            returned.append((words[pos]-expected[pos]) & MASK if wqm else words[pos])
                             expected[pos] = words[pos]  # Compare the full old-value multiset independently.
                         else:
-                            expected[pos] = delta
+                            expected[pos] = (x ^ 1) if wqm else delta
                     want_old = sorted(((seed + delta*j) & MASK) if in_view else 0 for j in range(len(lanes)))
-                    assert sorted(returned) == (want_old if glc else []), (name, returned, want_old)
+                    if wqm and glc and in_view:
+                        # Validate a serialization, including zero increments, without imposing GPU lane order.
+                        from functools import lru_cache
+                        from collections import Counter
+                        edges = Counter((old, x ^ 1) for old,(x,y) in zip(returned, lanes))
+                        pairs = tuple(edges)
+                        @lru_cache(None)
+                        def chain(value, counts):
+                            if not any(counts):
+                                return value == expected[target]
+                            return any(n and old == value and chain((value+add)&MASK,
+                                       counts[:i]+(n-1,)+counts[i+1:])
+                                       for i, ((old,add),n) in enumerate(zip(pairs,counts)))
+                        assert chain(seed, tuple(edges.values())), (name, edges, seed, expected[target])
+                    else:
+                        assert sorted(returned) == (want_old if glc else []), (name, returned, want_old)
             assert words == expected, (name, [(i,hex(a),hex(b)) for i,(a,b) in enumerate(zip(words,expected)) if a!=b], len(words))
             print(name, f"{len(coverage)} covered, {len(active)} active; 64 DWORDs and 32 pixels exact",
                   next((l for l in out.splitlines() if l.startswith("adapter=")), ""), flush=True)
@@ -150,6 +175,8 @@ def main(cli, consumer, sdk, backend):
         case("dynamic-two-counters", offset=72, dynamic=True)
         case("odd-edge", edge=True)
         case("wqm-restore-edge-helper-read", glc=False, edge=True, wqm=True)
+        case("wqm-glc-edge-helper-read", edge=True, wqm=True)
+        case("wqm-glc-out-of-view", offset=80, edge=True, wqm=True)
         for bad, reason in (("other", "graphics buffer atomic"), ("indexed", "indexed compute atomic"),
                             ("wqm", "pixel atomic requires exact coverage"), ("branch", "straight-line pixel raw DWORD add")):
             source = folder / (bad+".ps")
@@ -159,7 +186,7 @@ def main(cli, consumer, sdk, backend):
                                capture_output=True,text=True)
             assert r.returncode != 0 and not dest.exists() and reason in r.stderr, (bad,r.stderr)
             print(bad, r.stderr.strip(), flush=True)
-        print(backend, "11 actual draws and 4 refusal controls passed")
+        print(backend, "13 actual draws and 4 refusal controls passed")
         return 0
 
 
