@@ -1682,6 +1682,59 @@ struct DirectCompute {
         auto overflow = ir.binary("and", ir.binary("xor", a, sum), ir.binary("xor", b, sum));
         return select(cmp("slt", overflow, "0"), select(cmp("slt", a, "0"), "2147483648", "2147483647"), sum);
     }
+    bool packed_minmax(const Inst &i, const State &state) {
+        if (i.enc != Encoding::Mix)
+            return false;
+        const auto n = i.name;
+        const bool floating = n == "v_pk_min_f16" || n == "v_pk_max_f16";
+        const bool signed_int = n == "v_pk_min_i16" || n == "v_pk_max_i16";
+        if (!floating && !signed_int && n != "v_pk_min_u16" && n != "v_pk_max_u16")
+            return false;
+        // VOP3P NEG_HI/LO occupy the usual ABS/NEG fields. The third
+        // OP_SEL_HI bit is unused here, like the packed add and shift forms.
+        if (i.clamp || i.abs || i.neg || i.src[2] || (i.a & 0x2000))
+            refuse(i.pc, "unsupported packed 16-bit min/max encoding");
+        if (floating && (!half_mode_known || (mode_bits & 0xc0u) != 0xc0u))
+            refuse(i.pc, "unsupported packed binary16 min/max denormal mode");
+        auto source = [&](unsigned src) {
+            if (src <= 105) {
+                if (state[src].type == Symbol::Type::masked || state[src].type == Symbol::Type::uniform_mask)
+                    refuse(i.pc, "packed 16-bit min/max uses a lane mask");
+            } else if (src < 256 && src != 128 && src != 255) {
+                refuse(i.pc, "unsupported packed 16-bit min/max source");
+            }
+            return operand32(i, src);
+        };
+        const auto a = source(i.src[0]), b = source(i.src[1]);
+        const bool maximum = n.substr(5, 3) == "max";
+        auto half = [&](const string &word, bool high) {
+            return high ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+        };
+        auto order_key = [&](const string &bits) -> string {
+            if (floating) {
+                // Binary16 encodings are monotone within each sign. Reverse
+                // the negative half of that order and keep -0 below +0.
+                auto negative = cmp("uge", bits, "32768");
+                return ir.binary("xor", bits, select(negative, "65535", "32768"));
+            }
+            return signed_int ? ir.binary("xor", bits, "32768") : bits;
+        };
+        auto lane = [&](unsigned selectors) {
+            auto x = half(a, selectors & 1), y = half(b, selectors & 2);
+            auto result = select(cmp(maximum ? "ugt" : "ult", order_key(x), order_key(y)), x, y);
+            if (floating) {
+                // Follow the existing startup contract. One NaN selects
+                // the numeric side. Two NaNs use the canonical quiet NaN.
+                auto x_nan = cmp("ugt", ir.binary("and", x, "32767"), "31744");
+                auto y_nan = cmp("ugt", ir.binary("and", y, "32767"), "31744");
+                result = select(x_nan, select(y_nan, "32256", y), select(y_nan, x, result));
+            }
+            return result;
+        };
+        auto low = lane((i.a >> 11) & 3), high = lane((i.b >> 27) & 3);
+        vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+        return true;
+    }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
         if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
@@ -1888,7 +1941,7 @@ struct DirectCompute {
             if (graphics_input) write(i.dst, {});
             return;
         }
-        if (float_alu(i, permuted))
+        if (packed_minmax(i, state) || float_alu(i, permuted))
             return;
         if (i.enc == Encoding::Vopc && !i.clamp && !i.scale &&
             (n.find("class") == n.npos || n.find("_f16") != n.npos || n.find("_f32") != n.npos)) {
@@ -2998,7 +3051,7 @@ struct DirectCompute {
             if (!p.reached[k])
                 continue;
             const auto &op = p.code[k];
-            if (binary16_alu(op.name))
+            if (binary16_alu(op.name) || op.name == "v_pk_min_f16" || op.name == "v_pk_max_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
