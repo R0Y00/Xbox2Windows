@@ -36,7 +36,7 @@ def check_refusal_lines(log):
     ]
     expected.extend(
         prefix + "unavailable buffer at the supplied address: reason=buffer_unavailable "
-        + WIDE_BUFFER + rf" dest=({HEX}) dest_in_view_heap=1 address=({HEX}) address_readable={readable}"
+        + WIDE_BUFFER + rf" dest=(?P<dest>{HEX}) dest_in_view_heap=1 address=(?P<address>{HEX}) address_readable={readable}"
         for readable in (0, 1)  # reserved base, live narrow placement
     )
     lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
@@ -47,8 +47,8 @@ def check_refusal_lines(log):
         match = re.fullmatch(pattern, line)
         if not match:
             raise AssertionError(f"slot 70 line does not match\n  line     {line}\n  expected {pattern}")
-        if match.groups():
-            dest, address = match.groups()
+        if match.groupdict().get("dest"):
+            dest, address = match["dest"], match["address"]
             write = rf"x2w-d3d12 memory SRV written \d+: dest={dest} address={address} " + WIDE_BUFFER
             count = sum(re.fullmatch(write, entry) is not None for entry in writes)
             if count != 1:
