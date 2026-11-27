@@ -368,6 +368,7 @@ static std::string json_escape(std::string_view text) {
 }
 
 static void dedupe_graphics_markers(std::vector<fs::path>& paths) {
+    // Requires paths to be sorted so a stem's .a immediately precedes its .rtv.
     // A key with both markers is one request, the variant, as in gfx2hlsl.py request_source.
     for (size_t i = 0; i + 1 < paths.size();) {
         if (paths[i].extension() == L".a" && paths[i + 1].extension() == L".rtv" &&
