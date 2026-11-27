@@ -418,6 +418,8 @@ static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
         return i.wide ? (i.a >> 8) & 127 : 106;
+    if (i.name == "v_mad_u64_u32")  // VOP3B: the carry-out of the 64-bit add (#3000)
+        return (i.a >> 8) & 127;
     return {};
 }
 struct Symbol {
