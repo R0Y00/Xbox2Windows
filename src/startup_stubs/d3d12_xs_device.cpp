@@ -3019,6 +3019,17 @@ void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
     }
 }
 
+// X2W_COMPUTE_DISPATCH=1 turns on the compute-dispatch experiment: device slot 62 loads a validated
+// <key>.cs.cso and builds a real desktop compute pipeline, and command-list slot 14 Dispatch (installed
+// unconditionally by main) forwards it. Without the variable no module is loaded, so the default
+// placeholder path is exactly as inert as before and the source-built readback fixture is what turns
+// this on explicitly.
+bool compute_dispatch_enabled()
+{
+    char value[8];
+    const DWORD n = GetEnvironmentVariableA("X2W_COMPUTE_DISPATCH", value, sizeof(value));
+    return n == 1 && value[0] == '1';
+}
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -6381,10 +6392,11 @@ void dump_containers(const char* what, const void* desc, std::size_t bytes)
 HRESULT __stdcall placeholder_ok(Wrapper*, u64, u64, u64) { return S_OK; }
 
 // Device slot 62 (Xbox order): (D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, ppv); first seen from
-// XboxBvhBuilder.dll, followed by SetName on the result. The bytecode is console GPU code, not DXIL,
-// so no desktop pipeline is built: the result is a placeholder PipelineState until shader translation
-// exists. Logs the root signature, bytecode address, length and first 32 bytes.
-HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
+// XboxBvhBuilder.dll, followed by SetName on the result. With X2W_COMPUTE_DISPATCH=1 and render mode a
+// validated module published under the container's hash in the shader cache is loaded, so the result is a
+// real desktop pipeline; without one it stays a placeholder PipelineState. Logs the root signature,
+// bytecode address, length and first 32 bytes.
+HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
                                                    u64 extra1, const GUID* iid, void** out)
 {
     char text[48];
@@ -6395,15 +6407,56 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     dump_containers("compute", desc, sizeof(*desc));
     char bytes[3 * 32 + 1];
     hex_text(desc->CS.pShaderBytecode, desc->CS.BytecodeLength < 32 ? desc->CS.BytecodeLength : 32, bytes, sizeof(bytes));
+    // With X2W_COMPUTE_DISPATCH=1 a validated compute module is loaded by key from the shader cache,
+    // exactly as graphics translations are: the offline retarget/sign/gate step decides usability, so
+    // there is no runtime byte inspection here, and the placeholder is kept when no validated module
+    // exists.
+    ID3D12PipelineState* real_pipeline = nullptr;
+    ID3D12RootSignature* pipeline_root = nullptr;  // the root the desktop module was built against
+    char why[128] = "";
+    if (!compute_dispatch_enabled()) {
+        std::snprintf(why, sizeof(why), "compute dispatch is off");
+    } else if (render_mode()) {
+        wchar_t path[MAX_PATH];
+        const u64 compute_key = desc->CS.pShaderBytecode && desc->CS.BytecodeLength
+            ? fnv_bytes(desc->CS.pShaderBytecode, desc->CS.BytecodeLength) : 0;
+        ID3DBlob* blob = nullptr;
+        if (!compute_key || !cache_path(path, L"", compute_key, L".cs.cso") ||
+            FAILED(D3DReadFileToBlob(path, &blob)) || !blob) {
+            std::snprintf(why, sizeof(why), "no validated module");
+        } else {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+            compute.pRootSignature =
+                reinterpret_cast<ID3D12RootSignature*>(unwrap(reinterpret_cast<u64>(desc->pRootSignature)));
+            pipeline_root = compute.pRootSignature;
+            compute.CS.pShaderBytecode = blob->GetBufferPointer();
+            compute.CS.BytecodeLength = blob->GetBufferSize();
+            compute.NodeMask = desc->NodeMask;
+            compute.CachedPSO = {};  // A console cached-PSO blob must not reach the desktop runtime.
+            compute.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+            const HRESULT built = device_of(self)->CreateComputePipelineState(&compute, IID_PPV_ARGS(&real_pipeline));
+            blob->Release();
+            if (FAILED(built)) {
+                real_pipeline = nullptr;
+                std::snprintf(why, sizeof(why), "CreateComputePipelineState 0x%08lx", static_cast<unsigned long>(built));
+            }
+        }
+    }
     static LONG calls;
     if (first_calls(calls, 24))
         log("x2w-d3d12 Device::slot62(CreateComputePipelineState?) root=%p cs=%p len=0x%llx node=0x%x flags=0x%x extra=0x%llx,0x%llx "
-            "riid=%s -> placeholder [%s]", static_cast<void*>(desc->pRootSignature), desc->CS.pShaderBytecode,
-            static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
+            "riid=%s -> %s%s [%s]", static_cast<void*>(desc->pRootSignature), desc->CS.pShaderBytecode,
+            static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text,
+                real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why, bytes);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
-    *out = wrap(nullptr, pipeline_kind);
-    if (!*out) return E_OUTOFMEMORY;
+    *out = wrap(real_pipeline, pipeline_kind);
+    if (!*out) {
+        if (real_pipeline) real_pipeline->Release();
+        return E_OUTOFMEMORY;
+    }
     auto* pipeline = static_cast<Wrapper*>(*out);
+    pipeline->own().compute_pipeline = real_pipeline != nullptr;
+    pipeline->own().pipeline_root = real_pipeline ? pipeline_root : nullptr;
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
     return S_OK;
