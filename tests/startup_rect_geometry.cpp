@@ -274,7 +274,8 @@ float4 main(float4 pos : SV_Position) : SV_Target { return float4(1, 0, 0, 1); }
         // The four corners of the rectangle the three records name, clockwise on screen from the bottom left.
         std::array<std::pair<float, float>, 4> quad;
         float angle;
-        // False for the order whose winding the back-face test rejects: the stage must draw nothing for it.
+        // False when the stage must draw nothing: the swung order is rejected by back-face culling, the
+        // skewed triangle by the rectangle rule's right-angle guard.
         bool covered;
     };
     const auto turned = [](std::array<Vertex, 3> rectangle, float degrees) {
@@ -295,17 +296,21 @@ float4 main(float4 pos : SV_Position) : SV_Target { return float4(1, 0, 0, 1); }
         const float s = std::sin(15.0f * 3.14159265358979324f / 180.0f);
         for (auto& p : turned_square) p = {c * p.first - s * p.second, s * p.first + c * p.second};
     }
-    std::array<Scene, 3> scenes{{
+    std::array<Vertex, 3> skewed = corners;
+    skewed[1].x = -0.5f;  // the top-left corner moved a quarter of the way to the top-right
+    std::array<Scene, 4> scenes{{
         {"axis", {}, square, 0.0f, true},
         {"swung", {}, square, 0.0f, false},
         {"rotated", {}, turned_square, 15.0f, true},
+        {"skewed", {}, square, 0.0f, false},
     }};
     // The three corners a rectangle list names per rectangle: v0, v1 and v2. The fourth is derived. Both
     // records of the six-vertex dispatch name the same rectangle.
-    const std::array<std::array<Vertex, 3>, 3> records{{
+    const std::array<std::array<Vertex, 3>, 4> records{{
         {corners[0], corners[1], corners[2]},                 // bottom left, top left, top right
         {corners[0], corners[2], corners[1]},                 // bottom left, top right, top left
         {turned(corners, 15.0f)[0], turned(corners, 15.0f)[1], turned(corners, 15.0f)[2]},
+        {skewed[0], skewed[1], skewed[2]},                    // no axis corner and no right angle
     }};
     for (auto& scene : scenes) {
         const auto& three = records[&scene - scenes.data()];
