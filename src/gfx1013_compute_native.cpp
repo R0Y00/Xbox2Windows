@@ -766,7 +766,9 @@ struct Emit {
         if ((!indexed && sym.type != Symbol::Type::descriptor) || base + width > state.size())
             refuse(i.pc, "unproven resource descriptor s" + to_string(base));
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
-                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
+                                  (i.name == "buffer_store_raw" ||
+                                   (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
