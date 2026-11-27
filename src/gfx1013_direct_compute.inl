@@ -1164,6 +1164,42 @@ struct DirectCompute {
             vector_write(i.dst, result);
             return true;
         }
+        if (n == "v_frexp_exp_i32_f32" || n == "v_frexp_mant_f32") {
+            const bool exp_op = n == "v_frexp_exp_i32_f32";
+            if (i.subword || i.dpp_control || permuted || i.scale || (exp_op && i.clamp) ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            auto bits = operand32(i, i.src[0]);
+            if (i.abs & 1) bits = ir.binary("and", bits, "2147483647");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "2147483648");
+            auto sign = ir.binary("and", bits, "2147483648");
+            auto exponent = ir.binary("and", ir.binary("lshr", bits, "23"), "255");
+            auto mantissa = ir.binary("and", bits, "8388607");
+            auto keep = ir.value("or i1 " + cmp("eq", exponent, "255") + ", " +
+                                 cmp("eq", ir.binary("and", bits, "2147483647"), "0"));
+            string x = mantissa, steps = "0";
+            for (unsigned k : {16u, 8u, 4u, 2u, 1u}) {
+                auto low = cmp("ult", x, to_string(1u << (24 - k)));
+                x = select(low, ir.binary("shl", x, to_string(k)), x);
+                steps = select(low, ir.binary("add", steps, to_string(k)), steps);
+            }
+            auto denormal = cmp("eq", exponent, "0");
+            string result;
+            if (exp_op) {
+                auto e = select(denormal, ir.binary("sub", "1", steps), exponent);
+                result = select(keep, "0", ir.binary("sub", e, "126"));
+            } else {
+                auto frac = select(denormal, ir.binary("and", x, "8388607"), mantissa);
+                result = select(keep, bits, ir.binary("or", sign, ir.binary("or", "1056964608", frac)));
+                if (i.clamp) {
+                    auto nan = cmp("ugt", ir.binary("and", result, "2147483647"), "2139095040");
+                    auto low = ir.value("or i1 " + nan + ", " + cmp("slt", result, "0"));
+                    result = select(low, "0", select(cmp("sgt", result, "1065353215"), "1065353216", result));
+                }
+            }
+            vector_write(i.dst, result);
+            return true;
+        }
         if (n == "v_cvt_pkrtz_f16_f32") {
             if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported packed half conversion modifier");
