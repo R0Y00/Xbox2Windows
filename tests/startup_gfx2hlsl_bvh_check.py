@@ -3,8 +3,8 @@
 The instruction is RDNA 2 MIMG opcode 230. This check covers the translator path and the
 box model only: a constant inline BVH T#[12:15], an 11-dword packed address, a constant
 node base whose low three bits are 4 (binary16) or 5 (FP32), and the four child results.
-Triangle nodes, the 64-bit form, A16, NSA and every dynamic descriptor or node base are
-refused by name before any HLSL is emitted. The independent CPU box reference is
+The triangle kinds have a dedicated check. The 64-bit form, A16, NSA and every dynamic
+descriptor or node base are refused by name before any HLSL is emitted. The independent CPU box reference is
 tests/gfx1030_bvh_box/bvh_model.py; the Windows dispatch exercises both emitted helpers.
 """
 import math
@@ -407,7 +407,6 @@ def controls():
 
     # Every refusal must happen before a helper call or a result VGPR is emitted.
     cases = [
-        ("triangle node", dict(node=0x00), "triangle node (kind 0)"),
         ("unknown node kind", dict(node=0x06), "node kind 6"),
         ("unaligned node", dict(node=0x0d), "not an aligned 128-byte node"),
         ("non-constant node", dict(constant_node=False), "non-constant node base"),
@@ -422,7 +421,7 @@ def controls():
         ("node outside size", dict(node=0x25, word2=3), "outside descriptor size"),
         ("box16 node outside size", dict(node=0x54, word2=10), "outside descriptor size"),
         ("absolute base", dict(word0=0, word1=0), "absolute node base"),
-        ("size high bits", dict(word3=RESOURCE_TYPE | 0x100), "size above 4 GiB"),
+        ("size high bits", dict(word3=RESOURCE_TYPE | 0x100), "does not match node kind 5"),
     ]
     for label, kwargs, reason in cases:
         if label == "NSA address":
@@ -470,7 +469,7 @@ def compile_check(hlsl):
     with tempfile.TemporaryDirectory(dir=ROOT / "out" if (ROOT / "out").is_dir() else None) as temporary:
         source = Path(temporary) / "bvh_box.hlsl"
         source.write_text(hlsl, encoding="ascii")
-        result = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(source.with_suffix(".cso")), str(source)],
+        result = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(source.with_suffix(".cso")), str(source)],
                                 capture_output=True, text=True)
     if result.returncode or result.stderr:
         check("dxc compiles the translated helper", False, result.stderr or "exit %d" % result.returncode)
@@ -550,7 +549,7 @@ def run_dispatch(dxc, runner, adapter, directory, mutation=None):
     cso = directory / (name + ".cso")
     output = directory / (name + ".bin")
     source.write_text(dispatch_hlsl(mutation), encoding="ascii")
-    compiled = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
+    compiled = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
                               capture_output=True, text=True)
     if compiled.returncode or compiled.stderr:
         raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
