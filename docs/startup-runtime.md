@@ -1586,6 +1586,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
+| `X2W_INPUT_TRACE=1` | opt-in: logs the resolved virtual gamepad state (buttons and all six axes), the script time or `off`, the present number or `none`, and one line per script wait, mark or skipped group, all prefixed `x2w-input-trace`. At most one state line per change and one per 250 ms while unchanged; unset, nothing is logged. See [Input trace](#input-trace). |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -1980,6 +1981,31 @@ ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|
 
 It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
 values merge into every reading.
+
+### Input trace
+
+`X2W_INPUT_TRACE=1` (off by default) logs the gamepad state the stand-in resolves after the
+keyboard, XInput pad 0, the shared pad block, `X2W_INPUT_PRESS` and `X2W_INPUT_SCRIPT` have been
+merged. Every line starts with `x2w-input-trace` and goes to stderr and `X2W_TRAP_LOG` like the
+stand-in's other lines. A state line has the form
+
+```text
+x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
+```
+
+where `script` is the script time in seconds or `off`, and `present` is the latest present number
+from the picture signature or `none` without a presenter sample. One state line is written per
+change and, while the state is unchanged, at most once every 250 ms. Waits, marks and skipped
+groups add one `x2w-input-trace wait`, `mark` or `group` line each, with the script item and shifted
+script time. The fixture `startup_gameinput_trace` runs one script with the switch on and off:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gameinput_trace$' -V
+```
+
+The control must observe the same gamepad states and write no trace line. See
+[the input trace experiment](experiments/startup-input-trace.md) for the exact line fields, the
+fixture's expected states and the movement evidence it supports.
 
 `IGameInput::GetTemporalReading` uses the v0 ABI and returns `E_NOTIMPL` as
 [documented by Microsoft](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/deprecated/interfaces/igameinput/methods/igameinput_gettemporalreading). The
