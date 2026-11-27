@@ -3,6 +3,9 @@
 struct DirectCompute {
     static constexpr Word inline_float_words[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
                                                0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+    // The same nine constants as binary16, which an f16 operand reads instead of the f32 pattern.
+    static constexpr Word inline_half_words[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                              0xc000, 0x4400, 0xc400, 0x3118};
     static std::optional<Word> constant32(const Inst &i, unsigned r) {
         if (r >= 128 && r <= 192) return r - 128;
         if (r >= 193 && r <= 208) return Word(192) - r;
@@ -1116,7 +1119,10 @@ struct DirectCompute {
             if (i.subword || i.dpp_control || permuted || i.scale || (exp_op && i.clamp) ||
                 (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
                 refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
-            auto bits = ir.binary("and", operand32(i, i.src[0]), "65535");
+            // An inline float (240-248) reads its binary16 value, as v_add_f16 does.
+            const unsigned r = i.src[0];
+            auto bits = r >= 240 && r <= 248 ? to_string(inline_half_words[r - 240])
+                                             : ir.binary("and", operand32(i, r), "65535");
             if (i.abs & 1) bits = ir.binary("and", bits, "32767");
             if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
             auto sign = ir.binary("and", bits, "32768");
@@ -1347,9 +1353,7 @@ struct DirectCompute {
                 } else if (r >= 240 && r <= 248) {
                     // Inline floats are f32 patterns. The f16 operation consumes the
                     // binary16 rounding of that value.
-                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
-                                                0xc000, 0x4400, 0xc400, 0x3118};
-                    bits = to_string(halves[r - 240]);
+                    bits = to_string(inline_half_words[r - 240]);
                 } else if (r == 255)
                     bits = to_string(i.literal & 65535u);
                 else if (r >= 128 && r <= 192)
@@ -1695,6 +1699,7 @@ struct DirectCompute {
                 const auto &inst = program.code[j];
                 const auto n = inst.name;
                 const bool reads_scc = n == "s_cselect_b32" || n == "s_cselect_b64" ||
+                    n == "s_cmov_b32" || n == "s_cmov_b64" || n == "s_cmovk_i32" ||
                     std::find(inst.src.begin(), inst.src.end(), 253u) != inst.src.end();
                 // These scalar mask operations set SCC from their entire
                 // result and do not consume the incoming SCC. An explicit
@@ -2117,6 +2122,34 @@ struct DirectCompute {
             write(i.dst, to_string(Word(int16_t(i.a))));
             return;
         }
+        if (compute && (n == "s_cmov_b32" || n == "s_cmov_b64" || n == "s_cmovk_i32")) {
+            // RDNA 2 ISA SOP1/SOPK (#3070): D = SCC ? S0 : D; SCC is unchanged.
+            const bool pair = n == "s_cmov_b64";
+            if (pair ? ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
+                     : (i.dst > 106 && !(!wave64 && i.dst == 107)))
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0];
+            if (pair) {
+                if (!((s0 <= 104 && !(s0 & 1)) || (s0 >= 128 && s0 <= 208) || s0 == 255))
+                    refuse(i.pc, "invalid s_cmov_b64 source");
+            } else if (n == "s_cmov_b32") {
+                if (s0 > 106 && !(!wave64 && s0 == 107) && !constant32(i, s0))
+                    refuse(i.pc, "invalid s_cmov_b32 source");
+            }
+            auto cond = cmp("ne", read(128), "0");
+            auto old_lo = operand32(i, i.dst);
+            if (pair) {
+                auto old_hi = operand32(i, i.dst + 1);
+                auto new_lo = operand32(i, s0);
+                auto new_hi = pair_high(i, s0);
+                write(i.dst, select(cond, new_lo, old_lo));
+                write(i.dst + 1, select(cond, new_hi, old_hi));
+            } else {
+                auto next = n == "s_cmovk_i32" ? to_string(Word(int16_t(i.a))) : operand32(i, s0);
+                write(i.dst, select(cond, next, old_lo));
+            }
+            return;
+        }
         if (compute && (n == "v_readlane_b32" || n == "v_writelane_b32")) {
             if (i.enc != Encoding::Vop3 || i.dpp_control || (i.a & 0x7800u) || i.src[2])
                 refuse(i.pc, "lane read/write encoding or operand modifiers");
@@ -2211,6 +2244,36 @@ struct DirectCompute {
                 refuse_heap_contract(i.pc);
                 refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }
+        }
+        if (compute && (n == "s_cmp_eq_u64" || n == "s_cmp_lg_u64" || n == "s_bitcmp0_b64" || n == "s_bitcmp1_b64")) {
+            // Issue #3078: lower 64-bit SOPC scalar comparisons to pure 32-bit DXIL writes of SCC.
+            auto scalar64 = [&](unsigned src) -> std::pair<string, string> {
+                if (src == 125)
+                    return {"0", "0"};
+                if (src == 106 || src == 126)
+                    refuse(i.pc, "invalid " + string(n) + " source");
+                return {operand32(i, src), pair_high(i, src)};
+            };
+            auto [a_lo, a_hi] = scalar64(i.src[0]);
+            string cond;
+            if (n == "s_cmp_eq_u64" || n == "s_cmp_lg_u64") {
+                auto [b_lo, b_hi] = scalar64(i.src[1]);
+                const bool eq = n == "s_cmp_eq_u64";
+                const auto op = eq ? "eq" : "ne";
+                const auto combine = eq ? "and" : "or";
+                cond = ir.value(string(combine) + " i1 " + cmp(op, a_lo, b_lo) + ", " + cmp(op, a_hi, b_hi));
+            } else {
+                const unsigned index_src = i.src[1];
+                if (!(index_src <= 105 || (index_src >= 128 && index_src <= 208) || index_src == 255))
+                    refuse(i.pc, "invalid " + string(n) + " bit index");
+                auto idx = operand32(i, index_src);
+                auto upper = cmp("ne", ir.binary("and", idx, "32"), "0");
+                auto word = select(upper, a_hi, a_lo);
+                auto bit = ir.binary("and", shift("lshr", word, idx), "1");
+                cond = cmp(n == "s_bitcmp0_b64" ? "eq" : "ne", bit, "0");
+            }
+            write(128, ir.value("zext i1 " + cond + " to i32"));
+            return;
         }
         if (compute && n == "s_bfm_b64") {
             if ((i.dst & 1) || i.dst > 104)

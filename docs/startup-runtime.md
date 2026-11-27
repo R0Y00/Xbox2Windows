@@ -859,6 +859,20 @@ that its fixture's module and export are in that list, that a source-built DLL l
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
+**Window pictures.** At the end of a run that is still going, `debug_launch.py` saves the client area of the
+title's window as `window.png`. `--capture-every <seconds>` (`run.ps1 -CaptureEvery`, `run.sh --capture-every`)
+also saves it every N seconds (N is at least 1; 0, the default, is off) as `window_<sss>s.png`, with the seconds
+since the process started, so a run that passes several screens leaves one picture per screen. A frame whose
+pixels equal the previous frame is not saved, at most 120 files are written (later changes are counted, not
+saved), and the summary prints one line such as `window captures: 12 saved, 7 unchanged skipped, first change
+at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
+conversion to PNG uses whole-buffer slices instead of a per-byte loop. The end-of-run `window.png` is
+unchanged. `tests/startup_window_capture_check.py` checks the file names, the skip, the cap, the summary line
+and the pixels of the PNG against a per-pixel reference. `tests/startup_debug_window_check.py` runs the
+source-built `tests/startup_window_probe.cpp` (a window that is red, then blue after 3.5 s) with
+`--capture-every 1`: one red and one blue frame are saved, the others are skipped, the reported first change
+falls in the second the probe changes it, and without the option no `window_<sss>s.png` exists.
+
 `run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
 `x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
 the debugger breakpoints described above. The switches work independently and
@@ -1530,6 +1544,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
+| `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
@@ -1633,6 +1648,18 @@ Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
 D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
 budget in bytes for node 0 of the adapter matching the desktop device LUID.
 An unavailable segment reads `n/a`.
+
+The line ends with the system commit and the physical-page pool (#1199):
+`commit=<used>/<limit> avail=<free>` in MiB (all processes: RAM plus page files, what a new commit can still
+get) and `sections=<n> slabs=<n> slots=<in use>/<free>` (live 64 KiB physical-page sections, open slabs, slots in
+the open slabs), then `job_peak=<MiB> job_limit=<MiB>`: the peak commit of the job the title runs in and its memory
+limit (`run.ps1 -MemoryGiB`; `none` without a limit). Each reads `n/a` when it cannot be read. A run that ends on error 1455 shows from these whether
+the pool (a flat `sections`) or the resources below (committed texture bytes) grew. The first three commit failures
+(error 1455 or 8) of the page pool also
+log `x2w-xmem commit exhausted at <call> (error N): job memory limit N GiB reached (run.ps1 -MemoryGiB)` when the job peak is within 256 MiB of its limit (otherwise `job memory limit not reached`), then the job numbers, `system commit=... avail=...` and `pool sections=... slabs=...
+slots=.../...` with the hint that `X2W_XMEM_LAZY_COMMIT=1` (`run.ps1 -LazyMemory`) keeps untouched pages out of
+the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/startup_triage_run_check.py` that
+`triage_run.py` still reads the line with and without these fields.
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
@@ -2559,6 +2586,16 @@ These are measured on one executable; treat them as hypotheses for others.
   · [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview#geterroreventretrieveerrorrecord)
   · [DSTORAGE_ERROR_RECORD](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_error_record?view=gdk-2604)
   · [DSTORAGE_COMMAND_TYPE](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_command_type?view=gdk-2604)
+- **DirectStorage request totals (#2816).** The heartbeat's totals line and the first `Queue::EnqueueStatus` lines print
+  `requests raw=<n> inflated=<n> failed=<n> bcpack-blank=<n> completed=<n>`. `raw` counts the uncompressed copies only
+  (it was printed as `done=`, which read as zero for a title whose requests are all compressed), `inflated` every
+  compressed stream that was decoded (zlib, standalone or embedded BCPack), `bcpack-blank` the BCPack requests that
+  completed without decoded data, and `completed` is `raw + inflated + bcpack-blank`: every request that finished and
+  wrote its destination (a failed request is not in it). The text `inflated=<n> failed=<n>` is unchanged;
+  `tools/startup/live_view.py` parses it, takes `completed` from new lines and rebuilds it from `done`, `inflated` and
+  `bcpack-blank` on older ones. `startup_storage_failure_counts` checks the totals of a mixed run and of a run with only zlib
+  requests (`raw=0`, `completed` equal to the finished requests); `startup_live_telemetry_check.py` checks both line formats.
+  [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview)
 - **DirectStorage failure causes (#1198).** After its totals line, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: failed requests by cause` with one count for each of
   `read-at-or-past-eof`, `read-crossing-eof`, `read-other`, `destination-capacity`,
@@ -3486,7 +3523,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
   for each new combination of format, layout, one or several mips, one or several slices, flags,
   dimension, view format, view dimension and outcome (at most 200). The outcome is
   `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
-  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+  `published console layout`, one of the two hold reasons, `texture_no_resource` (no live resource at that base and description), `texture_unreadable` (the texels are not readable), `texture_over_64mib` (more than the 64 MiB single-copy limit) or `texture_unavailable` (publication failed otherwise).
 - `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
   submits that drop retained uploads.
 
