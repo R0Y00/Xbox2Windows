@@ -203,6 +203,9 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unsupported memory SRV arguments", "unsupported_description"),
         ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
         ("GPU-written resource at the supplied address", "gpu_written_resource"),
+        ("unavailable acceleration structure at the supplied address", "as_unaligned"),
+        ("unavailable acceleration structure at the supplied address", "as_not_placed"),
+        ("unavailable acceleration structure at the supplied address", "as_wrong_state"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
         ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
@@ -224,6 +227,15 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
     reported = sorted(key[0] for key in refusals)
     if reported != sorted(reasons):
         failures.append(f"slot70 reasons reported as {reported}, expected {sorted(reasons)}")
+    # The acceleration-structure names come from the header, so a new one cannot be forgotten here.
+    as_header = (Path(__file__).resolve().parent.parent / "src" / "startup_stubs" / "memory_srv_as.h").read_text(encoding="utf-8")
+    body = as_header.split("as_srv_refusal_name", 1)[1].split("}", 1)[0]
+    as_names = re.findall(r'return "(as_\w+)";', body)
+    if len(as_names) < 3:
+        failures.append(f"as_srv_refusal_name names not found in memory_srv_as.h: {as_names}")
+    for name in as_names:
+        if name not in triage_run.SLOT70_REASONS:
+            failures.append(f"SLOT70_REASONS lacks acceleration-structure refusal {name}")
 
 
 def check_empty_and_missing_dirs(failures: list[str]) -> None:

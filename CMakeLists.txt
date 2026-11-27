@@ -245,6 +245,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # and section count the DirectStorage heartbeat reports from it.
     add_test(NAME xmem_page_stats COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_page_stats_check.py" "$<TARGET_FILE:xmem_shim>")
+    # A page-token write names granted pages only: no section outside a grant, and a fresh grant reads zero.
+    add_test(NAME xmem_physical_write_owner COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_physical_write_owner_check.py" "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(xmem_physical_write_owner PROPERTIES TIMEOUT 120)
     # A few mapped pages commit about those pages, not the whole 256 MiB slab that holds them (#1199).
     add_test(NAME xmem_mapped_pages_commit COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_commit_check.py" "$<TARGET_FILE:xmem_shim>")
@@ -871,6 +875,19 @@ set_tests_properties(startup_storage_refused_reuse startup_storage_refused_reuse
 set_tests_properties(startup_storage_refused_reuse_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: R1 destination taken as data matches the stream prefix in 0 of 4096 byte")
 
+# #2788: the DirectStorage stand-in frees its COM objects at final Release, the queue's worker leaves
+# before the queue is freed, and a pending entry keeps the status array and source file it uses alive
+# after the guest releases them. The control deletes at zero without that accounting and must fail.
+add_executable(startup_xcrdapi_lifetime tests/startup_xcrdapi_lifetime.cpp)
+target_compile_features(startup_xcrdapi_lifetime PRIVATE cxx_std_17)
+add_dependencies(startup_xcrdapi_lifetime startup_stub_xcrdapi)
+add_test(NAME startup_xcrdapi_lifetime
+         COMMAND startup_xcrdapi_lifetime "$<TARGET_FILE:startup_stub_xcrdapi>")
+add_test(NAME startup_xcrdapi_lifetime_naive_control
+         COMMAND startup_xcrdapi_lifetime "$<TARGET_FILE:startup_stub_xcrdapi>" control)
+set_tests_properties(startup_xcrdapi_lifetime startup_xcrdapi_lifetime_naive_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_xcrdapi_lifetime_naive_control PROPERTIES WILL_FAIL TRUE)
+
 # Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
 # symbols. Interleaving with a 7-byte cycle budget is the negative control.
 add_executable(bcpack_encoder_check tests/bcpack_encoder_check.cpp)
@@ -1255,6 +1272,17 @@ set_tests_properties(startup_dump_fence_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DR
 add_test(NAME startup_dump_fence_removed_control_warp COMMAND startup_dump_fence_check --mutate removed)
 set_tests_properties(startup_dump_fence_removed_control_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45
     WILL_FAIL TRUE)
+
+# Per-draw texel history: three source-built draws where only the second covers the watched texel,
+# then a control without that draw. The report must name draw 2 and leave the texel black in the control.
+add_executable(startup_pixel_history tests/startup_pixel_history.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_pixel_history PRIVATE cxx_std_17)
+target_include_directories(startup_pixel_history PRIVATE src)
+target_link_libraries(startup_pixel_history PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_pixel_history_warp COMMAND startup_pixel_history)
+set_tests_properties(startup_pixel_history_warp PROPERTIES TIMEOUT 60)
+add_test(NAME startup_pixel_history_hardware COMMAND startup_pixel_history hardware)
+set_tests_properties(startup_pixel_history_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
 add_executable(startup_typed_buffer_view tests/startup_typed_buffer_view.cpp)
 target_compile_features(startup_typed_buffer_view PRIVATE cxx_std_17)
@@ -2042,6 +2070,10 @@ foreach(mutation IN ITEMS no-limit no-state no-root-args no-pairing no-bound)
     add_test(NAME startup_list_dispatch_${mutation}_control COMMAND startup_list_dispatch_check --mutate ${mutation})
     set_tests_properties(startup_list_dispatch_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+add_executable(upload_reservation_check tests/upload_reservation_check.cpp)
+target_include_directories(upload_reservation_check PRIVATE src)
+target_compile_features(upload_reservation_check PRIVATE cxx_std_17)
+add_test(NAME upload_reservation COMMAND upload_reservation_check)
 # The same slot driven through the stand-in on a desktop device: one refusal line per refused case, and the
 # forwarded calls counted by a pipeline-statistics query on the desktop list.
 add_executable(startup_list_dispatch_native tests/startup_list_dispatch_native.cpp)
@@ -3323,6 +3355,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_check.py")
     add_test(NAME startup_compute_image_store_d16 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_image_store_d16_check.py")
+    add_test(NAME startup_gfx2hlsl_image_store_3d1d COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_image_store_3d1d_check.py")
     add_test(NAME startup_gfx2hlsl_heap_record COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_heap_record_check.py")
     add_test(NAME startup_gfx2hlsl_heap_word COMMAND "${INTAKE_PYTHON}" -B
@@ -3701,7 +3735,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: a plain image_sample past a uniform join keeps its implicit LOD (Sample, not level 0).
     add_test(NAME startup_image_sample_implicit_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_implicit_lod_check.py")
-    # Startup shader translator: image_get_lod on a 2D texture (CalculateLevelOfDetail / Unclamped).
+    # Startup shader translator: image_get_lod on 2D and 2D-array textures.
     add_test(NAME startup_gfx2hlsl_image_get_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_get_lod_check.py")
     foreach(adapter IN ITEMS warp hardware)
@@ -4785,6 +4819,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_copied_vertex_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_copied_vertex_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_table_alias_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_table_alias_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_table_alias_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_direct_index_late_write_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_direct_index_late_write_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -4824,8 +4862,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
-        # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
-        foreach(gate IN ITEMS gate gate-ring)
+        # queue has run them. The ring control fills them from the shared upload ring, which must refuse the uploads
+        # past its 256 MiB cap while the queue is held. gate-ring-reuse: once those submits have completed, the ring
+        # must accept a new upload again.
+        # gate-ring-keep(-release): a closed list that is never Reset, without and with X2W_D3D12_RING_RELEASE_AT_SUBMIT.
+        foreach(gate IN ITEMS gate gate-ring gate-ring-reuse gate-ring-keep gate-ring-keep-release)
             string(REPLACE "-" "_" gate_name "${gate}")
             add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
                 "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
@@ -9986,6 +10027,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" depth "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_mesh57_skeleton_depth_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        # A slot 57 colour pair whose pixel stage leaves a kill through the early-exit null export (#2413).
+        add_test(NAME startup_mesh57_skeleton_kill_exit_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" killexit "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_mesh57_skeleton_kill_exit_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME startup_mesh57_formatted_load_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_mesh57_skeleton_check.py" formatted "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

@@ -386,6 +386,42 @@ WORDS_O = bytes.fromhex(
     '6a3c80be' '030088bf' '8300887d' '7e6a7e87' '007e008a' '0003febe' '04060a3a' '001070e004050480' '1503febe'
     '000081bf')
 
+# The two-mask loop from #2645. The displacements name the join, exit and head, respectively.
+LOOP_BREAK_SOURCE = """\
+v_lshlrev_b32 v4, 2, v0
+v_mov_b32 v5, 9
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 s22, exec_lo, vcc_lo
+s_mov_b32 s23, s22
+s_mov_b32 s24, 1
+s_mov_b32 exec_lo, s22
+s_cbranch_execz 6
+v_cmpx_gt_u32 s24, v0
+s_andn2_b32 s22, s22, exec_lo
+s_andn2_b32 s23, s23, exec_lo
+s_cbranch_scc0 6
+s_mov_b32 exec_lo, s22
+v_mov_b32 v5, s24
+s_mov_b32 exec_lo, s23
+s_add_u32 s24, s24, 1
+s_cmp_ge_u32 s24, 4
+s_cbranch_scc0 65524
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_mov_b32 exec_lo, s21
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+LOOP_BREAK_WORDS = bytes.fromhex(
+    '82000834 89020a7e 7e0395be 8300887d 7e6a1687 160397be 810398be 1603febe '
+    '060088bf 1800a87d 167e168a 177e178a 060084bf 1603febe 18020a7e 1703febe '
+    '18811880 188409bf f4ff84bf 06038abe 80038bbe 05030cf4000000fa 7fc08cbf '
+    '1503febe 001070e004050480 000081bf')
+
+
 def saveexec_fixture():
     # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
     # A single-thread group makes the lane bit the whole participating wave mask.
@@ -723,6 +759,7 @@ SPLICE = {
     's_bfe_u32 s21, s29, 0xe0010': '1dff959310000e00',
     's_max_u32 s21, s21, 1': '15819584',
     's_max_u32 s21, s21, 2': '15829584',
+    'v_cmp_gt_u32_e64 s21, 3, v0': '1500c4d483000200',
     's_bfe_u32 s21, s17, 0xe0011': '11ff959311000e00',
     's_mul_i32 s18, s18, s21': '12151293',
     's_mul_i32 s18, s18, 4': '12841293',
@@ -768,6 +805,15 @@ OOB_RAW = 's_or_b32 s19, s19, 0x30000000'
 RAW_CONVERSION = (STRIDE_EXTRACT, STRIDE_CLEAR, SCALE_RECORDS, OOB_CLEAR, OOB_RAW)
 CASES['I-raw'] = (SOURCE_A.replace('buffer_store_dword', '\n'.join((*RAW_CONVERSION, 'buffer_store_dword'))),
                   splice(*RAW_CONVERSION), *CASES['A'][2:])
+
+# Case I-raw-mask: s21 first holds a lane mask (a compare in a 24-lane group), then the clamped stride of the same
+# conversion. The descriptor-data write ends the mark, so the clamp is not a lane-mask read and the store lands as
+# in case A. The translator before that change refused it: s_max_u32 reads lane mask s21 as numeric data.
+MASK_S21 = 'v_cmp_gt_u32_e64 s21, 3, v0'
+CLAMPED_CONVERSION = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
+CASES['I-raw-mask'] = (SOURCE_A.replace('buffer_store_dword',
+                                        '\n'.join((MASK_S21, *CLAMPED_CONVERSION, 'buffer_store_dword'))),
+                       splice(MASK_S21, *CLAMPED_CONVERSION), *CASES['A'][2:])
 
 # Replace the nonzero stride constant in s5 with the first active lane of a
 # fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
@@ -873,7 +919,7 @@ def formatted_input():
 
 
 def expected(name):
-    if name in ('I', 'I-raw'):
+    if name in ('I', 'I-raw', 'I-raw-mask'):
         return expected('A')
     out = [SENTINEL] * WORDS
     if name == 'join-load':
@@ -1047,6 +1093,40 @@ MBCNT_REFUSALS = (
     ('v_mbcnt_lo_u32_b32 v8, -1, exec_lo', '080065d7c1fc0000', 'VGPR or known base'),
     ('v_mbcnt_lo_u32_b32 v8, -1, s4', '080065d7c1080000', 'VGPR or known base'),
 )
+
+
+def check_execz_loop_break():
+    # Trace the fixture once as a wave and once per singleton. Both saved masks lose
+    # the same lanes. SCC tests the entire remaining mask at the early exit.
+    def trace(lanes):
+        remaining = {lane for lane in lanes if lane < 3}
+        values = dict.fromkeys(lanes, 9)
+        counter = 1
+        while counter < 4:
+            if remaining:  # otherwise execz goes straight to the join
+                remaining = {lane for lane in remaining if lane >= counter}
+                if not remaining:
+                    break
+                values.update(dict.fromkeys(remaining, counter))
+            counter += 1
+        return values, counter
+
+    lanes = range(8)
+    wave, counter = trace(lanes)
+    singles = [trace([lane]) for lane in lanes]
+    assert list(wave.values()) == [values[lane] for lane, (values, _) in enumerate(singles)] == [9, 1, 2, 9, 9, 9, 9, 9]
+    # Make the scalar counter observable after restoring EXEC. Lane 0 leaves before
+    # the wave, while lanes 3..7 follow the latch even after the wave has left.
+    assert counter == 3 and [c for _, c in singles] == [1, 2, 3, 4, 4, 4, 4, 4]
+    store = '001070e004050480'
+    with_counter = patch(LOOP_BREAK_WORDS, store, '18020a7e' + store)
+    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
+    for program in (LOOP_BREAK_WORDS, with_counter):
+        refused(reason, lambda: translate('O', code=program).hlsl_cs())
+    # Remove just the latch or just the guard to isolate the control-flow diagnostic.
+    refused('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block',
+            lambda: translate('O', code=patch(LOOP_BREAK_WORDS, 'f4ff84bf', '000080bf')).hlsl_cs())
+    translate('O', code=patch(LOOP_BREAK_WORDS, '060088bf', '000080bf')).hlsl_cs()
 
 
 def check_mbcnt():
@@ -1596,6 +1676,7 @@ def check_controls():
     check_descriptor_scc()
     check_scc_modelled()
     check_mbcnt()
+    check_execz_loop_break()
     check_lane_mask_data()
     check_lane_mask_high_word()
     check_lane_mask_compare_pair()
@@ -1711,6 +1792,13 @@ def check_controls():
     # Captured programs clamp the extracted stride to at least 1 before scaling NUM_RECORDS.
     clamped = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
     assert translate('A', code=splice(*clamped)).hlsl_cs() == raw.hlsl_cs()
+    # After a lane mask in s21 the clamped conversion still matches case I-raw apart from the compare itself; the
+    # dispatch of case I-raw-mask stores through it. Control: a clamp that reads the mask itself stays refused.
+    masked = translate('I-raw-mask').hlsl_cs().splitlines()
+    assert [line for line in masked if line not in raw.hlsl_cs().splitlines()] == [
+        '    s21 = ((0x00000003u > v0) ? 1u : 0u);'], masked
+    refused('s_max_u32 reads lane mask s21 as numeric data', lambda: translate(
+        'A', code=splice(MASK_S21, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])).hlsl_cs())
     refused('buffer store through a modified descriptor', lambda: translate(
         'A', code=splice(STRIDE_EXTRACT, 's_max_u32 s21, s21, 2', *RAW_CONVERSION[1:])).hlsl_cs())
     reload = ('s_load_dwordx8 s[24:31], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)')
@@ -2190,6 +2278,7 @@ def assemble(llvm_mc, source):
 
 
 def check_binary(llvm_mc):
+    assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())

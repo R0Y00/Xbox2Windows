@@ -21,7 +21,7 @@ param(
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
     [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
-    [string]$StoragePath = "",                 # X2W_STORAGE_PATH: persistent local storage root (a trailing \ is added when missing)
+    [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
     [switch]$FakeUser,                         # answer the user API for one local user
@@ -43,8 +43,8 @@ foreach ($dll in "xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs
 $env:X2W_AUDIO_PERMISSIVE = "1"; $env:X2W_D3D12_DEVICE_NOOP = "1"; $env:X2W_D3D12_LIST_NOOP = "1"
 $env:X2W_D3D12_PERMISSIVE = "1"; $env:X2W_XMEM_PERMISSIVE = "1"; $env:X2W_RUNTIME_PROXY = "1"
 $config = Join-Path $DataDir "MicrosoftGame.config"
-if (Test-Path $config) {
-    $text = Get-Content $config -Raw
+if (Test-Path -LiteralPath $config) {
+    $text = Get-Content -LiteralPath $config -Raw
     if ($text -match "<TitleId>([^<]*)") { $env:X2W_TITLE_ID = $Matches[1] }
     if ($text -match "<SizeMB>([^<]*)") { $env:X2W_STORAGE_MB = $Matches[1] }
 }

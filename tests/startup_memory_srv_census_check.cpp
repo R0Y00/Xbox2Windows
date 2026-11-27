@@ -2,6 +2,7 @@
 // distinct refused shapes, the first 4 pipelines and the first 8 written entries, shapes only for
 // description-dependent reasons, the overflow counters, and a periodic report that is skipped when
 // nothing changed.
+#include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/memory_srv_census.h"
 
 #include <cstdio>
@@ -41,6 +42,27 @@ int main()
     check("same shape, other reason is a new shape", srv.note("texture_unavailable", &a));
     check("reasons without a shape keep none", !srv.note("null_address", &a) && !srv.note("null_destination", &a));
     check("unreadable description keeps no shape", !srv.note("unsupported_description", nullptr));
+    // Every name the acceleration-structure resolver can return is a census reason of its own (not "other")
+    // and, because that path does not read the resource description, keeps no shape. The names come from
+    // as_srv_refusal_name, so a fourth refusal that is not added to memory_srv_reasons fails here.
+    {
+        int as_names = 0;
+        MemorySrvCensus probe;
+        for (int r = static_cast<int>(AsSrvRefusal::none) + 1;; ++r) {
+            const char* name = as_srv_refusal_name(static_cast<AsSrvRefusal>(r));
+            if (!std::strcmp(name, "none")) break;
+            ++as_names;
+            const int index = memory_srv_reason_index(name);
+            check("acceleration-structure refusal has its own census reason", index < memory_srv_reason_count);
+            check("acceleration-structure refusal keeps no shape", !memory_srv_reason_has_shape(index) && !probe.note(name, &a));
+        }
+        check("the acceleration-structure refusals were enumerated", as_names >= 3);
+        MemorySrvCensus fresh;
+        fresh.note("as_unaligned", &a);
+        const auto fresh_report = lines(fresh, false);
+        check("as_unaligned is reported by name", fresh_report.size() == 1 && fresh_report[0].find(" as_unaligned 1,") != std::string::npos &&
+              fresh_report[0].find(" other 0;") != std::string::npos);
+    }
     const auto b = texture(128, DXGI_FORMAT_BC7_UNORM, 8), c = texture(256, DXGI_FORMAT_R8G8B8A8_UNORM, 9),
                d = texture(512, DXGI_FORMAT_BC3_UNORM, 10);
     check("third shape is detailed", srv.note("buffer_unavailable", &b));
@@ -58,7 +80,7 @@ int main()
     check("summary", !report.empty() && report[0] ==
           "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
           "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, gpu_written_resource 0, "
-          "buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
+          "as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
           "console_layout_xg_rows 0, console_layout_without_footprints 0, console_layout_beyond_xg_size 0, overlapping_resource 0, "
           "other 1; distinct shapes 128 (calls past the shape table 5)");
     check("first shape line", report.size() > 1 && report[1] ==
