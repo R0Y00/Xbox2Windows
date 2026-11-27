@@ -3366,7 +3366,9 @@ descriptions with:
   re-checking committed status to handle title memory deallocation/reallocation. On adapters supporting
   `D3D12_FEATURE_EXISTING_HEAPS` for `MEM_PRIVATE` memory, it opens the existing heap and creates a
   zero-copy placed resource alias; otherwise (or on WARP), it falls back to a committed upload buffer and
-  synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
+  synchronizes memory from the host. If the page offset cannot be expressed in whole elements for a
+  non-raw view, an upload copy starts at the view address. Cached backings leave this option available
+  even when an earlier raw call has already created a page backing. When the device wrapper is released (`refs == 0`),
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
@@ -3397,7 +3399,9 @@ typed format, views that end exactly at the end of the buffer, raw alignment of 
 element, widths, addresses and first elements above 4 GiB, page extent calculation, and cache range
 coverage. Its `_control` runs (`height`, `exact-fit`, `first-32`, `unplaced-extent`, `unplaced-covers`)
 expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises placed and unplaced buffer
-views with valid addresses on a device (WARP and hardware), and verifies the refusal lines.
+views with valid addresses on a device (WARP and hardware), and verifies the refusal lines. Its
+readback checks stride-12 views before and after a raw view on the same page, and compares stride-16
+views on fresh pages with and without a preceding unaligned raw call.
 
 `startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
 device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).

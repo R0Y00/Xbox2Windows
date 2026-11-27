@@ -189,7 +189,7 @@ bool address_resource_overlap(u64 address, u64 span)
     bool found = false;
     AcquireSRWLockShared(&note_lock);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || wrapper->own().exact_copy ||
+        if (wrapper->own().tiled_address_srv || wrapper->own().unplaced_srv_backing ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
@@ -437,6 +437,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+    w->own().unplaced_srv_backing = true;
     w->own().exact_copy = exact;
     note_resource(w, &rdesc, page_span);
     if (!is_upload) {
@@ -713,16 +714,21 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        const auto resolve = [&](Wrapper* candidate) {
+            const auto* info = candidate ? resource_info(candidate) : nullptr;
+            return info && x2w_startup::resolve_buffer_srv_desc(
+                reinterpret_cast<u64>(candidate->own().title_memory), info->console.Width,
+                input->address, input->view, adjusted);
+        };
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
-        if (!buffer) {
+        bool resolved = resolve(buffer);
+        if (!buffer || (!resolved && buffer->own().unplaced_srv_backing)) {
             buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes,
                                             input->view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW);
+            resolved = resolve(buffer);
         }
-        const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
-        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        if (!buffer || !info ||
-            !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
-                                                  info->console.Width, input->address, input->view, adjusted)) {
+        if (!resolved) {
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
             return;

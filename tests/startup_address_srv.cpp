@@ -699,6 +699,33 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     raw.view.Buffer.FirstElement = 4;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(9);
+
+    // Use fresh pages in the large allocation to exercise the upload path on every adapter.
+    auto* const raw_first = reinterpret_cast<unsigned char*>(large) + 65536;
+    *reinterpret_cast<std::uint32_t*>(raw_first + 0x100) = 55;
+    *reinterpret_cast<std::uint32_t*>(raw_first + 0x104) = 201;
+    raw.address = ptr(raw_first + 0x100);
+    raw.view.Buffer.FirstElement = 0;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(10);
+    structured.address = ptr(raw_first + 0x104);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(11);
+
+    auto* const refused_first = raw_first + 65536;
+    auto* const structured_only = refused_first + 65536;
+    *reinterpret_cast<std::uint32_t*>(refused_first + 0x10c) = 173;
+    *reinterpret_cast<std::uint32_t*>(structured_only + 0x10c) = 173;
+    raw.address = ptr(refused_first + 1);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(12);
+    structured.view.Buffer.StructureByteStride = 16;
+    structured.address = ptr(refused_first + 0x10c);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(13);
+    structured.address = ptr(structured_only + 0x10c);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(14);
     return 0;
 }
 
