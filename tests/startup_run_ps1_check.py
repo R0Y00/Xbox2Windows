@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-record = [sys.argv[1:], os.environ.get("X2W_TRACE_API"), os.environ.get("X2W_NATIVE_SHADERS")]
+record = [sys.argv[1:], os.environ.get("X2W_TRACE_API"), os.environ.get("X2W_NATIVE_SHADERS"), os.environ.get("X2W_TITLE_ID"), os.environ.get("X2W_STORAGE_MB")]
 Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
 watch = Path(__file__).with_name("watch.json")
@@ -136,7 +136,7 @@ def alive(pid):
 
 
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, native=False):
+             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, native=False, manifest="absent"):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -155,11 +155,19 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
         (build / f"{dll}.dll").write_bytes(b"")
-    exe, data, log = root / "run" / "t.exe", root / "data", root / "log"
+    exe, data, log = root / "run" / "t.exe", root / ("data [test]" if manifest.startswith("bracket") else "data"), root / "log"
     exe.parent.mkdir()
     exe.write_bytes(b"")
     data.mkdir()
+    if manifest in ("normal", "bracket"):
+        (data / "MicrosoftGame.config").write_text("<TitleId>1234</TitleId><SizeMB>42</SizeMB>", encoding="utf-8")
+    if manifest.startswith("bracket"):
+        decoy = root / "data t"
+        decoy.mkdir()
+        (decoy / "MicrosoftGame.config").write_text("<TitleId>9999</TitleId><SizeMB>99</SizeMB>", encoding="utf-8")
     env = dict(os.environ)
+    env.pop("X2W_TITLE_ID", None)
+    env.pop("X2W_STORAGE_MB", None)
     # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
     env["NO_COLOR"] = "1"
     env.pop("X2W_FAKE_USER", None)
@@ -221,9 +229,11 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             "--trace-files", "1", "--continue-asserts", "4", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
-    expected = [want, "1" if "-TraceApi" in switches else trace_api_env, str(sdk) if native else None]
+    expected = [want, "1" if "-TraceApi" in switches else trace_api_env, str(sdk) if native else None,
+                "1234" if manifest in ("normal", "bracket") else None,
+                "42" if manifest in ("normal", "bracket") else None]
     if got != expected:
-        found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API, X2W_NATIVE_SHADERS] was {got}, "
+        found.append(f"stub exit {code}: debugger [argv, trace, native SDK, title ID, storage MB] was {got}, "
                      f"expected {expected}")
     watch = startup / "watch.json"
     if translate:
@@ -249,6 +259,8 @@ def run_problems(shell, script, work, first_only):
         if found and first_only:
             return found
     found += run_case(shell, script, 7, work, absolute_build=True)
+    for manifest in ("normal", "bracket", "bracket_missing"):
+        found += run_case(shell, script, 0, work, manifest=manifest)
     if found and first_only:
         return found
     found += run_case(shell, script, 0, work, switches=["-FakeUser"])
