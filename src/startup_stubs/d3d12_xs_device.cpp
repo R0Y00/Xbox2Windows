@@ -4963,11 +4963,16 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
             hr = device_of(self)->CreateDescriptorHeap(&clamped, IID_PPV_ARGS(&heap));
         }
     }
-    static LONG heap_repairs;
-    if ((repaired || did_clamp) && SUCCEEDED(hr) && first_calls(heap_repairs, 4))
-        log("x2w-d3d12 Device::CreateDescriptorHeap repaired type=%d count=%u -> %u flags=0x%x -> 0x%x; "
-            "descriptors past the shader-visible count stay in title memory", desc->Type,
-            desc->NumDescriptors, clamped.NumDescriptors, desc->Flags, clamped.Flags);
+    static LONG shortcuts, heap_repairs;
+    if (SUCCEEDED(hr) && did_clamp && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        if (first_calls(shortcuts, 1))
+            log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
+                "view descriptors, the desktop heap takes %u; the rest stay in title memory",
+                desc->NumDescriptors, clamped.NumDescriptors);
+    } else if (SUCCEEDED(hr) && repaired && first_calls(heap_repairs, 4)) {
+        log("x2w-d3d12 Device::CreateDescriptorHeap repaired type=%d count=%u -> %u flags=0x%x -> 0x%x",
+            desc->Type, desc->NumDescriptors, clamped.NumDescriptors, desc->Flags, clamped.Flags);
+    }
     const D3D12_DESCRIPTOR_HEAP_DESC* request = repaired || did_clamp ? &clamped : desc;
     const std::uint64_t desktop = heap ? heap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
     static LONG calls;
