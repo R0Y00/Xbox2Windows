@@ -3840,6 +3840,11 @@ class Stage:
             self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
             self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
             self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
+            # Rebuilt every pass: a retry translates the program again, and a span recorded on an earlier pass
+            # would describe a chain that this pass must match itself.
+            self.wave_reduce_spans = []
+            self.reduce_plan = {}
+            self.reduce_pending = {}
             self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform, proven, mask) for constant-lane SGPR spills
             self.vcc_events = {}
             self.vcc_lost = self.vcc_descriptor_overwritten = False
@@ -4144,6 +4149,12 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
         for at, reason in self.quad_flow_refusals(branches, targets):
+            if refusals is None:
+                error = Unsupported(reason)
+                error.instruction = names[at]
+                raise error
+            refusals.append((reason, self.kind))
+        for at, reason in self.wave_reduce_branch_refusals():
             if refusals is None:
                 error = Unsupported(reason)
                 error.instruction = names[at]
@@ -10476,11 +10487,15 @@ class Stage:
     # (checked); the v_cndmask_b32_sdwa keeps its own handler, under the restored EXEC. The console packs pixels into
     # waves in its own way, so a correct program cannot depend on which pixels share a wave: the chain becomes one
     # WaveActiveBitOr / WaveActiveMin / WaveActiveMax of vX over the active lanes of the desktop wave, which leaves
-    # helper lanes out. Accepted only in a straight-line pixel stage whose EXEC is the entry mask, not widened by
-    # s_wqm (helper lanes would then be counted on the console). Every other shape that starts like a chain is refused
-    # with its reason: wave64, another fill, a wrong identity, missing or reordered steps, other or mixed operations,
-    # other lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or
-    # with vT rewritten before it, a branch target inside, or vP read before it is rewritten.
+    # helper lanes out. Accepted in a pixel stage whose EXEC is the entry mask, not widened by s_wqm (helper lanes
+    # would then be counted on the console). The chain itself is straight: no branch instruction and no branch target
+    # inside it, and EXEC is saved and restored as in the shapes above. A uniform branch (SCC proven uniform, or an
+    # unconditional s_branch) may sit before the chain, after it, or both; every lane then reaches the chain together,
+    # which is what WaveActive* reduces. A branch that is not proven uniform is refused, as is a non-uniform branch
+    # that changes EXEC inside the chain. Wave64 stays refused. Every other shape that starts like a chain is refused
+    # with its reason: another fill, a wrong identity, missing or reordered steps, other or mixed operations, other
+    # lane selects, the readlane before the restore, an unrestored EXEC, a later readlane in another place or with vT
+    # rewritten before it, or vP read before it is rewritten.
     WAVE_REDUCE = {'v_or_b32': ('WaveActiveBitOr({0})', 0), 'v_min_u32': ('WaveActiveMin({0})', 0xffffffff),
                    'v_max_u32': ('WaveActiveMax({0})', 0)}
     WAVE_REDUCE_STEPS = ('quad_perm:[1,0,3,2]', 'quad_perm:[2,3,0,1]', 'row_half_mirror', 'row_mirror')
@@ -10503,6 +10518,44 @@ class Stage:
     WAVE_REDUCE_FILLS = (wave_reduce_cndmask_fill,)
     # A VALU write of the first operand that keeps or reads the old value of that register does not end vP's life.
     WAVE_REDUCE_KEEPS = re.compile(r'v_(f?mac|pk_fmac|dot\w*c|interp_p2|writelane|swap|movrel)|.*(16|_dpp|_dpp8|_sdwa)$')
+
+    def wave_reduce_branch_reason(self, pc, end):
+        """None when this chain may run in the current pixel program.
+
+        A straight-line program is unchanged. A program with branches is accepted only when the chain span itself
+        holds no branch, every branch already translated is proven uniform (it is in uniform_branches, not
+        divergent_branches), and EXEC is still the entry mask at the caller. A uniform branch that has not been
+        translated yet sits after the chain; wave_reduce_branch_refusals checks it once its condition is known.
+        Anything else keeps the straight-line refusal. A probe that never ran translate() has no uniformity map and
+        stays refused, which is the previous behaviour."""
+        branched = getattr(self, 'has_branches', True) or bool(getattr(self, 'blocks', True))
+        if not branched:
+            return None
+        for off, _n, name, _asm in self.ins:
+            if pc < off <= end and (name.startswith('s_cbranch') or name == 's_branch'):
+                return 'wave reduction: branch inside the chain'
+        divergent = getattr(self, 'divergent_branches', None)
+        if divergent is None:
+            return 'wave reduction in a program with branches: only straight-line pixel stages are lowered'
+        earlier = [(off, name) for off, name in divergent.items() if off <= end]
+        if earlier:
+            off, name = min(earlier)
+            return ('wave reduction in a program with branches: %s at +0x%x is not proven uniform' % (name, off))
+        return None
+
+    def wave_reduce_branch_refusals(self):
+        """[(offset, reason)] for a chain whose program has a divergent branch after it.
+
+        The branch is classified only when translate() reaches it, which is after the chain has been matched."""
+        out = []
+        divergent = getattr(self, 'divergent_branches', {})
+        for start, end in getattr(self, 'wave_reduce_spans', ()):
+            later = sorted((off, name) for off, name in divergent.items() if off > end)
+            if later:
+                off, name = later[0]
+                out.append((start, 'wave reduction in a program with branches: %s at +0x%x is not proven uniform'
+                            % (name, off)))
+        return out
 
     def wave_reduction(self, base, ops):
         """True when this instruction belongs to a recognised wave reduction (its result is lowered at the restore of
@@ -10528,6 +10581,19 @@ class Stage:
         if base.endswith('_b64'):
             raise Unsupported('wave reduction in the wave64 form (%s %s): only the wave32 chain is lowered'
                               % (base, ', '.join(ops)))
+        # A non-uniform branch and an EXEC write that is not the chain's own restore, both before the lane-31
+        # readlane (or anywhere in the lookahead, if that readlane is not in it). The chain's s_mov of exec_lo and a
+        # following chain's s_or_saveexec_b32 are the writes the accepted shapes already have; either without an
+        # EXEC branch is left to the shape matcher.
+        read_at = next((k for k, (name, o, _m) in enumerate(steps)
+                        if name == 'v_readlane_b32' and len(o) == 3 and o[2] == '31'), None)
+        region = steps[1:read_at] if read_at else steps[1:]
+        exec_branch = next((name for name, _o, _m in region
+                            if name in ('s_cbranch_execz', 's_cbranch_execnz')), None)
+        extra_exec = any(writes_exec(name, o) and not (name == 's_mov_b32' and o[:1] == ['exec_lo'])
+                         and name != 's_or_saveexec_b32' for name, o, _m in region)
+        if exec_branch and extra_exec:
+            raise Unsupported('wave reduction: non-uniform branch %s changes EXEC inside the chain' % exec_branch)
         ss = reg_range(ops[0])
         if not ss or ss[0] != 's' or ss[1] != ss[2]:
             raise Unsupported('wave reduction: s_or_saveexec_b32 %s, -1 does not save EXEC in one SGPR' % ops[0])
@@ -10634,8 +10700,9 @@ class Stage:
             raise Unsupported('wave reduction: branch target 0x%x inside the chain' % inside[0])
         if getattr(self, 'kind', None) != 'ps' or getattr(self, 'fetched', False):
             raise Unsupported('wave reduction outside a pixel stage')
-        if getattr(self, 'has_branches', True) or getattr(self, 'blocks', True):
-            raise Unsupported('wave reduction in a program with branches: only straight-line pixel stages are lowered')
+        branch_reason = self.wave_reduce_branch_reason(pc, end)
+        if branch_reason:
+            raise Unsupported(branch_reason)
         if not getattr(self, 'exec_known', False):
             raise Unsupported('wave reduction: EXEC is not the entry mask')
         if getattr(self, 'wqm_exec', False):
@@ -10667,6 +10734,11 @@ class Stage:
         if later:
             self.reduce_pending = {**pending, items[read][0]: claim}
         plan[items[read][0]] = lambda: self.lower_wave_readlane(sd[1], vt, claim if later else None)
+        # Record the span only after every refusal above has passed, so a chain that is refused for EXEC or a
+        # later read of vP is not also reported as a branched-program reduction.
+        if getattr(self, 'has_branches', True) or bool(getattr(self, 'blocks', True)):
+            self.wave_reduce_spans = getattr(self, 'wave_reduce_spans', [])
+            self.wave_reduce_spans.append((pc, end))
         return True
 
     def lower_wave_reduction(self, op, vt, vp, ss, source):
