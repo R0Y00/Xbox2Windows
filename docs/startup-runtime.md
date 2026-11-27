@@ -1258,6 +1258,11 @@ the stop. The report copies only the 32-bit exception code and whether it was fi
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+`tools/startup/exit_report.py` is a narrower reader for the same directory when the question is only how the
+process ended. It reports the `EXIT_PROCESS` code, one of six fixed end-state labels, the last present/frame
+sample and the last presented surface. It does not copy module names, paths or addresses. Check with
+`python3 -B tests/startup_exit_report_check.py`.
+
 ## Iterating on start-up runs
 
 This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
