@@ -47,23 +47,25 @@ emits no helper call and no destination VGPR assignment.
 python -B tests/startup_gfx2hlsl_bvh_check.py
 ```
 
-The check compares the CPU box reference with the fixture in `tests/gfx1030_bvh_box/check.py` for five rays,
-compares the emitted sort network with the same reference, checks the sort-bit negative control (word 0 changes
-from `0x1d` to `0x25`), rounds the bounds to binary16 and checks the same box result, translates a synthetic
-constant-T# program for each node kind and checks the four child results and the manifest, and checks every
-refusal above. It also compiles the translated compute shader with DXC when one is available; without DXC it
-prints `dxc compile: skip` and does not count that as a pass.
+The check compares the CPU box reference with the fixture in `tests/gfx1030_bvh_box/check.py` for six FP32
+rays, compares the emitted helper with the same reference, checks the sort-bit negative control (word 0 changes
+from `0x1d` to `0x25`), checks the three-hit sort-disabled case whose equal keys must stay in child order
+(`0x25, 0x2d, 0x35, 0xffffffff`), rounds the bounds to binary16 and checks the same box result, translates a
+synthetic constant-T# program for each node kind and checks the four child results and the manifest, and checks
+every refusal above. It also compiles the translated compute shader with DXC when one is available; without DXC
+it prints `dxc compile: skip` and does not count that as a pass.
 
 ```text
 python -B tests/startup_gfx2hlsl_bvh_check.py dispatch <dxc> <offscreen_check> warp
 ```
 
-The dispatch mode compiles the helpers with a `RWByteAddressBuffer` in place of the bound
-`ByteAddressBuffer`, writes the two FP32 nodes, one binary16 node and ten rays, and compares all forty result
-words on a Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). All five FP32 and all five
-binary16 cases pass on WARP. It also dispatches a mutant that leaves missed child words in place; the case 2 word 0
-must stop being `0xffffffff`. That control caught the first version of this helper, which sorted the keys
-correctly but returned the original child pointer for a miss.
+The dispatch mode compiles both helpers with a `RWByteAddressBuffer` in place of the bound
+`ByteAddressBuffer`, writes three FP32 nodes, one binary16 node and eleven rays, and compares all forty-four
+result words on a Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). All six FP32 cases
+(including the unsorted three-hit case) and all five binary16 cases pass on WARP. It also dispatches a mutant
+that leaves missed child words in place; the all-miss case 2 word 0 at words 152..155 must stop being
+`0xffffffff`. That control caught the first version of this helper, which sorted the keys correctly but
+returned the original child pointer for a miss.
 
 This is a translator slice. It does not execute the native gfx1030 probe, does not bind the node buffer on a
 D3D12 device, and does not establish any title behavior.
