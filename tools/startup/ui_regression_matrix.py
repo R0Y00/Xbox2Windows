@@ -150,8 +150,16 @@ def _case_status(case: ET.Element) -> tuple[str, str]:
     status = case.get("status", "")
     if case.find("failure") is not None or case.find("error") is not None:
         return FAIL, _node_detail(case) or "CTest reported a failure"
-    if case.find("skipped") is not None or status == "notrun":
-        return SKIP, _node_detail(case) or "CTest reported a skip"
+    detail = _node_detail(case)
+    if status == "notrun":
+        # CTest also uses notrun for a missing executable, a missing configuration or a
+        # disabled test. Only the explicit capability markers are skips; the rest failed
+        # before the fixture could measure anything.
+        if detail.startswith(("SKIP_RETURN_CODE", "SKIP_REGULAR_EXPRESSION")):
+            return SKIP, detail
+        return FAIL, detail or "CTest marked the test not run"
+    if case.find("skipped") is not None:
+        return SKIP, detail or "CTest reported a skip"
     if status == "run":
         return PASS, ""
     return FAIL, f"unrecognized CTest result status {status!r}"
@@ -378,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     summary = summarize(results)
+    unexplained_failure = ctest_returncode != 0 and summary["failed"] == 0
     markdown = markdown_report(build_dir, selection, args.adapter, ctest_returncode, results, summary)
     payload = {
         "schema": "xbox2windows-startup-ui-regression-matrix-v1",
@@ -409,7 +418,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{summary['failed']} failed ({summary['selected']} selected)"
     )
 
-    if summary["failed"]:
+    if summary["failed"] or unexplained_failure:
+        if unexplained_failure:
+            print(
+                "ui_regression_matrix: CTest exited with "
+                f"{ctest_returncode} without a failed test result",
+                file=sys.stderr,
+            )
         return EXIT_FAILED
     if summary["skipped"]:
         return EXIT_INCOMPLETE

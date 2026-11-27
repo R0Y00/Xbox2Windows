@@ -39,6 +39,7 @@ args = sys.argv[1:]
 scenario_path = Path(os.environ["UI_MATRIX_SCENARIO"])
 record_path = Path(os.environ["UI_MATRIX_INVOCATIONS"])
 tests = json.loads(scenario_path.read_text(encoding="utf-8"))["tests"]
+exit_code = json.loads(scenario_path.read_text(encoding="utf-8")).get("exit_code")
 with record_path.open("a", encoding="utf-8") as record:
     record.write(json.dumps(args) + "\n")
 
@@ -72,20 +73,21 @@ root = ET.Element("testsuite", {
 })
 for test in selected:
     status = test.get("status", "pass")
+    junit_status = "run" if status == "pass" else "fail" if status == "fail" else "notrun"
     case = ET.SubElement(root, "testcase", {
         "name": test["name"],
-        "status": "run" if status == "pass" else "fail" if status == "fail" else "notrun",
+        "status": junit_status,
         "time": str(test.get("duration", 0)),
     })
     detail = str(test.get("detail", ""))
-    if status == "skip":
-        ET.SubElement(case, "skipped", {"message": detail or "exit code 77: skipped"})
+    if status in ("skip", "notrun"):
+        ET.SubElement(case, "skipped", {"message": detail or "SKIP_RETURN_CODE=77: skipped"})
     elif status == "fail":
         ET.SubElement(case, "failure", {"message": detail or "failure"}).text = detail
 
 ET.ElementTree(root).write(junit, encoding="utf-8", xml_declaration=True)
 print("%d tests ran" % len(selected))
-raise SystemExit(1 if failures else 0)
+raise SystemExit(exit_code if exit_code is not None else (1 if failures else 0))
 '''
 
 
@@ -99,7 +101,7 @@ FULL_SCENARIO = {
         test_case(
             "startup_sampler_heap_wrapped_hardware",
             "skip",
-            "exit code 77: hardware adapter unavailable",
+            "SKIP_RETURN_CODE=77: hardware adapter unavailable",
         ),
         test_case(
             "startup_xg_bc7_draw_warp",
@@ -110,15 +112,15 @@ FULL_SCENARIO = {
         test_case(
             "startup_xg_bc7_draw_hardware",
             "skip",
-            "exit code 77: D3D12 feature level 12 unavailable",
+            "SKIP_RETURN_CODE=77: D3D12 feature level 12 unavailable",
         ),
         test_case("startup_rect_gap_warp", "pass", duration=0.3),
-        test_case("startup_rect_gap_hardware", "skip", "exit code 77: no physical adapter"),
+        test_case("startup_rect_gap_hardware", "skip", "SKIP_RETURN_CODE=77: no physical adapter"),
         test_case("startup_ui_texture_bands_warp", "pass", duration=0.4),
         test_case(
             "startup_ui_texture_bands_hardware",
             "skip",
-            "exit code 77: D3D12 debug layer unavailable",
+            "SKIP_RETURN_CODE=77: D3D12 debug layer unavailable",
         ),
     ]
 }
@@ -246,6 +248,25 @@ def main():
         assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
         assert "must not be empty" in proc.stderr, proc.stderr
         assert not calls
+
+        # A binary that was never built is not a capability skip.
+        proc, output, report, _ = fixture.run({
+            "tests": [test_case("startup_ui_texture_bands_warp", "notrun", "Unable to find executable")]
+        })
+        assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        assert data["summary"] == {"selected": 1, "passed": 0, "skipped": 0, "failed": 1}, data
+        assert data["tests"][0]["status"] == "fail", data
+        assert "Unable to find executable" in data["tests"][0]["detail"], data
+        assert "| FAIL |" in output.read_text(encoding="utf-8")
+
+        # A nonzero CTest exit must not become exit 0 when every JUnit row says pass.
+        proc, output, report, _ = fixture.run({
+            "tests": [test_case("startup_ui_texture_bands_warp", "pass")],
+            "exit_code": 8,
+        })
+        assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
+        assert "without a failed test result" in proc.stderr, proc.stderr
 
     print("startup_ui_regression_matrix_check: ok")
     return 0
