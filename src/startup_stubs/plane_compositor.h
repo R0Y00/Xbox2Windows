@@ -26,6 +26,7 @@
 #include <d3dcompiler.h>
 
 #include "startup_stubs/present_planes.h"
+#include "startup_stubs/sampler_desc_check.h"
 #include "startup_stubs/present_view_format.h"
 
 namespace x2w_startup {
@@ -64,6 +65,7 @@ public:
             sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             sampler.MaxLOD = D3D12_FLOAT32_MAX;
             sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            x2w_startup::sanitize_static_sampler(sampler);
             const D3D12_ROOT_SIGNATURE_DESC desc{1, &parameter, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
             hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, nullptr);
             if (SUCCEEDED(hr)) hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_));
