@@ -6,6 +6,8 @@
 #include "gfx1013_compute_clear.h"
 #include "gfx1013_compute_native.h"
 #include "startup_stubs/native_global_srv.h"
+#include <d3d12.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -31,6 +33,51 @@ static double elapsed_ms(Clock::time_point since) {
 }
 
 namespace fs = std::filesystem;
+
+// FNV-1a over the pixel-input sidecars. The digest, not a timestamp, decides whether a published manifest
+// still describes the sidecar bytes: a content change with a preserved or older mtime must invalidate it.
+static void sidecar_hash_bytes(uint64_t& hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+static bool pixel_sidecar_hash(const fs::path& marker, std::string& digest) {
+    uint64_t hash = 1469598103934665603ull;
+    bool any = false;
+    for (const auto& path : {fs::path(marker).replace_extension(L".psin"),
+                             fs::path(marker).replace_extension(L".ps57in")}) {
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec))
+            continue;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            return false;
+        const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const auto name = path.extension().wstring();
+        sidecar_hash_bytes(hash, name.data(), name.size() * sizeof(wchar_t));
+        const uint64_t count = bytes.size();
+        sidecar_hash_bytes(hash, &count, sizeof(count));
+        sidecar_hash_bytes(hash, bytes.data(), bytes.size());
+        any = true;
+    }
+    if (!any)
+        return false;
+    char text[17]{};
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+    digest = text;
+    return true;
+}
+
+static bool read_published_digest(const fs::path& path, std::string& digest) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    digest.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    return !digest.empty();
+}
 
 static void publish_atomic(const fs::path& destination, const void* data, size_t size) {
     static std::atomic<unsigned long long> serial{};
@@ -108,7 +155,9 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
     const std::wstring direct_prefix=L"gfx1013-direct-cs@";
     const bool container=profile==L"gfx1013-container-cs";
     const bool graphics=profile==L"gfx1013-container-vs" || profile==L"gfx1013-container-ps";
-    const bool direct=container || graphics || profile==L"gfx1013-direct-constant-ps" || profile.compare(0,direct_prefix.size(),direct_prefix)==0;
+    const bool mesh_pixel=profile==L"gfx1013-raw-mesh-ps";
+    const bool mesh=profile==L"gfx1013-container-ms-uint-heap" || profile==L"gfx1013-container-ms" || profile==L"gfx1013-raw-ms";
+    const bool direct=container || graphics || mesh || mesh_pixel || profile==L"gfx1013-direct-constant-ps" || profile.compare(0,direct_prefix.size(),direct_prefix)==0;
     const std::wstring compute_prefix=direct?direct_prefix:L"gfx1013-compute-wave32@";
     if(container || profile.compare(0,compute_prefix.size(),compute_prefix)==0){
         auto offset=container?L"0":profile.substr(compute_prefix.size());
@@ -162,7 +211,76 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
         source.assign(std::istreambuf_iterator<char>(input),{});
         if (input.bad()) throw std::runtime_error("source read failed");
     }
-    if(graphics){
+    if(mesh){
+        auto mesh_ir=[&](x2w::NativeComputeShader shader) {
+            for (const auto &read : shader.mesh_heap_reads)
+                report<<"requires_heap_r32_uint root="<<read.root_parameter<<" dword="<<read.dword<<" mask="<<read.mask<<'\n';
+            return std::move(shader.dxil_ir);
+        };
+        if(profile!=L"gfx1013-raw-ms") source=mesh_ir(x2w::translate_mesh_container(source,profile==L"gfx1013-container-ms-uint-heap"));
+        else {
+            std::ifstream meta(fs::path(input_path).replace_extension(L".mslayout"));
+            x2w::MeshStageLayout layout{};
+            std::string version, extra;
+            unsigned wave=0;
+            if (!(meta>>version>>layout.threads>>layout.max_vertices>>layout.max_primitives>>layout.topology>>
+                  layout.group_stride>>wave) || version!="mesh1" || (wave!=32 && wave!=64))
+                throw std::runtime_error("raw mesh requires explicit mesh1 threads vertices primitives topology group_stride wave");
+            layout.wave32=wave==32;
+            while (meta>>extra) {
+                if (extra=="packed_parameters") {
+                    layout.packed_parameters=true;
+                    continue;
+                }
+                if (extra=="validate_uint_heap_reads") {
+                    layout.validate_uint_heap_reads=true;
+                    continue;
+                }
+                if (extra=="resource_heap") {
+                    unsigned sgpr;
+                    if (layout.resource_heap_sgpr || !(meta>>sgpr)) throw std::runtime_error("invalid mesh resource heap");
+                    layout.resource_heap_sgpr=sgpr;
+                    continue;
+                }
+                x2w::MeshRootInput input{};
+                input.root_address=extra=="root_address";
+                if ((extra!="table" && extra!="constants" && !input.root_address) || !(meta>>input.sgpr>>input.root_parameter) ||
+                    (extra=="constants" && (!(meta>>input.constant_count) || !input.constant_count)))
+                    throw std::runtime_error("invalid mesh entry root mapping");
+                layout.root_inputs.push_back(input);
+            }
+            if (layout.root_inputs.empty()) source=mesh_ir(x2w::translate_mesh_program(source,layout));
+            else {
+                auto bytes=x2w::read_shader_container_bytes(fs::path(input_path).replace_extension(L".root"));
+                Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> signature;
+                const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc=nullptr;
+                if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(bytes.data(),bytes.size(),IID_PPV_ARGS(&signature))) ||
+                    FAILED(signature->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc)))
+                    throw std::runtime_error("invalid raw mesh root signature");
+                source=mesh_ir(x2w::translate_mesh_program(source,layout,desc->Desc_1_1));
+            }
+        }
+        profile=L"ms_6_6";
+    } else if (mesh_pixel) {
+        std::ifstream meta(fs::path(input_path).replace_extension(L".pslayout"));
+        std::string tag, extra;
+        unsigned enable, address, wave;
+        if (!(meta >> tag >> enable >> address >> wave) || tag != "meshps1")
+            throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        const bool guest_root = bool(meta >> extra);
+        if (guest_root && (extra!="guest_root" || (meta >> extra)))
+            throw std::runtime_error("unexpected raw mesh PS layout field");
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> signature;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc=nullptr;
+        if (guest_root) {
+            auto bytes=x2w::read_shader_container_bytes(fs::path(input_path).replace_extension(L".root"));
+            if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(bytes.data(),bytes.size(),IID_PPV_ARGS(&signature))) ||
+                FAILED(signature->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc)))
+                throw std::runtime_error("invalid raw mesh PS root signature");
+        }
+        source=x2w::translate_mesh_pixel_program(source,enable,address,wave,desc ? &desc->Desc_1_1 : nullptr).dxil_ir;
+        profile=L"ps_6_6";
+    } else if(graphics){
         bool pixel=profile==L"gfx1013-container-ps";
         if(linked)source=linked->dxil_ir;
         else source=x2w::translate_graphics_container(source,pixel).dxil_ir;
@@ -630,10 +748,12 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     bool lost = false;
     if (!req.compute) {
         if (const auto psin_path = graphics_psin_path(req.marker)) {
-            if (fs::is_regular_file(*psin_path, ec)) {
-                const auto t = fs::last_write_time(*psin_path, ec);
-                if (!ec)
-                    psin_mtime = t;
+            for (const auto& path : {*psin_path, fs::path(*psin_path).replace_extension(L".ps57in")}) {
+                if (fs::is_regular_file(path, ec)) {
+                    const auto t = fs::last_write_time(path, ec);
+                    if (!ec && (!psin_mtime || t > *psin_mtime))
+                        psin_mtime = t;
+                }
             }
             lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
         }
@@ -642,7 +762,16 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
     if (has_manifest && !lost) {
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
-        if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
+        bool sidecar_changed = false;
+        if (!req.compute) {
+            std::string sidecar_digest;
+            if (pixel_sidecar_hash(req.marker, sidecar_digest)) {
+                std::string published_digest;
+                sidecar_changed = !read_published_digest(fs::path(stem) += L".psinh", published_digest) ||
+                                  published_digest != sidecar_digest;
+            }
+        }
+        if (!ec && !sidecar_changed && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
                 if (has_complete_dxbc(fs::path(stem) += L".cs.cso"))
                     return false;
@@ -741,6 +870,11 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
     else
         fs::remove(psdep_path, ignored);
+    std::string sidecar_digest;
+    if (pixel_sidecar_hash(req.marker, sidecar_digest))
+        publish_atomic(fs::path(stem) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+    else
+        fs::remove(fs::path(stem) += L".psinh", ignored);
     publish_atomic(manifest_path, manifest->data(), manifest->size());
     fs::remove(fail_path, ignored);
     return "compiled graphics";
@@ -868,6 +1002,22 @@ int wmain(int argc, wchar_t** argv) {
         return run_watch(argc, argv);
     if (argc >= 2 && std::wstring_view(argv[1]) == L"--refusals")
         return run_refusals(argc, argv);
+    if (argc == 5 && std::wstring_view(argv[1]) == L"--prepare-compute-pack") {
+        try {
+            std::wstring number(argv[4]);
+            if (number.empty() || number.size() > 7 || number.find_first_not_of(L"0123456789") != number.npos)
+                throw std::runtime_error("invalid compute entry byte offset");
+            auto start = Clock::now();
+            auto counts = x2w::build_compute_frontend_pack(argv[2], argv[3], static_cast<unsigned>(std::stoul(number)));
+            for (const auto &error : counts.errors) std::cerr << "unprepared " << error << "\n";
+            std::cout << "prepared=" << counts.prepared << " unsupported=" << counts.unsupported
+                      << " errors=" << counts.errors.size() << " elapsed_ms=" << std::chrono::duration<double,std::milli>(Clock::now()-start).count() << "\n";
+            return counts.errors.empty() ? 0 : 1;
+        } catch (const std::exception &error) {
+            std::cerr << "pack not published: " << error.what() << "\n";
+            return 1;
+        }
+    }
     if (argc == 4 && std::wstring_view(argv[1]) == L"--index-graphics-interfaces") {
         try {
             const auto stages = x2w::index_graphics_interfaces(argv[2],argv[3]);
@@ -888,7 +1038,9 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-vertex-id-vs or gfx1013-buffered-vs for a raw vertex program. gfx1013-sampled-pair takes one VS and one PS (in order).\n"
                      "gfx1013-buffered-pair takes a buffered vertex program and a pixel HLSL source.\n"
                      "gfx1013-group-clear@BYTE_OFFSET and gfx1013-compute-wave32@BYTE_OFFSET take a req_<key>.c67.\n"
-                     "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps.\n"
+                     "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps, gfx1013-container-ms.\n"
+                     "gfx1013-raw-ms reads guest mesh bytes and an explicit .mslayout sidecar.\n"
+                     "gfx1013-raw-mesh-ps uses an explicit .pslayout sidecar.\n"
                      "gfx1013-container-cs reads an optional req_<key>.views next to the .cdx (GPU-selected heap slot view types).\n"
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
@@ -896,7 +1048,8 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
                      "Use --refusals REQUEST_DIRECTORY [--jobs N] [--json] for a read-only refusal summary.\n"
                      "Use --watch SDK_DIRECTORY CACHE_DIRECTORY REQUEST_DIRECTORY [--jobs N] [--interval MS] [--once] to translate pending requests.\n"
-                     "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n";
+                     "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n"
+                     "Use --prepare-compute-pack REQUEST_DIRECTORY CACHE_DIRECTORY ENTRY_BYTE_OFFSET for captured compute.\n";
         return 2;
     }
     try {
@@ -960,6 +1113,13 @@ int wmain(int argc, wchar_t** argv) {
             jobs = (std::min)(parse_jobs_count(argv[4]), count);
         auto start=Clock::now();
         std::set<fs::path,PathLess> occupied(inputs.begin(),inputs.end());
+        if(profile==L"gfx1013-raw-ms" || profile==L"gfx1013-raw-mesh-ps") {
+            for (const auto& input : inputs) {
+                const auto layout = profile==L"gfx1013-raw-ms" ? L".mslayout" : L".pslayout";
+                occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(layout)));
+                occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(L".root")));
+            }
+        }
         if(compute_request) {
             for(const auto& input : inputs) {
                 for(auto suffix : {L".root",L".data",L".sa",L".sb",L".desc",L".views"})
@@ -968,7 +1128,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if(graphics_batch) {
             for(const auto& input : inputs) {
-                for(auto suffix : {L".b",L".root",L".ia",L".psin"})
+                for(auto suffix : {L".b",L".root",L".ia",L".psin",L".ps57in"})
                     occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(suffix)));
             }
         }
@@ -984,6 +1144,7 @@ int wmain(int argc, wchar_t** argv) {
                 if(graphics_batch) {
                     reserve_output(fs::path(stems[i]) += L".ps.cso");
                     reserve_output(fs::path(stems[i]) += L".psdep");
+                    reserve_output(fs::path(stems[i]) += L".psinh");
                     if(rectangles) reserve_output(fs::path(stems[i]) += L".gs.cso");
                 }
             }
@@ -1022,19 +1183,29 @@ int wmain(int argc, wchar_t** argv) {
             if (!manifest && !input.rtv_request.empty())
                 throw std::runtime_error("RTV variant has no runtime manifest: its vertex inputs, target types or bindings are not described");
             std::vector<unsigned char> gs_dxil;
-            if (rectangles) {
-                auto ir=x2w::native_rectangle_geometry(pair.vertex.outputs,pair.pixel.inputs);
-                gs_dxil = compile_to_dxil(compiler, ir, L"gs_6_6", argv[2], true, report);
+            if (rectangles || (manifest && !pair.input_layout.empty())) {
+                std::string ir;
+                try { ir = x2w::native_rectangle_geometry(pair.vertex.outputs, pair.pixel.inputs); }
+                catch (const x2w::UnsupportedComputeShader&) { if (rectangles) throw; }
+                if (!ir.empty()) {
+                    gs_dxil = compile_to_dxil(compiler, ir, L"gs_6_6", argv[2], true, report);
+                    if (manifest) *manifest += "fixedrectgs\n";
+                }
             }
             auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", argv[2], true, report);
             auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", argv[2], true, report);
-            if (rectangles)
+            if (!gs_dxil.empty())
                 publish_atomic(fs::path(stems[i]) += L".gs.cso", gs_dxil.data(), gs_dxil.size());
             publish_atomic(outputs[i], vs_dxil.data(), vs_dxil.size());
             publish_atomic(fs::path(stems[i]) += L".ps.cso", ps_dxil.data(), ps_dxil.size());
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+                std::string sidecar_digest;
+                if (pixel_sidecar_hash(inputs[i], sidecar_digest))
+                    publish_atomic(fs::path(stems[i]) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+                else
+                    fs::remove(fs::path(stems[i]) += L".psinh", ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
             fs::remove(fs::path(stems[i]) += L".fail", ignored);

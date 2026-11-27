@@ -12,6 +12,7 @@ from native_scalar_lds_check import scalar, sop1, vmove
 # format, channels actually requested, immediate byte displacement (plus group.x)
 CASES = [(24, 2, 0), (24, 2, 4), (56, 4, 3), (60, 4, 7), (13, 1, 12),
          (71, 4, 12), (75, 4, 4), (2, 1, 7), (12, 1, 7), (25, 2, 3), (24, 2, 8188)]
+CASES += [(fmt, 4, 1) for fmt in range(44, 56)]
 PACKED = struct.pack("<6I", 0x7fff8000, 0x40008001, 0x007fff81, 0xfc003c00, 0x0001bc00, 0x42987ec5)
 
 
@@ -19,7 +20,7 @@ def program(unsigned):
     # Load a raw SRV and UAV from separate table parameters. One writer per group.
     words = [sop1(3, 20, 4), sop1(3, 21, 128), sop1(3, 22, 5), sop1(3, 23, 128),
              0xf4080000 | 32 << 6 | 10, 0xfa000020, 0xf4080000 | 36 << 6 | 11, 0xfa000020,
-             scalar(0x1e, 7, 6, 135), vmove(8, 7), sop1(3, 126, 129)]
+             scalar(0x1e, 7, 6, 137), vmove(8, 7), sop1(3, 126, 129)]
     pos = 0
     for index, (fmt, channels, disp) in enumerate(CASES):
         if unsigned and index == 0:
@@ -45,6 +46,23 @@ def expected(group):
     result = []
     data = (PACKED * 342)[:8192]
     for fmt, count, disp in CASES:
+        if 44 <= fmt <= 55:
+            fields = (2, 10, 10, 10) if fmt < 50 else (10, 10, 10, 2)
+            number = (fmt - 44) % 6
+            bits = int.from_bytes(data[disp + group:disp + group + 4], "little")
+            for width in fields[:count]:
+                value = bits & ((1 << width) - 1)
+                bits >>= width
+                if number in (1, 3, 5) and value >> (width - 1):
+                    value -= 1 << width
+                if number == 0:
+                    value = fbits(value / ((1 << width) - 1))
+                elif number == 1:
+                    value = fbits(max(-1, value / ((1 << (width - 1)) - 1)))
+                elif number in (2, 3):
+                    value = fbits(value)
+                result.append(value & 0xffffffff)
+            continue
         width = 4 if fmt == 75 else 1 if fmt in (2, 56, 60) else 2
         if disp + group + width * count > len(data):
             result.extend([0] * count)
@@ -73,7 +91,7 @@ def main(cli, gpu, sdk):
         sa = struct.pack("<7I", 0, 0, 0, 32 | 1 << 16, 1, 0, 0x8c)
         reference = [0x69696969] * 2064
         for group in range(2):
-            start = 8 + 32 * group
+            start = 8 + 128 * group
             row = expected(group)
             reference[start:start + len(row)] = row
         for unsigned in (False, True):
@@ -87,7 +105,7 @@ def main(cli, gpu, sdk):
             actual = struct.unpack("<2064I", dest.read_bytes())
             differences = [i for i, (a, b) in enumerate(zip(actual, reference)) if a != b]
             if unsigned:
-                assert differences and set(differences) <= {8, 9, 40, 41}, differences
+                assert differences and set(differences) <= {8, 9, 136, 137}, differences
             else:
                 assert not differences, [(i, hex(actual[i]), hex(reference[i])) for i in differences]
         insn = next(i for i, w in enumerate(words) if w >> 26 == 0x3a)
