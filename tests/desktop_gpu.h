@@ -38,6 +38,11 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
                               UINT vertices = 3, const std::uint32_t* constants = nullptr);
+// One pixel. The pixel stage reads t0 as a raw buffer (a descriptor table) and b0 as entry constants.
+// source_dwords is the number of 32-bit elements in the raw view; the readback is the four exported words.
+void check_startup_raw_buffer(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                              const std::uint32_t* constants, UINT constant_count,
+                              const std::uint32_t* source, UINT source_dwords, std::uint32_t words[4]);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width = 1, UINT height = 1);

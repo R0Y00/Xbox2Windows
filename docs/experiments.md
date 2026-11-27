@@ -402,6 +402,17 @@ The descriptor modifications that compute buffer stores accept are accepted here
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_buffer_store$' --output-on-failure
 ```
 
+## Pixel structured-to-raw buffer loads
+
+A non-indexed `buffer_load_dword` in a pixel stage lowers a descriptor that went through the structured-to-raw conversion. The conversion is the one compute and vertex stores already record: `s_bfe_u32` of DW1 with `0xe0010` (optionally `s_max_u32` with 1), `s_and_b32` of DW1 with `0xc000ffff`, `s_mul_i32` of DW2 by that stride, then `s_and_b32` of DW3 with `0xcfffffff` and `s_or_b32` with `0x30000000`. The four words are tracked in the pixel stage the same way. The load is a raw byte-address read. Each dword is kept when its end byte is at or before the 32-bit product `NUM_RECORDS * stride` (`NUM_RECORDS * max(stride, 1)` when the extract was clamped); a wrapped address reads as zero. The entry constants are that view's `stride` and `numrecords`. The graphics stand-in fills `stride` and does not yet publish `numrecords`, so a completed pipeline still needs that constant before a draw applies the bound. The offscreen fixture supplies both and compares the pixel with a CPU model of the same product. An in-place word rewrite, a conversion missing the byte-count multiply or the raw out-of-range step, and an `idxen` load stay refused (`buffer load through a modified descriptor`, or `indexed load through a modified descriptor` for `idxen`).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ps_raw_descriptor$' --output-on-failure
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ps_raw_descriptor_(warp|hardware)$' --output-on-failure
+```
+
+The draw runs on the Windows test PC. A capability skip (77) is separate from a pass.
+
 ## Shared-exponent target stand-in
 
 `startup_packed_target` checks the selection rule with synthetic format support
