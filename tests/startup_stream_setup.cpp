@@ -141,7 +141,13 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
+    char pixel_uav_mode[32]{};
+    GetEnvironmentVariableA("X2W_TEST_PIXEL_UAV", pixel_uav_mode, sizeof(pixel_uav_mode));
+    const bool raw_pixel = std::strncmp(pixel_uav_mode, "raw-", 4) == 0;
+    if (raw_pixel)
+        std::printf("raw descriptor stride: %llu\n", static_cast<unsigned long long>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+    const D3D12_DESCRIPTOR_RANGE srv{raw_pixel ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        raw_pixel ? 4u : (joined_table || vertex_srv_pair ? 2u : 1u), 0, 0, 0};
     D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];

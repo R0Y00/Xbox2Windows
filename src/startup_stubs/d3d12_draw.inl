@@ -13,12 +13,13 @@
 
 // A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
 // for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
-// root table P. Only that form is read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// root table P. The native compiler also emits raw table views; a view qualifier or a 'channels' field, as in the compute line, is refused.
 // A trailing 'typedload' means the binding must also support a typed UAV load. The translator does not emit it
 // for a component store, which does not read the texel.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
     bool array = false;
+    bool raw = false;
     bool needs_typed_load = false;
 };
 constexpr unsigned pixel_uav_limit = 8;
@@ -39,9 +40,10 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     };
     if (w.size() < 2 || w[0] != "uav" || !number(w[1], out.index)) return "malformed view index";
     if (w.size() < 3) return "missing view kind";
-    if (w[2] == "raw" || w[2] == "table") return "buffer view (raw uav) is not bound";
-    if (w[2] != "tex2d" && w[2] != "tex2da") return "only tex2d and tex2da views are bound";
+    if (w[2] == "table") return "legacy untyped buffer view is not bound";
+    if (w[2] != "tex2d" && w[2] != "tex2da" && w[2] != "raw") return "only tex2d, tex2da and raw views are bound";
     out.array = w[2] == "tex2da";
+    out.raw = w[2] == "raw";
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
     if (w.size() < 4 || w[3] != "table") return "view source is not a table";
     if (w.size() < 6) return "missing table parameter or offset";
@@ -49,6 +51,7 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (!number(w[4], out.parameter) || out.parameter >= 16) return "table parameter out of range";
     if (!number(w[5], out.offset)) return "malformed table offset";
     out.needs_typed_load = w.size() == 7;
+    if (out.raw && (out.needs_typed_load || out.offset % 32)) return "raw view requires an aligned table record without typedload";
     return nullptr;
 }
 
@@ -500,7 +503,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     load_pso_recipes(tr);
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
-    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
+    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable views, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
@@ -2361,7 +2364,7 @@ struct PixelUavBinding {
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
 };
 
-// draw_lock held. The writable textures of tr (#1996 F), from the unordered-access views the title created at
+// draw_lock held. The writable views of tr (#1996 F), from the unordered-access views the title created at
 // their table entries (pixel_uav_view). False, with the reason logged, when one cannot be bound as the program
 // expects: the draw is then not translated, and no other view is bound in its place.
 bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding* out)
@@ -2374,6 +2377,11 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
     };
     for (std::size_t i = 0; i < tr.uavs.size(); ++i) {
         const PixelUav& uav = tr.uavs[i];
+        if (uav.raw) {
+            const UINT stride = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (stride < 32 || uav.offset % stride)
+                return refuse(i, "raw UAV offset is not a descriptor boundary", uav.offset);
+        }
         const x2w_startup::ViewTable& table = pass.view_tables[uav.parameter];
         if (!table.address) return refuse(i, "no descriptor table at the parameter", uav.parameter);
         const u64 entry = table.record(uav.offset, 32);
@@ -2401,8 +2409,21 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr,
-                                            uav.array, out[i].view, uav.needs_typed_load);
+        const char* reason = nullptr;
+        if (uav.raw) {
+            const auto* info = resource_info(resource);
+            if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                return refuse(i, "resource lacks ALLOW_UNORDERED_ACCESS", record.resource);
+            const x2w::ComputeViewBinding binding{x2w::ComputeViewKind::raw_buffer_uav, uav.parameter, uav.offset, uav.index, 4};
+            if (!described || record.counter || !info || info->initial_state != D3D12_RESOURCE_STATE_COMMON ||
+                desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                !x2w::native_buffer_store_view(binding, title_view, desc.Width))
+                return refuse(i, "incompatible raw buffer UAV", record.resource);
+            out[i].view = title_view;
+        } else {
+            reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr,
+                                    uav.array, out[i].view, uav.needs_typed_load);
+        }
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -2524,8 +2545,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
+    const bool raw_uav = std::any_of(tr->uavs.begin(), tr->uavs.end(), [](const PixelUav& uav) { return uav.raw; });
+    // ponytail: prove direct draws with one writable buffer first. SRVs and indexed
+    // draws can alias it through guest addresses, so do not guess their independence.
+    if (raw_uav && (indexed || indirect || tr->uavs.size() != 1 || !tr->srvs.empty())) {
+        log("x2w-draw %016llx raw UAV requires one writable view and a direct non-indexed draw without SRVs", tr->key);
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
     PixelUavBinding uav_bindings[pixel_uav_limit];
-    if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {
+    if (!resolve_pixel_uavs(*tr, pass, uav_bindings) ||
+        (raw_uav && !retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(uav_bindings[0].resource)))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -2901,6 +2931,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     for (UINT j = 0; j < tr->uavs.size(); ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (tr->uavs[j].raw) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.UAV.pResource = uav_bindings[j].resource;
+            list->ResourceBarrier(1, &barrier);
+        }
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
         if (first_calls(shown, 6)) {

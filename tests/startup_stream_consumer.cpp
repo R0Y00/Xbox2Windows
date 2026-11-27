@@ -17,6 +17,13 @@
 #include "startup_stream_setup.h"
 #include "startup_slot67_indirect.h"
 
+#ifdef OFFSCREEN_AGILITY_620
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
+__declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
+
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
