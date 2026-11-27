@@ -39,6 +39,7 @@ def box(child, depth, x=-8):
 NODES = {
     0: (box(0x25, 4), box(0x1d, 1), box(0x2d, 2, x=32), box(INVALID, 3)),
     256: (box(0x45, 7), box(0x3d, 5), box(0x35, 3), box(0x0d, 1)),
+    384: (box(0x25, 4), box(INVALID, 1), box(0x2d, 2), box(0x35, 3)),
 }
 ORIGIN = (0.5, -0.5, -1.0)
 FORWARD = (0.25, -0.125, 0.5)
@@ -48,6 +49,9 @@ RAYS = (
     ("all_miss", 0, 2.0, ORIGIN, FORWARD, (INVALID,) * 4),
     ("all_four", 256, 19.0, ORIGIN, FORWARD, (0x0d, 0x35, 0x3d, 0x45)),
     ("reverse", 0, 21.0, (0.0, 0.0, 10.0), (0.25, -0.125, -0.5), (0x25, 0x1d, INVALID, INVALID)),
+)
+UNSORTED_RAYS = (
+    ("unsorted_three_hits", 384, 19.0, ORIGIN, FORWARD, (0x25, 0x2d, 0x35, INVALID)),
 )
 
 failures = []
@@ -96,6 +100,9 @@ def model(nodes, extent, origin, direction, sort_boxes):
             items.append([child, tmin if sort_boxes else 0.0])
         else:
             items.append([INVALID, FLT_MAX])
+    if not sort_boxes:
+        ordered = [child for child, _key in items if child != INVALID]
+        return tuple(ordered) + (INVALID,) * (4 - len(ordered))
     for a, b in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
         if items[b][1] < items[a][1]:
             items[a], items[b] = items[b], items[a]
@@ -169,6 +176,13 @@ def controls():
     check("model without the sort bit matches the unsorted reference",
           model(NODES[0], 19.0, ORIGIN, FORWARD, False) == unsorted,
           str((model(NODES[0], 19.0, ORIGIN, FORWARD, False), unsorted)))
+    for name, offset, extent, origin, direction, expected in UNSORTED_RAYS:
+        actual = reference(NODES[offset], extent, origin, direction, False)
+        check("CPU reference keeps child order with the sort bit clear (%s)" % name, actual == expected,
+              str((actual, expected)))
+        actual = model(NODES[offset], extent, origin, direction, False)
+        check("helper keeps child order with the sort bit clear (%s)" % name, actual == expected,
+              str((actual, expected)))
     check("all-miss result is four 0xffffffff words",
           reference(NODES[0], 2.0, ORIGIN, FORWARD, True) == (INVALID,) * 4, "")
 
@@ -290,12 +304,13 @@ def dispatch_hlsl(mutate_miss=False):
         for i in range(4):
             lines.append("    data.Store(%du, 0u);" % (base_offset + 112 + 4 * i))
     lines.append("    DeviceMemoryBarrierWithGroupSync();")
-    for case, (_name, offset, extent, origin, direction, _expected) in enumerate(RAYS):
+    for case, (_name, offset, extent, origin, direction, _expected) in enumerate(RAYS + UNSORTED_RAYS):
         inv = tuple(1.0 / c for c in direction)
+        sort_word = "0x80000000u" if case < len(RAYS) else "0x00000000u"
         lines.append(
-            "    uint4 r%d = x2w_bvh_intersect_box32(data, 0x%08xu, 0x00100000u, 0x80000000u, "
+            "    uint4 r%d = x2w_bvh_intersect_box32(data, 0x%08xu, 0x00100000u, %s, "
             "0x0000000bu, 0x80000000u, %s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
-                case, (offset >> 3) | 5, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
+                case, (offset >> 3) | 5, sort_word, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
                 ffloat(origin[2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
         for word in range(4):
             lines.append("    data.Store(%du, r%d.%s);" % (512 + 16 * case + 4 * word, case, "xyzw"[word]))
@@ -313,7 +328,7 @@ def run_dispatch(dxc, runner, adapter, directory, mutate=False):
                               capture_output=True, text=True)
     if compiled.returncode or compiled.stderr:
         raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
-    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", "592", str(output)],
+    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", "608", str(output)],
                             capture_output=True, text=True)
     print(result.stdout, end="")
     if result.returncode == 77:
@@ -341,11 +356,16 @@ def check_dispatch(dxc, runner, adapter):
             got = tuple(words[128 + 4 * case:132 + 4 * case])
             check("dispatch case %d %s" % (case, _name), got == expected,
                   "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
+        for extra, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(UNSORTED_RAYS):
+            case = len(RAYS) + extra
+            got = tuple(words[128 + 4 * case:132 + 4 * case])
+            check("dispatch case %d %s" % (case, _name), got == expected,
+                  "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
         status, mutant = run_dispatch(dxc, runner, adapter, directory, mutate=True)
         if status == 77:
             print("dispatch control: skip (adapter unavailable)")
             return 77
-        changed = mutant[128:132]
+        changed = mutant[136:140]
         check("dispatch miss-fill control decays case 2", tuple(changed) != (INVALID,) * 4,
               "got %s" % ["%08x" % w for w in changed])
     if failures:

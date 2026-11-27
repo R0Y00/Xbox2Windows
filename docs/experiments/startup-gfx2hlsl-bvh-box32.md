@@ -41,21 +41,23 @@ emits no helper call and no destination VGPR assignment.
 python -B tests/startup_gfx2hlsl_bvh_check.py
 ```
 
-The check compares the CPU box reference with the fixture in `tests/gfx1030_bvh_box/check.py` for five rays,
-compares the emitted sort network with the same reference, checks the sort-bit negative control (word 0 changes
-from `0x1d` to `0x25`), translates a synthetic constant-T# program and checks the four child results and the
-manifest, and checks every refusal above. It also compiles the translated compute shader with DXC when one is
-available; without DXC it prints `dxc compile: skip` and does not count that as a pass.
+The check compares the CPU box reference with the fixture in `tests/gfx1030_bvh_box/check.py` for six rays,
+compares the emitted helper with the same reference, checks the sort-bit negative control (word 0 changes from
+`0x1d` to `0x25`), checks the three-hit sort-disabled case whose equal keys must stay in child order
+(`0x25, 0x2d, 0x35, 0xffffffff`), translates a synthetic constant-T# program and checks the four child results
+and the manifest, and checks every refusal above. It also compiles the translated compute shader with DXC when
+one is available; without DXC it prints `dxc compile: skip` and does not count that as a pass.
 
 ```text
 python -B tests/startup_gfx2hlsl_bvh_check.py dispatch <dxc> <offscreen_check> warp
 ```
 
 The dispatch mode compiles the same helper with a `RWByteAddressBuffer` in place of the bound
-`ByteAddressBuffer`, writes the two synthetic nodes and five rays, and compares all twenty result words on a
-Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). It also dispatches a mutant that leaves
-missed child words in place; the case 2 word 0 must stop being `0xffffffff`. That control caught the first version
-of this helper, which sorted the keys correctly but returned the original child pointer for a miss.
+`ByteAddressBuffer`, writes the three synthetic nodes and six rays, and compares all twenty-four result words on
+a Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`). It also dispatches a mutant that
+leaves missed child words in place; the all-miss case 2 word 0 at words 136..139 must stop being
+`0xffffffff`. That control caught the first version of this helper, which sorted the keys correctly but
+returned the original child pointer for a miss.
 
 This is a translator slice. It does not execute the native gfx1030 probe, does not bind the node buffer on a
 D3D12 device, and does not establish any title behavior.

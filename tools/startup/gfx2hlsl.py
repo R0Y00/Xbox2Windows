@@ -10785,12 +10785,22 @@ BVH_HELPERS = (
     '    c1 = h1 ? c1 : X2W_BVH_MISS;',
     '    c2 = h2 ? c2 : X2W_BVH_MISS;',
     '    c3 = h3 ? c3 : X2W_BVH_MISS;',
-    # A disabled sort uses one key for every hit: the network then only compacts misses,
-    # while an enabled sort orders the hits by entry distance.
-    '    float k0 = h0 ? (sort_boxes ? d0 : 0.0) : 3.402823466e+38;',
-    '    float k1 = h1 ? (sort_boxes ? d1 : 0.0) : 3.402823466e+38;',
-    '    float k2 = h2 ? (sort_boxes ? d2 : 0.0) : 3.402823466e+38;',
-    '    float k3 = h3 ? (sort_boxes ? d3 : 0.0) : 3.402823466e+38;',
+    # Sorting disabled keeps the children in their original order. Do not reuse the sort network:
+    # its nonadjacent compare-exchange stages move a later hit into an earlier position while
+    # compacting the miss between them, which reorders equal keys.
+    '    if (!sort_boxes) {',
+    '        uint4 ordered = miss;',
+    '        uint n = 0u;',
+    '        if (h0) ordered[n++] = c0;',
+    '        if (h1) ordered[n++] = c1;',
+    '        if (h2) ordered[n++] = c2;',
+    '        if (h3) ordered[n++] = c3;',
+    '        return ordered;',
+    '    }',
+    '    float k0 = h0 ? d0 : 3.402823466e+38;',
+    '    float k1 = h1 ? d1 : 3.402823466e+38;',
+    '    float k2 = h2 ? d2 : 3.402823466e+38;',
+    '    float k3 = h3 ? d3 : 3.402823466e+38;',
     '    x2w_bvh_sort_pair(c0, c1, k0, k1);',
     '    x2w_bvh_sort_pair(c2, c3, k2, k3);',
     '    x2w_bvh_sort_pair(c0, c2, k0, k2);',
