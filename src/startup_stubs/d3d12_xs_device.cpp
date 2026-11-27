@@ -7331,6 +7331,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && view_token_guarded())
+        log("x2w-render view tokens (X2W_D3D12_VIEW_TOKEN_GUARDED): written %ld, refused %ld", view_tokens_guarded_written,
+            view_tokens_guarded_refused);
     if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
         log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): skipped %ld, copied %ld", root_srv_copies_skipped,
             root_srv_copies_made);
