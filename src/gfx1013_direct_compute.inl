@@ -1030,6 +1030,59 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
             return true;
         }
+        if (n == "v_ldexp_f32") {
+            // pixel_aot.py ldexp32 (#3013): exact binary32 scaling of S0 by 2^S1. Zero, Inf and NaN pass unchanged,
+            // a denormal S0 is normalized rather than flushed, and a denormal result rounds to nearest even. S1 is
+            // a signed integer clamped to [-512, 512]. clamp saturates the result with integer tests: NaN and
+            // negative values (also -0) give +0, values from 1.0 give 1.0, and a denormal stays.
+            if (!i.wide || i.subword || i.dpp_control || permuted || i.scale || (i.a & 0x7800) || ((i.abs | i.neg) & 6) ||
+                i.src[2])
+                refuse(i.pc, "unsupported v_ldexp_f32 operand modifiers");
+            auto bits = operand32(i, i.src[0]);
+            if (i.abs & 1) bits = ir.binary("and", bits, "2147483647");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "2147483648");
+            auto delta = operand32(i, i.src[1]);
+            auto sign = ir.binary("and", bits, "2147483648");
+            auto exponent = ir.binary("and", ir.binary("lshr", bits, "23"), "255");
+            auto mantissa = ir.binary("and", bits, "8388607");
+            auto keep = ir.value("or i1 " + cmp("eq", exponent, "255") + ", " +
+                                 cmp("eq", ir.binary("and", bits, "2147483647"), "0"));
+            // Normalize a denormal mantissa: shift it left until bit 23 is set (5 halving steps, at most 23).
+            string x = mantissa, steps = "0";
+            for (unsigned k : {16u, 8u, 4u, 2u, 1u}) {
+                auto low = cmp("ult", x, to_string(1u << (24 - k)));
+                x = select(low, ir.binary("shl", x, to_string(k)), x);
+                steps = select(low, ir.binary("add", steps, to_string(k)), steps);
+            }
+            auto denormal = cmp("eq", exponent, "0");
+            mantissa = select(denormal, ir.binary("and", x, "8388607"), mantissa);
+            auto e = select(denormal, ir.binary("sub", "1", steps), exponent);
+            delta = select(cmp("slt", delta, "-512"), "-512", select(cmp("sgt", delta, "512"), "512", delta));
+            e = ir.binary("add", e, delta);
+            auto normal = ir.binary("or", sign, ir.binary("or", ir.binary("shl", e, "23"), mantissa));
+            // A result below the normal range: shift the full significand right by 1 - e (1..24) and round to
+            // nearest even.
+            auto full = ir.binary("or", mantissa, "8388608");
+            // Every shift stays in 1..24, also in the lanes whose result another select discards.
+            auto amount = select(cmp("sgt", e, "0"), "1", select(cmp("slt", e, "-23"), "24", ir.binary("sub", "1", e)));
+            auto half = ir.binary("shl", "1", ir.binary("sub", amount, "1"));
+            auto rest = ir.binary("and", full, ir.binary("sub", ir.binary("shl", half, "1"), "1"));
+            auto q = ir.binary("lshr", full, amount);
+            auto up = ir.value("or i1 " + cmp("ugt", rest, half) + ", " +
+                               ir.value("and i1 " + cmp("eq", rest, half) + ", " +
+                                        cmp("ne", ir.binary("and", q, "1"), "0")));
+            auto subnormal = ir.binary("or", sign, ir.binary("add", q, ir.value("zext i1 " + up + " to i32")));
+            string result = select(cmp("sgt", e, "0"), normal, select(cmp("slt", e, "-23"), sign, subnormal));
+            result = select(cmp("sgt", e, "254"), ir.binary("or", sign, "2139095040"), result);
+            result = select(keep, bits, result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "2147483647"), "2139095040");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("slt", result, "0"));
+                result = select(low, "0", select(cmp("sgt", result, "1065353215"), "1065353216", result));
+            }
+            vector_write(i.dst, result);
+            return true;
+        }
         if (n == "v_cvt_pkrtz_f16_f32") {
             if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported packed half conversion modifier");
