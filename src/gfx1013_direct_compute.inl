@@ -1254,7 +1254,9 @@ struct DirectCompute {
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
-        if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
+        const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" || n == "v_mac_legacy_f32";
+        if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && !unfused_mad &&
+            n != "v_mul_legacy_f32" &&
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -1359,6 +1361,28 @@ struct DirectCompute {
                 auto c = n == "v_fmac_f32" ? as_float(read(i.dst)) : n == "v_fmaak_f32" ? as_float(to_string(i.literal)) :
                          n == "v_fmamk_f32" ? fp(1) : fp(2);
                 result = ir.invoke("float", "tertiary.f32", 46, {{"float", a}, {"float", b}, {"float", c}}, "nounwind readnone");
+            } else if (unfused_mad) {
+                // gfx2hlsl.py mad32 and pixel_aot (#3005): flush denormal inputs to signed zero, round the product on
+                // its own (the legacy form makes 0 * anything 0), add the flushed addend and flush the sum. Plain
+                // fmul and fadd carry no fast-math flags, so DXIL does not allow them to be contracted into FMad.
+                auto ftz = [&](const string &x) {
+                    auto bits = ir.value("bitcast float " + x + " to i32");
+                    auto tiny = cmp("ult", ir.binary("and", bits, "2147483647"), "8388608");
+                    auto kept = ir.binary("and", bits, select(tiny, "2147483648", "4294967295"));
+                    return ir.value("bitcast i32 " + kept + " to float");
+                };
+                const bool legacy = n == "v_mad_legacy_f32" || n == "v_mac_legacy_f32";
+                if (n.substr(0, 5) == "v_mac" && ((i.abs | i.neg) & 4))
+                    refuse(i.pc, "unsupported " + string(n) + " accumulator modifier");
+                auto x = ftz(a), y = ftz(fp(1));
+                auto c = n.substr(0, 5) == "v_mac" ? ir.value("bitcast i32 " + read(i.dst) + " to float") : fp(2);
+                auto product = ir.value("fmul float " + x + ", " + y);
+                if (legacy) {
+                    auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + x + ", 0.0") + ", " +
+                                         ir.value("fcmp oeq float " + y + ", 0.0"));
+                    product = select_float(zero, "0.0", product);
+                }
+                result = ftz(ir.value("fadd float " + ftz(product) + ", " + ftz(c)));
             } else if (n == "v_mul_legacy_f32") {
                 auto b = fp(1);
                 auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + a + ", 0.0") + ", " +
