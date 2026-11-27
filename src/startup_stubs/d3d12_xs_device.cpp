@@ -1462,7 +1462,7 @@ std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (allocator_lock): chunks each closed list released at a fenced submit, until its Reset.
 std::unordered_map<Wrapper*, ReleasedUploadChunks> released_upload_chunks;
-LONG upload_resubmits_after_reuse;  // closed lists submitted again after a released chunk was reused
+LONG upload_resubmits_refused;  // closed lists submitted again after a released chunk was reused; not executed
 
 LONG allocator_swaps, allocator_creates;
 
@@ -1664,11 +1664,30 @@ bool submit_fence_fails()
 
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (opt-in): a closed list stops holding its upload ring chunks once its submit is
 // fenced, so the queue fence alone guards them; the ring then grows in 16 MiB chunks up to 512 MiB. A later submit
-// of the same list before its Reset fences its intact chunks again; one whose chunk was reused meanwhile is logged.
+// of the same list before its Reset fences its chunks again. One whose chunk was reused meanwhile is refused before
+// ExecuteCommandLists (released_chunks_recycled), so it never reads replaced bytes.
 bool ring_release_at_submit()
 {
     static const bool on = GetEnvironmentVariableW(L"X2W_D3D12_RING_RELEASE_AT_SUBMIT", nullptr, 0) != 0;
     return on;
+}
+
+// draw_lock and allocator_lock held, before the queue executes `list`. True when the closed list released its chunks
+// at an earlier fenced submit and one of them was reused since: the submit leaves it out, and it stays refused until
+// its Reset. Counted and logged.
+bool released_chunks_recycled(Wrapper* list)
+{
+    const auto released = released_upload_chunks.find(list);
+    if (released == released_upload_chunks.end()) return false;
+    UploadChunkMask recycled = 0;
+    resubmitted_upload_chunks(released->second, upload_chunks.data(), recycled);
+    if (!recycled) return false;
+    InterlockedIncrement(&upload_resubmits_refused);
+    static LONG logged;
+    if (first_calls(logged, 8))
+        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
+            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned>(recycled));
+    return true;
 }
 
 // draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
@@ -1691,15 +1710,9 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         chunks |= list->own().upload_chunks;
         const auto released = released_upload_chunks.find(list);
         if (released == released_upload_chunks.end()) continue;
+        // A list with a reused chunk was refused before the execute, under the same locks: all of them are intact.
         UploadChunkMask reused = 0;
         chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused);
-        if (reused) {
-            InterlockedIncrement(&upload_resubmits_after_reuse);
-            static LONG logged;
-            if (first_calls(logged, 8))
-                log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
-                    "it reads replaced upload bytes", static_cast<void*>(list), static_cast<unsigned>(reused));
-        }
     }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
@@ -4268,6 +4281,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
             if (w && w->own().kind == list_kind && w->own().list_ready) {
+                if (released_chunks_recycled(w)) continue;  // its upload bytes were replaced: it is not executed
                 ready.push_back(static_cast<ID3D12CommandList*>(w->own().real));
                 submitted.push_back(w);
             }

@@ -589,7 +589,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         };
         // X2W_TEST_CONSOLE_KEEP (with the shared ring): a second list A records 32 payloads (32 x 16 MiB = 512 MiB),
         // is submitted and waited for, and is never Reset. The fixture's own list then draws payload 32 over the right
-        // half. The target is read back; then A is submitted again, still closed and not Reset.
+        // half. A is then submitted again, still closed and not Reset, and the target is read back.
         if (GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_KEEP", nullptr, 0)) {
             constexpr unsigned kept = 32;
             void *allocator_a = nullptr, *list_a = nullptr;
@@ -622,9 +622,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             if (const int result = draw_gated_console_payload(guest, list, kept, false)) return result;
             invoke(list, 9);
             if (!submit_and_wait(list, 3)) return 25;
-            const int read = read_stream_target(desktop.Get(), frame, pixels);
-            if (!submit_and_wait(list_a, 4)) return 25;  // A again: closed, never Reset
-            return read;
+            // A again: closed, never Reset. The target is read back after it, so a stale A that ran (its last
+            // payload, 31, over the right half) shows in the pixels.
+            if (!submit_and_wait(list_a, 4)) return 25;
+            return read_stream_target(desktop.Get(), frame, pixels);
         }
         // Retrying the same bytes after abandoning a recording still needs an upload. The shared-ring
         // control skips it so every upload behind the gate comes from the ring, whose 256 MiB cap is

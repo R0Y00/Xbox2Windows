@@ -15,7 +15,8 @@
                                      and the right half reads the null view
   <consumer> <backend> gate-ring-keep-release  the same with X2W_D3D12_RING_RELEASE_AT_SUBMIT=1: A releases its
                                      chunks at its fenced submit, so B draws payload 32; A submitted again afterwards
-                                     is reported as reading reused chunks
+                                     would read reused chunks, so it is refused before the execute: the target, read
+                                     back after that submit, still holds payload 32 on the right (not A's payload 31)
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
 equations of AMD addrlib's GFX10 pattern tables, written out below. Reference: addrlib as Mesa carries it
@@ -296,13 +297,14 @@ def check_gate(directory, consumer, backend, mode):
             raise AssertionError(f"{mode}: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected {first.hex()} left, "
                                  f"{last.hex()} right\n{ring_lines}")
         refused = "x2w-draw upload ring reservation refused: no unused capacity" in log
-        reported = "submitted again after its released chunks" in log
+        reported = "were reused; refused, it is not executed" in log
         if release and not reported:
-            raise AssertionError(f"{mode}: list A submitted again after B reused its chunk was not reported")
+            raise AssertionError(f"{mode}: list A submitted again after B reused its chunk was not refused")
         if not release and (not refused or reported):
-            raise AssertionError(f"{mode}: expected the 256 MiB refusal and no release report (refused={refused}, reported={reported})")
-        print(f"{backend} {mode}: {half} left pixels hold payload 0 and {half} right pixels hold {last.hex()}; "
-              + ("A's chunks were released at its fenced submit and its later resubmit was reported" if release
+            raise AssertionError(f"{mode}: expected the 256 MiB refusal and no resubmit refusal (refused={refused}, reported={reported})")
+        print(f"{backend} {mode}: {half} left pixels hold payload 0 and {half} right pixels hold {last.hex()} after A's "
+              "resubmit; "
+              + ("A's chunks were released at its fenced submit and its stale resubmit was refused, not executed" if release
                  else "the never-Reset list kept its chunks and the ring refused past its cap"))
         return 0
     if ring:
