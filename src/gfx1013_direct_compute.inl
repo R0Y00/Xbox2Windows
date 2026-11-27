@@ -2206,6 +2206,21 @@ struct DirectCompute {
             };
             z = ir.binary("or", narrow(a), ir.binary("shl", narrow(b), "16"));
         }
+        else if (n == "v_sat_pk_u8_i16") {
+            // RDNA 2 ISA VOP1 0x62 / VOP3A 0x1e2: clamp each signed 16-bit half of S0 to [0, 255],
+            // pack into D[7:0] and D[15:8], and zero D[31:16].
+            if (i.wide && (i.src[1] != 0 || i.src[2] != 0))
+                refuse(i.pc, "v_sat_pk_u8_i16 with unused src1/src2 field set");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "v_sat_pk_u8_i16 with op_sel");
+            auto clamp_u8 = [&](const string &s16) {
+                auto nonneg = select(cmp("slt", s16, "0"), "0", s16);
+                return select(cmp("sgt", nonneg, "255"), "255", nonneg);
+            };
+            auto lo = clamp_u8(ir.binary("ashr", ir.binary("shl", a, "16"), "16"));
+            auto hi = clamp_u8(ir.binary("ashr", a, "16"));
+            z = ir.binary("or", lo, ir.binary("shl", hi, "8"));
+        }
         else if (n == "v_bfe_u32")
             z = ir.binary("and", shift("lshr", a, b), ir.binary("sub", shift("shl", "1", val(2)), "1"));
         else if (n == "v_bfe_i32") {
