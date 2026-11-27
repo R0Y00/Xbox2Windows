@@ -14,6 +14,9 @@ recording threads at once.
   write. A page that refuses the write (no access, read-only, a guard page, an in-page error) leaves the descriptor
   without a token, as `writable` returning false did; a guard page has its guard bit set again, as
   `probe_readable` does.
+- Only a token that lies inside one 4 KiB page takes the guarded write, so a refusal comes on its first byte and
+  changes nothing. A descriptor heap's title backing has no alignment check, so a token can cross a page boundary;
+  such a token keeps the full-span `writable` check, with or without the switch.
 - With the switch set, the render totals are followed every 300 frames by
   `x2w-render view tokens (X2W_D3D12_VIEW_TOKEN_GUARDED): written N, refused M`.
 - Unset, the check and the write are as before.
@@ -29,9 +32,14 @@ ctest --preset dev --no-tests=error -j 1 -R '^startup_view_token_' -V
 title memory the fixture owns and, after creation, makes the second read-only and gives the third a guard page. A
 texture SRV goes into each heap, and a second one into the writable heap. In both modes the writable heap holds both
 tokens, the read-only heap stays zero and the process keeps running, and the guard page keeps its guard bit and stays
-zero. The fixture-only export `x2w_d3d12_view_token_writes` reports the guarded writes: unset `0, 0`, set `2, 2`.
-Mutants: ignoring the switch fails `the guarded path did not write 2 tokens and refuse 2`; not setting the guard bit
-again fails `the guard page lost its guard bit`.
+zero. Two more heaps start 16 bytes before a page boundary, so their first token crosses into a read-only page or a
+guard page: in both modes the 16-byte writable prefix keeps its bytes, the left page stays `PAGE_READWRITE` without
+a guard bit, and the right page keeps its protection and stays zero. The fixture-only export
+`x2w_d3d12_view_token_writes` reports the guarded writes: unset `0, 0`, set `2, 2` (crossing tokens are not
+guarded writes). Mutants: ignoring the switch fails `the guarded path did not write 2 tokens and refuse 2`; not
+setting the guard bit again fails `the guard page lost its guard bit`; guarding crossing tokens too fails
+`a crossing heap's writable prefix changed` (read-only right page) and leaves the left page `0x104`
+(`PAGE_READWRITE | PAGE_GUARD`, guard right page).
 
 ## Startup run of the main executable
 

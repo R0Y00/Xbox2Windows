@@ -2,8 +2,11 @@
 // Three descriptor heaps over title memory the fixture owns, protected after creation: writable, read-only, and with a
 // guard page. A texture SRV (device slot 18) goes into each, and a second one into the writable heap. In both modes the
 // writable heap gets both tokens, the read-only heap stays zero without a crash, and the guard page keeps its guard bit
-// and stays zero. The stand-in's counters (x2w_d3d12_view_token_writes) tell the two paths apart: (0, 0) when the
-// switch is unset, (2 written, 2 refused) when it is set.
+// and stays zero. Two more heaps start 16 bytes before a page boundary (title backing has no alignment check), so
+// their first descriptor's token crosses into a read-only or a guard page: in both modes the writable prefix keeps its
+// bytes, the left page stays read-write without a guard bit, and the right page keeps its protection and stays zero.
+// The stand-in's counters (x2w_d3d12_view_token_writes) tell the two paths apart: (0, 0) when the switch is unset,
+// (2 written, 2 refused) when it is set; page-crossing tokens take the checked path and are not counted.
 //
 //   startup_view_token <warp|hardware> <unset|set>
 //     (X2W_D3D12_BUDGET=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_RENDER=1, plus X2W_D3D12_VIEW_TOKEN_GUARDED=1 for "set")
@@ -28,6 +31,9 @@ namespace {
 constexpr std::uint32_t token_magic = 0x56573258;  // "X2WV"
 constexpr UINT descriptors = 4;
 constexpr SIZE_T region_bytes = 0x10000;
+constexpr SIZE_T page = 0x1000;
+constexpr SIZE_T prefix = 16;  // bytes of a crossing heap's first descriptor on the left page
+constexpr unsigned char sentinel = 0xA5;
 
 template<class Result = HRESULT, class... Args>
 Result invoke(IUnknown* object, unsigned slot, Args... args)
@@ -63,6 +69,12 @@ ComPtr<IDXGIAdapter1> pick_adapter(IDXGIFactory4* factory, bool warp)
             return adapter;
     }
     return nullptr;
+}
+
+DWORD protection(const void* address)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) ? info.Protect : 0;
 }
 
 bool all_zero(const void* memory, std::size_t bytes)
@@ -101,27 +113,33 @@ int main(int argc, char** argv)
     const UINT stride = invoke<UINT>(guest.Get(), 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (!stride || UINT64{stride} * descriptors > 0x1000) return 3;
 
-    // Title memory the fixture owns: one region per heap, each heap in the region's first page.
-    enum { writable, read_only, guard, heap_count };
+    // Title memory the fixture owns: one region per heap. The first three heaps start at their region's first page; the
+    // crossing heaps start `prefix` bytes before the region's second page.
+    enum { writable, read_only, guard, cross_read_only, cross_guard, heap_count };
     void* memory[heap_count]{};
+    unsigned char* backing[heap_count]{};
     ComPtr<IUnknown> heaps[heap_count];
     for (int i = 0; i < heap_count; ++i) {
         memory[i] = VirtualAlloc(nullptr, region_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!memory[i]) return 3;
+        backing[i] = static_cast<unsigned char*>(memory[i]) + (i >= cross_read_only ? page - prefix : 0);
         const struct {
             D3D12_DESCRIPTOR_HEAP_DESC desc;
             UINT64 backing, bytes;
-        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptors}, reinterpret_cast<UINT64>(memory[i]),
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptors}, reinterpret_cast<UINT64>(backing[i]),
                     UINT64{stride} * descriptors};
         if (FAILED(invoke(guest.Get(), 14, &heap_desc, &__uuidof(ID3D12DescriptorHeap), heaps[i].GetAddressOf()))) return 3;
-        if (invoke<UINT64>(heaps[i].Get(), 9) != reinterpret_cast<UINT64>(memory[i])) {
+        if (invoke<UINT64>(heaps[i].Get(), 9) != reinterpret_cast<UINT64>(backing[i])) {
             std::puts("FAIL: the heap does not use the title memory it was given");
             return 3;
         }
     }
+    for (int i = cross_read_only; i < heap_count; ++i) std::memset(backing[i], sentinel, prefix);
     DWORD old = 0;
-    if (!VirtualProtect(memory[read_only], 0x1000, PAGE_READONLY, &old) ||
-        !VirtualProtect(memory[guard], 0x1000, PAGE_READWRITE | PAGE_GUARD, &old))
+    if (!VirtualProtect(memory[read_only], page, PAGE_READONLY, &old) ||
+        !VirtualProtect(memory[guard], page, PAGE_READWRITE | PAGE_GUARD, &old) ||
+        !VirtualProtect(backing[cross_read_only] + prefix, page, PAGE_READONLY, &old) ||
+        !VirtualProtect(backing[cross_guard] + prefix, page, PAGE_READWRITE | PAGE_GUARD, &old))
         return 3;
 
     D3D12_HEAP_PROPERTIES default_heap{};
@@ -154,6 +172,8 @@ int main(int argc, char** argv)
     view(0, memory[read_only], 0);
     view(1, memory[guard], 0);
     view(1, memory[writable], 1);
+    view(0, backing[cross_read_only], 0);
+    view(1, backing[cross_guard], 0);
 
     const auto* words = static_cast<const std::uint32_t*>(memory[writable]);
     expect(words[0] == token_magic && words[2] == 18, "the writable heap's first descriptor holds no slot 18 token");
@@ -163,8 +183,24 @@ int main(int argc, char** argv)
     MEMORY_BASIC_INFORMATION info{};
     expect(VirtualQuery(memory[guard], &info, sizeof(info)) && (info.Protect & PAGE_GUARD),
            "the guard page lost its guard bit");
-    if (VirtualProtect(memory[guard], 0x1000, PAGE_READWRITE, &old))
+    if (VirtualProtect(memory[guard], page, PAGE_READWRITE, &old))
         expect(all_zero(memory[guard], UINT64{stride} * descriptors), "the guard page was written");
+
+    // The crossing tokens: nothing written on either side, and neither page's protection changed.
+    for (int i = cross_read_only; i < heap_count; ++i) {
+        const char* const name = i == cross_read_only ? "read-only" : "guard";
+        const DWORD left = protection(backing[i]), right = protection(backing[i] + prefix);
+        std::printf("crossing heap (%s right page): left page 0x%lx, right page 0x%lx\n", name, left, right);
+        bool prefix_kept = true;
+        for (SIZE_T b = 0; b < prefix; ++b) prefix_kept = prefix_kept && backing[i][b] == sentinel;
+        expect(prefix_kept, "a crossing heap's writable prefix changed");
+        expect(left == PAGE_READWRITE, "a crossing heap's left page changed its protection");
+        expect(right == (i == cross_read_only ? PAGE_READONLY : (PAGE_READWRITE | PAGE_GUARD)),
+               "a crossing heap's right page changed its protection");
+        if (VirtualProtect(backing[i] + prefix, page, PAGE_READWRITE, &old))
+            expect(all_zero(backing[i] + prefix, UINT64{stride} * descriptors - prefix),
+                   "a crossing heap was written on its right page");
+    }
 
     LONG written = -1, refused = -1;
     x2w_d3d12_view_token_writes(&written, &refused);
@@ -174,6 +210,7 @@ int main(int argc, char** argv)
     else
         expect(written == 0 && refused == 0, "the guarded path ran with the switch unset");
     if (failures) return 1;
-    std::printf("PASS (%s): writable heap 2 tokens, read-only heap untouched, guard page kept\n", argv[2]);
+    std::printf("PASS (%s): writable heap 2 tokens, read-only heap untouched, guard page kept, crossing tokens "
+                "refused without a write or a protection change\n", argv[2]);
     return 0;
 }

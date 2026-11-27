@@ -165,9 +165,16 @@ bool view_token_guarded()
     return on;
 }
 LONG view_tokens_guarded_written, view_tokens_guarded_refused;
-// The token write of view_token_guarded(). A page that refuses the write (no access, read-only, a guard page, an
-// in-page error) leaves the descriptor without a token, as writable() returning false did; a guard page has its guard
-// bit set again.
+// Whether [dest, dest + bytes) lies inside one 4 KiB page. A descriptor heap's title backing has no alignment check,
+// so a token can cross a page; such a token takes the full-span writable() check instead of the guarded write.
+bool view_token_in_one_page(u64 dest, std::size_t bytes)
+{
+    return bytes && ((dest ^ (dest + bytes - 1)) & ~u64{0xFFF}) == 0;
+}
+// The token write of view_token_guarded(), for a span inside one page (view_token_in_one_page), so a refusal happens
+// on the first byte and writes nothing. A page that refuses the write (no access, read-only, a guard page, an in-page
+// error) leaves the descriptor without a token, as writable() returning false did; a guard page has its guard bit set
+// again, on that page only.
 __declspec(noinline) bool write_view_token(void* dest, const void* token, std::size_t bytes) noexcept
 {
     DWORD code = 0;
@@ -539,7 +546,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     const std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), 0,
                                     static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32), 0, 0};
     if (dest_title == dest_desktop || !title_backed(dest_title, token_bytes)) return;
-    if (view_token_guarded()) {
+    if (view_token_guarded() && view_token_in_one_page(dest_title, token_bytes)) {
         InterlockedIncrement(write_view_token(reinterpret_cast<void*>(dest_title), token, token_bytes)
                                  ? &view_tokens_guarded_written : &view_tokens_guarded_refused);
         return;
