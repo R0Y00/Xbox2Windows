@@ -2314,7 +2314,8 @@ These are measured on one executable; treat them as hypotheses for others.
   main-image `int3` sites, so a site that repeats never runs the budget out however long the run is.
   The first hit at one more site still stops the run, as do `X2W_STOP_AT` sites. `-ContinueAsserts N`
   counts hits instead: it steps over the first N hits at any site. A hit is stepped over when either
-  budget allows it. Run `ctest --preset dev --no-tests=error -R "^startup_debug"`. One of them fires about ten times a second in the texture-streaming path
+  budget allows it, and each budget counts only the hits it covers: the site budget takes the first N
+  distinct sites, and the hit budget counts the hits at other sites. Run `ctest --preset dev --no-tests=error -R "^startup_debug"`. One of them fires about ten times a second in the texture-streaming path
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.

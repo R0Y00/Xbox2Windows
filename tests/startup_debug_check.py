@@ -9,6 +9,8 @@ the caller sets _NO_DEBUG_HEAP=0. X2W_NOP_SOFT_ASSERTS=1 replaces a main-image I
 the first continue, and the probe repeats one site when STARTUP_DEBUG_PROBE_ASSERTS is set.
 --assert-sites N steps over every hit at up to N distinct main-image sites, however often each
 repeats, and stops at the first hit of one more site.
+With both budgets, each counts only the hits it covers (hits A, B, A with --assert-sites 1
+--continue-asserts 2 all continue).
 tests/startup_debug_probe.cpp is the main input: it hits two breakpoints, optionally repeats a
 third, reserves 256 MiB, prints its debug-heap flags, waits 3 s and exits 0.
 
@@ -235,6 +237,16 @@ def main(probe, calls_dll, group='all'):
             out, _ = run(probe, work, "assert-sites-stop", {"X2W_STOP_AT": f"{sites[1]:x}"},
                          options=("--assert-sites", "3"))
             assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out, out
+            # Both budgets: the hits A, B, A with --assert-sites 1 --continue-asserts 2. The site budget
+            # covers A, the hit budget B, and A's second hit is still A, so the probe runs to its end.
+            out, logdir = run(probe, work, "assert-sites-combined", {"STARTUP_DEBUG_PROBE_REVISIT": "1"},
+                              options=("--assert-sites", "1", "--continue-asserts", "2"))
+            assert "process exited with 0x00000000" in out, out
+            assert breakpoint_sites(logdir, image) == [sites[0], sites[1], sites[0]], text(logdir / "events.txt")
+            # Control: the hit budget alone runs out at A's second hit, so the site budget is what continues it.
+            out, _ = run(probe, work, "assert-sites-combined-control", {"STARTUP_DEBUG_PROBE_REVISIT": "1"},
+                         options=("--continue-asserts", "2"))
+            assert f"stopped at breakpoint (0x80000003) at {image}+{sites[0]:#x}" in out, out
             out, _ = run(probe, work, "assert-sites-negative", {}, options=("--assert-sites", "-1"))
             assert "expected an --assert-sites value of 0 or greater" in out, out
 

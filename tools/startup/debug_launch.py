@@ -147,6 +147,11 @@ def main():
         return 2
     memory = int(memory_gib * 2**30)
     asserts_seen = {}
+    # The two assert budgets keep their own books, so a hit one of them covers never uses up the other:
+    # assert_sites_admitted holds the sites --assert-sites covers (the first assert_sites distinct ones),
+    # asserts_counted the hits --continue-asserts stepped over.
+    assert_sites_admitted = set()
+    asserts_counted = 0
     # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
     # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is
     # unchanged, but a long mapping that traps once per chunk then runs at native speed.
@@ -780,10 +785,13 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts
-                       or ex_addr in asserts_seen and len(asserts_seen) <= assert_sites
-                       or ex_addr not in asserts_seen and len(asserts_seen) < assert_sites)
+                  and (ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites
+                       or skip_asserts == -1 or asserts_counted < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
+                if ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites:
+                    assert_sites_admitted.add(ex_addr)
+                else:
+                    asserts_counted += 1
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
