@@ -109,7 +109,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |
 | [Experimental startup stand-ins and debugger (trap-by-default DLLs)](docs/startup-runtime.md) | `ctest --preset release --no-tests=error -R '^startup_stubs$' -V` |
-| [Remap XMem pool pages through queue slot 31](docs/experiments.md#queue-page-batches-on-xmem-sections) | `ctest --preset release --no-tests=error -R 'queue_page_batch|xmem_page_batch_inflight' -V` |
+| [Remap XMem pool pages through queue slot 31](docs/experiments.md#queue-page-batches-on-xmem-sections) · [page runs](docs/experiments/xmem-page-runs.md) | `ctest --preset release --no-tests=error -R 'queue_page_batch|xmem_page_batch_inflight|xmem_placeholder_split' -V` |
 | [Sample a texture by address in a translated draw](docs/startup-runtime.md#textures-published-by-address-device-slot-70) | `ctest --preset release --no-tests=error -R '^startup_address_console_' -V` |
 | [Desktop audio render sink and its three-case fixture (WASAPI)](docs/experiments.md#desktop-audio-render-sink) | `ctest --preset release --no-tests=error -R '^startup_audio_output$' -V` |
 
@@ -302,6 +302,7 @@ Results are grouped by adapter. Open a report for the driver, build and any capa
 | AMD Radeon RX 6600M | 32 | Skipped, Shader Model 6.5 | 408 queries passed | [32.0.21045.29003 report, Windows 10 build 19045](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7128601597) |
 | AMD Radeon RX 7700 XT | 32 | Passed, 64 lanes | 408 queries passed | [32.0.32029.2010 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7133365031) |
 | Intel Arc A770 (driver 32.0.101.9175) | 32 (16 on direct run) | Skipped, lane range 8–32 | 408 queries passed per run | [Two runs by @Alexofbulgaria, debug layer unavailable](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7190203497) |
+| Intel Arc A380 | 16 | Skipped, lane range 8–32 | 408 queries passed | [32.0.101.9150 report, debug layer unavailable](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7215498163) |
 | NVIDIA GeForce RTX 3090 Ti | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.2140 report, debug layer enabled](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7222246091) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) · [10.0.26100.9711 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7070173394) · [Independent 10.0.26100.9711 run](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7070473372) · [10.0.26100.9711 source build at bc24dfd](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071126769) · [10.0.26100.9818 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071853781) · [Independent 10.0.26100.9818 run](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7077972845) |
 
