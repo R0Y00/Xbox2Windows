@@ -165,7 +165,7 @@ struct Fixture {
     {
         void* status = nullptr;
         void* queue = nullptr;
-        unsigned char description[0x20] = {};
+        unsigned char description[0x28] = {};
         *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
         if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "Status", nullptr, &status) != 0 ||
             reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue) != 0)
@@ -297,6 +297,9 @@ bool worker_cannot_start(Fixture& f)
 {
     Fixture::Queue q;
     if (!f.create(q, f.vtables)) return fail("cannot create the queue");
+    // A handle taken before the failure: it can only become signaled through the failure's SetEvent.
+    HANDLE early = queue_error_event(q.queue);
+    if (!early || WaitForSingleObject(early, 0) != WAIT_TIMEOUT) return fail("a new queue's error event was signaled");
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     fail_thread_creation = true;
     thread_attempts = 0;
@@ -308,6 +311,25 @@ bool worker_cannot_start(Fixture& f)
     if (attempts < 2) return fail("the worker start did not try both stack sizes");
     if (!failed_at_submit(f, q)) return false;
     if (!untouched_bytes(destination)) return fail("the failed request changed its destination");
+    const DWORD signaled_early = WaitForSingleObject(early, 0);
+    // Acquire the event after the failure as well, to exercise its initial signal state without a worker.
+    HANDLE event = queue_error_event(q.queue);
+    if (!event) return fail("GetErrorEvent failed after Submit without a worker");
+    const DWORD notified = WaitForSingleObject(event, 0);
+    StorageErrorRecord record{};
+    queue_retrieve_error_record(q.queue, &record);
+    const DWORD reset = WaitForSingleObject(event, 0);
+    const DWORD reset_early = WaitForSingleObject(early, 0);
+    CloseHandle(event);
+    CloseHandle(early);
+    if (signaled_early != WAIT_OBJECT_0) return fail("the failure did not signal an event taken before it");
+    if (reset_early != WAIT_TIMEOUT) return fail("retrieve did not reset the event taken before the failure");
+    if (notified != WAIT_OBJECT_0 || reset != WAIT_TIMEOUT || record.failure_count != requests_per_run ||
+        record.first_failure.result != E_OUTOFMEMORY ||
+        record.first_failure.command_type != x2w_startup::command_type_request ||
+        record.first_failure.destination != destination.data() ||
+        record.first_failure.source != f.stream.data() || record.first_failure.source_size != f.stream.size())
+        return fail("failed request's record or event was wrong after Submit without a worker");
     return serves_next_request(f, q);
 }
 
@@ -356,6 +378,10 @@ bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& th
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");
@@ -513,6 +539,10 @@ bool ordered_failure(Fixture& f, bool status_first, int requests, int fail_enque
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");
@@ -685,6 +715,167 @@ bool suffix_waits_for_prefix(Fixture& f, bool hold_deferred)
 bool suffix_waits_for_prefix_fence(Fixture& f) { return suffix_waits_for_prefix(f, false); }
 bool suffix_waits_for_deferred_fence(Fixture& f) { return suffix_waits_for_prefix(f, true); }
 
+// Cancelling OOM-deferred requests in both `unrecorded_head` (before Submit, failing via either
+// `fail_unrecorded` or `complete_deferred`) and `work->deferred_head` (after Submit, while the
+// worker holds a prefix fence) must leave their destinations untouched and avoid error records (#1843).
+bool cancelled_deferred_entries(Fixture& f)
+{
+    auto enqueue_tagged = [&](const Fixture::Queue& q, std::vector<unsigned char>& destination, std::uint64_t tag) {
+        StorageRequest req{};
+        req.options = 1 | 0x400000;
+        req.destination = destination.data();
+        req.destination_size = static_cast<unsigned>(destination.size());
+        req.source = const_cast<unsigned char*>(f.stream.data());
+        req.source_size = static_cast<unsigned>(f.stream.size());
+        req.cancellation_tag = tag;
+        reinterpret_cast<EnqueueRequestFn>(q.queue->vtable[3])(q.queue, &req);
+    };
+
+    auto check_no_error = [](Object* queue, HANDLE event, const char* label) -> bool {
+        StorageErrorRecord record{};
+        queue_retrieve_error_record(queue, &record);
+        if (WaitForSingleObject(event, 0) != WAIT_TIMEOUT || record.failure_count != 0 ||
+            record.first_failure.command_type != x2w_startup::command_type_none)
+            return fail(label);
+        return true;
+    };
+
+    // A. `unrecorded_head` cancelled before Submit, then Submit fails `ensure_work` -> `fail_unrecorded`.
+    {
+        Fixture::Queue q;
+        if (!f.create(q, f.vtables)) return fail("cancel-deferred A: cannot create queue");
+        HANDLE event = queue_error_event(q.queue);
+        if (!event) return fail("cancel-deferred A: cannot get error event");
+        std::vector<unsigned char> dst(f.plain.size(), untouched);
+        arm(1);
+        enqueue_tagged(q, dst, 0xC001ull);
+        disarm();
+        if (!has_unrecorded(q.queue)) {
+            CloseHandle(event);
+            return fail("cancel-deferred A: expected request to be deferred to unrecorded_head");
+        }
+        f.status_entry(q, 0);
+        f.signal(q, 1);
+        queue_cancel(q.queue, ~0ull, 0xC001ull);
+        arm(1);
+        f.submit(q);
+        disarm();
+        const bool ok = f.complete(q, 0) && q.fence.signals == 1 && untouched_bytes(dst) &&
+                        check_no_error(q.queue, event, "cancel-deferred A: cancelled unrecorded request recorded an error");
+        CloseHandle(event);
+        release(q.status);
+        release(q.queue);
+        if (!ok) return false;
+    }
+
+    // B. `unrecorded_head` cancelled before Submit, then Submit succeeds -> moved to `deferred_head` -> `complete_deferred`.
+    {
+        Fixture::Queue q;
+        if (!f.create(q, f.vtables)) return fail("cancel-deferred B: cannot create queue");
+        HANDLE event = queue_error_event(q.queue);
+        if (!event) return fail("cancel-deferred B: cannot get error event");
+        std::vector<unsigned char> dst(f.plain.size(), untouched);
+        arm(1);
+        enqueue_tagged(q, dst, 0xC002ull);
+        disarm();
+        if (!has_unrecorded(q.queue)) {
+            CloseHandle(event);
+            return fail("cancel-deferred B: expected request to be deferred to unrecorded_head");
+        }
+        f.status_entry(q, 0);
+        f.signal(q, 2);
+        queue_cancel(q.queue, ~0ull, 0xC002ull);
+        f.submit(q);
+        const bool waited = f.wait(q, 0);
+        const DWORD start = GetTickCount();
+        while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(1);
+        const bool ok = waited && q.fence.signals == 1 && untouched_bytes(dst) &&
+                        check_no_error(q.queue, event, "cancel-deferred B: cancelled unrecorded request recorded an error");
+        CloseHandle(event);
+        release(q.status);
+        release(q.queue);
+        if (!ok) return false;
+    }
+
+    // C. `work->deferred_head` cancelled live after Submit while the worker is held on a prefix fence.
+    {
+        struct HoldFence {
+            void** vtable;
+            HANDLE entered;
+            HANDLE release_evt;
+            static long __stdcall signal(void* self, std::uint64_t)
+            {
+                auto* h = static_cast<HoldFence*>(self);
+                SetEvent(h->entered);
+                WaitForSingleObject(h->release_evt, completion_timeout_ms);
+                return 0;
+            }
+        };
+        void* hold_vtable[11] = {};
+        hold_vtable[10] = reinterpret_cast<void*>(&HoldFence::signal);
+
+        Fixture::Queue q;
+        if (!f.create(q, f.vtables)) return fail("cancel-deferred C: cannot create queue");
+        HANDLE event = queue_error_event(q.queue);
+        if (!event) return fail("cancel-deferred C: cannot get error event");
+        HoldFence hold{hold_vtable, CreateEventW(nullptr, TRUE, FALSE, nullptr),
+                       CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        reinterpret_cast<EnqueueSignalFn>(q.queue->vtable[5])(q.queue, &hold, 10);
+
+        std::vector<std::vector<unsigned char>> dsts;
+        for (int attempt = 0; attempt < 64 && !has_unrecorded(q.queue); ++attempt) {
+            dsts.emplace_back(f.plain.size(), untouched);
+            arm(1);
+            enqueue_tagged(q, dsts.back(), 0xC003ull);
+            disarm();
+        }
+        const bool produced_unrecorded = has_unrecorded(q.queue);
+        if (produced_unrecorded) {
+            // Cancel any prefix entries that landed in `waiting` before pushing the trailing status/fence,
+            // leaving only the unrecorded request to move into `work->deferred_head` on Submit.
+            if (q.queue->work) {
+                const std::lock_guard guard(q.queue->work->mutex);
+                for (Entry& e : q.queue->work->waiting) {
+                    if (e.type == Entry::request) e.cancelled = true;
+                }
+            }
+            f.status_entry(q, 0);
+            f.signal(q, 3);
+            f.submit(q);
+            const bool entered = WaitForSingleObject(hold.entered, completion_timeout_ms) == WAIT_OBJECT_0;
+            bool in_deferred = false;
+            if (q.queue->work) {
+                const std::lock_guard guard(q.queue->work->mutex);
+                in_deferred = q.queue->work->deferred_head != nullptr;
+            }
+            queue_cancel(q.queue, ~0ull, 0xC003ull);
+            SetEvent(hold.release_evt);
+            const bool waited = f.wait(q, 0);
+            const DWORD start = GetTickCount();
+            while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(1);
+            bool all_untouched = true;
+            for (const auto& d : dsts)
+                if (!untouched_bytes(d)) all_untouched = false;
+            const bool ok = entered && in_deferred && waited && q.fence.signals == 1 && all_untouched &&
+                            check_no_error(q.queue, event, "cancel-deferred C: cancelled deferred_head request recorded an error");
+            CloseHandle(hold.entered);
+            CloseHandle(hold.release_evt);
+            CloseHandle(event);
+            release(q.status);
+            release(q.queue);
+            if (!ok) return false;
+        } else {
+            CloseHandle(hold.entered);
+            CloseHandle(hold.release_evt);
+            CloseHandle(event);
+            release(q.status);
+            release(q.queue);
+            return fail("cancel-deferred C: failed to trigger unrecorded_head behind prefix fence");
+        }
+    }
+    return true;
+}
+
 // A crash is never silent: whatever ends the process names the stage it was in.
 const char* volatile current_stage = "start";
 
@@ -807,6 +998,7 @@ int main()
     if (!stage("entries_keep_their_order", entries_keep_their_order, f)) return 1;
     if (!stage("suffix_waits_for_prefix", suffix_waits_for_prefix_fence, f)) return 1;
     if (!stage("suffix_waits_for_deferred_fence", suffix_waits_for_deferred_fence, f)) return 1;
+    if (!stage("cancelled_deferred_entries", cancelled_deferred_entries, f)) return 1;
     std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
 }

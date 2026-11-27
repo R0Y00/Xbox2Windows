@@ -1,0 +1,6 @@
+LIBRARY startup_runtime_proxy_decoy
+EXPORTS
+    QueryApiImpl
+    query_calls
+    RegQueryValueExW = decoy_reg_query_value_ex_w
+    registry_query_calls

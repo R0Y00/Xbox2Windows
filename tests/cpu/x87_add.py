@@ -369,7 +369,18 @@ class Runner:
         self.call.argtypes, self.call.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint64
         self.seeded = self.harness.x87_seeded
         self.seeded.argtypes, self.seeded.restype = [ctypes.c_void_p] * 4, ctypes.c_uint64
-        self.lib = ctypes.CDLL(str(Path(path).resolve()))
+        self.path = Path(path).resolve()
+        self.lib = ctypes.CDLL(str(self.path))
+
+    def export(self, name):
+        """The fixture export `name`, or a diagnostic naming the DLL."""
+        try:
+            return getattr(self.lib, name)
+        except AttributeError:
+            raise AssertionError(
+                f"{self.path.name} has no export {name!r}. "
+                "Rebuild the fixture target and verify that it exports this symbol."
+            ) from None
 
     def _buffers(self, data):
         guard = b"\xa5" * GUARD
@@ -384,7 +395,7 @@ class Runner:
 
     def __call__(self, name, data):
         guard, source, target = self._buffers(data)
-        function = ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value
+        function = ctypes.cast(self.export(name), ctypes.c_void_p).value
         state = self.call(function, ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
         return self._output(name, data, guard, source, target), state
 
@@ -397,7 +408,7 @@ class Runner:
             m80_bytes(SEED_VALUE)[:10] + b"\0" * 6 + SEED_CONTROL.to_bytes(2, "little") + b"\0" * 62)
         io = (ctypes.c_uint64 * 2)(ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
         state = self.seeded(ctypes.cast(getattr(self.harness, harness), ctypes.c_void_p).value,
-                            ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value,
+                            ctypes.cast(self.export(name), ctypes.c_void_p).value,
                             ctypes.addressof(io), ctypes.addressof(probe))
         return self._output(name, data, guard, source, target), state, bytes(probe[32:42]), bytes(probe[48:76])
 
@@ -484,7 +495,7 @@ def check_rejections():
     rejected = {
         "the profile off (default)": (attempt(f"{fld} {fstp} c3", x87=False), "unsupported query operation"),
         "fbld m80": (attempt(f"{fld} df 21 de c1 {fstp} c3"), "unsupported x87 operation"),
-        "fsin": (attempt(f"{fld} d9 fe {fstp} c3"), "unsupported x87 operation"),
+        "f2xm1": (attempt(f"{fld} d9 f0 {fstp} c3"), "unsupported x87 operation"),
         "fnstsw m16": (attempt(f"{fld} dd 3a {fstp} c3"), "stores status-word bits"),
         "fldcw": (attempt(f"d9 29 {fld} {fstp} c3"), "fldcw"),
         "fninit": (attempt(f"{fld} db e3 {fstp} c3"), "unsupported x87 operation"),

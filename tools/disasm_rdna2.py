@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import tempfile
 
 # Register decode helpers
 
@@ -642,11 +643,20 @@ VOP1_OPS = {
     0x51: ("v_cvt_f16_i16_e32", "Convert int16 to float16"),
     0x52: ("v_cvt_u16_f16_e32", "Convert float16 to uint16"),
     0x53: ("v_cvt_i16_f16_e32", "Convert float16 to int16"),
+    0x54: ("v_rcp_f16_e32", "Reciprocal 1/x float16"),
+    0x55: ("v_sqrt_f16_e32", "Square root sqrt(x) float16"),
+    0x56: ("v_rsq_f16_e32", "Reciprocal square root 1/sqrt(x) float16"),
+    0x57: ("v_log_f16_e32", "Logarithm log2(x) float16"),
+    0x58: ("v_exp_f16_e32", "Exponent 2^x float16"),
+    0x59: ("v_frexp_mant_f16_e32", "Mantissa of float16"),
+    0x5a: ("v_frexp_exp_i16_f16_e32", "Exponent of float16 as int16"),
     0x5b: ("v_floor_f16_e32", "Floor float16"),
     0x5c: ("v_ceil_f16_e32", "Ceiling float16"),
     0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
     0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
     0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x60: ("v_sin_f16_e32", "Sine float16"),
+    0x61: ("v_cos_f16_e32", "Cosine float16"),
     0x62: ("v_sat_pk_u8_i16_e32", "Saturate int16 pair to packed uint8"),
     0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
     0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
@@ -1029,7 +1039,8 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_interp_mov_f32_e64": (True, True),
 }
 
-# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+# The v_interp_mov_f32 parameter selector (VINTRP vsrc field, VOP3A src1 field): p10, p20 and p0.
+# LLVM prints any other value as invalid_param_<n> and its assembler accepts none of them.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
 
 
@@ -2545,6 +2556,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 in (233, 234, 250):
+            return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
             extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
@@ -2623,8 +2636,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         vsrc = w0 & 0xff
         op_names = {0: "v_interp_p1_f32_e32", 1: "v_interp_p2_f32_e32", 2: "v_interp_mov_f32_e32"}
         op_name = op_names.get(op, f"v_interp_{op}")
-        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         comment = f"Parameter interpolation stage {op+1} for attribute {attr}.{chan}"
+        if op == 2:
+            # The mov form's vsrc field is the parameter selector, not a VGPR.
+            if vsrc >= len(VINTRP_MOV_PARAMS):
+                return (4, f"{op_name}_unsupported", f"{op_name} <unsupported VINTRP encoding>",
+                        f"v_interp_mov_f32 parameter selector {vsrc} is not p10, p20 or p0")
+            return (4, op_name, f"{op_name} v{vdst}, {VINTRP_MOV_PARAMS[vsrc]}, attr{attr}.{chan}", comment)
+        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         return (4, op_name, asm, comment)
 
     # 9. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)
@@ -2688,12 +2707,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sbase_str = f"s[{sbase}:{sbase + base_width - 1}]"
         soffset = (w1 >> 25) & 0x7f
         imm_offset = w1 & 0x1fffff
+        if imm_offset & 0x100000:
+            # GFX9+ SMEM OFFSET[20:0] is a signed 21-bit byte offset (LLVM sign-extends it)
+            imm_offset -= 0x200000
+        imm_str = f"-0x{-imm_offset:x}" if imm_offset < 0 else f"0x{imm_offset:x}"
         if soffset == 125:
-            off_str = f"0x{imm_offset:x}"
+            off_str = imm_str
         else:
             off_str = decode_s_reg(soffset)
             if imm_offset:
-                off_str += f" offset:0x{imm_offset:x}"
+                off_str += f" offset:{imm_str}"
         mods = []
         if (w0 >> 16) & 1:
             mods.append("glc")
@@ -2727,6 +2750,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op not in MIMG_DERIV_OPS:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
+        a16 = (w1 >> 30) & 1
+        packed_2d = (
+            a16
+            and op_name in ("image_load", "image_sample", "image_sample_lz")
+            and dim_name == "SQ_RSRC_IMG_2D"
+        )
+        if packed_2d:
+            addr_count = 1  # Two 16-bit 2D coordinates share one VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2765,10 +2796,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("tfe")
         if (w0 >> 17) & 1:
             mods.append("lwe")
-        if (w1 >> 30) & 1:
+        if a16:
             mods.append("a16")
         if d16:
             mods.append("d16")
+        if packed_2d and nsize:
+            mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
         if (w0 & 0x4040) or (w1 >> 26) & 0xf:
@@ -3184,50 +3217,112 @@ def print_disassembly(shader_name: str, instructions: list[dict], show_comments:
     print()
 
 
-def main():
+def _paths_collide(path_a: Path, path_b: Path) -> bool:
+    """Return True when two paths resolve to or refer to the same file."""
+    if path_a.resolve() == path_b.resolve():
+        return True
+    try:
+        return path_a.exists() and path_b.exists() and path_a.samefile(path_b)
+    except OSError:
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", type=Path, default=[], help="Path to shader binary .bin file(s) or folder")
     parser.add_argument("--hex", default=None, help="Direct hex string to decode (e.g. '0300a0bf8002047e')")
     parser.add_argument("--output", type=Path, default=None, help="Save disassembly listing to output file")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    # Hex decode mode
-    if args.hex:
-        raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
-        insns = disassemble_binary(raw_bytes, "hex_input")
-        print_disassembly("hex_input", insns)
-        return 0
-
-    if not args.targets:
-        parser.error("Specify targets or provide hex via --hex")
+    if args.output is not None:
+        try:
+            if args.output.is_dir():
+                print(f"error: {args.output}: output path is a directory", file=sys.stderr)
+                return 1
+        except OSError as exc:
+            print(f"error: {args.output}: {exc}", file=sys.stderr)
+            return 1
 
     all_listings = []
+    had_error = False
+
+    # Hex decode mode
+    if args.hex is not None:
+        hex_text = "".join(args.hex.split())
+        if not hex_text:
+            parser.error("--hex: expected a non-empty hex string")
+        try:
+            raw_bytes = bytes.fromhex(hex_text)
+        except ValueError as exc:
+            parser.error(f"--hex: {exc}")
+        insns = disassemble_binary(raw_bytes, "hex_input")
+        print_disassembly("hex_input", insns)
+        all_listings.append(("hex_input", insns))
+        args.targets = []
+    elif not args.targets:
+        parser.error("Specify targets or provide hex via --hex")
+
     for target in args.targets:
-        if target.is_file():
-            data = target.read_bytes()
-            insns = disassemble_binary(data, target.name)
-            print_disassembly(target.name, insns)
-            all_listings.append((target.name, insns))
-        elif target.is_dir():
-            files = sorted(target.glob("*.bin"))
-            print(f"[*] Found {len(files)} shader binary files in {target.name}...")
-            for f in files[:20]:  # Limit preview to 20 when folder passed
-                data = f.read_bytes()
-                insns = disassemble_binary(data, f.name)
-                print_disassembly(f.name, insns)
-                all_listings.append((f.name, insns))
+        try:
+            if target.is_file():
+                if args.output is not None and _paths_collide(args.output, target):
+                    print(f"error: --output {args.output} collides with input {target}", file=sys.stderr)
+                    return 1
+                data = target.read_bytes()
+                insns = disassemble_binary(data, target.name)
+                print_disassembly(target.name, insns)
+                all_listings.append((target.name, insns))
+            elif target.is_dir():
+                files = sorted(f for f in target.glob("*.bin") if f.is_file())
+                preview = files[:20]  # Limit preview to 20 when folder passed
+                if args.output is not None:
+                    for f in preview:
+                        if _paths_collide(args.output, f):
+                            print(f"error: --output {args.output} collides with input {f}", file=sys.stderr)
+                            return 1
+                print(f"[*] Found {len(files)} shader binary files in {target.name}...")
+                for f in preview:
+                    data = f.read_bytes()
+                    insns = disassemble_binary(data, f.name)
+                    print_disassembly(f.name, insns)
+                    all_listings.append((f.name, insns))
+            else:
+                print(f"error: {target}: not found", file=sys.stderr)
+                had_error = True
+        except OSError as exc:
+            print(f"error: {target}: {exc}", file=sys.stderr)
+            had_error = True
 
-    if args.output and all_listings:
-        with args.output.open("w", encoding="utf-8") as out_f:
-            for name, insns in all_listings:
-                out_f.write(f"; Disassembly: {name}\n")
-                for item in insns:
-                    out_f.write(f"    {item['assembly']:<40} ; +0x{item['offset']:04x} // {item['comment']}\n")
-                out_f.write("\n")
-        print(f"[+] Disassembly saved to: {args.output}")
+    if args.output is not None and all_listings and not had_error:
+        tmp_path = None
+        try:
+            output_path = args.output
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=output_path.parent,
+                prefix=f".{output_path.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as out_f:
+                tmp_path = Path(out_f.name)
+                for name, insns in all_listings:
+                    out_f.write(f"; Disassembly: {name}\n")
+                    for item in insns:
+                        out_f.write(f"    {item['assembly']:<40} ; +0x{item['offset']:04x} // {item['comment']}\n")
+                    out_f.write("\n")
+            tmp_path.replace(output_path)
+            tmp_path = None
+            print(f"[+] Disassembly saved to: {args.output}")
+        except OSError as exc:
+            print(f"error: {args.output}: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
-    return 0
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

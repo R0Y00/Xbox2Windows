@@ -109,11 +109,24 @@ SAMPLE_C_LZ_WORDS = bytes.fromhex(
     '04040cf4000000fa' 'ff0398be12100008' '800399be' '80039abe' '80039bbe'
     'f002007e' 'ff02027e0000403f' 'ff02047e0000803e' '0902067e' '7fc08cbf'
     '2801bcf00004c400' '703f8cbf' '0f1800f804040404' '000081bf')
+# The same stage with sampler word 2 = 0x70000000 (MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT): the level-zero
+# form ignores them, so the draw must match the CPU reference below exactly like the plain stage.
+S_MOV_S26_ZERO = bytes.fromhex('80039abe')
+SAMPLE_C_LZ_W2 = 0x70000000
+SAMPLE_C_LZ_W2_WORDS = SAMPLE_C_LZ_WORDS.replace(
+    S_MOV_S26_ZERO, bytes.fromhex('ff039abe') + struct.pack('<I', SAMPLE_C_LZ_W2))
+assert SAMPLE_C_LZ_WORDS.count(S_MOV_S26_ZERO) == 1 and SAMPLE_C_LZ_W2_WORDS != SAMPLE_C_LZ_WORDS
 SAMPLE_C_SOURCE = SAMPLE_C_LZ_SOURCE.replace('image_sample_c_lz ', 'image_sample_c ')
 SAMPLE_C_WORDS = SAMPLE_C_LZ_WORDS.replace(bytes.fromhex('2801bcf00004c400'), bytes.fromhex('2801a0f00004c400'))
 SAMPLE_C_CALL = 'r0.SampleCmpLevelZero(q0, float3(F(v1), F(v2), F(v3)), F(v0))'
 CMP_ZERO = ','.join(['00000000'] * 4)
 CMP_ONE = ','.join(['3f800000'] * 4)
+
+
+def cmp_reference(slice_value):
+    """CPU reference of the comparison draw: point-clamp read of texel (1, 0) of the rounded slice, LESS, ref 0.5."""
+    depth = 0.25 + 0.5 * min(1, max(0, int(slice_value + 0.5)))
+    return ','.join(['%08x' % struct.unpack('<I', struct.pack('<f', 1.0 if 0.5 < depth else 0.0))[0]] * 4)
 
 # image_load_mip on a 2D array: x from a constant, y = 0, slice from root constant 1 (s9), mip a constant.
 MIP_IMAGE = bytes.fromhex('280f04f000000400')
@@ -139,6 +152,31 @@ MIP_INSTRUCTION_NSA = 'image_load_mip v[0:3], [v0, v1, v3, v2], s[16:23] dmask:0
 # name: (x, mip). The 4x4 texture has mips of 4x4, 2x2 and 1x1, so x = 1 is valid for mips 0 and 1 only.
 MIP_FIXTURES = {'mip 0': (1, 0), 'mip 1': (1, 1), 'mip 2': (0, 2)}
 
+
+def check_compare_modifiers():
+    """image_sample_c needs exactly one dim and one dmask; anything else is refused by name.
+
+    No machine code and no device: the refusal is decided from the modifier list alone, so a bare
+    stage is enough. The legal list is checked to reach a *different* failure, which proves the
+    guard is not simply raising for every input.
+    """
+    base = 'image_sample_c'
+    for mods in (['dim:SQ_RSRC_IMG_2D'], ['dmask:0x1'],
+                 ['dim:SQ_RSRC_IMG_2D', 'dim:SQ_RSRC_IMG_2D', 'dmask:0x1']):
+        stage = G.Stage.__new__(G.Stage)
+        try:
+            stage.image_compare(['v1', 'v2', 'v3', 's4'], mods, 'c')
+        except G.Unsupported as error:
+            assert str(error) == '%s without exactly one dim and dmask' % base, (mods, error)
+        else:
+            raise AssertionError('%s accepted modifiers %s' % (base, mods))
+    stage = G.Stage.__new__(G.Stage)
+    try:
+        stage.image_compare(['v1', 'v2', 'v3', 's4'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'c')
+    except G.Unsupported as error:
+        assert 'without exactly one dim and dmask' not in str(error), error
+    except AttributeError:
+        pass  # past the guard: the bare stage has none of the state the lowering needs
 
 def mip_words(x, mip, image=MIP_IMAGE):
     return (bytes.fromhex('04040cf4000000fa' + MIP_X[x] + '8002027e' '0902047e' '0211047e' + MIP_LEVEL[mip] + '7fc08cbf')
@@ -188,8 +226,18 @@ def mip_controls():
     accepted[1] |= 0x10  # unorm
     assert 't = %s;' % MIP_CALL in translate(mip_words(1, 0, bytes(accepted))).hlsl_ps()
 
-    # Refused: packed 16-bit data or addresses and fault-status returns need their own lowering.
-    for flag, byte, mask in (('d16', 7, 0x80), ('a16', 7, 0x40), ('tfe', 2, 0x01)):
+    # Packed 16-bit data narrows the four channels into v[0:1] and marks SRV 0 for exact D16 validation.
+    d16 = bytearray(MIP_IMAGE)
+    d16[7] |= 0x80
+    d16_pipe = translate(mip_words(1, 0, bytes(d16)))
+    d16_ps = d16_pipe.hlsl_ps()
+    assert 't = %s;' % MIP_CALL in d16_ps, d16_ps
+    assert 'v0 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_ps, d16_ps
+    assert 'v1 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_ps, d16_ps
+    assert 'd16srv 0 exact' in d16_pipe.manifest().splitlines(), d16_pipe.manifest()
+
+    # Refused: packed addresses and fault-status returns need their own lowering.
+    for flag, byte, mask in (('a16', 7, 0x40), ('tfe', 2, 0x01)):
         refused = bytearray(MIP_IMAGE)
         refused[byte] |= mask
         try:
@@ -239,6 +287,7 @@ def mip_controls():
 
 
 def controls():
+    check_compare_modifiers()
     # image_sample: a Texture2DArray, with the slice as the third component of the coordinate.
     pipe = translate(SAMPLE_WORDS)
     ps, manifest = pipe.hlsl_ps(), pipe.manifest()
@@ -337,6 +386,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
          False),
         ('sample_c_lz', SAMPLE_C_LZ_WORDS, SAMPLE_C_CALL, cmp_cases, cmp_mutants, True),
         ('sample_c', SAMPLE_C_WORDS, SAMPLE_C_CALL, cmp_cases, cmp_mutants, True),
+        ('sample_c_lz_word2_bits', SAMPLE_C_LZ_W2_WORDS, SAMPLE_C_CALL,
+         [(z, cmp_reference(float(z))) for z in ('0', '1', '0.25', '0.75')], cmp_mutants, True),
     ]
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
     with tempfile.TemporaryDirectory() as tmp:

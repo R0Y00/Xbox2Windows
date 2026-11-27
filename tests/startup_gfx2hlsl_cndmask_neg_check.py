@@ -10,6 +10,7 @@ shaders in the first main-game loading-screen cache (#870).
 The instruction bytes are **constructed here** from the field layout the checked-in decoder reads
 (`tools/disasm_rdna2.py`, VOP3A branch):
   w0: [31:26] = 0b110101, [25:16] opcode (VOP2 e64 = 0x100 + VOP2 opcode), [7:0] vdst
+      [9:8] abs for src1 and src0
   w1: [8:0] src0, [17:9] src1, [28:27] omod, [31:29] neg
 """
 import os
@@ -108,7 +109,7 @@ check('no negation is unchanged', emitted == 'v31 = (s0 & 1) ? v30 : v30;', emit
 check('a negation on another integer op stays refused',
       refused(encode_vop2_e64(AND_B32, 1, V30, V30, neg1=1)))
 
-# Plain negative inline constants keep their bit patterns even when the printed spelling is identical.
+# 5. Plain immediates keep their bit patterns even when their printed spelling is ambiguous.
 asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 193, V30))
 check('plain inline -1 still translates',
       asm == ['v_cndmask_b32_e64 v31, -1, v30, s0'] and
@@ -117,33 +118,81 @@ asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 243, V30))
 check('plain inline -1.0 still translates',
       asm == ['v_cndmask_b32_e64 v31, -1.0, v30, s0'] and
       'v31 = (s0 & 1) ? v30 : 0xbf800000u;' in emitted, emitted)
-check('NEG on inline integer remains refused', refused(encode_vop2_e64(CNDMASK, 31, 129, V30, neg0=1)))
-check('NEG on inline float remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 242, neg1=1)))
-check('NEG on literal remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 255, neg1=1)
-                                              + struct.pack('<I', 0x12345678)))
-# 6. Every edge of the refused immediate ranges, plus the constants just inside them: a mutation moving a
-#    range boundary by one has to fail one of these.
-for edge in (128, 208, 240, 248):
-    check('NEG on the immediate at %d is refused' % edge,
-          refused(encode_vop2_e64(CNDMASK, 31, edge, V30, neg0=1)))
 asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 240, V30))
 check('plain 0.5 still translates',
       asm == ['v_cndmask_b32_e64 v31, 0.5, v30, s0'] and '0x3f000000u' in emitted, emitted)
+literal = struct.pack('<I', 0x12345678)
+asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, V30, 255) + literal)
+check('plain literal still translates',
+      asm == ['v_cndmask_b32_e64 v31, v30, 0x12345678, s0'] and
+      emitted == 'v31 = (s0 & 1) ? 0x12345678u : v30;', emitted)
+
+# 6. Check the exact sign-flipped words at the integer encoding boundaries and for every inline float.
+for source, expected in ((128, '80000000'), (129, '80000001'), (192, '80000040'),
+                         (193, '7fffffff'), (208, '7ffffff0'), (240, 'bf000000'),
+                         (241, '3f000000'), (242, 'bf800000'), (243, '3f800000'),
+                         (244, 'c0000000'), (245, '40000000'), (246, 'c0800000'),
+                         (247, '40800000'), (248, 'be22f983')):
+    asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, source, V30, neg0=1))
+    check('NEG on src0 encoding %d' % source,
+          asm == [f'v_cndmask_b32_e64 v31, 0x{expected}, v30, s0'] and
+          emitted == f'v31 = (s0 & 1) ? v30 : 0x{expected}u;', emitted)
+
+neg_literal = encode_vop2_e64(CNDMASK, 31, V30, 255, neg1=1) + literal
+asm, emitted = translate(neg_literal)
+check('NEG on a literal in src1',
+      asm == ['v_cndmask_b32_e64 v31, v30, 0x92345678, s0'] and
+      emitted == 'v31 = (s0 & 1) ? 0x92345678u : v30;', emitted)
+decoded = G.decode(neg_literal + encode_vop2_e64(CNDMASK, 31, V30, V30))
+check('the next instruction starts after the literal dword',
+      [(offset, size) for offset, size, _, _ in decoded] == [(0, 12), (12, 8)], repr(decoded))
+
+both_neg = encode_vop2_e64(CNDMASK, 31, 129, 240, neg0=1, neg1=1)
+asm, emitted = translate(both_neg)
+check('NEG on two immediates in the same instruction',
+      asm == ['v_cndmask_b32_e64 v31, 0x80000001, 0xbf000000, s0'] and
+      emitted == 'v31 = (s0 & 1) ? 0xbf000000u : 0x80000001u;', emitted)
 
 # 7. The select takes no output modifier; one that reaches it is refused rather than dropped from the text.
 check('a clamp on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, clamp=1)))
 check('a mul:2 on the select is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, omod=1)))
 
-# 8. Source absolute values and a negated mask reach `u()`/`u_src()` as text they cannot model, and are
-#    refused. llvm-mc rejects all three spellings, so they are decoder-produced words only; the property
-#    under test is that production refuses the printed operand rather than translating it.
-check('an absolute value on the first source is refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1)))
-check('an absolute value on the second source is refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs1=1)))
-check('absolute values on both sources are refused',
-      refused(encode_vop2_e64(CNDMASK, 31, V30, V30, abs0=1, abs1=1)))
+# 8. A negated mask, ABS on an immediate, and ABS on another integer op stay refused; source ABS on
+#    v_cndmask_b32_e64 registers is lowered and tested by startup_gfx2hlsl_cndmask_abs_check.py.
+check('an absolute value on another integer op stays refused',
+      refused(encode_vop2_e64(AND_B32, 1, V30, V30, abs1=1)))
 check('a negated mask is refused', refused(encode_vop2_e64(CNDMASK, 31, V30, V30, neg_mask=1)))
+
+check('ABS on an inline immediate is refused',
+      refused(encode_vop2_e64(CNDMASK, 31, 193, V30, abs0=1)))
+check('ABS with NEG on an inline immediate is refused',
+      refused(encode_vop2_e64(CNDMASK, 31, V30, 240, abs1=1, neg1=1)))
+check('ABS with NEG on a literal is refused',
+      refused(encode_vop2_e64(CNDMASK, 31, V30, 255, abs1=1, neg1=1) + literal))
+
+
+# 9. Restore the old encoded-source refusal in-process and require the previously accepted cases to fail.
+decode = G.decode
+
+
+def decode_refusing_neg_immediates(code):
+    decoded = decode(code)
+    for offset, _size, name, _asm in decoded:
+        if name == 'v_cndmask_b32_e64':
+            word1, = struct.unpack_from('<I', code, offset + 4)
+            for i in range(2):
+                source = (word1 >> (9 * i)) & 0x1ff
+                if word1 & (1 << (29 + i)) and (128 <= source <= 208 or 240 <= source <= 248 or source == 255):
+                    raise G.Unsupported('v_cndmask_b32_e64 NEG on an immediate')
+    return decoded
+
+
+G.decode = decode_refusing_neg_immediates
+try:
+    check('restoring the old refusal rejects both negated inline sources', refused(both_neg))
+    check('restoring the old refusal rejects the negated literal', refused(neg_literal))
+finally:
+    G.decode = decode
 
 
 if failures:

@@ -18,6 +18,9 @@ A family is a dict with:
   body:      mnemonic -> the recorded pixel body words (llvm-mc -mcpu=gfx1013)
   refused:   assembly lines that must stay refused
   accepted:  assembly lines that must translate (one instruction, no pipeline)
+  pipeline:  optional keyword arguments of the Pipeline built for the fixture (a selected contract)
+  ulps:      optional mnemonic -> how many binary32 ulps a lane may read off its reference (default 0, exact)
+             a nonzero bound measures distance on the number line, so it accepts -0.0 for +0.0 and back
 Every reference is written from the ISA description with plain integer arithmetic, not from the lowering.
 """
 import re
@@ -46,7 +49,8 @@ def body_source(family, op):
 
 
 def translate(family, op, mutate=False):
-    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PRE_WORDS + family['body'][op] + POST_WORDS, root_blob())
+    pipe = G.Pipeline(vs_words([(0, 0, 0)] * 4), PRE_WORDS + family['body'][op] + POST_WORDS, root_blob(),
+                      **family.get('pipeline', {}))
     text = pipe.hlsl_ps()
     if mutate:
         pattern, replacement, _ = family['mutations'][op]
@@ -70,6 +74,27 @@ def check(label, ok):
         raise AssertionError(label)
 
 
+def order(word):
+    """Position of a binary32 word on the number line, so the ulp distance of two words is a subtraction."""
+    return -(word & 0x7fffffff) if word >> 31 else word
+
+
+def actual(run):
+    """The readback the renderer reports on a mismatch, or None if the run failed any other way."""
+    # A mismatch exits 1 even when the debug layer also logged errors; those must not be tolerated away.
+    if re.search(r'debug_errors=[1-9]', run.stdout):
+        return None
+    found = re.search(r'startup_flat_param mismatch expected=[0-9a-f,]+ actual=([0-9a-f,]+)', run.stderr)
+    return [int(w, 16) for w in found.group(1).split(',')] if found else None
+
+
+def within(got, want, ulps):
+    if not ulps:
+        return got == list(want)  # exact, so -0.0 and +0.0 and the integer words stay distinct
+    return got is not None and len(got) == len(want) and all(abs(order(g) - order(w)) <= ulps
+                                                              for g, w in zip(got, want))
+
+
 def expected(family, op, sets, mutated=False):
     arity, reference, _ = family['ops'][op]
     function = family['mutations'][op][2] if mutated else reference
@@ -87,7 +112,11 @@ def controls(family):
         # Each mutation reads a wrong word in the first draw, so the mutated draw cannot pass by accident.
         first = sets[:4]
         check('%s: mutation changes draw set 0' % op,
-              expected(family, op, first, True) != expected(family, op, first))
+              not within(expected(family, op, first, True), expected(family, op, first),
+                         2 * family.get('ulps', {}).get(op, 0)))
+    # 1 ulp either side of -3.0 and of 0.0, a sign change at zero, and a word 5 ulps off.
+    check('ulp distance', within([0xc03fffff, 0xc0400001, 0x80000001, 0x00000002], [0xc0400000, 0xc0400000, 0, 0], 2)
+          and not within([0xc0400005], [0xc0400000], 4) and not within(None, [0], 4))
     check('accepted forms translate', not any(refused(a) for a in family['accepted']))
     check('refused forms stay refused', all(refused(a) for a in family['refused']))
 
@@ -121,11 +150,18 @@ def check_draw(family, dxc, renderer, adapter, fxc=None):
                 for index in range(0, len(sets), 4):
                     chunk = sets[index:index + 4]
                     vs = compile_hlsl(compiler, kind, G.Pipeline(vs_words(chunk), PRE_WORDS + family['body'][op]
-                                                                 + POST_WORDS, root_blob()).hlsl_vs(),
+                                                                 + POST_WORDS, root_blob(),
+                                                                 **family.get('pipeline', {})).hlsl_vs(),
                                       'vs_%s_%d_%s' % (op, index, kind), vs_profile, directory)
-                    want = words_text(expected(family, op, chunk))
+                    ulps = family.get('ulps', {}).get(op, 0)
+                    reference = expected(family, op, chunk)
+                    want = words_text(reference)
                     run = draw(renderer, adapter, vs, good, want)
-                    if run.returncode:
+                    # The renderer compares exactly; a mismatch within the operation's ulp bound still passes.
+                    if run.returncode and ulps and within(actual(run), reference, ulps):
+                        print('%s %s within %d ulps: reads %s' % (kind, op, ulps, words_text(actual(run))),
+                              flush=True)
+                    elif run.returncode:
                         raise AssertionError('%s %s inputs %s\n%s\n%s' % (kind, op, chunk, run.stdout, run.stderr))
                     draws += 1
                     print('%s %s %s: %s' % (kind, op, [tuple('%x' % v for v in x[:arity]) for x in chunk], want),
@@ -133,11 +169,13 @@ def check_draw(family, dxc, renderer, adapter, fxc=None):
                     if index:
                         continue
                     # The same draw with the mutated lowering must read the mutated words, not the reference.
-                    wrong = words_text(expected(family, op, chunk, True))
+                    mutated = expected(family, op, chunk, True)
+                    wrong = words_text(mutated)
                     bad = compile_hlsl(compiler, kind, translate(family, op, True)[1], 'mutated_%s_%s' % (op, kind),
                                        ps_profile, directory)
                     run = draw(renderer, adapter, vs, bad, want)
-                    if run.returncode == 0 or 'actual=%s' % wrong not in run.stderr:
+                    got = actual(run)
+                    if run.returncode == 0 or within(got, reference, ulps) or not within(got, mutated, ulps):
                         raise AssertionError('%s %s mutation did not read %s\n%s\n%s'
                                              % (kind, op, wrong, run.stdout, run.stderr))
                     mutations += 1

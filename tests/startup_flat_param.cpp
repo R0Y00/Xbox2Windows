@@ -3,7 +3,7 @@
 // Draws one pixel with a translated vertex and pixel stage and returns the four 32-bit words of
 // the colour. The entry constants (cbuffer entry : register(b0)) are visible to both stages, because
 // the translated vertex stage reads ud0, the rectangle-list switch; they are all 0 here (plain
-// triangles). The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
+// triangles) unless the caller passes four words. The target is R32G32B32A32_FLOAT, so the readback is the raw words the pixel stage
 // exported.
 #include "desktop_gpu.h"
 
@@ -32,7 +32,9 @@ std::vector<char> read_blob(const char* path)
 }  // namespace
 
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                              std::uint32_t* words, UINT width, UINT height)
+                              std::uint32_t* words, UINT width, UINT height,
+                              D3D12_CULL_MODE cull, BOOL front_ccw, UINT vertices,
+                              const std::uint32_t* constants)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -59,7 +61,8 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.CullMode = cull;
+    pd.RasterizerState.FrontCounterClockwise = front_ccw;
     pd.RasterizerState.DepthClipEnable = TRUE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
@@ -94,15 +97,15 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     auto* list = commands.list.Get();
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
-    const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};
-    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
+    const std::uint32_t zeros[entry_constants] = {0, 0, 0, 0};
+    list->SetGraphicsRoot32BitConstants(0, entry_constants, constants ? constants : zeros, 0);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
+    list->DrawInstanced(vertices, 1, 0, 0);
     transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION out{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     out.PlacedFootprint = footprint;
