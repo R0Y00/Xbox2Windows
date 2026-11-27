@@ -1148,6 +1148,73 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
             return true;
         }
+        if (n == "v_cvt_f16_u16" || n == "v_cvt_f16_i16" || n == "v_cvt_u16_f16" || n == "v_cvt_i16_f16") {
+            if (graphics_input)
+                return false;
+            const bool to_f16 = n == "v_cvt_f16_u16" || n == "v_cvt_f16_i16";
+            const bool is_signed = n == "v_cvt_f16_i16" || n == "v_cvt_i16_f16";
+            if (i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " DPP form");
+            if (i.subword)
+                refuse(i.pc, "unsupported " + string(n) + " SDWA form");
+            if (i.scale || (!to_f16 && i.clamp))
+                refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            if ((to_f16 && (i.abs || i.neg)) || (i.wide && (((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            const unsigned r = i.src[0];
+            string bits;
+            if (r >= 240 && r <= 248) {
+                constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                            0xc000, 0x4400, 0xc400, 0x3118};
+                bits = to_string(halves[r - 240]);
+            } else if (r == 255) {
+                bits = to_string(i.literal & 65535u);
+            } else if (r >= 128 && r <= 192) {
+                bits = to_string((r - 128) & 65535u);
+            } else if (r >= 193 && r <= 208) {
+                bits = to_string((192u - r) & 65535u);
+            } else {
+                bits = ir.binary("and", operand32(i, r), "65535");
+            }
+            string result;
+            if (to_f16) {
+                string f;
+                if (is_signed) {
+                    auto s16 = ir.binary("ashr", ir.binary("shl", bits, "16"), "16");
+                    f = ir.value("sitofp i32 " + s16 + " to float");
+                } else {
+                    f = ir.value("uitofp i32 " + bits + " to float");
+                }
+                auto fbits = ir.value("bitcast float " + f + " to i32");
+                result = packed_half_rne(fbits);
+                if (i.clamp) {
+                    auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                    auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                    result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+                }
+            } else {
+                if (i.abs & 1)
+                    bits = ir.binary("and", bits, "32767");
+                if (i.neg & 1)
+                    bits = ir.binary("xor", bits, "32768");
+                auto f = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+                auto lower = ir.value("fcmp oge float " + f + ", " + (is_signed ? "-32768.0" : "0.0"));
+                auto upper = ir.value("fcmp olt float " + f + ", " + (is_signed ? "32768.0" : "65536.0"));
+                auto safe = select_float(ir.value("and i1 " + lower + ", " + upper), f, "0.0");
+                auto converted = ir.value(string(is_signed ? "fptosi" : "fptoui") + " float " + safe + " to i32");
+                auto bounded = select(upper, converted, is_signed ? "32767" : "65535");
+                bounded = select(lower, bounded, is_signed ? "32768" : "0");
+                auto ordered = ir.value("fcmp ord float " + f + ", " + f);
+                result = ir.binary("and", select(ordered, bounded, "0"), "65535");
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         if (n == "v_ldexp_f32") {
             // pixel_aot.py ldexp32 (#3013): exact binary32 scaling of S0 by 2^S1. Zero, Inf and NaN pass unchanged,
             // a denormal S0 is normalized rather than flushed, and a denormal result rounds to nearest even. S1 is
@@ -2998,7 +3065,8 @@ struct DirectCompute {
             if (!p.reached[k])
                 continue;
             const auto &op = p.code[k];
-            if (binary16_alu(op.name))
+            if (binary16_alu(op.name) || op.name == "v_cvt_f16_u16" || op.name == "v_cvt_f16_i16" ||
+                op.name == "v_cvt_u16_f16" || op.name == "v_cvt_i16_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
