@@ -3579,9 +3579,10 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
-    // A placeholder builder pipeline still needs its normal request path: gate only a Dispatch
-    // whose pipeline already names a translated compute program.
-    if (command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key &&
+    // A slot 62 builder pipeline is tracked by the wrapper itself, not by a slot 67 request key.
+    // Gate its indirect Dispatch before the signature and argument checks so a partial builder
+    // cannot reach ExecuteIndirect.
+    if (command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().builder_pipeline &&
         !compute_builder_dispatch_allowed(self, "ExecuteIndirect"))
         return refuse("the compute builder gate refused the Dispatch", indirect_compute_pipeline, indirect_other_refusal_code::builder_gate);
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
@@ -4386,9 +4387,9 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
     auto* list = recording(self);
     const Pass& pass = pass_of(self);
-    // A placeholder builder pipeline still needs its normal request path: gate only a Dispatch
-    // whose pipeline already names a translated compute program.
-    if (list && pass.pipeline && pass.pipeline->own().compute_request_key &&
+    // Slot 62 marks the wrapper itself. Slot 67 has no builder tag, so its request path is
+    // unchanged; a builder Dispatch is gated here regardless of the request-key field.
+    if (list && pass.pipeline && pass.pipeline->own().builder_pipeline &&
         !compute_builder_dispatch_allowed(self, "Dispatch")) return;
     if (list && pass.pipeline && pass.pipeline->own().compute_request_key) {
         record_translated_dispatch(self, {{x, y, z}});

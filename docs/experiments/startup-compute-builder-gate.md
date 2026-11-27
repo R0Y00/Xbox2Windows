@@ -21,9 +21,9 @@ and state machine are tested without a device or a title module.
 A builder Dispatch is allowed when every tracked builder pipeline has a real desktop PSO. On the
 first builder Dispatch the gate makes the missing pipelines on the spot. If one cannot be made, the
 builder is turned off for the rest of the run and the Dispatch is refused with a named reason. A
-non-builder Dispatch is unchanged. A placeholder pipeline without a translated compute request key
-keeps its normal request path: the gate applies only once a translation exists. The gate is counted
-in the compute totals line as `builder gate refused N`.
+non-builder Dispatch is unchanged. The gate is keyed on the slot 62 wrapper's builder tag, not on
+`compute_request_key`: slot 67 never receives that tag, so its request publication path is
+unchanged. The gate is counted in the compute totals line as `builder gate refused N`.
 
 ## Scope and limits
 
@@ -32,11 +32,18 @@ on-the-spot creation first requires a structurally valid desktop compute contain
 root signature. A console DXIL program fails by name and latches the builder off, which is the
 intended conservative result until the translation path publishes real compute PSOs.
 
-The module-resolution path is exercised by the existing slot 62 call flow only when the gate is on;
-the device-free test covers the classifier and the all-or-none state machine, not a loaded title
-module. A real-title run with the gate on must report either `all have a desktop PSO` or one named
-reason, and must never leave a partially tracked builder running.
+The runtime test loads a source-built `XboxBvhBuilder.dll` helper and calls the public slot 62
+path through it. Two fake console pipelines are tracked, a direct `Dispatch` and an indirect
+`ExecuteIndirect` are both refused with the gate enabled, and the same direct call through a
+non-builder slot 62 wrapper is left untouched. A separate run of the existing slot 67 request check
+with `X2W_COMPUTE_BUILDER_GATE=1` passes, so request publication keeps its normal path.
+
+The helper test proves the caller-module tag and the wiring into both public Dispatch paths. It
+does not prove that a translated builder set can be completed; the fake console container fails
+desktop PSO creation by name and latches the builder off, which is the intended conservative result.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_compute_builder_gate$' -V
+ctest --preset dev --no-tests=error -R '^startup_compute_builder_gate_runtime$' -V
+ctest --preset dev --no-tests=error -R '^startup_compute_builder_gate_request_warp$' -V
 ```
