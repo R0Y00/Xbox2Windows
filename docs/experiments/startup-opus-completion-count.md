@@ -35,7 +35,7 @@ At the last `XApuDisconnect`, and from `atexit` when a run never disconnects, th
 one stable line when the counters moved since the previous summary:
 
 ```text
-x2w-audio XApu opus summary: type3=8 packets=2 completions=2 refusals=7 invalid_argument=1 opus_error=1 capacity=1 queue_full=1 short_command=1 unknown_handle=1 out_of_memory=0 header=1
+x2w-audio XApu opus summary: type3=10 packets=2 completions=2 refusals=9 invalid_argument=3 opus_error=1 capacity=1 queue_full=1 short_command=1 unknown_handle=1 out_of_memory=0 header=1
 ```
 
 The line is written to stderr and to `X2W_TRAP_LOG`, like the other audio lines. It is a snapshot;
@@ -51,9 +51,10 @@ ctest --preset dev --no-tests=error -R '^startup_xapu_opus_count$' -V
 
 The fixture encodes synthetic 1 kHz tones with libopus and drives the real stand-in exports. It
 checks two successful decodes and dequeues, a malformed packet, insufficient capacity, an invalid
-rate, a short command, an unknown handle, a full queue, a null header, saturation at
-`UINT64_MAX`, one summary after the last disconnect, and that typed completions off neither
-decode nor add a summary line. It passed in Debug with libopus 1.5.2 on Windows 11 build 26300.
+rate, an out-of-range slot in both the legacy and typed-stream paths, a short command, an unknown
+handle, a full queue, a null header, saturation at `UINT64_MAX`, one summary after the last
+disconnect, and that typed completions off neither decode nor add a summary line. It passed in
+Debug with libopus 1.5.2 on Windows 11 build 26300.
 
 ## Limits
 
