@@ -10,6 +10,12 @@ from native_direct_container_check import patched_pixel, vertex
 from startup_stream_draw_check import vop1, vop2
 
 
+def assert_debug_clean(stderr):
+    for line in stderr.splitlines():
+        if "x2w-d3d12-debug " in line:
+            assert " sev=0 " not in line and " sev=1 " not in line, line
+
+
 def triangle():
     code = [vop2(0x1a, 1, 129, 0), vop2(0x1b, 1, 130, 1), vop2(0x1b, 2, 130, 0)]
     for v in (1, 2):
@@ -24,7 +30,7 @@ def check(folder, consumer, sdk, adapter, compiler):
     vs, ps, root, pixels = [folder / name for name in ("vs", "ps", "root", "pixels")]
     vs.write_bytes(triangle())
     ps.write_bytes(patched_pixel(2, [vop1(1, 0, 128), vop1(1, 1, 242)], export=(0xf800180f, 0x01000001)))
-    env = dict(os.environ, X2W_SHADER_CACHE=str(cache), X2W_NATIVE_SHADERS=sdk,
+    env = dict(os.environ, X2W_SHADER_CACHE=str(cache), X2W_NATIVE_SHADERS=sdk, X2W_NATIVE_SHADERS_ONLY="0",
                X2W_D3D12_DEBUG="1", X2W_D3D12_RENDER="1", X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1")
     clear = bytes((0, 0, 255, 255))
     red = bytes((255, 0, 0, 255))
@@ -47,7 +53,7 @@ def check(folder, consumer, sdk, adapter, compiler):
     subprocess.run([compiler, "--watch", sdk, cache, cache, "--once"], check=True, timeout=45)
     marker, = cache.glob("req_*.a")
     manifest = cache / (marker.stem.removeprefix("req_") + ".txt")
-    published = {p: p.read_bytes() for p in
+    published = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in
                  (manifest, manifest.with_suffix(".vs.cso"), manifest.with_suffix(".ps.cso"))}
     for fault, diagnostic in (("MANIFEST", "unsupported manifest version"), ("ROOT", "failed 0x80004005")):
         manifest.rename(str(manifest) + ".pending")
@@ -60,8 +66,73 @@ def check(folder, consumer, sdk, adapter, compiler):
         assert run.returncode == 0 and diagnostic in run.stderr and "-> drawn;" in run.stderr, run.stderr
         assert first.read_bytes() == clear * 32
         assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
-        assert all(path.read_bytes() == expected for path, expected in published.items())
+        assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
+                   for path, expected in published.items())
         print(f"{adapter} {fault}: same-process fallback drew 16 red pixels after publication")
+
+    # The published pair alone draws the target when native preparation is disabled.
+    pixels.unlink()
+    disk_env = {name: value for name, value in env.items() if name != "X2W_NATIVE_SHADERS"}
+    run = subprocess.run(args, env=disk_env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stderr
+    assert "native graphics" not in run.stderr and "-> drawn;" in run.stderr, run.stderr[-8000:]
+    assert_debug_clean(run.stderr)
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    print(f"{adapter} disk pair: native disabled, 16 red and 16 clear pixels")
+
+    # A candidate PSO failure falls back to that pair in the same draw, without rewriting it.
+    pso_env = dict(env, X2W_NATIVE_SHADERS_ONLY="0", X2W_TEST_NATIVE_GRAPHICS_PSO_FAILURE="1")
+    pixels.unlink()
+    run = subprocess.run(args, env=pso_env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stderr
+    assert "candidate pipeline failed 0x80004005 (injected)" in run.stderr, run.stderr[-8000:]
+    assert "published disk pair recovered" in run.stderr and "-> drawn;" in run.stderr, run.stderr[-8000:]
+    assert_debug_clean(run.stderr)
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
+               for path, expected in published.items())
+    print(f"{adapter} PSO: candidate failure recovered the published disk pair, 16 red and 16 clear pixels")
+
+    # The native path still creates its own pipeline when no fault is injected.
+    pixels.unlink()
+    run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stderr
+    assert "native graphics" in run.stderr and "ready=1 cache(frontend,vs,ps)=1,1,1" in run.stderr, run.stderr[-8000:]
+    assert "candidate pipeline failed" not in run.stderr and "refused:" not in run.stderr, run.stderr[-8000:]
+    assert "-> drawn;" in run.stderr, run.stderr[-8000:]
+    assert_debug_clean(run.stderr)
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    print(f"{adapter} native: successful candidate still drew 16 red and 16 clear pixels")
+
+    # A missing or invalid pair refuses the draw with a diagnostic rather than an all-clear target.
+    ps_cso = manifest.with_suffix(".ps.cso")
+    held_ps = Path(str(ps_cso) + ".hold")
+    ps_cso.rename(held_ps)
+    try:
+        pixels.unlink()
+        run = subprocess.run(args, env=pso_env, capture_output=True, text=True, timeout=45)
+        assert run.returncode == 0, run.stderr
+        assert "no valid published disk pair" in run.stderr and "-> drawn;" not in run.stderr, run.stderr[-8000:]
+        assert pixels.read_bytes() == clear * 32
+        print(f"{adapter} missing pair: refused with a diagnostic, 32 clear pixels")
+    finally:
+        held_ps.rename(ps_cso)
+    held_manifest = Path(str(manifest) + ".hold")
+    manifest.rename(held_manifest)
+    manifest.write_text("x2w-manifest 999\n")
+    try:
+        pixels.unlink()
+        run = subprocess.run(args, env=pso_env, capture_output=True, text=True, timeout=45)
+        assert run.returncode == 0, run.stderr
+        assert "unsupported manifest version" in run.stderr, run.stderr[-8000:]
+        assert "no valid published disk pair" in run.stderr and "-> drawn;" not in run.stderr, run.stderr[-8000:]
+        assert pixels.read_bytes() == clear * 32
+        print(f"{adapter} invalid pair: refused with a diagnostic, 32 clear pixels")
+    finally:
+        manifest.unlink()
+        held_manifest.rename(manifest)
+    assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
+               for path, expected in published.items())
     ps.write_bytes(patched_pixel(1, [0xffffffff], export=(0xf800180f, 0x01000001)))
     run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
     assert run.returncode == 0 and "refused:" in run.stderr and "-> drawn;" not in run.stderr, run.stderr

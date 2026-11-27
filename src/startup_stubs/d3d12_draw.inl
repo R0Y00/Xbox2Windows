@@ -175,6 +175,9 @@ struct Translation {
     x2w_startup::ComPtr<ID3D12CommandSignature> indexed_signature;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
+    bool native_candidate = false;  // shaders and manifest were prepared in-process; a published disk pair may also exist
+    u64 revision = 0;               // bumped when a disk pair replaces the native shaders, invalidating created PSOs
+    std::string rtv_request;        // the RTV variant text this translation was prepared for, else empty
     LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
@@ -287,7 +290,7 @@ bool native_shaders_only()
     return enabled;
 }
 
-void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {})
+void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {}, bool count = true)
 {
     tr.state = 2;
     if (manifest.empty() && native_shaders_only()) {
@@ -298,7 +301,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     const bool provided = !manifest.empty();
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!provided && !read_text(path, manifest)) {
-        if (!tr.manifest_retry.pending()) {
+        if (count && !tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
@@ -418,8 +421,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
         return;
     }
     tr.state = 1;
-    if (previously_missing) InterlockedDecrement(&translation_missing);
-    InterlockedIncrement(&translation_ready);
+    if (count && previously_missing) InterlockedDecrement(&translation_missing);
+    if (count) InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable textures, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
@@ -452,6 +455,7 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         auto ps = stage(pair.pixel.dxil_ir, L"ps_6_6", ps_hit);
         Translation candidate;
         candidate.key = tr.key;
+        candidate.rtv_request = request.rtv_request;
         if (!pair.input_layout.empty()) {
             try { candidate.fixed_rectangle_ir = x2w::native_rectangle_geometry(pair.vertex.outputs, pair.pixel.inputs); }
             catch (const x2w::UnsupportedComputeShader&) {} // Triangle lists and strips still use the original pair.
@@ -467,6 +471,7 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         }
         candidate.vs = vs.Detach();
         candidate.ps = ps.Detach();
+        candidate.native_candidate = true;
         tr = std::move(candidate);
         log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
             tr.key, tr.state == 1, frontend_hit, vs_hit, ps_hit);
@@ -1099,6 +1104,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (!entry) {
         entry = new Translation;
         entry->key = key;
+        entry->rtv_request = request;
 #ifdef X2W_NATIVE_SHADERS
         if (GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", nullptr, 0) &&
             publish_shader_request(key, L".rtv", request.data(), request.size()) && try_native_graphics(*entry, true)) return entry;
@@ -1131,6 +1137,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
     key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    if (tr.revision) key = fnv_bytes(&tr.revision, sizeof(tr.revision), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
@@ -1204,11 +1211,42 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     X2W_ZONE("desktop pipeline creation");
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
-        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
-        static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
-    check_device("translated CreateGraphicsPipelineState", 0);
+    HRESULT hr = E_FAIL;
+    const bool injected = tr.native_candidate && x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_PSO_FAILURE");
+    if (!injected) {
+        hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
+            pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+            static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
+        check_device("translated CreateGraphicsPipelineState", 0);
+    }
+    if (FAILED(hr) && pipeline) {
+        pipeline->Release();
+        pipeline = nullptr;
+    }
+    if (FAILED(hr) && tr.native_candidate) {
+        // A native candidate whose shaders this device cannot turn into a PSO keeps the published pair usable.
+        log("x2w-draw native graphics %016llx candidate pipeline failed 0x%08lx%s", tr.key,
+            static_cast<unsigned long>(hr), injected ? " (injected)" : "");
+        if (!native_shaders_only()) {
+            Translation fallback;
+            fallback.key = tr.key;
+            fallback.rtv_request = tr.rtv_request;
+            load_translation(fallback, tr.rtv_request, {}, false);
+            if (fallback.state == 1) {
+                fallback.revision = tr.revision + 1;
+                tr = std::move(fallback);
+                log("x2w-draw native graphics %016llx published disk pair recovered", tr.key);
+                ID3D12PipelineState* recovered = pipeline_for(bound, tr, pass, indexed_rect);
+                if (!recovered)
+                    log("x2w-draw native graphics %016llx published disk pair pipeline failed", tr.key);
+                return recovered;
+            }
+            log("x2w-draw native graphics %016llx no valid published disk pair", tr.key);
+        } else {
+            log("x2w-draw native graphics %016llx no published disk pair in native-only mode", tr.key);
+        }
+    }
     bound.pipelines[key] = pipeline;
     return pipeline;
 }
