@@ -246,14 +246,18 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     load = words_list.index(0xe0301000)  # buffer_load_dword v2, v1, s[20:23], 0 offen
     store = words_list.index(0xe0701000)  # buffer_store_dword v2, v1, s[12:15], 0 offen
 
-    def window(rewritten=rewrite, prefix=(), store_word=0x80030201):
+    def window(rewritten=rewrite, prefix=(), store_word=0x80030201, load_words=(0xe0301000, 0x80060201)):
         """PROGRAM with the rewrite after the heap load and the load through s[24:27]."""
         program = list(words_list)
-        program[load + 1] = 0x80060201  # buffer_load_dword v2, v1, s[24:27], 0 offen
+        program[load:load + 2] = load_words  # default: buffer_load_dword v2, v1, s[24:27], 0 offen
         program[store + 1] = store_word
         return program[:after_wait] + list(prefix) + list(rewritten) + program[after_wait:]
 
     WINDOW = window()
+    # tbuffer_load_format_x v2, v1, s[24:27], 0 format:[BUF_FMT_32_UINT] offen: a formatted load through the window.
+    # 32_UINT converts nothing, so the output is the slot data as for WINDOW.
+    TBUFFER_LOAD = (0xe8a01000, 0x80060201)
+    TWINDOW = window(load_words=TBUFFER_LOAD)
     second_load = window([0xbe980320 if w == 0xbe980314 else w for w in rewrite])
     second_load[after_wait - 1:after_wait - 1] = [0xf4080801, 0x22000000]  # before the s_waitcnt
     # The branch word sits at after_wait + 1; its target is next pc + 4 * simm16, here the s_lshl_b32 at word lshl.
@@ -278,6 +282,9 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         # s_cmp_lg_u32 s16, s16 and s_cbranch_scc1 back to the s_lshl_b32 before the heap load (never taken): the
         # loop contains the heap load, which would run again for another selection
         "window_loop": (loop_around_load, "heap byte window loaded inside a loop"),
+        # the same loop around the heap load, read by the formatted load
+        "twindow_loop": (window(prefix=loop_around_load[after_wait:after_wait + 2], load_words=TBUFFER_LOAD),
+                         "heap byte window loaded inside a loop"),
     }
     for name, (program, expected) in shapes.items():
         directory = base / ("shape_" + name)
@@ -311,6 +318,10 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         # does not contain the load, which runs once
         "window_loop_after_load": (window(prefix=(0xbf071010, 0xbf85fffe)),
                                    "a loop after the heap load does not refuse the window, a .cso is published"),
+        # tbuffer_load_format_xyzw v[2:5], v1, s[24:27], 0 format:[BUF_FMT_8_8_8_8_UNORM] offen: a converting format
+        # through the window (values through a window are checked by native_mtbuf_check.py on a table window)
+        "twindow_unorm": (window(load_words=(0xe9c31000, 0x80060201)),
+                          "a converting formatted load through the window compiles and publishes a .cso"),
     }
     for name, (program, message) in compiled_shapes.items():
         directory, window_stem = shader_request(name, program)
@@ -319,25 +330,29 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
         require(code == 0 and "requests=1 compiled=1 refused=0" in out and
                 (out_dir / (window_stem[len("req_"):] + ".cs.cso")).exists(), "compile_dxil: " + message)
-    window_outputs = {}
-    for n in (0, 1):
-        directory, window_stem = shader_request(f"window{n}", WINDOW)
-        code, out, err = run([fixture, "record", sdk, cache, directory / (window_stem + ".cdx"), adapter, n, "ok"])
-        require(code == 0 and "output matches slot %d data" % n in out,
-                f"record window select {n}: u0 equals the slot {n} data read through the rewritten descriptor")
-        out_dir = base / f"window{n}_out"
-        code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
-        cso = out_dir / (window_stem[len("req_"):] + ".cs.cso")
-        require(code == 0 and "requests=1 compiled=1 refused=0" in out and cso.exists(),
-                f"compile_dxil window select {n}: compiled and published a .cso")
-        window_outputs[n] = (directory, window_stem, cso)
+    # The raw load (window) and the formatted load (twindow) through the rewritten descriptor.
+    for label, program in (("window", WINDOW), ("twindow", TWINDOW)):
+        window_outputs = {}
+        for n in (0, 1):
+            directory, window_stem = shader_request(f"{label}{n}", program)
+            code, out, err = run([fixture, "record", sdk, cache, directory / (window_stem + ".cdx"), adapter, n, "ok"])
+            require(code == 0 and "output matches slot %d data" % n in out,
+                    f"record {label} select {n}: u0 equals the slot {n} data read through the rewritten descriptor")
+            out_dir = base / f"{label}{n}_out"
+            code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
+            cso = out_dir / (window_stem[len("req_"):] + ".cs.cso")
+            require(code == 0 and "requests=1 compiled=1 refused=0" in out and cso.exists(),
+                    f"compile_dxil {label} select {n}: compiled and published a .cso")
+            window_outputs[n] = (directory, window_stem, cso)
+            code, out, err = run([fixture, "replay", sdk, cache, directory / (window_stem + ".cdx"), cso,
+                                  directory / (window_stem + ".views"), adapter, "ok", n])
+            require(code == 0 and "output matches slot %d data" % n in out,
+                    f"replay {label} select {n}: output equals slot {n} data")
+        directory, window_stem, cso = window_outputs[0]
         code, out, err = run([fixture, "replay", sdk, cache, directory / (window_stem + ".cdx"), cso,
-                              directory / (window_stem + ".views"), adapter, "ok", n])
-        require(code == 0 and "output matches slot %d data" % n in out, f"replay window select {n}: output equals slot {n} data")
-    directory, window_stem, cso = window_outputs[0]
-    code, out, err = run([fixture, "replay", sdk, cache, directory / (window_stem + ".cdx"), cso,
-                          directory / (window_stem + ".views"), adapter, "ok", 1])
-    require(code == 1 and "mismatch word 0" in out, "replay window select 0 compared with slot 1 data reports a mismatch")
+                              directory / (window_stem + ".views"), adapter, "ok", 1])
+        require(code == 1 and "mismatch word 0" in out,
+                f"replay {label} select 0 compared with slot 1 data reports a mismatch")
 
     missing = base / "missing" / (stem + ".views")
     code, out, err = replay(selections[0], outputs[0], missing, "refused", 0)
