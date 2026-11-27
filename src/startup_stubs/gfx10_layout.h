@@ -5,7 +5,8 @@
 //
 // A console resource description carries its swizzle mode in the Layout field as 0x100 + mode. The
 // modes handled here are 256 B, 4 KiB and 64 KiB blocks in the standard (S) and display (D) orders:
-// 0x101, 0x102, 0x105, 0x106, 0x109 and 0x10a, and the linear mode 0x100. The address equations,
+// 0x101, 0x102, 0x105, 0x106, 0x109 and 0x10a, and the linear mode 0x100, which also takes
+// one-dimensional textures (one row per mip, no block-compressed formats). The address equations,
 // block dimensions and mip-tail rules follow AMD addrlib as Mesa carries it under src/amd/addrlib, at the revision
 // tools/fetch_addrlib.py pins: Mesa 25.1.0, commit 5c142e46f3f6e752ed745fd48912ebb8fad67145. The three
 // files used carry this notice:
@@ -81,13 +82,20 @@ inline bool supports_volume(const D3D12_RESOURCE_DESC& d)
            d.MipLevels && d.MipLevels <= max_mips && d.SampleDesc.Count == 1;
 }
 
-// A two-dimensional, single-sample texture whose memory this header can address, or a volume
-// supports_volume takes.
+// A two-dimensional, single-sample texture whose memory this header can address, a one-dimensional
+// one in the linear mode, or a volume supports_volume takes. addrlib refuses a 1D surface taller than one row (HwlComputeSurfaceInfoLinear). A 1D
+// array is refused here as well as in address_view_fits: the draw uploads a 1D texture only when it is not an array.
 inline bool supports(const D3D12_RESOURCE_DESC& d)
 {
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) return supports_volume(d);
     const UINT mode = swizzle_mode(d), log2 = block_log2(mode);
-    if ((!log2 && mode != linear_mode) || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !element_of(d.Format).bytes) return false;
+    const Element element = element_of(d.Format);
+    if ((!log2 && mode != linear_mode) || !element.bytes) return false;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        if (mode != linear_mode || d.Height != 1 || d.DepthOrArraySize != 1 || element.texels != 1) return false;
+    } else if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        return false;
+    }
     if (!d.Width || !d.Height || d.Width > 16384 || d.Height > 16384 || !d.DepthOrArraySize) return false;
     if (!d.MipLevels || d.MipLevels > max_mips || d.SampleDesc.Count != 1) return false;
     return mode == linear_mode || log2 >= 12 || d.MipLevels == 1; // a 256 B block has no mip tail here

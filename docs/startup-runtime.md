@@ -3560,9 +3560,10 @@ draw that samples the view copies each mip of each array slice from that layout 
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
 after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
 
-The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+The description must be two-dimensional, or in the linear mode `0x100` one-dimensional and not an array (one row per mip, no block-compressed format), at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
-texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 1D, 2D or 2D-array view must match the texture's dimension and fit the mip and slice ranges. A cube view is taken on a 2D array of exactly six slices (the faces, +X to -Z) and is bound where a translation's manifest declares `texcube`; `tools/startup/gfx2hlsl.py` does not emit that kind yet, because it refuses `dim:SQ_RSRC_IMG_CUBE`. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+
 
 A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
 at most 2048 texels on each side and an uncompressed format with a known element size, with one mip
@@ -3578,7 +3579,7 @@ and at most five mips remain; tail mip k from the end starts at byte k x 256 of 
 read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoMacroTiled`). Each
 depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
-without a live texture, cube views, three-dimensional descriptions in any
+without a live texture, cube views of other arrays, three-dimensional descriptions in any
 other layout or with a block-compressed format, multisampled textures, the XOR swizzle modes and
 every other layout value. The texels must be readable and span
 at most 64 MiB.
