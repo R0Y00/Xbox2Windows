@@ -1653,6 +1653,29 @@ struct DirectCompute {
             vector_write(i.dst, result);
             return;
         }
+        if (compute && (n == "v_dot8_i32_i4" || n == "v_dot8_u32_u4")) {
+            // Integer dot products use both packed words as-is. Require the
+            // canonical VOP3P OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
+            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+                refuse(i.pc, "unsupported packed nibble dot operand modifiers");
+            const bool sign = n == "v_dot8_i32_i4";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            auto nibble = [&](const string &word, unsigned shift) {
+                if (sign) {
+                    auto aligned = shift < 28 ? ir.binary("shl", word, to_string(28 - shift)) : word;
+                    return ir.binary("ashr", aligned, "28");
+                }
+                auto shifted = shift ? ir.binary("lshr", word, to_string(shift)) : word;
+                return shift < 28 ? ir.binary("and", shifted, "15") : shifted;
+            };
+            // Eight 4-bit products sum to [-448, 512] (signed) or [0, 1800] (unsigned),
+            // which always fits in i32. Saturate only the final addition to the accumulator.
+            string dot = ir.binary("mul", nibble(a, 0), nibble(b, 0));
+            for (unsigned shift = 4; shift < 32; shift += 4)
+                dot = ir.binary("add", dot, ir.binary("mul", nibble(a, shift), nibble(b, shift)));
+            vector_write(i.dst, i.clamp ? saturated_add(dot, acc, sign) : ir.binary("add", dot, acc));
+            return;
+        }
         if (n == "v_mad_u32_u16" || n == "v_mad_i32_i16") {
             // AMD RDNA 2 ISA, VOP3A opcodes 883/885. Only the two
             // multiplicands are halfwords. The addend and result are dwords.
