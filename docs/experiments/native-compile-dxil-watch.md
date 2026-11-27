@@ -23,7 +23,7 @@ ctest --preset release --no-tests=error -V -R "^native_compile_dxil_watch$"
 
 ## Limits
 
-- Watches startup graphics (`req_<key>.a`) and slot-67 compute (`req_<key>.c67`) requests; `.rtv` variants and
-  slot-57 mesh requests remain outside the native path.
+- Watches startup graphics (`req_<key>.a`), RTV variant (`req_<key>.rtv`), and slot-67 compute
+  (`req_<key>.c67`) requests; slot-57 mesh requests remain outside the native path.
 - `run.ps1 -Translate` still invokes `gfx2hlsl.py --watch` until the remaining graphics/runtime migration items
   in #2935 land.

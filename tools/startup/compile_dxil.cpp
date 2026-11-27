@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -366,6 +367,44 @@ static std::string json_escape(std::string_view text) {
     return out;
 }
 
+static void dedupe_graphics_markers(std::vector<fs::path>& paths) {
+    // A key with both markers is one request, the variant, as in gfx2hlsl.py request_source.
+    for (size_t i = 0; i + 1 < paths.size();) {
+        if (paths[i].extension() == L".a" && paths[i + 1].extension() == L".rtv" &&
+            paths[i].stem() == paths[i + 1].stem())
+            paths.erase(paths.begin() + i);
+        else
+            ++i;
+    }
+}
+
+static std::optional<fs::path> graphics_psin_path(const fs::path& marker) {
+    if (marker.extension() == L".a")
+        return fs::path(marker).replace_extension(L".psin");
+    if (marker.extension() != L".rtv")
+        return std::nullopt;
+    std::ifstream file(marker, std::ios::binary);
+    if (!file)
+        return std::nullopt;
+    char buf[257]{};
+    file.read(buf, 256);
+    const std::string_view text(buf, static_cast<size_t>(file.gcount()));
+    if (text.substr(0, 5) != "rtv1 ")
+        return std::nullopt;
+    const std::string_view rest = text.substr(5);
+    const std::string_view token = rest.substr(0, rest.find(' '));
+    if (token.empty() || token.size() > 20 || token.find_first_not_of("0123456789") != token.npos)
+        return std::nullopt;
+    uint64_t base = 0;
+    const auto end = token.data() + token.size();
+    const auto parsed = std::from_chars(token.data(), end, base);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+        return std::nullopt;
+    wchar_t name[32]{};
+    std::swprintf(name, std::size(name), L"req_%016llx.psin", static_cast<unsigned long long>(base));
+    return marker.parent_path() / name;
+}
+
 static int run_refusals(int argc, wchar_t** argv) {
     fs::path request_dir;
     bool has_dir = false;
@@ -406,12 +445,13 @@ static int run_refusals(int argc, wchar_t** argv) {
             const auto path = file.path();
             if (path.stem().wstring().rfind(L"req_", 0) != 0)
                 continue;
-            if (path.extension() == L".a")
+            if (path.extension() == L".a" || path.extension() == L".rtv")
                 graphics_inputs.push_back(fs::weakly_canonical(path));
             else if (path.extension() == L".c67")
                 compute_inputs.push_back(fs::weakly_canonical(path));
         }
         std::sort(graphics_inputs.begin(), graphics_inputs.end(), PathLess{});
+        dedupe_graphics_markers(graphics_inputs);
         std::sort(compute_inputs.begin(), compute_inputs.end(), PathLess{});
 
         struct Task {
@@ -439,8 +479,13 @@ static int run_refusals(int argc, wchar_t** argv) {
                         } else {
                             auto input = x2w::read_graphics_request(graphics_inputs[task.index]);
                             bool hit = false;
-                            (void)x2w::prepare_direct_graphics(input.a, input.b, request_dir, hit,
-                                                               input.root, input.input_layout, input.pixel_entry, false);
+                            auto pair = x2w::prepare_direct_graphics(input.a, input.b, request_dir, hit,
+                                                                     input.root, input.input_layout, input.pixel_entry,
+                                                                     false, input.rtv_formats);
+                            if (!input.rtv_request.empty() &&
+                                !x2w::format_graphics_runtime_manifest(pair, input.rtv_request))
+                                throw std::runtime_error(
+                                    "RTV variant has no runtime manifest: its vertex inputs, target types or bindings are not described");
                         }
                     } catch (const fs::filesystem_error&) {
                         results[t] = "unreadable shader request";
@@ -583,13 +628,14 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     std::optional<fs::file_time_type> psin_mtime;
     bool lost = false;
     if (!req.compute) {
-        const fs::path psin_path = fs::path(req.marker).replace_extension(L".psin");
-        if (fs::is_regular_file(psin_path, ec)) {
-            const auto t = fs::last_write_time(psin_path, ec);
-            if (!ec)
-                psin_mtime = t;
+        if (const auto psin_path = graphics_psin_path(req.marker)) {
+            if (fs::is_regular_file(*psin_path, ec)) {
+                const auto t = fs::last_write_time(*psin_path, ec);
+                if (!ec)
+                    psin_mtime = t;
+            }
+            lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
         }
-        lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
     }
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
@@ -627,7 +673,7 @@ static std::vector<WatchRequest> collect_watch_requests(const fs::path& request_
         const auto path = file.path();
         const auto ext = path.extension().wstring();
         const bool is_compute = ext == L".c67";
-        if (!is_compute && ext != L".a")
+        if (!is_compute && ext != L".a" && ext != L".rtv")
             continue;
         const auto stem = path.stem().wstring();
         if (stem.size() != 20 || stem.rfind(L"req_", 0) != 0)
@@ -640,6 +686,13 @@ static std::vector<WatchRequest> collect_watch_requests(const fs::path& request_
     std::sort(found.begin(), found.end(), [](const WatchRequest& a, const WatchRequest& b) {
         return PathLess{}(a.marker, b.marker);
     });
+    for (size_t i = 0; i + 1 < found.size();) {
+        if (!found[i].compute && !found[i + 1].compute && found[i].marker.extension() == L".a" &&
+            found[i + 1].marker.extension() == L".rtv" && found[i].key == found[i + 1].key)
+            found.erase(found.begin() + i);
+        else
+            ++i;
+    }
     std::vector<WatchRequest> pending;
     for (auto& req : found) {
         if (is_watch_request_pending(request_dir, req, skip_failed))
@@ -671,10 +724,13 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
     auto input = x2w::read_graphics_request(req.marker);
     bool hit = false;
     auto pair = x2w::prepare_direct_graphics(input.a, input.b, cache_dir, hit, input.root, input.input_layout,
-                                             input.pixel_entry);
-    auto manifest = x2w::format_graphics_runtime_manifest(pair);
+                                             input.pixel_entry, true, input.rtv_formats);
+    auto manifest = x2w::format_graphics_runtime_manifest(pair, input.rtv_request);
     if (!manifest)
-        throw std::runtime_error("unsupported startup runtime manifest bindings");
+        throw std::runtime_error(
+            input.rtv_request.empty()
+                ? "unsupported startup runtime manifest bindings"
+                : "RTV variant has no runtime manifest: its vertex inputs, target types or bindings are not described");
     auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", cache_dir, true, sink);
     auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", cache_dir, true, sink);
     publish_atomic(fs::path(stem) += L".vs.cso", vs_dxil.data(), vs_dxil.size());
@@ -863,12 +919,7 @@ int wmain(int argc, wchar_t** argv) {
             }
             if (inputs.empty()) throw std::runtime_error("no ready shader requests");
             std::sort(inputs.begin(),inputs.end());
-            // A key with both markers is one request, the variant, as in gfx2hlsl.py request_source. The two would
-            // otherwise name the same outputs.
-            for (size_t i = 0; i + 1 < inputs.size();)
-                if (inputs[i].extension()==L".a" && inputs[i+1].extension()==L".rtv" && inputs[i].stem()==inputs[i+1].stem())
-                    inputs.erase(inputs.begin()+i);
-                else ++i;
+            dedupe_graphics_markers(inputs);
             fs::create_directories(argv[first+2]);
             for (const auto& path : inputs) {
                 auto key_stem = path.stem().wstring().substr(4);

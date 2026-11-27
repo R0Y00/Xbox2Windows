@@ -33,6 +33,6 @@ ctest --preset release --no-tests=error -V -R "^native_compile_dxil_refusals$"
 - `--refusals` reports the first refusal reached per request by `read_graphics_request` /
   `prepare_direct_graphics(..., /*write_cache=*/false)` and `read_compute_request` / `translate_compute`; it
   does not walk past the first refusal or invoke DXC.
-- Graphics requests use `req_<key>.a`. `--requests` also compiles `.rtv` variant requests
-  ([note](native-rtv-variant-requests.md)), with the same `.fail` lifecycle; `--refusals` does not summarize
-  them. Slot-57 mesh requests remain outside the native path.
+- Graphics requests use `req_<key>.a` and `req_<key>.rtv` ([RTV variant note](native-rtv-variant-requests.md));
+  when both markers share a key, the variant takes precedence. Slot-57 mesh requests remain outside the
+  native path.

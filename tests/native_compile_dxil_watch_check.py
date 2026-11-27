@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "tools" / "startup"))
 
 import gfx2hlsl as G  # noqa: E402
+from native_rtv_variant_check import FLOAT32, UINT16, UNORM8, put_variant  # noqa: E402
 from native_startup_request_cache_check import (  # noqa: E402
     COMPUTE_GROUP,
     COMPUTE_RSRC2,
@@ -151,6 +152,34 @@ def main(argv: list[str]) -> int:
         assert rs.stdout == rp.stdout, (rs.stdout, rp.stdout)
         assert G.pending_keys(str(d_parallel), skip_failed=True) == []
 
+        # RTV variants in --once: compile base + variants, publish rtv1 manifest + .psdep, and recheck on base .psin update.
+        d_rtv = work / "once_rtv"
+        d_rtv.mkdir()
+        rtv_base = put_graphics_request(d_rtv, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        rtv_u16, rtv_u16_line = put_variant(d_rtv, rtv_base, (UINT16, UNORM8))
+        rtv_f32, rtv_f32_line = put_variant(d_rtv, rtv_base, (FLOAT32,))
+        rtv_bad, _ = put_variant(d_rtv, rtv_base, (7,))
+        r_rtv = run_once(cli, sdk, frontend, d_rtv, jobs=2)
+        assert r_rtv.returncode == 0, (r_rtv.returncode, r_rtv.stdout, r_rtv.stderr)
+        for vkey, vline in ((rtv_u16, rtv_u16_line), (rtv_f32, rtv_f32_line)):
+            assert f"{vkey:016x}: compiled graphics" in r_rtv.stdout, r_rtv.stdout
+            vtxt = (d_rtv / f"{vkey:016x}.txt").read_text(encoding="ascii")
+            assert vtxt.splitlines()[-1] == vline, vtxt
+            assert (d_rtv / f"{vkey:016x}.psdep").is_file()
+            assert not (d_rtv / f"{vkey:016x}.fail").exists()
+        assert f"{rtv_bad:016x}: refused:" in r_rtv.stdout and (d_rtv / f"{rtv_bad:016x}.fail").is_file()
+        assert G.pending_keys(str(d_rtv), skip_failed=True) == []
+
+        # Updating the base request's .psin (with mismatched .b) rechecks both the base and its .rtv variants.
+        (d_rtv / f"req_{rtv_base:016x}.b").write_bytes(ps_words(2))
+        touch(d_rtv / f"req_{rtv_base:016x}.psin", mtime=time.time() + 2.0)
+        r_rtv_recheck = run_once(cli, sdk, frontend, d_rtv, jobs=2)
+        assert r_rtv_recheck.returncode == 0, (r_rtv_recheck.returncode, r_rtv_recheck.stdout, r_rtv_recheck.stderr)
+        for key in (rtv_base, rtv_u16, rtv_f32):
+            assert f"{key:016x}: refused:" in r_rtv_recheck.stdout, r_rtv_recheck.stdout
+            assert not (d_rtv / f"{key:016x}.txt").exists()
+            assert (d_rtv / f"{key:016x}.fail").is_file()
+
         # Part 2: Live background --watch process retries pre-existing .fail once, skips unchanged .fail,
         # translates newly written graphics/compute requests, and clears .fail when fixed.
         wdir = work / "live_watch"
@@ -198,6 +227,18 @@ def main(argv: list[str]) -> int:
             )
             assert (wdir / f"{mut_key:016x}.vs.cso").read_bytes().startswith(b"DXBC")
             assert (wdir / f"{mut_key:016x}.ps.cso").read_bytes().startswith(b"DXBC")
+
+            # Write a valid .rtv variant and an invalid .rtv variant while the watcher is running.
+            live_rtv, live_rtv_line = put_variant(wdir, mut_key, (UINT16, UNORM8))
+            live_rtv_bad, _ = put_variant(wdir, mut_key, (7,))
+            live_rtv_txt = wdir / f"{live_rtv:016x}.txt"
+            live_rtv_fail = wdir / f"{live_rtv_bad:016x}.fail"
+            assert wait_for(lambda: live_rtv_txt.exists() and live_rtv_fail.exists()), (
+                "watcher did not process newly written .rtv variants"
+            )
+            assert live_rtv_txt.read_text(encoding="ascii").splitlines()[-1] == live_rtv_line
+            assert (wdir / f"{live_rtv:016x}.vs.cso").read_bytes().startswith(b"DXBC")
+            assert (wdir / f"{live_rtv:016x}.ps.cso").read_bytes().startswith(b"DXBC")
 
             # Write a new compute request while the watcher is running.
             live_cs = put_compute_request(wdir, c_code, c_root, c_sa)

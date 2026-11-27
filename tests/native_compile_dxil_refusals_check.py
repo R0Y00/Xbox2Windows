@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE.parent / "tools" / "startup"))
 
 import gfx2hlsl as G  # noqa: E402
 import triage_run  # noqa: E402
+from native_rtv_variant_check import FLOAT32, UINT16, UNORM8, pixel_stage, put_variant  # noqa: E402
 from native_startup_request_cache_check import (  # noqa: E402
     COMPUTE_GROUP,
     COMPUTE_RSRC2,
@@ -28,6 +29,7 @@ from native_startup_request_cache_check import (  # noqa: E402
     ps_words,
     put_compute_request,
     put_graphics_request,
+    stream_vertex_container,
 )
 from startup_compute_translate_check import state_a  # noqa: E402
 
@@ -235,6 +237,43 @@ def main(argv: list[str]) -> int:
             "graphics": {"examined": 0, "no_refusal": 0, "refused": 0, "reasons": []},
             "compute": {"examined": 0, "no_refusal": 0, "refused": 0, "reasons": []},
         }, empty_json
+
+        # RTV variant requests (.rtv): valid + refused variants, read-only guarantee, and same-key dedup.
+        rtv_dir = work / "rtv_refusals"
+        rtv_dir.mkdir()
+        rtv_base = put_graphics_request(rtv_dir, stream_vertex_container(), pixel_stage(), g_root)
+        rtv_u16, _ = put_variant(rtv_dir, rtv_base, (UINT16, UNORM8))
+        rtv_f32, _ = put_variant(rtv_dir, rtv_base, (FLOAT32,))
+        rtv_forged, _ = put_variant(rtv_dir, rtv_base, (UINT16,), name_key=0x1111222233334444)
+        rtv_missing, _ = put_variant(rtv_dir, 0x9999888877776666, (UINT16,))
+        rtv_bad_fmt, _ = put_variant(rtv_dir, rtv_base, (7,))
+
+        rtv_before = snapshot_tree(rtv_dir)
+        r_rtv1 = subprocess.run([cli, "--refusals", rtv_dir, "--json"], capture_output=True, text=True, check=True)
+        r_rtv2 = subprocess.run(
+            [cli, "--refusals", rtv_dir, "--jobs", "2", "--json"], capture_output=True, text=True, check=True
+        )
+        assert snapshot_tree(rtv_dir) == rtv_before, "--refusals modified RTV request directory"
+        assert r_rtv1.stdout == r_rtv2.stdout, (r_rtv1.stdout, r_rtv2.stdout)
+        rtv_json = json.loads(r_rtv1.stdout)
+        assert rtv_json["graphics"]["examined"] == 6, rtv_json
+        assert rtv_json["graphics"]["no_refusal"] == 3, rtv_json
+        assert rtv_json["graphics"]["refused"] == 3, rtv_json
+        for variant_key in (rtv_base, rtv_u16, rtv_f32, rtv_forged, rtv_missing, rtv_bad_fmt):
+            assert f"{variant_key:016x}" not in r_rtv1.stdout.lower(), (variant_key, r_rtv1.stdout)
+
+        dedupe_dir = work / "rtv_dedupe"
+        dedupe_dir.mkdir()
+        dedupe_key = put_graphics_request(dedupe_dir, stream_vertex_container(), pixel_stage(), g_root)
+        put_variant(dedupe_dir, dedupe_key, (UINT16,), name_key=dedupe_key)
+        r_dedupe = subprocess.run([cli, "--refusals", dedupe_dir, "--json"], capture_output=True, text=True, check=True)
+        dedupe_json = json.loads(r_dedupe.stdout)
+        assert dedupe_json["graphics"] == {
+            "examined": 1,
+            "no_refusal": 0,
+            "refused": 1,
+            "reasons": [{"reason": "invalid RTV variant request", "count": 1}],
+        }, dedupe_json
 
         # 3. Negative controls for invalid --refusals CLI invocations.
         bad_file = work / "not_a_dir.txt"
