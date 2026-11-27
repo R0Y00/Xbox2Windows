@@ -201,6 +201,44 @@ void test_degenerate_triangle_ignored_for_cone() {
     require(data.bounds[0].cone_axis[2] > 0.99f, "cone axis follows the real triangle");
 }
 
+void require_within_limits(const MeshletBufferData& data, std::uint32_t max_vertices, std::uint32_t max_primitives,
+                           std::size_t triangles) {
+    std::size_t total = 0;
+    for (const auto& d : data.meshlets) {
+        require(d.vertex_count > 0 && d.vertex_count <= max_vertices, "meshlet vertex count within requested limit");
+        require(d.primitive_count > 0 && d.primitive_count <= max_primitives,
+                "meshlet primitive count within requested limit");
+        total += d.primitive_count;
+    }
+    require(total == triangles, "all triangles preserved under small limits");
+}
+
+void test_small_limits() {
+    const int grid = 6;
+    std::vector<MeshletVertex> verts;
+    for (int y = 0; y <= grid; ++y)
+        for (int x = 0; x <= grid; ++x) verts.push_back(make_vertex(float(x), float(y), 0.0f));
+    std::vector<std::uint32_t> indices;
+    for (int y = 0; y < grid; ++y) {
+        for (int x = 0; x < grid; ++x) {
+            const std::uint32_t v0 = static_cast<std::uint32_t>(y * (grid + 1) + x);
+            const std::uint32_t v1 = v0 + (grid + 1);
+            indices.insert(indices.end(), {v0, v1, v1 + 1, v0, v1 + 1, v0 + 1});
+        }
+    }
+    const std::size_t tris = indices.size() / 3;
+    require_within_limits(x2w::meshlet::build_meshlets(verts, indices, 3, 126), 3, 126, tris);
+    require_within_limits(x2w::meshlet::build_meshlets(verts, indices, 64, 1), 64, 1, tris);
+    require_within_limits(x2w::meshlet::build_meshlets(verts, indices, 4, 2), 4, 2, tris);
+    require_within_limits(x2w::meshlet::build_meshlets(verts, indices, 256, 256), 256, 256, tris);
+    require_within_limits(x2w::meshlet::build_meshlets(verts, indices), x2w::meshlet::kMaxMeshletVertices,
+                          x2w::meshlet::kMaxMeshletPrimitives, tris);
+
+    // Triangles that repeat a vertex need fewer slots but must still respect the limit.
+    const std::vector<std::uint32_t> degenerate{0, 0, 1, 2, 2, 2, 3, 4, 5, 1, 1, 1};
+    require_within_limits(x2w::meshlet::build_meshlets(verts, degenerate, 3, 126), 3, 126, degenerate.size() / 3);
+}
+
 void test_negative_controls() {
     const std::vector<MeshletVertex> verts{make_vertex(0, 0, 0), make_vertex(0, 1, 0), make_vertex(1, 0, 0)};
     auto expect_throw = [](auto&& fn, const char* what) {
@@ -215,6 +253,9 @@ void test_negative_controls() {
     expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1}); }, "non-multiple-of-3 indices rejected");
     expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 3}); }, "out-of-range vertex index rejected");
     expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 2}, 0, 10); }, "max_vertices=0 rejected");
+    expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 2}, 1, 10); }, "max_vertices=1 rejected");
+    expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 2}, 2, 10); }, "max_vertices=2 rejected");
+    expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 2}, 257, 10); }, "max_vertices>256 rejected");
     expect_throw([&] { x2w::meshlet::build_meshlets(verts, {0, 1, 2}, 64, 257); }, "max_primitives>256 rejected");
 }
 
@@ -228,6 +269,7 @@ int main() {
         test_culling_scene();
         test_cone_width_threshold();
         test_degenerate_triangle_ignored_for_cone();
+        test_small_limits();
         test_negative_controls();
         std::puts("meshlet_builder_check: PASS");
         return 0;

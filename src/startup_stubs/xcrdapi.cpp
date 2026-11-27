@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/resident_pages.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
@@ -75,6 +76,24 @@ struct QueueObject : Object {
     HANDLE error_event = nullptr;
 };
 
+// Live stand-in objects by kind, and running queue workers. The lifetime fixture reads them through
+// x2w_xcrdapi_live_objects and x2w_xcrdapi_live_workers to prove that a final Release frees the
+// object and that the queue's worker has left (#2788).
+LONG live_by_kind[4];
+LONG live_workers;
+
+// Test-only mutant (#2788): X2W_TEST_XCRDAPI_LIFETIME_MUTANT=naive deletes at final Release without
+// stopping the worker or retaining the objects a queue entry uses. The fixture must reject it.
+bool naive_lifetime_mutant() noexcept
+{
+    static const bool naive = [] {
+        char text[16];
+        const DWORD length = GetEnvironmentVariableA("X2W_TEST_XCRDAPI_LIFETIME_MUTANT", text, sizeof(text));
+        return length == 5 && std::memcmp(text, "naive", 5) == 0;
+    }();
+    return naive;
+}
+
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
@@ -91,6 +110,7 @@ struct Entry {
     std::unique_ptr<ULONG_PTR[]> tokens;
     std::size_t token_count = 0;
     Object* array;
+    Object* source;  // request: the file the entry reads, retained while the entry is pending
     unsigned index;
     void* fence;
     u64 value;
@@ -115,6 +135,10 @@ struct QueueWork {
     struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
     struct Unrecorded* deferred_tail = nullptr;
     bool completing = false;     // a thread owns completion of snapshot entries, so they stay in order; guarded by mutex
+    bool stopping = false;       // final Release asked the worker to leave; guarded by mutex
+    bool destroy_on_worker = false;  // the final Release ran on the worker itself; guarded by mutex
+    HANDLE thread = nullptr;     // kept for the join; closed by the releasing thread, guarded by the setup mutex
+    DWORD thread_id = 0;         // guarded by the setup mutex
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
@@ -152,55 +176,53 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
-// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
-// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
-// destination's size, not the region's. Reads attributes only; no page is touched.
-static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
-{
-    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
-    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
-    while (page < end) {
-        DWORD count = 0;
-        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
-        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
-        for (DWORD i = 0; i < count; ++i) {
-            const auto& page_info = pages[i].VirtualAttributes;
-            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
-            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
-                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
-                return false;
-        }
-    }
-    return true;
-}
-
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
 // no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
 // their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
-// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
-// large regions: each query scans to the end of the region (#2684).
+// destination to the region walk (x2w_local::committed_writable), which judges it region by region. That walk
+// is slow on the title's large regions: each query scans to the end of the region (#2684). Lazily mapped
+// physical pages (X2W_XMEM_LAZY_COMMIT) are committed first.
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
-    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    const std::uintptr_t end = cursor + bytes;
-    if (resident_read_write(cursor, end)) return true;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return false;
-        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= cursor) return false;
-        cursor = region_end;
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - start) return false;
+    x2w_local::commit_lazy(destination, bytes);
+    if (x2w_local::resident_read_write(start, start + bytes)) return true;
+    return x2w_local::committed_writable(destination, bytes);
+}
+
+// Copies bytes of data into a plain-memory destination whose whole declared capacity must be writable. With
+// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy, under XMem's mapping mutex when
+// either range overlaps one of its runs, so an XMem run break (the pages of a shared view unmapped and mapped again)
+// can neither make a mapped destination look reserved nor take it away during the copy. Without xmem.dll the check
+// and the copy run here.
+// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); ERROR_INVALID_ADDRESS when
+// the copy faulted (part of the destination may be written); ERROR_INVALID_PARAMETER for an invalid request.
+static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)
+{
+    using CopyToDestination = BOOL(WINAPI*)(void*, SIZE_T, const void*, SIZE_T);
+    static const CopyToDestination copy = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<CopyToDestination>(GetProcAddress(xmem, "x2w_xmem_copy_to_destination")) : nullptr;
+    }();
+    if (copy) return copy(destination, capacity, data, bytes) ? ERROR_SUCCESS : GetLastError();
+    if (!destination_writable(destination, capacity)) return ERROR_NOACCESS;
+    std::memcpy(destination, data, bytes);
+    return ERROR_SUCCESS;
+}
+
+// The outcome logged for a copy that copy_to_destination did not complete, by its error. text holds the last case.
+static const char* copy_outcome(DWORD error, char (&text)[40])
+{
+    switch (error) {
+    case ERROR_NOACCESS: return "destination not writable";
+    case ERROR_INVALID_ADDRESS: return "copy faulted (part of the destination may be written)";
+    case ERROR_INVALID_PARAMETER: return "invalid copy request";
+    default:
+        std::snprintf(text, sizeof(text), "copy failed (error %lu)", static_cast<unsigned long>(error));
+        return text;
     }
-    return true;
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
@@ -304,15 +326,23 @@ long __stdcall query_interface(Object* self, const GUID* riid, void** out)
     return S_OK;
 }
 unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long>(InterlockedIncrement(&self->refs)); }
+
+void destroy_object(Object* self) noexcept;
+
+// Final Release of a queue: stop the worker, wait for it to leave, then drop the entries that never
+// ran. Returns true when the worker owns the destruction (Release ran on the worker itself).
+// Defined after the entry helpers below.
+bool shutdown_queue(Object* self);
+
 unsigned long __stdcall release(Object* self)
 {
     const auto refs = static_cast<unsigned long>(InterlockedDecrement(&self->refs));
-    if (refs == 0 && self->kind == queue) {
-        auto& object = *static_cast<QueueObject*>(self);
-        const std::lock_guard guard(object.error_mutex);
-        if (object.error_event) CloseHandle(std::exchange(object.error_event, nullptr));
-    }
-    return refs;
+    if (refs != 0) return refs;
+    // The factory is a process singleton: it stays alive for the life of the process (#2788).
+    if (self->kind == factory) return 0;
+    if (self->kind == queue && !naive_lifetime_mutant() && shutdown_queue(self)) return 0;
+    destroy_object(self);
+    return 0;
 }
 
 void** make_table(unsigned kind);
@@ -327,7 +357,51 @@ Object* make(unsigned kind)
     object->kind = kind;
     object->refs = 1;
     object->handle = INVALID_HANDLE_VALUE;
+    InterlockedIncrement(&live_by_kind[kind / 0x20 - 1]);
     return object;
+}
+
+void destroy_object(Object* self) noexcept
+{
+    const unsigned index = self->kind / 0x20 - 1;
+    if (self->kind == queue) {
+        auto* object = static_cast<QueueObject*>(self);
+        {
+            const std::lock_guard guard(object->error_mutex);
+            if (object->error_event) CloseHandle(std::exchange(object->error_event, nullptr));
+        }
+        delete object;
+    } else if (self->kind == file) {
+        auto* object = static_cast<FileObject*>(self);
+        if (object->handle != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(object->handle, INVALID_HANDLE_VALUE));
+        delete object;
+    } else if (self->kind == status) {
+        delete[] self->results;
+        delete self;
+    } else {
+        return;  // the factory singleton is never freed
+    }
+    InterlockedDecrement(&live_by_kind[index]);
+}
+
+// The status array an entry completes and the file a request reads must outlive the guest's Release
+// while the entry is pending: the entry owns one reference on each until it is consumed (#2788).
+void retain_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) InterlockedIncrement(&object->refs);
+}
+
+void release_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) release(object);
+}
+
+void release_entry(Entry& entry) noexcept
+{
+    release_entry_object(entry.source);
+    entry.source = nullptr;
+    release_entry_object(entry.array);
+    entry.array = nullptr;
 }
 
 // Factory slot 4, PC IDStorageFactory::OpenFile(PCWSTR path, REFIID riid, void** ppv).
@@ -422,6 +496,8 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // format, 1 seen), +0x08 destination pointer, +0x18 destination size (u32), +0x20 source (File object
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
+// requests_done counts the uncompressed copies only (the "raw" count of the status lines); a compressed request
+// is counted in requests_compressed ("inflated"), or in requests_bcpack_blank when its BCPack data was not decoded.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 
 // Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
@@ -515,6 +591,16 @@ LONG sample_failure_counts(StorageFailureCounts& counts) noexcept
         total += static_cast<ULONG>(counts[i]);
     }
     return static_cast<LONG>(total);
+}
+
+// The counters of the status lines: "raw=R inflated=I failed=F bcpack-blank=B completed=C". "inflated=%ld
+// failed=%ld" stays byte-for-byte what it was, because tools/startup/live_view.py parses it. completed is every
+// request that wrote its destination and finished: raw + inflated + bcpack-blank (a failed request is not in it), so
+// a run whose requests are all compressed still shows storage progressing.
+int format_request_counts(char* out, std::size_t size, LONG raw, LONG inflated, LONG failed, LONG blank) noexcept
+{
+    return std::snprintf(out, size, "raw=%ld inflated=%ld failed=%ld bcpack-blank=%ld completed=%ld", raw, inflated,
+                         failed, blank, raw + inflated + blank);
 }
 
 int format_failure_causes(char* out, std::size_t size, int second, const StorageFailureCounts& n) noexcept
@@ -681,6 +767,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    char copy_failure[40];  // copy_outcome's text for an error it does not name
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
@@ -868,11 +955,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // The title's destination can be smaller in memory than its declared capacity (#870:
                 // a write fault inside this copy). Judge the whole declared capacity before the first
                 // byte is written, so a refusal leaves every page untouched.
-                if (destination_writable(destination, destination_capacity)) {
-                    std::memcpy(destination, data, decode_length);
-                } else {
-                    outcome = "destination not writable";
-                    failure = StorageFailure::destination_not_writable;
+                const DWORD copied = copy_to_destination(destination, destination_capacity, data, decode_length);
+                if (copied != ERROR_SUCCESS) {
+                    outcome = copy_outcome(copied, copy_failure);
+                    failure = copied == ERROR_NOACCESS ? StorageFailure::destination_not_writable : StorageFailure::other;
                     data = nullptr;
                     written = false;
                 }
@@ -975,6 +1061,8 @@ void complete_deferred(Object* self, QueueWork* work);
 
 bool deferred_pending(const QueueWork& work);
 
+void discard_entries(QueueWork* work) noexcept;
+
 DWORD WINAPI queue_worker(void* parameter)
 {
     on_queue_worker = true;
@@ -984,7 +1072,10 @@ DWORD WINAPI queue_worker(void* parameter)
         Entry entry;
         {
             std::unique_lock lock(work.mutex);
-            work.wake.wait(lock, [&] { return !work.submitted.empty() && !deferred_pending(work); });
+            work.wake.wait(lock, [&] {
+                return work.stopping || (!work.submitted.empty() && !deferred_pending(work));
+            });
+            if (work.stopping) break;
             entry = std::move(work.submitted.front());
             work.submitted.pop_front();
         }
@@ -1008,6 +1099,7 @@ DWORD WINAPI queue_worker(void* parameter)
             copy_reason(reason, "unknown exception");
         }
         if (failed) fail_entry(self, entry, reason);
+        release_entry(entry);
         {
             const std::lock_guard guard(work.mutex);
             if (work.submitted.empty()) {
@@ -1018,6 +1110,23 @@ DWORD WINAPI queue_worker(void* parameter)
         work.drained.notify_all();
         complete_deferred(self, &work);
     }
+    bool destroy = false;
+    {
+        const std::lock_guard guard(work.mutex);
+        destroy = work.destroy_on_worker;
+    }
+    if (destroy) {
+        // The final Release ran on this worker (a fence callback released the queue). The worker cannot
+        // join itself: it drops the entries that never ran and frees the queue as it exits.
+        discard_entries(&work);
+        self->work = nullptr;
+        delete &work;
+        destroy_object(self);
+        InterlockedDecrement(&live_workers);
+        return 0;
+    }
+    InterlockedDecrement(&live_workers);
+    return 0;
 }
 
 // Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
@@ -1062,8 +1171,10 @@ bool start_worker(Object* self, QueueWork* work)
         return false;
     }
     work->worker_started = true;
+    work->thread = worker;
+    work->thread_id = GetThreadId(worker);
+    InterlockedIncrement(&live_workers);
     ResumeThread(worker);
-    CloseHandle(worker);
     return true;
 }
 
@@ -1075,11 +1186,20 @@ struct Unrecorded {
     u64 after;
     Entry::Type type;
     Object* array;
+    Object* source;  // request: the file the entry would read, retained until the node is dropped
     unsigned index;
     void* fence;
     u64 value;
     unsigned char bytes[sizeof(StorageRequest)];
 };
+
+void release_unrecorded(Unrecorded& node) noexcept
+{
+    release_entry_object(node.source);
+    node.source = nullptr;
+    release_entry_object(node.array);
+    node.array = nullptr;
+}
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
 // worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
@@ -1131,13 +1251,25 @@ bool has_unrecorded(Object* self)
     return self->unrecorded_head != nullptr;
 }
 
-void defer_unrecorded(Object* self, const Entry& entry)
+void defer_unrecorded(Object* self, Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, {}};
+    auto* node = new (std::nothrow) Unrecorded{};
     if (!node) {
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
         return;
     }
+    node->next = nullptr;
+    node->submission_id = 0;
+    node->after = 0;
+    node->type = entry.type;
+    node->array = entry.array;
+    node->source = entry.source;
+    node->index = entry.index;
+    node->fence = entry.fence;
+    node->value = entry.value;
+    entry.array = nullptr;
+    entry.source = nullptr;  // the node now owns the entry's references
     if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
     const std::lock_guard guard(setup_mutex());
     (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
@@ -1155,6 +1287,7 @@ void fail_unrecorded(Object* self)
     while (node) {
         Unrecorded* const next = node->next;
         fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+        release_unrecorded(*node);
         delete node;
         node = next;
     }
@@ -1172,6 +1305,7 @@ void fail_waiting(Object* self, QueueWork* work)
             work->waiting.pop_front();
         }
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
     }
 }
 
@@ -1300,11 +1434,58 @@ void complete_deferred(Object* self, QueueWork* work)
         }
         if (node) {
             fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+            release_unrecorded(*node);
             delete node;
         } else {
             fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+            release_entry(entry);
         }
     }
+}
+
+// Drops every entry that will never run and releases the objects those entries held. Called after the
+// worker has left, so no other thread touches the queue.
+void discard_entries(QueueWork* work) noexcept
+{
+    for (Entry& entry : work->waiting) release_entry(entry);
+    work->waiting.clear();
+    for (Entry& entry : work->submitted) release_entry(entry);
+    work->submitted.clear();
+    for (Entry& entry : work->failing) release_entry(entry);
+    work->failing.clear();
+    Unrecorded* node = work->deferred_head;
+    work->deferred_head = work->deferred_tail = nullptr;
+    while (node) {
+        Unrecorded* const next = node->next;
+        release_unrecorded(*node);
+        delete node;
+        node = next;
+    }
+    work->cached_streams.clear();
+}
+
+bool shutdown_queue(Object* self)
+{
+    QueueWork* work = self->work;
+    if (!work) return false;
+    bool on_worker;
+    {
+        const std::lock_guard guard(work->mutex);
+        work->stopping = true;
+        on_worker = work->worker_started && GetCurrentThreadId() == work->thread_id;
+        if (on_worker) work->destroy_on_worker = true;
+    }
+    work->wake.notify_all();
+    if (on_worker) return true;  // the worker frees the queue as it exits
+    if (work->thread) {
+        WaitForSingleObject(work->thread, INFINITE);
+        CloseHandle(work->thread);
+        work->thread = nullptr;
+    }
+    discard_entries(work);
+    self->work = nullptr;
+    delete work;
+    return false;
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
@@ -1346,6 +1527,15 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     entry.type = Entry::request;
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
     const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & memory_source_option)) {
+        // The request keeps the file it reads alive until its turn: the guest may Release it after
+        // EnqueueRequest (#2788).
+        auto* source = *reinterpret_cast<Object* const*>(request + 0x20);
+        if (source && x2w_local::readable(source, sizeof(Object)) && source->kind == file) {
+            retain_entry_object(source);
+            entry.source = source;
+        }
+    }
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
         const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
@@ -1373,13 +1563,18 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || x2w_local::first_calls(calls, 8))
-        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
-            static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
+    if (!valid || x2w_local::first_calls(calls, 8)) {
+        char counts[128];
+        format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, requests_failed,
+                              requests_bcpack_blank);
+        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests %s)", static_cast<void*>(array), index,
+            valid ? "" : " INVALID ARRAY", counts);
+    }
     if (!valid) return;
     InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
     Entry entry{};
     entry.type = Entry::status_entry;
+    retain_entry_object(array);
     entry.array = array;
     entry.index = index;
     push(self, std::move(entry));
@@ -1546,6 +1741,23 @@ DWORD heartbeat_interval_ms() noexcept
 
 }  // namespace
 
+// Fixture-only probes (#2788): objects alive by kind (0 = every kind) and running queue workers.
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_objects(unsigned kind)
+{
+    if (kind == 0) {
+        unsigned long total = 0;
+        for (LONG count : live_by_kind) total += static_cast<unsigned long>(count);
+        return total;
+    }
+    if (kind != factory && kind != file && kind != status && kind != queue) return 0;
+    return static_cast<unsigned long>(live_by_kind[kind / 0x20 - 1]);
+}
+
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_workers()
+{
+    return static_cast<unsigned long>(live_workers);
+}
+
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
 {
     char id[48];
@@ -1595,12 +1807,14 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                                   static_cast<unsigned long long>(sample.sections));
                 else
                     std::snprintf(section_text, sizeof(section_text), "unknown");
-                // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
+                // The counts keep "inflated=%ld failed=%ld" for tools/startup/live_view.py (format_request_counts);
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
-                    section_text);
+                char counts[128];
+                format_request_counts(counts, sizeof(counts), requests_done, requests_compressed, failed,
+                                      requests_bcpack_blank);
+                log("x2w-dstorage heartbeat %d s: requests %s; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, counts,
+                    zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory, section_text);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
                 char ends[384];

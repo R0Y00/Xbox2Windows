@@ -29,8 +29,12 @@ namespace x2w_startup {
 // tools/startup/triage_run.py keeps the same list (SLOT70_REASONS).
 constexpr const char* memory_srv_reasons[] = {
     "null_destination", "unreadable_resource", "unreadable_view", "null_address",
-    "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource", "buffer_unavailable",
-    "texture_unavailable",
+    "unsupported_description", "destination_outside_view_heaps", "gpu_written_resource",
+    // the acceleration-structure holds of publish_as_srv (memory_srv_as.h, as_srv_refusal_name)
+    "as_unaligned", "as_not_placed", "as_wrong_state",
+    "buffer_unavailable", "texture_unavailable",
+    // the three causes texture_unavailable used to lump together (d3d12_memory_srv.inl, texture_unavailable_reason)
+    "texture_no_resource", "texture_unreadable", "texture_over_64mib",
     // the partial-tile holds of device_memory_srv (upstream #2105)
     "partial_tile_xg_rows", "partial_tile_beyond_xg_size",
     // the console-layout holds of device_memory_srv (#2015)
@@ -38,6 +42,21 @@ constexpr const char* memory_srv_reasons[] = {
     "console_layout_beyond_xg_size", "overlapping_resource",
 };
 constexpr int memory_srv_reason_count = static_cast<int>(sizeof(memory_srv_reasons) / sizeof(memory_srv_reasons[0]));
+
+// The largest layout the transient upload ring accepts for one copy (publish_tiled_texture).
+constexpr std::uint64_t max_published_texture_bytes = 64ull << 20;
+
+// Why no texture came back for a memory SRV (d3d12_memory_srv.inl, texture_unavailable_reason). `published` is true when a
+// publication was attempted (BC, console layout, single element), false when only a live resource could have served the
+// view. `readable` runs only for a layout within the limit, so a huge layout never pays a page-touch pass.
+template <class Readable>
+inline const char* texture_unavailable_cause(bool published, std::uint64_t bytes, Readable&& readable)
+{
+    if (!published) return "texture_no_resource";
+    if (bytes > max_published_texture_bytes) return "texture_over_64mib";
+    if (!readable()) return "texture_unreadable";
+    return "texture_unavailable";  // publication failed for another reason (no wrapper)
+}
 
 inline int memory_srv_reason_index(const char* reason)
 {
@@ -47,10 +66,13 @@ inline int memory_srv_reason_index(const char* reason)
 }
 
 // The reasons that depend on the resource description: their shapes are kept. The others (no
-// destination, unreadable arguments, no address, a destination outside the view heaps) do not.
+// destination, unreadable arguments, no address, a destination outside the view heaps, and the
+// acceleration-structure holds, which read only the view's address) do not.
 inline bool memory_srv_reason_has_shape(int reason)
 {
     return reason < memory_srv_reason_count && reason != memory_srv_reason_index("null_destination") &&
+           reason != memory_srv_reason_index("as_unaligned") && reason != memory_srv_reason_index("as_not_placed") &&
+           reason != memory_srv_reason_index("as_wrong_state") &&
            reason != memory_srv_reason_index("unreadable_resource") && reason != memory_srv_reason_index("unreadable_view") &&
            reason != memory_srv_reason_index("null_address") && reason != memory_srv_reason_index("destination_outside_view_heaps");
 }
