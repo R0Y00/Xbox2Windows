@@ -17148,7 +17148,14 @@ With a device slot 67 placeholder bound, command-list slot 14 looks up the trans
 
 `startup_compute_dispatch_two_mips_` writes two distinct patterns through two UAVs of one RGBA16_FLOAT texture in the same translated Dispatch. The test compares all 1,280 half values in the 32×8 and 16×4 subresources, including the sentinel values outside the written rectangles. Before translation both mips keep their sentinels. Exchanging the two views moves the patterns to opposite mips and changes 64 half values relative to the ordered case.
 
-The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>` follows the render totals; "not modelled" counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
+Every 300 render frames, `x2w-render upload ring: reserved <n> MiB in <n> reservations, refusals <n>, capacity <n> MiB` reports
+cumulative successful reservations and their 512-byte-rounded sizes, including reservations in recycled chunks.
+`refusals` counts reservation attempts that exhaust the allocator's available options. The submit-time rejection
+of a list whose chunks were recycled is logged separately. `capacity` is the total allocated chunk size.
+With `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1`, completed fenced submits can make chunks reusable sooner,
+so cumulative reserved bytes can exceed capacity. These totals do not measure current occupancy.
+
+The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>, builder gate refused <n>` follows the upload ring totals. The builder gate field counts dispatches refused by `X2W_COMPUTE_BUILDER_GATE`. The "not modelled" field counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
 
 The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
