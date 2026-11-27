@@ -3,6 +3,9 @@
 struct DirectCompute {
     static constexpr Word inline_float_words[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
                                                0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+    // The same nine constants as binary16, which an f16 operand reads instead of the f32 pattern.
+    static constexpr Word inline_half_words[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                              0xc000, 0x4400, 0xc400, 0x3118};
     static std::optional<Word> constant32(const Inst &i, unsigned r) {
         if (r >= 128 && r <= 192) return r - 128;
         if (r >= 193 && r <= 208) return Word(192) - r;
@@ -1116,7 +1119,10 @@ struct DirectCompute {
             if (i.subword || i.dpp_control || permuted || i.scale || (exp_op && i.clamp) ||
                 (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
                 refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
-            auto bits = ir.binary("and", operand32(i, i.src[0]), "65535");
+            // An inline float (240-248) reads its binary16 value, as v_add_f16 does.
+            const unsigned r = i.src[0];
+            auto bits = r >= 240 && r <= 248 ? to_string(inline_half_words[r - 240])
+                                             : ir.binary("and", operand32(i, r), "65535");
             if (i.abs & 1) bits = ir.binary("and", bits, "32767");
             if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
             auto sign = ir.binary("and", bits, "32768");
@@ -1280,9 +1286,7 @@ struct DirectCompute {
                 } else if (r >= 240 && r <= 248) {
                     // Inline floats are f32 patterns. The f16 operation consumes the
                     // binary16 rounding of that value.
-                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
-                                                0xc000, 0x4400, 0xc400, 0x3118};
-                    bits = to_string(halves[r - 240]);
+                    bits = to_string(inline_half_words[r - 240]);
                 } else if (r == 255)
                     bits = to_string(i.literal & 65535u);
                 else if (r >= 128 && r <= 192)

@@ -1544,6 +1544,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
+| `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
@@ -1647,6 +1648,18 @@ Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
 D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
 budget in bytes for node 0 of the adapter matching the desktop device LUID.
 An unavailable segment reads `n/a`.
+
+The line ends with the system commit and the physical-page pool (#1199):
+`commit=<used>/<limit> avail=<free>` in MiB (all processes: RAM plus page files, what a new commit can still
+get) and `sections=<n> slabs=<n> slots=<in use>/<free>` (live 64 KiB physical-page sections, open slabs, slots in
+the open slabs), then `job_peak=<MiB> job_limit=<MiB>`: the peak commit of the job the title runs in and its memory
+limit (`run.ps1 -MemoryGiB`; `none` without a limit). Each reads `n/a` when it cannot be read. A run that ends on error 1455 shows from these whether
+the pool (a flat `sections`) or the resources below (committed texture bytes) grew. The first three commit failures
+(error 1455 or 8) of the page pool also
+log `x2w-xmem commit exhausted at <call> (error N): job memory limit N GiB reached (run.ps1 -MemoryGiB)` when the job peak is within 256 MiB of its limit (otherwise `job memory limit not reached`), then the job numbers, `system commit=... avail=...` and `pool sections=... slabs=...
+slots=.../...` with the hint that `X2W_XMEM_LAZY_COMMIT=1` (`run.ps1 -LazyMemory`) keeps untouched pages out of
+the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/startup_triage_run_check.py` that
+`triage_run.py` still reads the line with and without these fields.
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
@@ -3510,7 +3523,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
   for each new combination of format, layout, one or several mips, one or several slices, flags,
   dimension, view format, view dimension and outcome (at most 200). The outcome is
   `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
-  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+  `published console layout`, one of the two hold reasons, `texture_no_resource` (no live resource at that base and description), `texture_unreadable` (the texels are not readable), `texture_over_64mib` (more than the 64 MiB single-copy limit) or `texture_unavailable` (publication failed otherwise).
 - `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
   submits that drop retained uploads.
 
