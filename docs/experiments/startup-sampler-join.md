@@ -2,9 +2,9 @@
 
 For 2D explicit-level `image_sample_l` and `image_sample_lz`, a single forward SCC diamond may select two inline four-word sampler definitions. Both arms must finish by writing all four words as literals, with proven uniform control flow and unchanged EXEC. Only normalized point wrap/clamp XY addressing and point mip filtering are admitted, with validated LOD limits. Two `smpl` static bindings preserve the descriptors; the selected runtime word chooses between complete `SampleLevel` calls. Any intervening overlap write invalidates the join proof. Implicit derivatives, partial definitions and more complex control flow retain their existing refusals.
 
-The source-built fixture exercises the emitted dispatcher against an independent point-texel oracle for both root-constant selector outcomes and both sample forms. Swapping the sampler bindings changes the result. Six refusal controls and eight binary assembly variants are included.
+The source-built fixture evaluates both root-constant selector outcomes for both sample forms with an independent point-texel oracle. A third variant holds word 0 unchanged and varies only MAX_LOD in word 1; the explicit level selects mip 1 or mip 0. Swapping sampler bindings changes the result in every variant. Six refusal controls and nine binary assembly variants are included.
 
-Both portable checks passed on Apple Silicon with LLVM 23.1.6.
+Both portable checks passed on Apple Silicon; the expanded nine-variant fixture was assembled with LLVM 15.0.7.
 
 ```bash
 python3 -B tests/startup_image_sample_l_join_check.py

@@ -1,4 +1,4 @@
-"""Source-built 2D point wrap/clamp samplers selected by a uniform SCC diamond.
+"""Source-built 2D point samplers with differing address modes or maximum LOD.
 
 No arguments: portable translation and independent dispatcher/sample oracle.
 binary <llvm-mc>: reassemble every recorded fixture.
@@ -35,8 +35,8 @@ s_endpgm
 '''
 
 
-def arm(w0):
-    return (f's_mov_b32 s24, {w0:#x}\ns_mov_b32 s25, 0x200000\n'
+def arm(w0, w1=0x200000):
+    return (f's_mov_b32 s24, {w0:#x}\ns_mov_b32 s25, {w1:#x}\n'
             's_mov_b32 s26, 0x4000000\ns_mov_b32 s27, 0\n')
 
 
@@ -48,6 +48,8 @@ def source(name):
         pre = 'v_mov_b32_e32 v8, v0\n' + pre
         cond = 'v_cmp_eq_u32_e32 vcc, 0, v8\ns_cbranch_vccz BB1\n'
     taken = arm(CLAMP_XY | 0x8000 if name == 'invalid mode' else CLAMP_XY)
+    if name == 'l_word1':
+        taken = arm(0, 0)
     if name == 'partial':
         taken = f's_mov_b32 s24, {CLAMP_XY:#x}\n'
     tail = 's_mov_b32 s24, s9\n' if name == 'overwrite' else ''
@@ -63,6 +65,7 @@ def source(name):
 WORDS = {
     'l': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'lz': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe7fc08cbf080f9cf00004c400703f8cbf0f1800f804050607000081bf',
+    'l_word1': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe050082bf800398be800399beff039abe0000000480039bbe7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'nonuniform': '0003107e04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e8010847d070086bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'partial': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe010082bf920398be7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'overwrite': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe090398be7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
@@ -89,16 +92,22 @@ def texel(mip, x, y):
 
 
 # u=1.125 wraps to x=0 or clamps to the final column; v=0.375 is interior.
-EXPECTED = {'l': (texel(1, 0, 0), texel(1, 1, 0)), 'lz': (texel(0, 0, 1), texel(0, 3, 1))}
+EXPECTED = {
+    'l': (texel(1, 0, 0), texel(1, 1, 0)),
+    'lz': (texel(0, 0, 1), texel(0, 3, 1)),
+    'l_word1': (texel(1, 0, 0), texel(0, 0, 1)),
+}
 
 
-def sampler_manifest(pipe):
+def sampler_manifest(pipe, name):
     lines = [line for line in pipe.manifest().splitlines() if line.startswith('smpl ')]
     assert len(lines) == 2, lines
     fields = [line.split() for line in lines]
     assert [int(f[1]) for f in fields] == [0, 1], lines
     samplers = [tuple(int(w, 0) for w in f[2:]) for f in fields]
-    assert set(samplers) == {(0, 0x200000, 1 << 26, 0), (CLAMP_XY, 0x200000, 1 << 26, 0)}, samplers
+    expected = ({(0, 0, 1 << 26, 0), (0, 0x200000, 1 << 26, 0)} if name == 'l_word1'
+                else {(0, 0x200000, 1 << 26, 0), (CLAMP_XY, 0x200000, 1 << 26, 0)})
+    assert set(samplers) == expected, samplers
     return lines, samplers
 
 
@@ -148,13 +157,13 @@ def selected_texel(text, samplers, selector):
 
 
 def controls():
-    for name, (wrap, clamp) in EXPECTED.items():
+    for name, expected in EXPECTED.items():
         pipe = pipeline(name)
         text = pipe.hlsl_ps()
-        _, samplers = sampler_manifest(pipe)
+        _, samplers = sampler_manifest(pipe, name)
         assert 'udsrc 1 rootconst 1 0' in pipe.manifest()
-        assert wrap != clamp
-        for selector, want in ((0, wrap), (0x3f800000, clamp)):
+        assert expected[0] != expected[1]
+        for selector, want in zip((0, 0x3f800000), expected):
             assert selected_texel(text, samplers, selector) == want, (name, selector)
             assert selected_texel(text, samplers[::-1], selector) != want, (name, selector, 'swapped')
     for name, reason in REFUSALS.items():
@@ -164,13 +173,14 @@ def controls():
             assert reason in str(error), (name, reason, str(error))
         else:
             raise AssertionError(f'{name} unexpectedly accepted')
-    print('uniform sampler diamond: two forms, both selector outcomes, swapped bindings and six refusal controls passed')
+    print(f'uniform sampler diamond: {len(EXPECTED)} forms, both selector outcomes, '
+          f'swapped bindings and {len(REFUSALS)} refusal controls passed')
 
 
 def binary(llvm_mc):
     for name, encoded in WORDS.items():
         assert assemble(llvm_mc, source(name)) == bytes.fromhex(encoded), name
-    print('all eight authored fixtures reassemble exactly')
+    print(f'all {len(WORDS)} authored fixtures reassemble exactly')
 
 
 def draw(dxc, renderer, adapter):
@@ -180,7 +190,7 @@ def draw(dxc, renderer, adapter):
         for name, expected in EXPECTED.items():
             pipe = pipeline(name)
             ps = compile_hlsl(dxc, 'dxc', pipe.hlsl_ps(), f'joined_{name}', 'ps_6_0', directory)
-            lines, _ = sampler_manifest(pipe)
+            lines, _ = sampler_manifest(pipe, name)
             manifest = '\n'.join(lines)
             for selector, want in enumerate(expected):
                 got = read_pixel(renderer, adapter, vs, ps, manifest, '0/3', selector=selector)
