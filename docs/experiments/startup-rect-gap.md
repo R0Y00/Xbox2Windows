@@ -50,10 +50,19 @@ keeping precedence, so every input the old rule accepted is unchanged. After the
 square in another corner order, which back-face culling rejects by its winding) and `rotated` all match the
 model: 0 of 32 pixels differ.
 
+The native IR copy had the same corner rule, but its LLVM IR wrote the tolerance as the decimal
+`1.000000e-06`; LLVM rejects that non-representable float constant, so every native rectangle pair was
+refused before a PSO existed. It now uses the binary32 value's exact hexadecimal double,
+`0x3EB0C6F7A0000000`. `native_rectangle_geometry_warp` compiles that geometry CSO and runs the same
+`axis`, `swung` and `rotated` scenes through the native VS/PS pair with back-face culling on; all three
+cover exactly the literal model's 32 pixels. The HLSL and native implementations are therefore pinned to
+the same rule by readback, not only by compiling the IR.
+
 ## Commands and environment
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^(startup_rect_geometry|startup_rect_gap)_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^(native_rectangle_pso|native_rectangle_geometry)_warp$' -V
 ctest --preset dev --no-tests=error -R '^(startup_indirect_translated_indexed_rect|startup_indirect_rectlist|native_direct_container|rectlist_topology|rectlist_draw)_(warp|hardware)?$'
 ```
 

@@ -12,7 +12,8 @@
 //               the right-angle corner is identified, and the corner the non-indexed path derives in the vertex
 //               stage. No corner shares an axis with its neighbours, so the axis test cannot identify it.
 // Each vertex record is 12 bytes (a mask at +0, XY at +4) and both orders must cover the pixels the two
-// triangles of the literal rule cover. Without an adapter argument the fixture uses WARP.
+// triangles of the literal rule cover. Without an adapter argument the fixture uses WARP. `--native-gs`
+// replaces the HLSL stage with a geometry CSO emitted from src/gfx1013_rect_geometry.cpp.
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
@@ -23,6 +24,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -103,7 +106,24 @@ std::vector<std::uint32_t> reference(const std::array<std::pair<float, float>, 4
 
 int main(int argc, char** argv)
 {
-    const bool hardware = argc > 1 && std::strcmp(argv[1], "hardware") == 0;
+    bool hardware = false;
+    const char* native_vs = nullptr;
+    const char* native_ps = nullptr;
+    const char* native_gs = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "hardware") == 0) {
+            hardware = true;
+        } else if (std::strcmp(argv[i], "--native-gs") == 0 && i + 1 < argc) {
+            native_gs = argv[++i];
+        } else if (std::strcmp(argv[i], "--native-vs") == 0 && i + 1 < argc) {
+            native_vs = argv[++i];
+        } else if (std::strcmp(argv[i], "--native-ps") == 0 && i + 1 < argc) {
+            native_ps = argv[++i];
+        } else {
+            std::printf("usage: startup_rect_geometry [hardware] [--native-gs FILE]\n");
+            return 2;
+        }
+    }
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
@@ -149,8 +169,29 @@ float4 main(In input) : SV_Position { return float4(input.xy, 0, 1); })";
     static const char ps_text[] = R"(
 float4 main(float4 pos : SV_Position) : SV_Target { return float4(1, 0, 0, 1); })";
     ComPtr<ID3DBlob> vs, ps, gs, gs_errors;
-    if (FAILED(compile(vs_text, "vs_5_1", vs)) || FAILED(compile(ps_text, "ps_5_1", ps))) return 6;
-    if (FAILED(x2w_startup::compile_indexed_rect_geometry(vs.Get(), ps.Get(), &gs, &gs_errors))) {
+    const auto load_blob = [](const char* path, ComPtr<ID3DBlob>& blob) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return false;
+        const std::string bytes{std::istreambuf_iterator<char>(file), {}};
+        if (FAILED(D3DCreateBlob(bytes.size(), &blob))) return false;
+        std::memcpy(blob->GetBufferPointer(), bytes.data(), bytes.size());
+        return true;
+    };
+    const bool native = native_vs || native_ps || native_gs;
+    if (native && !(native_vs && native_ps && native_gs)) {
+        std::printf("--native-vs, --native-ps and --native-gs must be used together\n");
+        return 2;
+    }
+    if (native) {
+        if (!load_blob(native_vs, vs) || !load_blob(native_ps, ps) || !load_blob(native_gs, gs)) {
+            std::printf("missing native stage\n");
+            return 7;
+        }
+        std::printf("geometry: native %zu bytes\n", static_cast<std::size_t>(gs->GetBufferSize()));
+    } else if (FAILED(compile(vs_text, "vs_5_1", vs)) || FAILED(compile(ps_text, "ps_5_1", ps))) {
+        return 6;
+    }
+    if (!native && FAILED(x2w_startup::compile_indexed_rect_geometry(vs.Get(), ps.Get(), &gs, &gs_errors))) {
         if (gs_errors) std::printf("geometry: %s\n", static_cast<const char*>(gs_errors->GetBufferPointer()));
         return 7;
     }

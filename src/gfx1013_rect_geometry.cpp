@@ -96,12 +96,14 @@ std::string native_rectangle_geometry(const std::vector<GraphicsLinkage> &output
     for (unsigned i = 0; i < 3; ++i) {
         auto &p = position[i], &a = position[(i + 1) % 3], &b = position[(i + 2) % 3];
         auto across = distance2(a, b), to_a = distance2(p, a), to_b = distance2(p, b);
-        // (p - a) . (p - b), squared, against 1e-6 of |p - a|^2 |p - b|^2: the two sides meet at a right angle.
+        // (p - a) . (p - b), squared, against the binary32 value of 1e-6 of |p - a|^2 |p - b|^2: the two
+        // sides meet at a right angle. The hex double is the only spelling LLVM IR accepts for this
+        // non-representable decimal constant.
         auto diff = [&](const string &u, const string &v) { return ir.value("fsub float " + u + ", " + v); };
         auto times = [&](const string &u, const string &v) { return ir.value("fmul float " + u + ", " + v); };
         auto dot = ir.value("fadd float " + times(diff(p[0], a[0]), diff(p[0], b[0])) + ", " +
                             times(diff(p[1], a[1]), diff(p[1], b[1])));
-        auto limit = ir.value("fmul float " + times(to_a, to_b) + ", 1.000000e-06");
+        auto limit = ir.value("fmul float " + times(to_a, to_b) + ", 0x3EB0C6F7A0000000");
         geometric[i] = both(both(compare("ogt", across, to_a), compare("ogt", across, to_b)),
                             compare("ole", times(dot, dot), limit));
     }
