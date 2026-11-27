@@ -1214,7 +1214,12 @@ def check_execz_exit_run():
         return code[:at] + bytes.fromhex(new) + code[at + 4:]
 
     reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block'
-    for at, new in ((60, '1503febe'),   # remask from s21: breaking lanes are active in the wave's v_xor
+    # Workgroups above 32 threads are outside this single-wave32 proof.
+    for big in ((33, 1, 1), (64, 1, 1)):
+        refused(reason, lambda group=big: translate('O', code=EXIT_RUN_WORDS, group=group).hlsl_cs())
+    for at, new in ((28, '800395be'),   # s_mov_b32 s21, 0: restore mask was never saved from EXEC
+                    (52, '007e168a'),   # s_andn2_b32 s22, s0, exec_lo: destination differs from source
+                    (60, '1503febe'),   # remask from s21: breaking lanes are active in the wave's v_xor
                     (84, '00008abf'),   # s_barrier 0x0 in place of the run's s_waitcnt
                     (84, '090090bf'),   # s_sendmsg 0x9
                     (84, '01008fbf'),   # s_setprio 1

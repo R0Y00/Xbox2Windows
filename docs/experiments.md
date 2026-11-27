@@ -15785,10 +15785,11 @@ breaking lanes from a saved EXEC mask and `s_cbranch_scc0` tests that mask. The 
 installs the same mask into EXEC before its vector work. Both paths reach a scalar descriptor
 load and wait, followed by `s_mov_b32 exec_lo, s21` to restore EXEC.
 
-For groups of up to 32 threads, the translator accepts this straight exit when the staying
-path's vector work is lane-local and predicated off for exiting lanes. The shared run allows
-scalar ALU, loads and waits with regular SGPRs. It must reach a restore from an unchanged copy
-of EXEC, and the two paths must agree on the run's inputs and any scalar state used afterward.
+For groups of up to 32 threads (`x * y * z <= 32`; larger workgroups are rejected and left for
+follow-up work), the translator accepts this straight exit when the staying path's vector work is
+lane-local and predicated off for exiting lanes. The shared run allows scalar ALU, loads and waits
+with regular SGPRs. It must reach a restore from an unchanged copy of EXEC, and the two paths must
+agree on the run's inputs and any scalar state used afterward.
 The wave and singleton traces both produce `[9, 9, 9, KEY^3, KEY^4, KEY^5, KEY^6, KEY^7]`.
 With three threads, the whole wave also takes the exit and both traces produce `[9, 9, 9]`.
 

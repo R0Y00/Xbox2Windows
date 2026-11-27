@@ -2993,8 +2993,9 @@ class Stage:
         """Prove the straight b32 lane-exhaustion exit and its shared scalar run before restoring EXEC (#2645 T3).
 
         ANDN2 clears the breaking lanes from a saved mask, SCC tests whether that mask is empty, and the staying
-        path installs it as EXEC. The wave can do extra vector work only with the exiting lane disabled. A lane
-        that skipped the guard keeps its original mask bit through ANDN2 because EXEC was clear for that lane.
+        path installs it as EXEC. The proof is scoped to single-wave32 groups (`x * y * z <= 32`) and rejects if
+        `mask` or `scc` is live at `target`. The wave can do extra vector work only with the exiting lane disabled.
+        A lane that skipped the guard keeps its original mask bit through ANDN2 because EXEC was clear for that lane.
         The shared run can read neither incoming EXEC nor scalar values that differ between the wave and model.
         """
         x, y, z = self.pipe.group
