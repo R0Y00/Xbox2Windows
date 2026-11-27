@@ -1395,6 +1395,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         if (console_layout->mips != mips || console_layout->slices != slices || plan.count != mips) return false;
         for (UINT i = 0; i < mips; ++i)
             if (!plan.bytes(i) || plan.rows[i] != console_layout->rows(i) ||
+                plan.placed[i].Footprint.Depth != console_layout->layers(i) ||
                 plan.row_bytes[i] != u64{console_layout->columns(i)} * console_layout->bytes_per_element) return false;
     }
     // A texture given the 4 KiB allocation answer is read in the compact plan XG describes and writes for it
@@ -1466,7 +1467,9 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     }
                     std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
-                console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
+                // The depth layers of a volume follow one another, rows[i] rows apart.
+                console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch,
+                                       std::size_t{plan.placed[i].Footprint.RowPitch} * plan.rows[i]);
                 plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }

@@ -3383,9 +3383,18 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+
+A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one mip, one
+sample, at most 2048 texels on each side and an uncompressed format with a known element size,
+viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+(`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
+`GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
+16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
+every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
-textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
+other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
+swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
@@ -3394,7 +3403,7 @@ for the address wrote desktop-footprint rows, so the bytes are not in the layout
 names. As for a partial-tile view, a texture already published there samples the null view while
 that is so. `console_layout_beyond_xg_size`: the layout runs past the size the XG stand-in reports
 for the description (the desktop copyable footprints of a slice rounded up to 64 KiB, times the
-slices), which the title may not own.
+slices; a volume is one slice, whose footprints span every depth layer), which the title may not own.
 
 Upload lifetime: each upload of a console-layout texture is written into an upload buffer of its own
 (`x2w_upload::make_page`), not into the shared upload ring. The recording keeps a reference to the
@@ -3424,6 +3433,9 @@ Limits and choices that are not measured against a console:
   elements are checked only against the addrlib pattern rows restated from the addrlib source text
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
+- The thick `0x105` volume layout is compared with addrlib itself when the build has it
+  (`startup_gfx10_volume_addrlib`: every element address of 190 volumes). Mip chains, block-compressed
+  volumes and volumes in the other modes are not handled; they stay refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
@@ -3438,7 +3450,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
 Checks (reproduction in `docs/experiments.md`, "Sample by-address textures of the non-XOR console
 layouts"):
 
-- `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
+- `ctest --preset release --no-tests=error -R '^startup_gfx10_(layout|volume)' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
 
 ## Linear buffer backing (device slot 133, opt-in)

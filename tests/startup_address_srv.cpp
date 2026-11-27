@@ -260,8 +260,8 @@ int draw_bc_address_srvs(void* guest, void* list)
 }
 
 // X2W_TEST_CONSOLE_VIEW names a file of texels and X2W_TEST_CONSOLE_DESC the texture they belong to
-// ("width,height,mips,format,layout,viewed mip"). No resource object exists at the address; one mip is
-// viewed and drawn over the whole target. With X2W_TEST_CONSOLE_XG_ROWS=1 the address is first announced
+// ("width,height,mips,format,layout,viewed mip", and a depth for a volume viewed as a Texture3D). No
+// resource object exists at the address; one mip is viewed and drawn over the whole target. With X2W_TEST_CONSOLE_XG_ROWS=1 the address is first announced
 // the way the XG stand-in announces a copy of desktop-footprint rows; with =after the announcement comes
 // between the publication and the draw.
 int draw_console_address_srv(void* guest, void* list)
@@ -269,21 +269,28 @@ int draw_console_address_srv(void* guest, void* list)
     wchar_t path[MAX_PATH]{};
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", path, MAX_PATH);
     char text[96]{};
-    unsigned width = 0, height = 0, mips = 0, format = 0, layout = 0, viewed = 0;
+    unsigned width = 0, height = 0, mips = 0, format = 0, layout = 0, viewed = 0, depth = 0;
     if (!length || length >= MAX_PATH || !GetEnvironmentVariableA("X2W_TEST_CONSOLE_DESC", text, sizeof(text)) ||
-        std::sscanf(text, "%u,%u,%u,%u,%u,%u", &width, &height, &mips, &format, &layout, &viewed) != 6) return 43;
+        std::sscanf(text, "%u,%u,%u,%u,%u,%u,%u", &width, &height, &mips, &format, &layout, &viewed, &depth) < 6) return 43;
     alignas(4096) static std::array<char, 1 << 20> backing{};
     std::ifstream input(path, std::ios::binary);
     input.read(backing.data(), backing.size());
     if (!input.gcount() || !input.eof()) return 43;
-    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, static_cast<UINT16>(mips),
-        static_cast<DXGI_FORMAT>(format), {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_RESOURCE_DESC desc{depth ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width,
+        height, static_cast<UINT16>(depth ? depth : 1), static_cast<UINT16>(mips), static_cast<DXGI_FORMAT>(format), {1, 0},
+        static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
     ViewAt v{};
     v.view.Format = desc.Format;
-    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    v.view.Texture2D.MostDetailedMip = viewed;
-    v.view.Texture2D.MipLevels = 1;
+    if (depth) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        v.view.Texture3D.MostDetailedMip = viewed;
+        v.view.Texture3D.MipLevels = 1;
+    } else {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.view.Texture2D.MostDetailedMip = viewed;
+        v.view.Texture2D.MipLevels = 1;
+    }
     v.address = ptr(backing.data());
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;

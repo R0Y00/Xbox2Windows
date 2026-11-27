@@ -1030,6 +1030,59 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
             return true;
         }
+        if (n == "v_ldexp_f32") {
+            // pixel_aot.py ldexp32 (#3013): exact binary32 scaling of S0 by 2^S1. Zero, Inf and NaN pass unchanged,
+            // a denormal S0 is normalized rather than flushed, and a denormal result rounds to nearest even. S1 is
+            // a signed integer clamped to [-512, 512]. clamp saturates the result with integer tests: NaN and
+            // negative values (also -0) give +0, values from 1.0 give 1.0, and a denormal stays.
+            if (!i.wide || i.subword || i.dpp_control || permuted || i.scale || (i.a & 0x7800) || ((i.abs | i.neg) & 6) ||
+                i.src[2])
+                refuse(i.pc, "unsupported v_ldexp_f32 operand modifiers");
+            auto bits = operand32(i, i.src[0]);
+            if (i.abs & 1) bits = ir.binary("and", bits, "2147483647");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "2147483648");
+            auto delta = operand32(i, i.src[1]);
+            auto sign = ir.binary("and", bits, "2147483648");
+            auto exponent = ir.binary("and", ir.binary("lshr", bits, "23"), "255");
+            auto mantissa = ir.binary("and", bits, "8388607");
+            auto keep = ir.value("or i1 " + cmp("eq", exponent, "255") + ", " +
+                                 cmp("eq", ir.binary("and", bits, "2147483647"), "0"));
+            // Normalize a denormal mantissa: shift it left until bit 23 is set (5 halving steps, at most 23).
+            string x = mantissa, steps = "0";
+            for (unsigned k : {16u, 8u, 4u, 2u, 1u}) {
+                auto low = cmp("ult", x, to_string(1u << (24 - k)));
+                x = select(low, ir.binary("shl", x, to_string(k)), x);
+                steps = select(low, ir.binary("add", steps, to_string(k)), steps);
+            }
+            auto denormal = cmp("eq", exponent, "0");
+            mantissa = select(denormal, ir.binary("and", x, "8388607"), mantissa);
+            auto e = select(denormal, ir.binary("sub", "1", steps), exponent);
+            delta = select(cmp("slt", delta, "-512"), "-512", select(cmp("sgt", delta, "512"), "512", delta));
+            e = ir.binary("add", e, delta);
+            auto normal = ir.binary("or", sign, ir.binary("or", ir.binary("shl", e, "23"), mantissa));
+            // A result below the normal range: shift the full significand right by 1 - e (1..24) and round to
+            // nearest even.
+            auto full = ir.binary("or", mantissa, "8388608");
+            // Every shift stays in 1..24, also in the lanes whose result another select discards.
+            auto amount = select(cmp("sgt", e, "0"), "1", select(cmp("slt", e, "-23"), "24", ir.binary("sub", "1", e)));
+            auto half = ir.binary("shl", "1", ir.binary("sub", amount, "1"));
+            auto rest = ir.binary("and", full, ir.binary("sub", ir.binary("shl", half, "1"), "1"));
+            auto q = ir.binary("lshr", full, amount);
+            auto up = ir.value("or i1 " + cmp("ugt", rest, half) + ", " +
+                               ir.value("and i1 " + cmp("eq", rest, half) + ", " +
+                                        cmp("ne", ir.binary("and", q, "1"), "0")));
+            auto subnormal = ir.binary("or", sign, ir.binary("add", q, ir.value("zext i1 " + up + " to i32")));
+            string result = select(cmp("sgt", e, "0"), normal, select(cmp("slt", e, "-23"), sign, subnormal));
+            result = select(cmp("sgt", e, "254"), ir.binary("or", sign, "2139095040"), result);
+            result = select(keep, bits, result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "2147483647"), "2139095040");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("slt", result, "0"));
+                result = select(low, "0", select(cmp("sgt", result, "1065353215"), "1065353216", result));
+            }
+            vector_write(i.dst, result);
+            return true;
+        }
         if (n == "v_cvt_pkrtz_f16_f32") {
             if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported packed half conversion modifier");
@@ -1398,7 +1451,8 @@ struct DirectCompute {
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
                     n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
-                    n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" || n == "s_xor_b32";
+                    n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
+                    n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32";
                 const bool preserves_pair = n == "s_mul_i32" || n == "s_mul_hi_i32" || n == "s_mul_hi_u32" ||
                     n == "s_bfm_b32" || n == "s_bfm_b64" || n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" ||
                     n == "s_pack_hh_b32_b16";
@@ -1427,8 +1481,29 @@ struct DirectCompute {
         }
         return scc_live[program.at.at(definition.next)];
     }
+    string saturated_add(const string &a, const string &b, bool sign) {
+        auto sum = ir.binary("add", a, b);
+        if (!sign)
+            return select(cmp("ult", sum, a), "4294967295", sum);
+        auto overflow = ir.binary("and", ir.binary("xor", a, sum), ir.binary("xor", b, sum));
+        return select(cmp("slt", overflow, "0"), select(cmp("slt", a, "0"), "2147483648", "2147483647"), sum);
+    }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
+        if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
+            // Integer dot products use both packed words as-is. Require the
+            // canonical VOP3P OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
+            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+                refuse(i.pc, "unsupported packed byte dot operand modifiers");
+            const bool sign = n == "v_dot4_i32_i8";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            // The dot alone fits into i32 even for four unsigned 255*255
+            // products. Saturate only the final addition to the accumulator.
+            auto dot = ir.invoke("i32", "dot4AddPacked.i32", sign ? 163 : 164,
+                                 {{"i32", i.clamp ? "0" : acc}, {"i32", a}, {"i32", b}}, "nounwind readnone");
+            vector_write(i.dst, i.clamp ? saturated_add(dot, acc, sign) : dot);
+            return;
+        }
         if (n == "v_mad_u32_u16" || n == "v_mad_i32_i16") {
             // AMD RDNA 2 ISA, VOP3A opcodes 883/885. Only the two
             // multiplicands are halfwords. The addend and result are dwords.
@@ -1443,14 +1518,7 @@ struct DirectCompute {
             };
             auto product = ir.binary("mul", half(0), half(1));
             auto addend = operand32(i, i.src[2]);
-            auto sum = ir.binary("add", product, addend);
-            if (i.clamp) {
-                if (sign) {
-                    auto overflow = ir.binary("and", ir.binary("xor", product, sum), ir.binary("xor", addend, sum));
-                    sum = select(cmp("slt", overflow, "0"),
-                                 select(cmp("slt", product, "0"), "2147483648", "2147483647"), sum);
-                } else sum = select(cmp("ult", sum, product), "4294967295", sum);
-            }
+            auto sum = i.clamp ? saturated_add(product, addend, sign) : ir.binary("add", product, addend);
             vector_write(i.dst, sum);
             return;
         }
@@ -1512,6 +1580,41 @@ struct DirectCompute {
             (n.find("class") == n.npos || n.find("_f16") != n.npos || n.find("_f32") != n.npos)) {
             auto condition = comparison(i);
             write_ballot(i.dst, condition);
+            return;
+        }
+        if (compute && (n == "v_dot2_i32_i16" || n == "v_dot2_u32_u16")) {
+            // These VOP3P dot forms consume both halfwords as-is.
+            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+                refuse(i.pc, "unsupported packed halfword dot operand modifiers");
+            const bool sign = n == "v_dot2_i32_i16";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            auto low_half = [&](const string &word) {
+                return sign ? ir.binary("ashr", ir.binary("shl", word, "16"), "16")
+                            : ir.binary("and", word, "65535");
+            };
+            auto low_product = ir.binary("mul", low_half(a), low_half(b));
+            auto high_half = sign ? "ashr" : "lshr";
+            auto high_product = ir.binary("mul", ir.binary(high_half, a, "16"), ir.binary(high_half, b, "16"));
+            auto pair = ir.binary("add", low_product, high_product);
+            auto sum = ir.binary("add", pair, acc);
+            if (i.clamp) {
+                // Accumulate both carries and the three sign extensions in
+                // the upper word. Clamp only after the accumulator is added.
+                auto carry = [&](const string &result, const string &left) {
+                    return ir.value("zext i1 " + cmp("ult", result, left) + " to i32");
+                };
+                auto upper = ir.binary("add", carry(pair, low_product), carry(sum, pair));
+                if (sign) {
+                    for (const auto &word : {low_product, high_product, acc})
+                        upper = ir.binary("add", upper, ir.binary("ashr", word, "31"));
+                    auto fits = cmp("eq", upper, ir.binary("ashr", sum, "31"));
+                    auto bound = select(cmp("slt", upper, "0"), "2147483648", "2147483647");
+                    sum = select(fits, sum, bound);
+                } else {
+                    sum = select(cmp("eq", upper, "0"), sum, "4294967295");
+                }
+            }
+            vector_write(i.dst, sum);
             return;
         }
         const bool select_mods = n == "v_cndmask_b32" && i.wide && !((i.abs | i.neg) & 4);
@@ -1706,6 +1809,39 @@ struct DirectCompute {
             }
             write(i.dst, lo);
             write(i.dst + 1, hi);
+            return;
+        }
+        if (compute && (n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64")) {
+            // gfx2hlsl.py scalar_wide_op (#3062): D = f(S0, S1 & 63); SCC = (D != 0). Read all sources before
+            // writing the destination pair so an overlapping destination cannot observe a half-written input.
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0], s1 = i.src[1];
+            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_int = s0 >= 128 && s0 <= 208;
+            const bool s1_ok = s1 <= 105 || (s1 >= 128 && s1 <= 208) || s1 == 255;
+            if (!(s0_pair || s0_int || s0 == 255) || !s1_ok)
+                refuse(i.pc, "invalid " + string(n) + " source");
+            const bool arithmetic = n == "s_ashr_i64";
+            auto lo = operand32(i, s0);
+            string hi = "0";
+            if (s0_pair)
+                hi = operand32(i, s0 + 1);
+            else if (s0 >= 193 && s0 <= 208)
+                hi = "4294967295";
+            else if (s0 == 255 && arithmetic && (i.literal & 0x80000000u))
+                hi = "4294967295";
+            auto amt = ir.value("zext i32 " + ir.binary("and", operand32(i, s1), "63") + " to i64");
+            auto wide = ir.value("or i64 " + ir.value("shl i64 " + ir.value("zext i32 " + hi + " to i64") + ", 32") +
+                                 ", " + ir.value("zext i32 " + lo + " to i64"));
+            auto shifted = ir.value(string(arithmetic ? "ashr" : n == "s_lshr_b64" ? "lshr" : "shl") +
+                                    " i64 " + wide + ", " + amt);
+            auto out_lo = ir.value("trunc i64 " + shifted + " to i32");
+            auto out_hi = ir.value("trunc i64 " + ir.value("lshr i64 " + shifted + ", 32") + " to i32");
+            ir.features |= 1048576;
+            write(i.dst, out_lo);
+            write(i.dst + 1, out_hi);
+            write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", out_lo, out_hi), "0") + " to i32"));
             return;
         }
         auto a = val(0);
