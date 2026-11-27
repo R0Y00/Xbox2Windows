@@ -59,6 +59,7 @@ struct Inst {
     bool clamp = false, wide = false, subword = false;
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
+    unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -282,13 +283,17 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.enc = Encoding::Vop1;
             i.op -= 0x180;
         }
+        if (direct && !graphics && i.enc == Encoding::Vop3 && (i.op == 0x377 || i.op == 0x378)) {
+            // The shared extent decoder already counts the trailing literal word.
+            // S1 and S2 may both reference that word.
+            if (i.src[0] == 255)
+                refuse(pc, "permlane S0 cannot be a literal");
+        }
         lit = std::find(i.src.begin(), i.src.end(), 255) != i.src.end();
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
         const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
-        if (direct && half_alu && i.src[0] == 250)
-            refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && (i.op == 0x88 || (direct && i.op == 0x8f));
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -388,10 +393,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             auto control=take();
             // DPP_CTRL[8] selects patterns outside a quad; bit 17 is
             // reserved. FI and BOUND_CTRL are independent of the pattern.
-            if ((control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
+            if (!half_alu && (control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
             if (control & (1u << 17)) refuse(pc,"reserved DPP16 control bit");
             const auto pattern = (control >> 8) & 0x1ff;
             i.dpp_control = pattern;
+            i.dpp_row_mask = control >> 28;
+            i.dpp_bank_mask = (control >> 24) & 15;
             if (pattern > 255 && !i.mirror_mask() && i.dpp_row().op == Inst::DppRowOp::None)
                 refuse(pc,"unsupported DPP lane selection");
             i.dpp_fetch_inactive = (control & (1u << 18)) != 0;

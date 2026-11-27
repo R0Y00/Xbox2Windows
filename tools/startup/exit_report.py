@@ -133,9 +133,8 @@ class ExitSummary:
             self.last_exception = exception
 
 
-def _read_logs(root: Path) -> tuple[list[str], list[str]]:
-    lines: list[str] = []
-    names: list[str] = []
+def _read_logs(root: Path) -> dict[str, list[str]]:
+    logs: dict[str, list[str]] = {}
     for name in LOG_NAMES:
         path = root / name
         if not path.is_file():
@@ -144,33 +143,23 @@ def _read_logs(root: Path) -> tuple[list[str], list[str]]:
             data = path.read_bytes()[:MAX_BYTES]
         except OSError:
             continue
-        names.append(name)
-        lines.extend(data.decode("utf-8", errors="replace").splitlines())
-    return names, lines
+        logs[name] = data.decode("utf-8", errors="replace").splitlines()
+    return logs
 
 
 def summarize(root: Path) -> ExitSummary:
-    names, lines = _read_logs(root)
+    logs = _read_logs(root)
     summary = ExitSummary()
-    # finished.txt is authoritative for the final state; parse it before the other logs so an
-    # earlier duplicate event cannot overwrite a later exit code.
-    for name in ("finished.txt", "run.out"):
-        path = root / name
-        if path.is_file():
-            try:
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    summary.observe(line)
-            except OSError:
-                pass
-    for name in names:
+    # finished.txt is authoritative for the final state, so parse it after the other logs and
+    # let its exit code and end time overwrite an earlier duplicate event.
+    for name in LOG_NAMES:
         if name in ("finished.txt", "run.out"):
             continue
-        path = root / name
-        try:
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                summary.observe(line)
-        except OSError:
-            pass
+        for line in logs.get(name, ()):
+            summary.observe(line)
+    for name in ("finished.txt", "run.out"):
+        for line in logs.get(name, ()):
+            summary.observe(line)
     return summary
 
 

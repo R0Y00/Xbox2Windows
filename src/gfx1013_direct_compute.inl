@@ -885,7 +885,52 @@ struct DirectCompute {
         ir.features |= 0x40000000;
         return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
     }
+    static bool is_image_atomic(const Inst &i) {
+        return i.enc == Encoding::Image && (i.op == 16 || i.op == 17 || i.op == 23);
+    }
+    void image_atomic(const Inst &i, const State &s) {
+        const bool compare_exchange = i.op == 16;
+        const bool return_old = (i.a & 0x2000u) != 0; // GLC returns the pre-operation value.
+        const unsigned coord = i.b & 255, base = ((i.b >> 16) & 31) * 4;
+        const unsigned mask = (i.a >> 8) & 15, dim = (i.a >> 3) & 7;
+        if (graphics_input || dim != 1 || (i.a & 0x3c0c6u) || (i.b & 0xffe00000u) ||
+            mask != (compare_exchange ? 3u : 1u) || coord == 255 || (compare_exchange && i.dst == 255) ||
+            s.at(base).type != Symbol::Type::descriptor)
+            refuse(i.pc, "unsupported typed 2D image atomic operands");
+        constexpr auto kind = ComputeViewKind::uint_texture_uav;
+        analysis.binding(i, s, base, 8, kind, 0, dim);
+        const auto &bindings = analysis.result.bindings;
+        const auto &descriptor = s.at(base);
+        const auto it = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
+            return b.kind == kind && b.root_parameter == descriptor.value && b.byte_offset == descriptor.offset;
+        });
+        if (it == bindings.end())
+            throw std::logic_error("missing image atomic binding");
+        const auto handle = ir.handle({1, it->shader_register, 2, 5, 1, 0}); // RWTexture2D<uint>
+        const auto label = to_string(label_number++);
+        const auto enabled = active();
+        ir.body << "  br i1 " << enabled << ", label %imageAtomic" << label << ", label %imageAtomicEnd" << label
+                << "\nimageAtomic" << label << ":\n";
+        std::vector<std::pair<string, string>> args{{"%dx.types.Handle", handle}};
+        if (!compare_exchange)
+            args.emplace_back("i32", i.op == 17 ? "0" : "7"); // AtomicBinOp IADD or UMAX.
+        args.emplace_back("i32", read(256 + coord));
+        args.emplace_back("i32", read(257 + coord));
+        args.emplace_back("i32", "undef");
+        if (compare_exchange)
+            args.emplace_back("i32", read(257 + i.dst));
+        args.emplace_back("i32", read(256 + i.dst));
+        const auto previous = ir.invoke("i32", compare_exchange ? "atomicCompareExchange.i32" : "atomicBinOp.i32",
+                                        compare_exchange ? 79 : 78, args, "nounwind");
+        if (return_old)
+            write(256 + i.dst, previous);
+        ir.body << "  br label %imageAtomicEnd" << label << "\nimageAtomicEnd" << label << ":\n";
+    }
     void image_io(const Inst &i, const State &s, std::optional<PixelHeapIndex> selected = {}) {
+        if (is_image_atomic(i)) {
+            image_atomic(i, s);
+            return;
+        }
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
         // With a different texture in neighboring lanes, compute the quad's
         // derivatives on the original coordinates, independently of the
@@ -1687,8 +1732,6 @@ struct DirectCompute {
             // existing refusal; this lowering is the direct compute path.
             if (graphics_input)
                 return false;
-            if (i.dpp_control || permuted)
-                refuse(i.pc, "unsupported " + string(n) + " DPP form");
             if (i.clamp || i.scale)
                 refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
             // op_sel bits 11..14 select a high half. Bit 15 is clamp, already refused.
@@ -1699,7 +1742,9 @@ struct DirectCompute {
             auto half_bits = [&](unsigned j) {
                 const unsigned r = i.src[j];
                 string bits;
-                if (i.subword) {
+                if (!j && permuted) {
+                    bits = ir.binary("and", *permuted, "65535");
+                } else if (i.subword) {
                     // A DWORD selection reads the low half for binary16 arithmetic.
                     const unsigned sel = i.src_select[j];
                     bits = subword(operand32(i, r), sel == 6 ? 4 : sel, false);
@@ -1740,6 +1785,58 @@ struct DirectCompute {
             vector_write(i.dst, i.subword ? place_subword(i, rounded)
                                           : ir.binary("or", ir.binary("and", read(i.dst), "4294901760"),
                                                       ir.binary("and", rounded, "65535")));
+            return true;
+        }
+        if (n == "v_fma_f16" || n == "v_fmac_f16" || n == "v_fmamk_f16" || n == "v_fmaak_f16") {
+            if (graphics_input)
+                return false;
+            if (i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " DPP form");
+            if (i.subword)
+                refuse(i.pc, "unsupported " + string(n) + " SDWA form");
+            if (i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " omod");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            if (n == "v_fmac_f16" && i.wide && (((i.abs | i.neg) & 4) || i.src[2]))
+                refuse(i.pc, "unsupported v_fmac_f16 third-source modifier");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto half_bits = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                string bits;
+                if (r >= 240 && r <= 248) {
+                    constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
+                                                0xc000, 0x4400, 0xc400, 0x3118};
+                    bits = to_string(halves[r - 240]);
+                } else if (r == 255)
+                    bits = to_string(i.literal & 65535u);
+                else if (r >= 128 && r <= 192)
+                    bits = to_string((r - 128) & 65535u);
+                else if (r >= 193 && r <= 208)
+                    bits = to_string((192u - r) & 65535u);
+                else
+                    bits = ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j))
+                    bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j))
+                    bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto a = half_bits(0);
+            auto b = n == "v_fmamk_f16" ? to_string(i.literal & 65535u) : half_bits(1);
+            auto c = n == "v_fma_f16"   ? half_bits(2)
+                   : n == "v_fmac_f16"  ? ir.binary("and", read(i.dst), "65535")
+                   : n == "v_fmamk_f16" ? half_bits(1)
+                                        : to_string(i.literal & 65535u);
+            auto result = fused_half_rne(a, b, c);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
             return true;
         }
         const auto rule = alu_rules.find(n);
@@ -3510,6 +3607,51 @@ struct DirectCompute {
         } else
             vector_write(i.dst, place_subword(i, z));
     }
+    void lower_permlane(const Inst &i, unsigned threads) {
+        const bool cross_row = i.name == "v_permlanex16_b32";
+        if (threads % (cross_row ? 32 : 16))
+            refuse(i.pc, string(i.name) + " needs a thread count divisible by " + (cross_row ? "32" : "16"));
+
+        // VOP3A retains op_sel in word 0 bits 11..14: bit 0 is FI and bit 1 is BOUND_CTRL.
+        const unsigned op_sel = (i.a >> 11) & 15;
+        if ((op_sel & ~3u) || i.neg || i.abs || i.clamp || i.scale)
+            refuse(i.pc, "unsupported permlane modifier or op_sel");
+        const bool fi = op_sel & 1;
+        const bool bound_zero = op_sel & 2;
+
+        // D and S0 are VGPRs. S1 and S2 are uniform SGPRs or constants.
+        if (i.src[0] < 256)
+            refuse(i.pc, "permlane S0 must be a VGPR");
+        for (unsigned reg : {i.src[1], i.src[2]})
+            if (reg > 105 && (wave64 || reg != 107) && !constant32(i, reg))
+                refuse(i.pc, "permlane selectors must be uniform SGPRs or constants");
+
+        // S1 packs the nibbles for row lanes 0..7 and S2 packs those for 8..15.
+        auto row_lane = ir.binary("and", lane, "15");
+        auto selectors = select(cmp("uge", row_lane, "8"), operand32(i, i.src[2]), operand32(i, i.src[1]));
+        auto shift = ir.binary("shl", ir.binary("and", row_lane, "7"), "2");
+        auto pick = ir.binary("and", ir.binary("lshr", selectors, shift), "15");
+
+        // Permlane16 uses the current row; permlanex16 toggles row bit 4.
+        // Both rows of the pair are in the same physical wave32, even for guest wave64.
+        auto row_base = ir.binary("and", lane, "4294967280");
+        if (cross_row)
+            row_base = ir.binary("xor", row_base, "16");
+        auto source_lane = ir.binary("or", row_base, pick);
+        auto src = operand32(i, i.src[0]);
+        auto value = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32",src},{"i32",source_lane}}, "nounwind");
+
+        // Assume DPP's inactive-source rule: FI bypasses the guest EXEC test.
+        // Otherwise an inactive source yields zero with BOUND_CTRL or preserves D.
+        if (!fi) {
+            auto exec = wave64 ? select(upper_half, read(127), read(126)) : read(126);
+            auto source_bit = ir.binary("shl", "1", source_lane);
+            auto source_usable = cmp("ne", ir.binary("and", exec, source_bit), "0");
+            value = select(source_usable, value, bound_zero ? "0" : read(i.dst));
+        }
+        // Guest EXEC still predicates the destination write.
+        vector_write(i.dst, value);
+    }
     void lower_dpp(const Inst &i, const State &state, unsigned threads) {
         // All lane selections stay in one physical wave32 for split guest wave64.
         // Shader control flow stays wave-uniform. Guest EXEC predicates VGPR
@@ -3523,7 +3665,7 @@ struct DirectCompute {
                               : mask ? "DPP mirror needs complete source lane groups"
                               : "DPP quad_perm needs a thread count divisible by four");
         const auto rule = alu_rules.find(i.name);
-        if (rule == alu_rules.end() || rule->second.arity > 2)
+        if (!binary16_alu(i.name) && (rule == alu_rules.end() || rule->second.arity > 2))
             refuse(i.pc, "unsupported DPP arithmetic");
         if (i.enc == Encoding::Vop1 && ((i.neg | i.abs) & 2))
             refuse(i.pc, "unexpected second DPP source modifier");
@@ -3549,20 +3691,34 @@ struct DirectCompute {
         }
         auto src = operand32(i, i.src[0]);
         auto word = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32",src},{"i32",source_lane}}, "nounwind");
-        string previous;
         if (!i.dpp_fetch_inactive) {
             auto exec = wave64 ? select(upper_half, read(127), read(126)) : read(126);
             auto source_enabled = cmp("ne", ir.binary("and", exec, ir.binary("shl", "1", source_lane)), "0");
             source_usable = source_usable.empty() ? source_enabled
                           : ir.value("and i1 " + source_usable + ", " + source_enabled);
         }
+        string write_enabled;
         if (!source_usable.empty()) {
             if (i.dpp_bound_zero) word = select(source_usable, word, "0");
-            else previous = read(i.dst);
+            else write_enabled = source_usable;
         }
+        // Row and bank masks gate destination writes independently of the source and BOUND_CTRL.
+        auto apply_mask = [&](unsigned mask, const string &index) {
+            auto enabled = cmp("ne", ir.binary("and", to_string(mask), ir.binary("shl", "1", index)), "0");
+            write_enabled = write_enabled.empty() ? enabled : ir.value("and i1 " + write_enabled + ", " + enabled);
+        };
+        if (i.dpp_row_mask != 15) {
+            auto row_index = ir.binary("lshr", lane, "4");
+            if (wave64) row_index = ir.binary("or", row_index, select(upper_half, "2", "0"));
+            apply_mask(i.dpp_row_mask, row_index);
+        }
+        if (i.dpp_bank_mask != 15)
+            apply_mask(i.dpp_bank_mask, ir.binary("and", ir.binary("lshr", lane, "2"), "3"));
+        string previous;
+        if (!write_enabled.empty()) previous = read(i.dst);
         arithmetic(i, state, &word);
         if (!previous.empty())
-            write(i.dst, select(source_usable, read(i.dst), previous));
+            write(i.dst, select(write_enabled, read(i.dst), previous));
     }
     // Returns true when the instruction is a MODE write this path has accepted
     // (including a no-op that leaves the implemented contract in place).
@@ -3679,7 +3835,11 @@ struct DirectCompute {
             op.name == "v_cvt_f16_u16" ||
             op.name == "v_cvt_f16_i16" ||
             op.name == "v_cvt_u16_f16" ||
-            op.name == "v_cvt_i16_f16")
+            op.name == "v_cvt_i16_f16" ||
+            op.name == "v_fma_f16" ||
+            op.name == "v_fmac_f16" ||
+            op.name == "v_fmamk_f16" ||
+            op.name == "v_fmaak_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
@@ -3692,7 +3852,7 @@ struct DirectCompute {
         half_mode_known = !(half_binary && mode_write && conditional);
         const bool writes_uavs = std::any_of(p.code.begin(), p.code.end(), [](const Inst &i) {
             return i.name.substr(0, 12) == "buffer_store" || i.name.substr(0, 13) == "buffer_atomic" ||
-                   (i.enc == Encoding::Image && i.op == 8);
+                   (i.enc == Encoding::Image && i.op == 8) || is_image_atomic(i);
         });
         std::set<unsigned> labels{entry};
         for (auto &i : p.code)
@@ -3740,6 +3900,8 @@ struct DirectCompute {
                 if (virtual_waves) yield_virtual_wave("4294967295");
                 else ir.body << "  ret void\n";
             }
+            else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
+                lower_permlane(i, x*y*z);
             // Hardware scheduling and register-dependency waits have no SGPR
             // operands. SSA dependencies carry these constraints into DXIL.
             else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||

@@ -1248,6 +1248,75 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
+// Called under draw_lock. The fallback uses only the bound attachments and
+// never binds a descriptor heap or reads a guest buffer.
+bool draw_missing_translation(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Pass& pass,
+                              UINT count, UINT instances, UINT start, UINT start_instance)
+{
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"X2W_DRAW_MISSING_SHADER", value, 2) == 1 && value[0] == L'1';
+    }();
+    if (!enabled || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST || !pass.targets_single_sample ||
+        !pass.viewport_set || !pass.scissor_set) return false;
+
+    struct Pipeline {
+        x2w_startup::ComPtr<ID3D12RootSignature> root;
+        x2w_startup::ComPtr<ID3D12PipelineState> state;
+    };
+    static std::unordered_map<u64, Pipeline> pipelines;
+    u64 key = fnv_bytes(&device, sizeof(device));
+    key = fnv_bytes(&pass.graphics_root, sizeof(pass.graphics_root), key);
+    key = fnv_bytes(&pass.dsv_format, sizeof(pass.dsv_format), key);
+    key = fnv_bytes(pass.target_formats, pass.target_count * sizeof(DXGI_FORMAT), key);
+    auto [entry, inserted] = pipelines.try_emplace(key);
+    auto& pipeline = entry->second;
+    if (inserted) {
+        pipeline.root = pass.graphics_root;
+        HRESULT hr = S_OK;
+        if (!pipeline.root) {
+            const D3D12_ROOT_SIGNATURE_DESC empty{};
+            x2w_startup::ComPtr<ID3DBlob> signature;
+            hr = D3D12SerializeRootSignature(&empty, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr);
+            if (SUCCEEDED(hr))
+                hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                                 IID_PPV_ARGS(&pipeline.root));
+        }
+        constexpr char source[] =
+            "float4 vertex() : SV_Position { return float4(2, 0, 0, 1); }\n"
+            "void pixel() { clip(-1); }\n";
+        x2w_startup::ComPtr<ID3DBlob> vs, ps;
+        if (SUCCEEDED(hr))
+            hr = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "vertex", "vs_5_0", 0, 0, &vs, nullptr);
+        if (SUCCEEDED(hr))
+            hr = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "pixel", "ps_5_0", 0, 0, &ps, nullptr);
+        if (SUCCEEDED(hr)) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = pipeline.root.Get();
+            desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+            desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+            desc.SampleMask = ~0u;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.DepthClipEnable = TRUE;
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = pass.target_count;
+            std::copy_n(pass.target_formats, pass.target_count, desc.RTVFormats);
+            desc.DSVFormat = pass.dsv_format;
+            desc.SampleDesc.Count = 1;
+            hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline.state));
+        }
+        if (FAILED(hr))
+            log("x2w-draw missing shader fallback setup failed 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    if (!pipeline.state) return false;
+    list->SetPipelineState(pipeline.state.Get());
+    list->SetGraphicsRootSignature(pipeline.root.Get());
+    list->DrawInstanced(count, instances, start, start_instance);
+    return true;
+}
+
 bool effective_blend_state(const BoundPipeline& bound, const Translation& tr, UINT target_count, D3D12_BLEND_DESC& blend)
 {
     blend = x2w_startup::default_pso_blend();
@@ -2762,7 +2831,7 @@ bool fixed_vertex_view(Wrapper* self, const Pass& pass, const Translation& tr, b
 }
 
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance,
-                     TranslatedIndirectDraw* indirect)
+                     TranslatedIndirectDraw* indirect, bool* used_fallback = nullptr)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
@@ -2773,6 +2842,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    if (used_fallback && tr && tr->manifest_retry.pending() &&
+        draw_missing_translation(device_of(self->own().list_device), list, pass, count, instances, start, start_instance)) {
+        *used_fallback = true;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return true;
+    }
     if (indirect && tr) indirect->shader_key = tr->key;
     if (!tr || tr->state != 1) {
         if (indirect) indirect->refusal_code = indirect_refusal_code::translation_not_ready;
@@ -3399,6 +3474,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     return draw_translated(self, indexed, count, instances, start, base_vertex, start_instance, nullptr);
+}
+
+LONG missing_shader_fallback_draws;
+
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance)
+{
+    bool used_fallback = false;
+    const bool drawn = draw_translated(self, false, count, instances, start, 0, start_instance, nullptr, &used_fallback);
+    if (used_fallback) {
+        const LONG n = InterlockedIncrement(&missing_shader_fallback_draws);
+        if (n == 1) log("x2w-draw recorded first missing shader fallback");
+    } else {
+        InterlockedIncrement(drawn ? &translated_draws : &untranslated_draws);
+    }
 }
 
 const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* signature, ID3D12Resource* argument, u64 offset,

@@ -58,15 +58,19 @@ python -B tools/startup/ui_regression_matrix.py `
 
 The tool first asks CTest for the matching names with --show-only=json-v1, applies the adapter
 filter to that list, and then runs exactly those names with -R. It reads CTest's JUnit report, so
-a CTest testcase with no failure or skip marker is the only thing counted as a pass. A testcase
-marked notrun or carrying a skipped element is a skip; a failure or error is a fail. The Markdown
+a CTest testcase with no failure or skip marker is the only thing counted as a pass. A notrun
+testcase is a skip only when its skipped message starts with SKIP_RETURN_CODE or
+SKIP_REGULAR_EXPRESSION; a missing executable, missing configuration or disabled test is a fail.
+A testcase carrying a skipped element after a runnable status is a skip; a failure or error is a
+fail. The Markdown
 table keeps the three states visible and the JSON object has the same rows plus the summary counts
 and the CTest command.
 
-Exit status is 0 when every selected row passed, 1 when at least one row failed, 3 when there were
-no failures but at least one skip, and 2 for a malformed or empty selection, a missing CTest
-executable or a build that produced no usable JUnit report. A skip therefore never turns a matrix
-green. A selected build with no matching tests is rejected before any output is written.
+Exit status is 0 when every selected row passed, 1 when at least one row failed or CTest returned
+nonzero without a failed row, 3 when there were no failures but at least one skip, and 2 for a
+malformed or empty selection, a missing CTest executable or a build that produced no usable JUnit
+report. A skip therefore never turns a matrix green. A selected build with no matching tests is
+rejected before any output is written.
 
 ## What remains a limit
 
@@ -81,9 +85,10 @@ green. A selected build with no matching tests is rejected before any output is 
   selected that device: the rectangle fixture, for example, can report the Microsoft Basic Render
   Driver for a hardware invocation. Record the observed adapter, driver, Windows build and
   debug-layer status separately when a row is used as hardware evidence.
-- A skip is a capability or environment result, not a pass. The JUnit report does not preserve the
-  process exit code for every CTest version, so the matrix does not label a generic skip as 77;
-  the CTest SKIP_RETURN_CODE property is what makes a 77 a skip.
+- A skip is a capability or environment result, not a pass. CTest's notrun status also covers a
+  missing executable, a missing multi-config configuration and a disabled test; those rows are
+  failures unless the skipped message explicitly carries SKIP_RETURN_CODE or
+  SKIP_REGULAR_EXPRESSION. A nonzero CTest exit with no failed row is also a failure.
 - The matrix does not run the full startup, does not load game files and does not establish a
   playable port or a frame rate.
 

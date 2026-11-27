@@ -29,6 +29,10 @@ The Markdown table reports:
 The JSON form contains the same allowlisted fields. It never contains an input path, a module name, a raw
 address, an exception parameter or free-form log text.
 
+Each log is read once, capped at 16 MiB, and only the capped text is parsed. `finished.txt` is parsed after
+the other logs because it is authoritative for the final exit code and end time; a duplicate exit event in
+`events.txt` cannot overwrite it. The highest present sample wins regardless of file order.
+
 ## What it proves
 
 It distinguishes a process that returned 0 from one that returned 1, an exception stop, a timeout and a
@@ -46,5 +50,6 @@ python -B tests/startup_exit_report_check.py
 ```
 
 The synthetic check covers a clean exit, a nonzero exit, an exception stop, a timeout, a stop-file request, a
-missing exit event, filtered first-chance events, hostile paths and addresses, the highest present sample and
-the JSON form. It is listed in `tests/checks/python-linux/startup_exit_report.txt` for the Linux CI job.
+missing exit event, filtered first-chance events, hostile paths and addresses, the highest present sample,
+the 16 MiB cap, the `finished.txt` authority, a second-chance filtered code, and the JSON form. It is listed
+in `tests/checks/python-linux/startup_exit_report.txt` for the Linux CI job.

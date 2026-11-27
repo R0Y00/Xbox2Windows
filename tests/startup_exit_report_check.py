@@ -113,6 +113,39 @@ def main() -> int:
         assert needle not in hostile, f"hostile input leaked {needle!r}\n{hostile}"
     assert hostile_summary.exception_events == 1
 
+    # The 16 MiB cap applies to the lines that are parsed, not to a discarded first read.
+    bounded, bounded_summary = report({
+        "events.txt": "  12.500 exit 0x00000000\n",
+        "stdout.txt": "x" * (exit_report.MAX_BYTES + 10) +
+                      "x2w-d3d12 heartbeat: 99 frames presented in 12.0 s (8.25 fps overall)\n",
+    })
+    assert "| Last present | not reported |" in bounded, bounded
+    assert bounded_summary.last_present_frames is None, bounded_summary
+
+    # finished.txt is authoritative even when events.txt contains an earlier exit line.
+    authority, authority_summary = report({
+        "finished.txt": "process exited with 0x00000005 after 10.00 s\n",
+        "events.txt": "3.000 exit 0x00000000\n",
+    })
+    expect(authority, authority_summary, [
+        "| Exit code | `0x00000005` (5) |",
+        "| Classification | nonzero exit |",
+        "| End time | `10.0` s |",
+    ], "finished authority")
+
+    # The highest present sample wins regardless of file order.
+    ordered, ordered_summary = report({
+        "stderr.txt": "x2w-d3d12 heartbeat: 50 frames presented in 5.0 s (10.0 fps overall)\n",
+        "stdout.txt": "x2w-d3d12 heartbeat: 20 frames presented in 2.0 s (10.0 fps overall)\n",
+    })
+    expect(ordered, ordered_summary, ["| Last present | `50` frames at `5` s (`10` fps overall) |"], "highest heartbeat")
+
+    second_chance, second_chance_summary = report({
+        "events.txt": "  1.000 exception 0x80000003 breakpoint at ntdll.dll+0x1 second-chance params=[]\n",
+    })
+    assert second_chance_summary.exception_events == 1, second_chance
+    assert "0x80000003" in second_chance, second_chance
+
     payload = exit_report.as_json(clean_summary)
     assert payload["classification"] == "clean exit" and payload["last_present_frames"] == 7395
     assert json.loads(json.dumps(payload)) == payload

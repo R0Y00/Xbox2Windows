@@ -42,7 +42,8 @@ enum class ComputeViewKind {
     // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
     // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
     // fallback and never read.
-    heap_sampler
+    heap_sampler,
+    uint_texture_uav
 };
 inline bool accepts_cbv_window(ComputeViewKind kind) {
     return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
@@ -62,7 +63,8 @@ struct IndexedAtomicView {
 };
 inline bool compute_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::texture_uav || kind == ComputeViewKind::half_scalar_uav ||
-           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav || compute_buffer_uav(kind);
+           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav ||
+           kind == ComputeViewKind::uint_texture_uav || compute_buffer_uav(kind);
 }
 struct ComputeViewBinding {
     ComputeViewKind kind;

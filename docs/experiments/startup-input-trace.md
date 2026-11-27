@@ -32,7 +32,7 @@ Every line starts with `x2w-input-trace`. A state line is written when the resol
 changes and, while it is unchanged, at most once every 250 ms:
 
 ```text
-x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
+x2w-input-trace state buttons=0x00000000 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
 ```
 
 `buttons` is the GameInput button mask in hexadecimal. `lt`, `rt`, `lx`, `ly`, `rx` and `ry` use
@@ -86,13 +86,14 @@ with it off. The child sets `X2W_INPUT_CLOCK_MS` before every poll and publishes
 1.0 s. The script is:
 
 ```text
-mark=start@0,wait=0.5/2,4@+0.5+0.5,lx=1@+0.5+1,mark=turn@+0,ly=0.5@+0+0.5
+mark=start@0,wait=0.5/2,4@+0.5+0.5,lx=1@+0.5+1,mark=turn@+0,ly=0.5@+0+0.5,8@+1.1+0.1
 ```
 
 The wait completes at 1.5 s, so A is down at 2.0-2.5 s and the left stick is right with Y at 0.5 at
-2.5-3.0 s. The trace child must contain the exact state lines at 2.000 s and 2.500 s, the begun,
-changed and done wait lines, both marks, no timeout, and between 12 and 20 state lines over the four
-second run. The control must observe the same gamepad states, keep the ordinary `x2w-input script`
+2.5-3.0 s. A 0.1 s B press runs at 3.6-3.7 s, off the 250 ms heartbeat grid. The trace child must
+contain the exact state lines at 2.000 s, 2.500 s and 3.600 s, the begun, changed and done wait
+lines, both marks, no timeout, and between 12 and 21 state lines over the four second run. The
+control must observe the same gamepad states, keep the ordinary `x2w-input script`
 mark line, and contain no `x2w-input-trace` line. The expected states and trace lines are built from
 source; the fixture uses no game files, dump or captured input.
 
