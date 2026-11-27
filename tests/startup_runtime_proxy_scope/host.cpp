@@ -1,14 +1,16 @@
-// Windows-only: EXE + late-loaded package helper through the real loader.
+// Windows-only: EXE + package helpers through the real loader.
 //
-// Loads a carrier DLL that hosts runtime_proxy (X2W_RUNTIME_PROXY=1), a fake xgameruntime.dll, an
-// unrelated decoy that also exports QueryApiImpl, then a helper beside the EXE. The helper's
-// GetProcAddress IAT is rewritten after linking (outside LdrDllNotification). Looking up
-// QueryApiImpl on xgameruntime must return the proxy; the same name on the decoy must still be the
-// decoy's export. A QueryApiImpl pointer cached before the proxy attaches stays the real export
-// (pre-attach gap). A delay-imported QueryApiImpl that has already bound is rewritten to the proxy;
-// an unbound delay thunk must not be. RegQueryValueExW is hooked on advapi32.dll only: the decoy's
-// same-named export stays its own, with X2W_DEVICE_TYPE unset and set, and never becomes the registry
-// the hook calls. No game files.
+// Loads a fake xgameruntime.dll, an unrelated decoy that also exports QueryApiImpl, and two helpers
+// beside the EXE, then a carrier DLL that hosts runtime_proxy (X2W_RUNTIME_PROXY=1). One helper calls
+// its delay-imported QueryApiImpl before the carrier attaches, so the bind goes through the unhooked
+// GetProcAddress and the slot holds the real export. After attach that slot must become the proxy:
+// the hooked lookup is not what writes it. The other helper is never called. After the scan its delay
+// slot must still point inside its own image. The helpers' GetProcAddress IATs are rewritten after
+// linking (outside LdrDllNotification). Looking up QueryApiImpl on xgameruntime must return the proxy;
+// the same name on the decoy must still be the decoy's export. A QueryApiImpl pointer cached before
+// the proxy attaches stays the real export (pre-attach gap). RegQueryValueExW is hooked on
+// advapi32.dll only: the decoy's same-named export stays its own, with X2W_DEVICE_TYPE unset and set,
+// and never becomes the registry the hook calls. No game files.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -88,6 +90,18 @@ bool wait_for_slot(ULONGLONG* slot, ULONGLONG expect, int ms)
         Sleep(10);
     }
 }
+
+bool slot_in_module(HMODULE module, ULONGLONG value)
+{
+    if (!module) return false;
+    auto* base = reinterpret_cast<const unsigned char*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+    return x2w_runtime_patch::address_in_image(value, reinterpret_cast<ULONGLONG>(module), nt->OptionalHeader.SizeOfImage);
+}
 }
 
 int main()
@@ -116,6 +130,25 @@ int main()
     // export after attach (IAT/GPA hooks do not rewrite already-held function pointers).
     const FARPROC cached_before_proxy = xgr_query;
 
+    // Bind the delay slot before the proxy exists, through the helper's own GetProcAddress.
+    const HMODULE helper = load_beside(dir, L"startup_runtime_proxy_helper.dll");
+    check("load package helper before the proxy", helper != nullptr);
+    const auto call_delay = helper ? reinterpret_cast<QueryFn>(GetProcAddress(helper, "call_delay_query")) : nullptr;
+    check("helper exports call_delay_query", call_delay != nullptr);
+    if (call_delay) call_delay(nullptr, nullptr, nullptr);
+    ULONGLONG* delay_slot = delay_query_slot(helper);
+    check("helper has delay QueryApiImpl slot", delay_slot != nullptr);
+    check("delay slot holds the real export before attach",
+          delay_slot && xgr_query && *delay_slot == reinterpret_cast<ULONGLONG>(xgr_query));
+
+    // Never call this one. The scan must leave the delay thunk inside the helper image.
+    const HMODULE unbound = load_beside(dir, L"startup_runtime_proxy_helper_unbound.dll");
+    check("load unbound helper", unbound != nullptr);
+    ULONGLONG* unbound_slot = delay_query_slot(unbound);
+    check("unbound helper has delay QueryApiImpl slot", unbound_slot != nullptr);
+    check("unbound delay thunk starts inside its image", unbound_slot && slot_in_module(unbound, *unbound_slot));
+    if (failures) return 1;
+
     const HMODULE carrier = load_beside(dir, L"startup_runtime_proxy_carrier.dll");
     check("load proxy carrier", carrier != nullptr);
     if (!carrier) return 1;
@@ -135,37 +168,21 @@ int main()
     const FARPROC host_decoy = decoy ? GetProcAddress(decoy, "QueryApiImpl") : nullptr;
     check("host GetProcAddress(decoy) stays original", host_decoy == decoy_query);
 
-    const HMODULE helper = load_beside(dir, L"startup_runtime_proxy_helper.dll");
-    check("late-load package helper", helper != nullptr);
     const auto resolve = helper ? reinterpret_cast<ResolveFn>(GetProcAddress(helper, "resolve_query")) : nullptr;
     check("helper exports resolve_query", resolve != nullptr);
-    const auto call_delay = helper ? reinterpret_cast<QueryFn>(GetProcAddress(helper, "call_delay_query")) : nullptr;
-    check("helper exports call_delay_query", call_delay != nullptr);
 
     check("helper sees proxied xgameruntime QueryApiImpl",
           resolve && wait_for_helper_hook(resolve, xgr, host_xgr, 2000));
     const FARPROC helper_decoy = resolve ? resolve(decoy) : nullptr;
     check("helper GetProcAddress(decoy) stays original", helper_decoy == decoy_query);
 
-    ULONGLONG* delay_slot = delay_query_slot(helper);
-    check("helper has delay QueryApiImpl slot", delay_slot != nullptr);
-    if (delay_slot) {
-        const ULONGLONG before_bind = *delay_slot;
-        check("delay slot unbound before first use",
-              !x2w_runtime_patch::delay_query_slot_is_bound(before_bind, reinterpret_cast<ULONGLONG>(xgr_query),
-                                                            reinterpret_cast<ULONGLONG>(host_xgr)));
-        // Negative: give the quiet rebind pass time; an unbound thunk must stay untouched.
-        Sleep(300);
-        check("unbound delay slot not rewritten", *delay_slot == before_bind);
-        if (call_delay) call_delay(nullptr, nullptr, nullptr);
-        // The quiet rebind pass may already have swapped the slot for the proxy.
-        const ULONGLONG after_bind = *delay_slot;
-        check("delay bind wrote real export or proxy",
-              after_bind == reinterpret_cast<ULONGLONG>(xgr_query) ||
-                  after_bind == reinterpret_cast<ULONGLONG>(host_xgr));
-        check("bound delay slot rewritten to proxy",
-              wait_for_slot(delay_slot, reinterpret_cast<ULONGLONG>(host_xgr), 2000));
-    }
+    // The slot already held the real export. Only the delay-slot rewrite turns it into the proxy.
+    check("bound delay slot rewritten to proxy",
+          delay_slot && host_xgr && wait_for_slot(delay_slot, reinterpret_cast<ULONGLONG>(host_xgr), 2000));
+    // The bound slot and the unbound slot can be visited in either order. One more quiet pass
+    // covers a helper the successful rewrite's pass had not reached yet.
+    Sleep(400);
+    check("unbound delay thunk stays inside its image", unbound_slot && slot_in_module(unbound, *unbound_slot));
 
     // Intended call: invoke the proxied entry; the fake xgameruntime must run.
     const auto xgr_seen = xgr ? reinterpret_cast<SeenFn>(GetProcAddress(xgr, "query_calls")) : nullptr;

@@ -62,6 +62,13 @@ inline bool delay_query_slot_is_bound(std::uint64_t slot_value, std::uint64_t re
     return real_query != 0 && slot_value != 0 && slot_value != proxy && slot_value == real_query;
 }
 
+// True when `address` lies in [image_base, image_base + image_size). A delay thunk lives in the
+// importing image; the real export and the proxy do not.
+inline bool address_in_image(std::uint64_t address, std::uint64_t image_base, std::uint64_t image_size) noexcept
+{
+    return image_size != 0 && address >= image_base && (address - image_base) < image_size;
+}
+
 // Store `proxy` only when `exchange` still observes `real_query`. `exchange(slot, desired, expected)`
 // returns the previous value and writes `desired` only when the slot equals `expected`
 // (InterlockedCompareExchange). An earlier read can see the export and the delay loader can then

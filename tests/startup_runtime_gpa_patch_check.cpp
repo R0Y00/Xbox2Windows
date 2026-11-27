@@ -4,7 +4,9 @@
 // a direct xgameruntime.dll!QueryApiImpl on the regular import table, delay-import hits with
 // delay_import set, and ordinal thunks ignored. A bound delay QueryApiImpl slot is replaced only when
 // the compare-exchange still sees the real export, and only that store is counted. A slot changed
-// back to its thunk before the exchange stays untouched. A synthetic PE32+ image is walked; the mutated
+// back to its thunk before the exchange stays untouched. A slot that already holds the real export
+// becomes the proxy only through that exchange, and an in-image thunk stays inside the image.
+// A synthetic PE32+ image is walked; the mutated
 // control classifies by import name alone (accepting QueryApiImpl from other.dll) and must fail.
 // No Windows loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
@@ -193,6 +195,28 @@ int main(int argc, char** argv)
     check("proxy already installed stays", already == proxy);
     check("proxy already installed is not counted", already_replacements == 0);
     check("null slot refused", !patch::replace_bound_delay_query(nullptr, real_export, proxy, cas));
+
+    // Same pass condition as the loader test: the slot is the real export before the proxy attaches,
+    // and only the exchange turns it into the proxy. An uncalled helper's thunk stays in its image.
+    constexpr std::uint64_t image_base = 0x180000000ull;
+    constexpr std::uint64_t image_size = 0x20000ull;
+    constexpr std::uint64_t image_thunk = image_base + 0x1400ull;
+    check("thunk lies inside the helper image", patch::address_in_image(image_thunk, image_base, image_size));
+    check("real export lies outside the helper image", !patch::address_in_image(real_export, image_base, image_size));
+    check("proxy lies outside the helper image", !patch::address_in_image(proxy, image_base, image_size));
+    std::uint64_t prebound = real_export;
+    const bool rewritten = patch::replace_bound_delay_query(&prebound, real_export, proxy, cas);
+    check("bound delay slot rewritten to proxy", rewritten && prebound == proxy);
+    std::uint64_t still_thunk = image_thunk;
+    check("unbound delay thunk stays inside the helper",
+          !patch::replace_bound_delay_query(&still_thunk, real_export, proxy, cas) &&
+              patch::address_in_image(still_thunk, image_base, image_size));
+    // Passing the slot's own value as the export is the unsafe rewrite: the thunk becomes the proxy
+    // and no longer lies in the helper image.
+    std::uint64_t unsafe = image_thunk;
+    check("slot used as the export rewrites the thunk",
+          patch::replace_bound_delay_query(&unsafe, unsafe, proxy, cas) && unsafe == proxy);
+    check("rewritten thunk leaves the helper image", !patch::address_in_image(unsafe, image_base, image_size));
 
     auto image = build_image();
     int gpa = 0, query = 0, delay_hits = 0, regular_hits = 0;

@@ -1180,11 +1180,12 @@ add_test(NAME startup_console_mode_control
 add_test(NAME startup_console_mode_provider_control
          COMMAND startup_console_mode --control provider --decoy "$<TARGET_FILE:startup_console_mode_decoy>")
 set_tests_properties(startup_console_mode_control startup_console_mode_provider_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
-# EXE + late-loaded package helper through the real Windows loader: proxied xgameruntime QueryApiImpl,
-# unrelated same-named export stays original, a bound delay QueryApiImpl is rewritten while the slot
-# still holds the real export, and an unbound delay thunk and a pre-attach cached pointer are
-# negative controls. Notification only enqueues; rewrite runs after link. The gpa-patch check counts
-# a replacement only when the slot still holds that export at the write.
+# EXE + package helpers through the real Windows loader: proxied xgameruntime QueryApiImpl,
+# unrelated same-named export stays original. One helper binds its delay QueryApiImpl slot to the
+# real export before the proxy attaches; the scan must then store the proxy. A second helper is
+# never called, and after the scan its thunk must still lie inside its own image. A pre-attach
+# cached pointer stays the real export. Notification only enqueues; rewrite runs after link. The
+# gpa-patch check counts a replacement only when the slot still holds that export at the write.
 if (WIN32)
     set(X2W_PROXY_SCOPE_DIR "${CMAKE_CURRENT_BINARY_DIR}/startup_runtime_proxy_scope")
     add_library(startup_runtime_proxy_carrier SHARED
@@ -1206,6 +1207,13 @@ if (WIN32)
     # holds the real export after first use (the bound-delay rewrite path).
     target_link_libraries(startup_runtime_proxy_helper PRIVATE startup_runtime_proxy_xgr delayimp)
     target_link_options(startup_runtime_proxy_helper PRIVATE "/DELAYLOAD:xgameruntime.dll")
+    # Same delay import, never called. Its slot stays the in-image thunk.
+    add_library(startup_runtime_proxy_helper_unbound SHARED
+        tests/startup_runtime_proxy_scope/helper.cpp
+        tests/startup_runtime_proxy_scope/helper_unbound.def)
+    target_compile_features(startup_runtime_proxy_helper_unbound PRIVATE cxx_std_17)
+    target_link_libraries(startup_runtime_proxy_helper_unbound PRIVATE startup_runtime_proxy_xgr delayimp)
+    target_link_options(startup_runtime_proxy_helper_unbound PRIVATE "/DELAYLOAD:xgameruntime.dll")
     add_library(startup_runtime_proxy_decoy SHARED
         tests/startup_runtime_proxy_scope/decoy.cpp
         tests/startup_runtime_proxy_scope/decoy.def)
@@ -1213,7 +1221,8 @@ if (WIN32)
     add_executable(startup_runtime_proxy_scope tests/startup_runtime_proxy_scope/host.cpp)
     target_include_directories(startup_runtime_proxy_scope PRIVATE src)
     target_compile_features(startup_runtime_proxy_scope PRIVATE cxx_std_17)
-    foreach(tgt IN ITEMS startup_runtime_proxy_carrier startup_runtime_proxy_helper startup_runtime_proxy_xgr
+    foreach(tgt IN ITEMS startup_runtime_proxy_carrier startup_runtime_proxy_helper
+                         startup_runtime_proxy_helper_unbound startup_runtime_proxy_xgr
                          startup_runtime_proxy_decoy startup_runtime_proxy_scope)
         set_target_properties(${tgt} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${X2W_PROXY_SCOPE_DIR}"
@@ -1221,7 +1230,7 @@ if (WIN32)
             ARCHIVE_OUTPUT_DIRECTORY "${X2W_PROXY_SCOPE_DIR}")
     endforeach()
     add_dependencies(startup_runtime_proxy_scope startup_runtime_proxy_carrier startup_runtime_proxy_helper
-                     startup_runtime_proxy_xgr startup_runtime_proxy_decoy)
+                     startup_runtime_proxy_helper_unbound startup_runtime_proxy_xgr startup_runtime_proxy_decoy)
     add_test(NAME startup_runtime_proxy_scope COMMAND "$<TARGET_FILE:startup_runtime_proxy_scope>")
     set_tests_properties(startup_runtime_proxy_scope PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 endif()

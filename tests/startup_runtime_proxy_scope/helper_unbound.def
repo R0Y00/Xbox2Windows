@@ -1,0 +1,4 @@
+LIBRARY startup_runtime_proxy_helper_unbound
+EXPORTS
+    resolve_query
+    call_delay_query
