@@ -1051,6 +1051,7 @@ x2w_startup::LinearBuffers& linear_buffers()
 void retire_placement(Wrapper* w);
 void register_retire_queue(Wrapper* queue);
 void retire_resource(Wrapper* w);
+void retire_resource_maps(Wrapper* w);
 void retire_leave_class(const void* object, RetireLeft why);
 void retire_add_view_ref(const void* object);
 void retire_release_view_ref(const void* object);
@@ -1074,6 +1075,7 @@ ULONG __stdcall release(Wrapper* self)
         if (self->own().budget) self->own().budget->end_use();
         if (self->own().backing_budget) self->own().backing_budget->end_use();
         if (self->own().kind == descriptor_heap_kind) retire_drop_heap_views(self);
+        if (self->own().kind == resource_kind) retire_resource_maps(self);
         if (self->own().kind == resource_kind && self->own().title_memory) {
             drop_mesh_lease_owner(self);
             retire_placement(self);
@@ -4809,7 +4811,15 @@ void* __stdcall queue_get_desc(void* a, void* b)
 // pointer is that memory (subresource offsets inside it are not modeled). Others map on desktop.
 // Successful desktop Maps are counted per subresource, and Unmap is forwarded only against such a count.
 SRWLOCK resource_map_lock = SRWLOCK_INIT;
-std::unordered_map<Wrapper*, std::unordered_map<UINT, std::uint64_t>> resource_maps;  // guarded by resource_map_lock
+x2w_startup::ResourceMapCounts resource_maps;  // guarded by resource_map_lock
+
+void retire_resource_maps(Wrapper* self)
+{
+    AcquireSRWLockExclusive(&resource_map_lock);
+    resource_maps.retire(self);
+    ReleaseSRWLockExclusive(&resource_map_lock);
+}
+
 HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANGE* range, void** data)
 {
     HRESULT hr = S_OK;
@@ -4824,7 +4834,14 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
              (heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
         AcquireSRWLockExclusive(&resource_map_lock);
         hr = !real ? E_FAIL : cpu_hidden ? E_INVALIDARG : real->Map(subresource, range, &mapped);
-        if (SUCCEEDED(hr)) ++resource_maps[self][subresource];
+        if (SUCCEEDED(hr)) {
+            try {
+                resource_maps.record(self, subresource);
+            } catch (const std::bad_alloc&) {
+                real->Unmap(subresource, nullptr);
+                hr = E_OUTOFMEMORY;
+            }
+        }
         ReleaseSRWLockExclusive(&resource_map_lock);
     }
     if (data) *data = SUCCEEDED(hr) ? mapped : nullptr;
@@ -4839,15 +4856,8 @@ void __stdcall resource_unmap(Wrapper* self, UINT subresource, const D3D12_RANGE
 {
     if (self->own().title_memory || !self->own().real) return;
     AcquireSRWLockExclusive(&resource_map_lock);
-    const auto wrapper = resource_maps.find(self);
-    if (wrapper != resource_maps.end()) {
-        const auto entry = wrapper->second.find(subresource);
-        if (entry != wrapper->second.end() && x2w_startup::consume_map_count(entry->second)) {
-            static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
-            if (!entry->second) wrapper->second.erase(entry);
-            if (wrapper->second.empty()) resource_maps.erase(wrapper);
-        }
-    }
+    if (resource_maps.consume(self, subresource))
+        static_cast<ID3D12Resource*>(self->own().real)->Unmap(subresource, range);
     ReleaseSRWLockExclusive(&resource_map_lock);
 }
 

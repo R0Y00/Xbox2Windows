@@ -14,6 +14,18 @@ int main() {
     std::uint64_t maps = 0; assert(!consume_map_count(maps));
     maps = 2; assert(consume_map_count(maps) && maps == 1);
     assert(consume_map_count(maps) && !consume_map_count(maps));
+    ResourceMapCounts resource_maps;
+    int released = 0, live = 0;
+    resource_maps.record(&released, 0);
+    resource_maps.record(&released, 0);
+    resource_maps.record(&released, 1);
+    resource_maps.record(&live, 0);
+    assert(resource_maps.consume(&released, 0));
+    resource_maps.retire(&released);
+    assert(!resource_maps.consume(&released, 0) && !resource_maps.consume(&released, 1));
+    assert(resource_maps.consume(&live, 0) && !resource_maps.consume(&live, 0));
+    resource_maps.record(&released, 0);
+    assert(resource_maps.consume(&released, 0) && !resource_maps.consume(&released, 0));
     D3D12_RESOURCE_DESC d{}; D3D12_CLEAR_VALUE c{}, copy{};
     c.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     assert(!optimized_clear_value(nullptr, d, copy));

@@ -7,6 +7,35 @@
 
 namespace x2w_startup {
 inline bool consume_map_count(std::uint64_t& count) { if (!count) return false; --count; return true; }
+
+class ResourceMapCounts {
+    using Subresources = std::unordered_map<unsigned, std::uint64_t>;
+    std::unordered_map<const void*, Subresources> resources_;
+
+public:
+    void record(const void* resource, unsigned subresource) {
+        auto entry = resources_.find(resource);
+        if (entry == resources_.end()) {
+            resources_.emplace(resource, Subresources{{subresource, 1}});
+        } else {
+            ++entry->second[subresource];
+        }
+    }
+
+    bool consume(const void* resource, unsigned subresource) {
+        auto entry = resources_.find(resource);
+        if (entry == resources_.end()) return false;
+        auto& subresources = entry->second;
+        auto count = subresources.find(subresource);
+        if (count == subresources.end() || !consume_map_count(count->second)) return false;
+        if (!count->second) subresources.erase(count);
+        if (subresources.empty()) resources_.erase(entry);
+        return true;
+    }
+
+    void retire(const void* resource) { resources_.erase(resource); }
+};
+
 class DebugDrainBudget {
     std::unordered_map<unsigned, std::uint64_t> counts_;
     unsigned errors_ = 0, other_ = 0;

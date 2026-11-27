@@ -99,6 +99,22 @@ int main(int argc, char** argv)
     void* data = nullptr;
     if (SUCCEEDED(static_cast<HRESULT>(invoke(tex, 8, 0, 0, arg(&data))))) return 9;
     invoke(tex, 9, 0, 0);
+
+    D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_RANGE no_cpu_reads{0, 0};
+    auto map_upload = [&](void*& resource) {
+        void* mapped = nullptr;
+        return ok(invoke(device, 27, arg(&upload_heap), 0, arg(&buffer), D3D12_RESOURCE_STATE_GENERIC_READ,
+                         0, arg(&__uuidof(ID3D12Resource)), arg(&resource))) &&
+               resource && ok(invoke(resource, 8, 0, arg(&no_cpu_reads), arg(&mapped))) && mapped;
+    };
+    void* persistent = nullptr;
+    if (!map_upload(persistent) || static_cast<IUnknown*>(persistent)->Release() != 0) return 13;
+    void* next = nullptr;
+    if (!map_upload(next)) return 14;
+    invoke(next, 9, 0, arg(&no_cpu_reads));
+    if (static_cast<IUnknown*>(next)->Release() != 0) return 15;
+
     struct HeapRequest { D3D12_DESCRIPTOR_HEAP_DESC desc; std::uint64_t address, bytes; } request{};
     request.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     request.desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; request.desc.NumDescriptors = 1048577;
