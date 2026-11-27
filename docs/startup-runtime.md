@@ -1258,6 +1258,16 @@ the stop. The report copies only the 32-bit exception code and whether it was fi
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+`tools/startup/refusal_census.py --cache <X2W_SHADER_CACHE dir> --log <stderr> [--log ...]` ranks the
+refused shader keys of a run by the work they block. Each `<key>.fail` contributes its first line (the first
+refusal); its weight is the largest count the stand-in log gives that key: the dispatches of its
+`compute census key` line, the `no RTV translation` and `ExecuteIndirect` refusal lines that name it, and the
+per-key use or not-drawn counts when the build prints them. A refused key no line names weighs 0 (requested,
+never needed). Classes are the `triage_run.py` shader categories, or the first refusal with registers,
+numbers and addresses replaced by `R`, `N` and `H`; `--shareable` keeps only the fixed categories. It
+writes a Markdown ranking (stdout or `--out-md`) and one TSV row per refused key (`--out-tsv`). Check with
+`python3 -B tests/startup_refusal_census_check.py` (ctest `startup_refusal_census`).
+
 ## Iterating on start-up runs
 
 This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
