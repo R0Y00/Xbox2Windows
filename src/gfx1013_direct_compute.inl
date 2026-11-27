@@ -1828,6 +1828,28 @@ struct DirectCompute {
                 vector_write(i.dst, place_subword(i, count ? ir.binary("add", value, b) : value));
             return;
         }
+        if (n == "s_bcnt0_i32_b32" || n == "s_bcnt1_i32_b32") {
+            auto bits = n == "s_bcnt0_i32_b32" ? ir.binary("xor", a, "4294967295") : a;
+            auto count = ir.invoke("i32", "unaryBits.i32", 31, {{"i32", bits}}, "nounwind readnone");
+            write(i.dst, count);
+            write(128, ir.value("zext i1 " + cmp("ne", count, "0") + " to i32"));
+            return;
+        }
+        if (n == "s_ff0_i32_b32" || n == "s_ff1_i32_b32" || n == "v_ffbl_b32" || n == "s_flbit_i32_b32" ||
+            n == "v_ffbh_u32" || n == "s_flbit_i32" || n == "v_ffbh_i32") {
+            // DXIL FirstbitLo (32) counts from bit 0; FirstbitHi (33) and FirstbitSHi (34) count from bit 31,
+            // as these gfx10 scans do. All three return ~0 when no bit qualifies, and none of the scans writes SCC.
+            bool low = n == "s_ff0_i32_b32" || n == "s_ff1_i32_b32" || n == "v_ffbl_b32";
+            bool sign = n == "s_flbit_i32" || n == "v_ffbh_i32";
+            auto bits = n == "s_ff0_i32_b32" ? ir.binary("xor", a, "4294967295") : a;
+            auto index = ir.invoke("i32", "unaryBits.i32", low ? 32 : sign ? 34 : 33, {{"i32", bits}},
+                                   "nounwind readnone");
+            if (scalar)
+                write(i.dst, index);
+            else
+                vector_write(i.dst, place_subword(i, index));
+            return;
+        }
         if (n == "v_swap_b32") {
             if (i.wide || i.src[0] < 256)
                 refuse(i.pc, "invalid vector swap source");
