@@ -75,6 +75,9 @@ def controls():
         check("triangle kind %d call carries the node and four results" % kind,
               "0x0000000%du" % kind in call_line
               and all("v%d = bt" % reg in hlsl for reg in range(32, 36)), call_line)
+        check("triangle kind %d call passes origin, direction and inverse from v18..v26" % kind,
+              "float3(F(v18), F(v19), F(v20)), float3(F(v21), F(v22), F(v23)), "
+              "float3(F(v24), F(v25), F(v26))" in call_line, call_line)
 
     pipe, hlsl, refusals = translate_triangle(0x00, sort_boxes=False)
     check("sort-disabled triangle translates", pipe is not None and not refusals, str(refusals))
@@ -82,6 +85,14 @@ def controls():
         call = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_triangle(r0" in line), "")
         check("sort-disabled triangle call keeps the zero sort word",
               "0x00001000u, 0x00000000u, 0x0000000bu, 0x81000000u" in call, call)
+
+    # One T# can cover both node types, so a box node ignores the triangle return mode bit.
+    pipe, hlsl, refusals = translate_triangle(node=0x05, word3=RESOURCE_TYPE | TRIANGLE_MODE)
+    check("box node with triangle return mode bit translates", pipe is not None and not refusals, str(refusals))
+    if pipe is not None:
+        call = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_box32(r0" in line), "")
+        check("box call preserves the ignored return mode bit",
+              "0x00001000u, 0x80000000u, 0x0000000bu, 0x81000000u" in call, call)
 
     helpers = "\n".join(G.BVH_HELPERS)
     check("translated triangle shader embeds the dispatch-tested helpers",
@@ -102,7 +113,7 @@ def controls():
 
     cases = [
         ("triangle return mode 0", dict(node=0x00, word3=RESOURCE_TYPE), "does not match node kind 0"),
-        ("box return mode 1", dict(node=0x05, word3=RESOURCE_TYPE | TRIANGLE_MODE), "does not match node kind 5"),
+        ("box reserved word 3 bit", dict(node=0x05, word3=RESOURCE_TYPE | 0x100), "does not match node kind 5"),
         ("unknown node kind", dict(node=0x06), "node kind 6"),
         ("node outside size", dict(node=0x20, word2=3), "outside descriptor size"),
         ("absolute base", dict(node=0x00, word0=0, word1=0), "absolute node base"),

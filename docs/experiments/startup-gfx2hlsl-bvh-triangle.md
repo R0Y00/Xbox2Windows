@@ -26,8 +26,10 @@ barycentric numerators `u`, `v` and `w`, the determinant `u + (v + w)` and
 ## Return and descriptor
 
 Triangle return mode 1 (bit 120 of the BVH T#, bit 24 of descriptor DWORD 3) returns the four words
-`{t, determinant, v, w}` as float bit patterns. A miss is `{+inf, 1.0, 0, 0}`. Return mode 0 and
-every other reserved word-3 bit are refused by name before any HLSL is emitted.
+`{t, determinant, v, w}` as float bit patterns. A miss is `{+inf, 1.0, 0, 0}`. For triangle nodes,
+return mode 0 and every other reserved word-3 bit are refused by name before any HLSL is emitted.
+Box nodes (kinds 4 and 5) ignore bit 24 because one T# can cover both node types; every other
+word-3 bit is still refused for them.
 
 The accepted slice uses:
 
@@ -60,9 +62,11 @@ python3 -B tests/startup_gfx2hlsl_bvh_triangle_check.py dispatch <dxc> <offscree
 ```
 
 The check reuses the 119 triangle witnesses in `tests/gfx1030_bvh_box/check.py` and the independent
-model in `tests/gfx1030_bvh_box/bvh_model.py`. It covers all four kinds, every ID map byte, edge and
-vertex hits, outside and behind rays, zero direction and negative zero, `t = 0`, `extent = 0`,
-1024x scaling in both directions, degenerate and malformed nodes, and the box kinds 6 and 7.
+model in `tests/gfx1030_bvh_box/bvh_model.py`. These witnesses come from the CPU model (#2921), not a
+hardware capture; the dispatch shows that the HLSL matches the model, not RDNA 2 hardware. It covers
+all four kinds, each of the four ID map bytes, edge and vertex hits, outside and behind rays, zero
+direction and negative zero, `t = 0`, `extent = 0`, 1024x scaling in both directions, degenerate and
+malformed nodes, and the unknown kinds 6 and 7 (instance and procedural in the model).
 
 The dispatch writes 71 unique triangle images at 64-byte offsets, runs the emitted helper for all
 119 witnesses, and compares all 476 result words. It passes on WARP (`1414:008c`, driver

@@ -8108,8 +8108,13 @@ class Stage:
         if vals[3] is not None:
             if (vals[3] >> 28) & 0xf != 8:
                 raise Unsupported('%s descriptor type %d is not 8' % (name, (vals[3] >> 28) & 0xf))
-            expected_mode = 0x01000000 if triangle else 0
-            if (vals[3] & 0x0fffffff) != expected_mode:
+            # The triangle return mode bit only selects the triangle result layout. One T# can
+            # cover both node types, so a box node ignores it; every other reserved bit is refused.
+            if triangle:
+                mode_ok = (vals[3] & 0x0fffffff) == 0x01000000
+            else:
+                mode_ok = (vals[3] & 0x0effffff) == 0
+            if not mode_ok:
                 raise Unsupported('%s descriptor word 3 %#x does not match node kind %d' % (name, vals[3], kind))
         base = key[0][1]
         if base == 0:
@@ -11106,7 +11111,7 @@ BVH_HELPERS = (
     # slice does not bind, so it is refused here as a miss rather than read at address zero.
     'bool x2w_bvh_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
     '    return (word1 & 0x7fffff00u) == 0u &&',
-    '        word3 == 0x80000000u && word2 < 0x04000000u &&',
+    '        (word3 & 0xfeffffffu) == 0x80000000u && word2 < 0x04000000u &&',
     '        (word0 != 0u || (word1 & 0x000000ffu) != 0u);',
     '}',
     # A triangle node is 64 bytes: five float3 vertices at 0..59 and one ID dword at 60.
@@ -11134,8 +11139,9 @@ BVH_HELPERS = (
     '    float rz = x2w_bvh_component(rel, kz);',
     '    return float3(rx - sx * rz, ry - sy * rz, sz * rz);',
     '}',
-    # Triangle return mode 1 (bit 120) is the only triangle mode this slice lowers. The box
-    # return mode is zero and is checked separately by each box helper.
+    # Triangle return mode 1 (bit 120) is the only triangle mode this slice lowers. A box
+    # node ignores bit 120 because one T# covers both node types; its helper checks every
+    # other word-3 bit.
     'bool x2w_bvh_triangle_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
     '    return (word1 & 0x7fffff00u) == 0u && (word3 & 0x0fffffffu) == 0x01000000u &&',
     '        (word3 >> 28u) == 8u && word2 < 0x04000000u &&',

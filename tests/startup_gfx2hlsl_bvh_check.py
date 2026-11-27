@@ -198,10 +198,22 @@ def dispatch_cases():
         cases.append(dict(name=name, helper="x2w_bvh_intersect_box16", pointer=(offset >> 3) | 4,
                           word0=0x1000, word1=0, word2=0x40,
                           extent=extent, origin=origin, direction=direction, expected=expected))
+    # A T# can cover both box and triangle nodes; box kinds ignore the triangle return mode
+    # bit. These cases fail if either the translator or the emitted box helper rejects it.
+    name, offset, extent, origin, direction, expected = RAYS[0]
+    cases.append(dict(name="box32_return_mode_ignored", helper="x2w_bvh_intersect_box32",
+                      pointer=(offset >> 3) | 5, word0=0x1000, word1=SORT_ENABLE, word2=0x0b,
+                      word3=RESOURCE_TYPE | 0x01000000, extent=extent, origin=origin,
+                      direction=direction, expected=expected))
+    name, offset, extent, origin, direction, expected = HALF_RAYS[0]
+    cases.append(dict(name="box16_return_mode_ignored", helper="x2w_bvh_intersect_box16",
+                      pointer=(offset >> 3) | 4, word0=0x1000, word1=SORT_ENABLE, word2=0x40,
+                      word3=RESOURCE_TYPE | 0x01000000, extent=extent, origin=origin,
+                      direction=direction, expected=expected))
     return cases
 
 
-BUFFER_SIZE = RESULT_OFFSET + 16 * (len(RAYS) + len(UNSORTED_RAYS) + len(HALF_RAYS) + len(HALF_UNSORTED_RAYS))
+BUFFER_SIZE = RESULT_OFFSET + 16 * len(dispatch_cases())
 
 
 def translate_program(*, node=0x05, sort_boxes=True, word0=0x1000, word1=None, word2=0x0b,
@@ -347,6 +359,16 @@ def controls():
         call = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_box16(r0" in line), "")
         check("sort-disabled box16 call uses a zero sort word",
               "0x00001000u, 0x00000000u, 0x0000000bu, 0x80000000u" in call, call)
+
+    # One T# can cover both node types, so a box node ignores the triangle return mode bit.
+    for node, helper in ((0x05, "x2w_bvh_intersect_box32"), (0x04, "x2w_bvh_intersect_box16")):
+        pipe, hlsl, refusals = translate_program(node=node, word3=RESOURCE_TYPE | 0x01000000)
+        check("box kind %d with triangle return mode bit translates" % (node & 7),
+              pipe is not None and not refusals, str(refusals))
+        if pipe is not None:
+            call = next((line for line in hlsl.splitlines() if helper + "(r0" in line), "")
+            check("box kind %d call preserves the ignored return mode bit" % (node & 7),
+                  "0x00001000u, 0x80000000u, 0x0000000bu, 0x81000000u" in call, call)
 
     # Independently decode the 40-bit unit field; test the same raw DWORDs in
     # the emitted call and the decoded byte-address binding in the manifest.
@@ -549,9 +571,10 @@ def dispatch_hlsl(mutation=None):
     for case, item in enumerate(dispatch_cases()):
         inv = tuple(1.0 / c for c in item["direction"])
         lines.append(
-            "    uint4 r%d = %s(data, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, 0x80000000u, "
+            "    uint4 r%d = %s(data, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, "
             "%s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
                 case, item["helper"], item["pointer"], item["word0"], item["word1"], item["word2"],
+                item.get("word3", 0x80000000),
                 ffloat(item["extent"]), ffloat(item["origin"][0]), ffloat(item["origin"][1]),
                 ffloat(item["origin"][2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
         for word in range(4):

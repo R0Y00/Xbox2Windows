@@ -29,7 +29,8 @@ in `min.x`.
   for binary16, two for FP32; `size=0` is a one-unit span) and below 4 GiB;
 - a constant node pointer whose low three bits are 4 (64-byte aligned) or 5 (128-byte aligned) and inside the
   same 4 GiB relative address window; the entire node must fit within the 48-bit absolute address space;
-- either value of the sort bit.
+- either value of the sort bit, and either value of the triangle return mode bit (bit 120);
+  it selects the triangle result layout and does not change a box result.
 
 The manifest names the node allocation with `srv <i> bvh base 0x<base> size 0x<size>`, using the decoded
 byte address for `base` and the unchanged descriptor size field for `size`. All four original descriptor
@@ -40,7 +41,7 @@ of this change.
 
 ## Refused by name
 
-Triangle nodes (kinds 0..3), every other node kind, `image_bvh64_intersect_ray`, A16,
+Every node kind other than 4 and 5, `image_bvh64_intersect_ray`, A16,
 non-sequential addresses, a pixel or vertex stage, a node pointer that is not a straight-line constant, a T#
 loaded at run time, a type other than 8, nonzero box growing, an absolute (zero) base, a size that
 does not cover the node, size bits above 4 GiB, a node address that wraps the 48-bit address space,
