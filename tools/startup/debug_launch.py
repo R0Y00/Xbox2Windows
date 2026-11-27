@@ -23,7 +23,7 @@ k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
 
-from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
+from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
 from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
 
@@ -197,8 +197,12 @@ def main():
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     pi = PROCESS_INFORMATION()
     flags = 0x2 | 0x4 | 0x400  # DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+    startup, extra_flags, startup_keep, startup_note = startup_for_create(si, env)
+    if startup_note:
+        print(startup_note)
+    flags |= extra_flags
     if not k32.CreateProcessW(exe, ctypes.create_unicode_buffer(f'"{exe}"'), None, None, True, flags,
-                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(si), ctypes.byref(pi)):
+                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(startup), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))

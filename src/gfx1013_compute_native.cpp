@@ -87,7 +87,7 @@ struct Inst {
     }
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
-Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false) {
+Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
     Inst i;
     i.pc = pc;
@@ -201,8 +201,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
-            if ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u)
+            if (direct && !graphics) {
+                if ((a & 0x0203e000u) || (i.b & 0x00e00000u))
+                    refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
+                // The MUBUF encoding has no trailing literal word.
+                const unsigned soffset = i.b >> 24;
+                if (soffset > 105 && !(soffset >= 128 && soffset <= 208))
+                    refuse(pc, "raw buffer load scalar offset needs an SGPR or inline integer");
+            } else if ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u) {
                 refuse(pc, "raw buffer load needs offen with zero scalar offset and no modifiers");
+            }
             i.name = "buffer_load_dword";
         } else {
             if (i.op > 3)
@@ -270,6 +278,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
+        const unsigned sdwa_mask_limit = direct && !graphics && !wave64 ? 107 : 106;
         if (direct && i.src[0] == 249 && (sdwa_compare || i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2)) {
             // Operand profiles from disasm_rdna2's GFX10 VOP1/VOP2 SDWA
             // decoder. Admit only profiles with a direct result placement.
@@ -293,7 +302,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             const Word ext = take();
             const unsigned sources = i.enc == Encoding::Vop1 ? 1 : 2;
             if (sdwa_compare) {
-                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > 106))
+                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > sdwa_mask_limit))
                     refuse(pc, "invalid SDWA compare destination");
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
             } else {
@@ -339,7 +348,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             } else {
                 // VOPC has a scalar mask destination in the same bits that VOP2 uses for placement.
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
-                if ((ext & 0x70480000u) || (i.dst > 105 && i.dst != 106))
+                if ((ext & 0x70480000u) || i.dst > sdwa_mask_limit)
                     refuse(pc, "invalid SDWA class modifiers or mask destination");
                 i.neg = (ext >> 20) & 1;
                 i.abs = (ext >> 21) & 1;
@@ -563,8 +572,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
+               i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
@@ -664,7 +673,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
             if (pc >= code.size() || (next != instructions.begin() && std::prev(next)->second.next > pc))
                 refuse(pc, "branch outside code or into an instruction");
             const auto fetch = fixed.find(pc);
-            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics);
+            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics,wave64);
             if (next != instructions.end() && instruction.next > next->first)
                 refuse(pc, "overlapping instruction boundaries");
             instructions.emplace_hint(next, pc, instruction);
@@ -764,8 +773,12 @@ struct Emit {
         const bool indexed = sym.type == Symbol::Type::indexed_descriptor;
         if ((!indexed && sym.type != Symbol::Type::descriptor) || base + width > state.size())
             refuse(i.pc, "unproven resource descriptor s" + to_string(base));
+        if (sym.value == compute_sampler_heap)
+            refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
-                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
+                                  (i.name == "buffer_store_raw" ||
+                                   (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
@@ -844,15 +857,44 @@ struct Emit {
         it->required_bytes = (std::max)(it->required_bytes, bytes);
         return (write ? "w" : "r") + to_string(it->shader_register);
     }
-    unsigned sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
-                           bool implicit_sample = false, bool comparison = false) {
+    // heap: the sampler is entry `index` of the directly indexed sampler heap. Otherwise `index` is the static sampler register.
+    struct SamplerRef {
+        bool heap;
+        unsigned index;
+    };
+    SamplerRef sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
+                             bool implicit_sample = false, bool comparison = false) {
         const unsigned base = ((i.b >> 21) & 31) * 4;
         ComputeSampler sampler{{}, lod, comparison};
+        unsigned literal = 0, heap = 0;
+        const auto &first = state.at(base);
         for (unsigned j = 0; j < 4; ++j) {
             const auto &s = state.at(base + j);
-            if (s.type != Symbol::Type::constant)
-                refuse(i.pc, "nonconstant sampler");
-            sampler.words[j] = s.value;
+            literal += s.type == Symbol::Type::constant;
+            // The heap content is fixed within a dispatch, so contiguity of the four words of one 16-byte entry is enough.
+            heap += s.type == Symbol::Type::descriptor && s.value == compute_sampler_heap && !s.definition &&
+                    first.offset % 16 == 0 && s.offset == first.offset + 4 * j;
+            if (s.type == Symbol::Type::constant)
+                sampler.words[j] = s.value;
+        }
+        if (literal != 4 && heap != 4)
+            refuse(i.pc, "nonconstant sampler");
+        if (heap == 4) {
+            if (gather_base_level)
+                refuse(i.pc, "gather through the sampler heap is not translated");
+            if (comparison)
+                refuse(i.pc, "comparison sampler from the sampler heap is not translated");
+            if (implicit_sample)
+                refuse(i.pc, "sampler from the sampler heap needs image_sample_l or image_sample_lz");
+            const unsigned entry = first.offset / 16, bytes = 16 * (entry + 1);
+            auto &list = result.bindings;
+            auto found = std::find_if(list.begin(), list.end(),
+                                      [](const auto &b) { return b.kind == ComputeViewKind::heap_sampler; });
+            if (found == list.end())
+                list.push_back({ComputeViewKind::heap_sampler, compute_sampler_heap, 0, 0, bytes});
+            else
+                found->required_bytes = (std::max)(found->required_bytes, bytes);
+            return {true, entry};
         }
         if (comparison) {
             // Field constraints from pixel_aot.comparison_sampler_state. The
@@ -891,12 +933,12 @@ struct Emit {
             all.push_back(sampler);
             it = std::prev(all.end());
         }
-        return first_sampler+static_cast<unsigned>(it - all.begin());
+        return {false, first_sampler + static_cast<unsigned>(it - all.begin())};
     }
     void image(const Inst &i, const State &state) {
         unsigned mask = (i.a >> 8) & 15, base = ((i.b >> 16) & 31) * 4, addr = i.b & 255;
         const bool half_store = i.op == 8 && (i.b & 0x80000000u);
-        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3e000000u))
+        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3c000000u))
             refuse(i.pc, "unsupported image flags");
         bool store = i.op == 8, lod = i.op == 39, gather = i.op == 71;
         if (i.op != 0 && !store && !lod && !gather)
@@ -927,7 +969,10 @@ struct Emit {
         if (lod || gather) {
             if (gather && mask != 1)
                 refuse(i.pc, "unsupported gather channel");
-            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler_index(i, state, lod)
+            const auto sampler = sampler_index(i, state, lod);
+            if (sampler.heap)
+                refuse(i.pc, "sampler heap reads need the direct DXIL path");
+            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler.index
                  << ",float2(asfloat(" << x << "),asfloat(" << y << "))" << (lod ? ",0);\n" : ");\n");
         } else
             body << "t=" << tex << ".Load(int3(" << x << "," << y << ",0));\n";
@@ -1319,6 +1364,8 @@ struct Emit {
             if (i.op < 8) {
                 if (s.at(i.src[0]).type != Symbol::Type::table)
                     refuse(i.pc, "unknown scalar table base");
+                if (s.at(i.src[0]).value == compute_sampler_heap)
+                    refuse(i.pc, "sampler heap reads need the direct DXIL path");
                 if (s.at(i.src[0]).value == compute_resource_heap && i.b >> 25 == 125)
                     refuse(i.pc, "unsupported immediate whole-heap descriptor");
                 if (i.b >> 25 != 125) {
@@ -1525,8 +1572,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     }
     // In this compute ABI the two directly indexed heaps follow the user root parameters.
     // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
-    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user)
+    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
         initial[next] = {Symbol::Type::table, compute_resource_heap};
+        initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
+    }
     const bool wave64 = stage && !stage->wave32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;

@@ -5,6 +5,7 @@ table-bound 2D SRV. The instruction reads U, V and explicit LOD from three
 contiguous VGPRs and returns the four taps of one component. The supported
 constant sampler has normalized clamp addressing, zero minimum LOD, point
 mip filtering and no mip bias. Unsupported image and sampler forms refuse.
+The direct path (`image_io`) and the HLSL compute emitter (`image`) treat MIMG word 1 bits 29:26 as reserved; bit 25 is the top bit of the sampler index.
 
 The lowering follows the existing startup HLSL implementation. Clamp LOD
 to the sampler's maximum, round with `floor(lod + 0.5)`, and cap the index

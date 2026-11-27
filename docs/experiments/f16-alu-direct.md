@@ -26,7 +26,7 @@ Each of these is a named diagnostic:
 
 `s_round_mode` and `s_denorm_mode` that leave the f16 fields at that contract, and that leave the f32 fields unchanged, are accepted. A write that changes an f32 rounding or denormal field keeps the previous control-instruction refusal. A guest branch together with a MODE write makes the contract unprovable and is refused with the rounding diagnostic.
 
-fma, fmac, fmamk, fmaak, min, max, ldexp, the min3/max3/med3 forms, div_fixup, VOP1 and the `v_pk` forms stay on the generic direct-lowering diagnostic. The fixture checks `v_fmac_f16` and `v_min_f16`.
+For the plain scalar-half forms, fma, fmac, fmamk, fmaak, min, max, ldexp, the min3/max3/med3 forms, div_fixup and VOP1 stay on the generic direct-lowering diagnostic. The fixture checks `v_fmac_f16` and `v_min_f16`. VOP3P arithmetic has a [separate experiment](native-packed-f16.md).
 
 ## Linux
 
