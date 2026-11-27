@@ -78,8 +78,24 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
-        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    const char* newline = std::strchr(sampler_line, '\n');
+    if (!newline) {
+        if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+            throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    } else {
+        const std::string first(sampler_line, newline);
+        const char* second = newline + 1;
+        int first_index = -1, second_index = -1;
+        if (!two_dimensional || !view_levels || std::strchr(second, '\n') ||
+            (std::sscanf(first.c_str(), "smp %d", &first_index) != 1 &&
+             std::sscanf(first.c_str(), "smpl %d", &first_index) != 1) ||
+            (std::sscanf(second, "smp %d", &second_index) != 1 &&
+             std::sscanf(second, "smpl %d", &second_index) != 1) ||
+            first_index != 0 || second_index != 1 ||
+            !samplers.read_manifest_line(first.c_str()) || !samplers.read_manifest_line(second) ||
+            samplers.statics.size() != 2 || samplers.heap || samplers.comparison[0] || samplers.comparison[1])
+            throw std::runtime_error("Expected two ordered noncomparison inline samplers in the 2D view draw");
+    }
     const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
     const auto root = create_root(device, samplers);
 

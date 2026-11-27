@@ -2854,6 +2854,59 @@ class Stage:
                  for n in range(r[1], r[2] + 1)]
         return None if any(w is None for w in words) else words
 
+    def sampler_join_shape(self, branches):
+        # A single forward SCC diamond, with all four final writes in each arm literal.
+        if (getattr(self, 'kind', None) != 'ps' or len(branches) != 2 or
+                not any(name in ('image_sample_l', 'image_sample_lz') for _, _, name, _ in self.ins)):
+            return None
+        (cond, taken), (skip, join) = sorted(branches)
+        if not cond < skip < taken < join:
+            return None
+        row = {off: (n, name) for off, n, name, _ in self.ins}
+        if (row[cond][1] not in ('s_cbranch_scc0', 's_cbranch_scc1') or
+                row[skip][1] != 's_branch' or skip + row[skip][0] != taken):
+            return None
+        literals = [set(), set()]
+        bases = set()
+        for off, _, name, asm in self.ins:
+            _, ops, mods = parse(asm)
+            if off < join and (writes_exec(name, ops) or (cond < off and name == 's_endpgm')):
+                return None
+            arm = 0 if cond < off < skip else 1 if taken <= off < join else None
+            if arm is not None:
+                dests = scalar_destinations(name, asm)
+                if 'any' in dests:
+                    return None
+                literals[arm].difference_update(dests)
+                if (name == 's_mov_b32' and len(ops) == 2 and not mods and
+                        re.fullmatch(r'(?:0x[0-9a-fA-F]+|\d+)', ops[1])):
+                    literals[arm].update(dests)
+            if (off >= join and name in ('image_sample_l', 'image_sample_lz') and len(ops) == 4
+                    and 'dim:SQ_RSRC_IMG_2D' in mods):
+                r = reg_range(ops[3])
+                if r and r[0] == 's' and r[2] == r[1] + 3 and r[2] <= 105:
+                    regs = set(range(r[1], r[2] + 1))
+                    if all(regs <= written for written in literals):
+                        bases.add(r[1])
+        return cond, join, bases
+
+    def joined_sampler_call(self, tex, operand, pair, uv, level, name):
+        for words in pair:
+            # Point-filtered normalized wrap/clamp, with an actual point mip filter.
+            w0, w1, w2, w3 = words
+            if (w0 & ~0x3f or (w0 & 7) not in (0, 2) or ((w0 >> 3) & 7) not in (0, 2)
+                    or w1 & ~0xffffff or w2 != 1 << 26 or w3):
+                raise Unsupported('%s with unsupported joined sampler words' % name)
+            self.lod_sampler_words(name, words)
+        a, b = pair
+        base = reg_range(operand)[1]
+        k = next(i for i in range(4) if a[i] != b[i])
+        self.used_s.add(base + k)
+        qa = self.pipe.sampler(a, lod_limits=True)
+        qb = self.pipe.sampler(b, lod_limits=True)
+        return '(s%d == 0x%08xu ? %s.SampleLevel(%s, %s, %s) : %s.SampleLevel(%s, %s, %s))' % (
+            base + k, a[k], tex, qa, uv, level, tex, qb, uv, level)
+
     def execz_refusals(self):
         """{offset: reason} for compute blocks that s_cbranch_execz skips and the one-lane model cannot run.
 
@@ -3459,6 +3512,7 @@ class Stage:
         execz_targets = set() if getattr(self, 'kind', None) == 'cs' else {
             t for t in targets if all(pc < t and names[pc] == 's_cbranch_execz' for pc, to in branches if to == t)}
         back_targets = {to for pc, to in branches if to <= pc}
+        sampler_diamond = self.sampler_join_shape(branches) if branches else None
         self.mesh_allocation_block = None
         splits = set(targets)
         if getattr(self, 'kind', None) == 'ms' and targets:
@@ -3589,6 +3643,7 @@ class Stage:
             incoming = {}
             kept = {}
             self.back_force = {}
+            self.sampler_joins = {}
             written = set(init_written)
             falls = True
             start = 0
@@ -3638,6 +3693,19 @@ class Stage:
                     arriving = ([({reg: self.sym.get(reg) for reg in here}, written & here)] if falls else []) + \
                         incoming.get(off, [])
                     written = (written - here) | set().union(*(w for _, w in arriving))
+                    self.sampler_joins.clear()
+                    if (sampler_diamond and off == sampler_diamond[1] and falls and len(arriving) == 2
+                            and self.exec_known and self.uniform_cf and sampler_diamond[0] in self.uniform_branches):
+                        for base in sampler_diamond[2]:
+                            regs = range(base, base + 4)
+                            if any(forced.get(off, {}).get(r) is not None for r in regs):
+                                continue
+                            if not all(all(r in w and s.get(r) and s[r][0] == 'const' and len(s[r]) == 2
+                                           for r in regs) for s, w in arriving):
+                                continue
+                            pair = tuple(tuple(s[r][1] & 0xffffffff for r in regs) for s, _ in arriving)
+                            if pair[0] != pair[1]:
+                                self.sampler_joins[base] = pair
                     for reg in here:
                         paths = [s[reg] for s, w in arriving if reg in w]
                         force = forced.get(off, {}).get(reg)
@@ -3722,6 +3790,10 @@ class Stage:
                                     reg, 'run' if run_time_symbol(sym) else 'refuse')
                 falls = name not in ('s_branch', 's_setpc_b64', 's_endpgm')
                 dests = scalar_destinations(name, asm)
+                if self.sampler_joins and dests:
+                    for base in tuple(self.sampler_joins):
+                        if 'any' in dests or any(r in dests for r in range(base, base + 4)):
+                            del self.sampler_joins[base]
                 written |= every_sgpr if 'any' in dests else dests
                 last_write.update(dict.fromkeys(every_sgpr if 'any' in dests else dests, off))
                 self._pre_fconst = dict(self.float_const_s)
@@ -7268,6 +7340,11 @@ class Stage:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
+            sjoin = None
+            if dim == 'SQ_RSRC_IMG_2D' and how in ('l', 'lz') and not packed_2d and not heap and words is None:
+                r = reg_range(ops[3])
+                if r and r[0] == 's' and r[2] == r[1] + 3:
+                    sjoin = getattr(self, 'sampler_joins', {}).get(r[1])
             if how == 'b':
                 # The guest clamps the biased LOD to the sampler's MIN_LOD and MAX_LOD. Only a constant descriptor
                 # can be read here, and only its limits are carried to the static sampler (line smpl), so a sampler
@@ -7280,6 +7357,8 @@ class Stage:
                 if heap or not words or self.default_sampler_words(words):
                     raise Unsupported('image_get_lod with a sampler that is not constant (LOD limits and bias unknown)')
                 smp = self.pipe.sampler(tuple(self.lod_sampler_words('image_get_lod', words)), lod_limits=True)
+            elif sjoin is not None:
+                smp = None
             elif how in ('sample', 'l', 'lz', 'd') and (heap or (words and self.default_sampler_words(words))):
                 # A heap sampler, or the fixed default that stands in for one, keeps its unbounded static LOD range: the
                 # descriptor is read at run time, so its MIN_LOD, MAX_LOD and bias are not validated here (#2221).
@@ -7309,6 +7388,8 @@ class Stage:
                 axes = len(grads[0])
                 dx, dy = ['float%d(%s)' % (axes, ', '.join(self.f(r) for r in g)) for g in grads]
                 call = '%s.SampleGrad(%s, %s, %s, %s)' % (tex, smp, uv, dx, dy)
+            elif sjoin is not None:
+                call = self.joined_sampler_call(tex, ops[3], sjoin, uv, self.f(lod) if how == 'l' else '0', name)
             elif how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'b':
