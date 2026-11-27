@@ -66,11 +66,13 @@ def pipeline(step, low, high, mip_filter):
     return fixture.G.Pipeline(fixture.VS_WORDS, code, fixture.root_blob(flags=0), ps_hw_inputs=(0x8000, 0x8000))
 
 
-def read_pixel(renderer, adapter, vs, ps, sampler, view, *, selector=None, array=False):
+def read_pixel(renderer, adapter, vs, ps, sampler, view, *, selector=None, array=False, mip_base=None):
     mode = '--startup-image-2d-array-view' if array else '--startup-image-2d-view'
     args = [renderer, adapter, mode, vs, ps, sampler, view]
-    if selector is not None:
-        args.append(str(selector))
+    if selector is not None or mip_base is not None:
+        args.append(str(0 if selector is None else selector))
+    if mip_base is not None:
+        args.append(str(mip_base))
     run = subprocess.run(args, capture_output=True, text=True, timeout=30)
     print(run.stdout, end='')
     if run.returncode == 77:

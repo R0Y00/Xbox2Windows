@@ -172,8 +172,16 @@ static const char* mnemonic(Encoding enc, unsigned op) {
         case 0x169: return "v_mul_lo_u32";
         case 0x16c: return "v_mul_hi_i32";
         case 0x300: return "v_lshrrev_b64";
+        case 0x340: return "v_mad_u16";
         case 0x346: return "v_lshl_add_u32";
         case 0x347: return "v_add_lshl_u32";
+        case 0x352: return "v_min3_i16";
+        case 0x353: return "v_min3_u16";
+        case 0x355: return "v_max3_i16";
+        case 0x356: return "v_max3_u16";
+        case 0x358: return "v_med3_i16";
+        case 0x359: return "v_med3_u16";
+        case 0x35e: return "v_mad_i16";
         case 0x365: return "v_mbcnt_lo_u32_b32";
         case 0x366: return "v_mbcnt_hi_u32_b32";
         case 0x36f: return "v_lshl_or_b32";

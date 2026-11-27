@@ -12,7 +12,11 @@ and UNUSED_PRESERVE, which copies it from the old destination. DWORD and byte
 destinations, UNUSED_SEXT, byte sources, source sext, scalar and constant sources,
 clamp, and output modifiers are refused. SDWA min and max remain refused.
 
+Direct wave32 compute SDWA VOPC compares can write a 32-bit mask to `vcc_hi` and read it as a scalar source.
+
 ## Fixture
+
+The wave32 GPU fixture also covers SDWA packed RTZ f32-to-f16 placement and add-with-carry, including per-lane VCC input and output before destination placement.
 
 The fixture compares the IR and hardware results against the same exact binary16
 model as the plain-form fixture. The hardware run dispatches two wave32 groups,
