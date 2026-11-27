@@ -165,7 +165,7 @@ def publish(directory, *stages, ps_inputs=None):
     directory.mkdir(exist_ok=True)
     key = 1469598103934665603
     tail = b"" if ps_inputs is None else b"psin1" + struct.pack("<II", *ps_inputs)
-    for byte in b"x2w-startup-shader-28" + b"".join(stages) + tail:
+    for byte in b"x2w-startup-shader-29" + b"".join(stages) + tail:
         key = ((key ^ byte) * 1099511628211) & ((1 << 64) - 1)
     hex_key = f"{key:016x}"
     stem = f"req_{hex_key}"

@@ -13,7 +13,7 @@ def write_request(work, words, root, sa=None):
         sa = struct.pack("<7I", 0, 0, 0, 32 | (8 << 16), 1, 0, (6 << 1) | (1 << 10))
     desc = struct.pack("<12Q", 0, 0, len(sa), 0, 0, 0, len(code), 0, len(data), 0, 0, 0)
     parts = {".c67":code, ".data":data, ".root":root, ".desc":desc, ".sa":sa, ".sb":b""}
-    payload = b"x2w-startup-shader-28cs" + b"".join(struct.pack("<Q", len(p))+p for p in parts.values())
+    payload = b"x2w-startup-shader-29cs" + b"".join(struct.pack("<Q", len(p))+p for p in parts.values())
     key = 1469598103934665603
     for byte in payload:
         key = (key ^ byte)*1099511628211 & 0xffffffffffffffff
