@@ -9,15 +9,17 @@ The shader cache holds one request set per key (req_<key>.<ext>) and, for every 
 refused, <key>.fail whose first line is the first refusal. The stage comes from the request files:
 .c67 compute, .m57 / .m86 mesh, .a / .b graphics (VS+PS pair), .rtv render-target variant.
 
-The weight of a refused key is the largest count the stand-in log gives it (each refused key blocks
-every draw or dispatch that needed it):
-  x2w-render compute census key K: N dispatches, T translated[, first refusal: ...]   -> N
+The weight of a refused key is the largest failure count in the stand-in logs, with total-use
+estimates as a fallback:
+  x2w-render compute census key K: N dispatches, T translated[, first refusal: ...]   -> max(0, N - T)
+  x2w-render compute census key K: N dispatches (older logs)                         -> N
   x2w-draw no RTV translation for K                                                 -> lines
   x2w-render translated ExecuteIndirect Draw refused, shader K                      -> lines
   x2w-render ExecuteIndirect refused, key K                                         -> lines
   x2w-render key use graphics|compute K ... uses N   (per-key use report, if the build prints it) -> N
   x2w-render not drawn key K: N                       (not-drawn report, if the build prints it)  -> N
-A refused key no log line names has weight 0: it was requested but never needed in that run.
+A refused key absent from the logs has weight 0 because the logs recorded no evidence for it.
+Runtime indirect-draw counters are reported separately by key and reason.
 
 Classes: the fixed category labels of triage_run.py when one matches, otherwise the first refusal with
 registers, numbers and addresses normalized. --shareable keeps only the fixed labels (unknown text becomes
@@ -38,13 +40,16 @@ from triage_run import OTHER, classify_shader_reason  # noqa: E402
 STAGES = (("c67", "compute"), ("m57", "mesh57"), ("m86", "mesh86"), ("a", "graphics"), ("b", "graphics"),
           ("rtv", "rtv"))
 KEY = r"([0-9a-f]{16})"
+KEY_USE = re.compile(r"key use (?:graphics|compute) " + KEY + r" .* uses (\d+)")
+INDIRECT_DRAW = re.compile(r"x2w-d3d12 indirect-draw refusal \d+: key=" + KEY +
+                           r" reason=(\w+) calls=(\d+)\b")
+MISSING_EVIDENCE = "Keys absent from sampled or truncated logs have weight 0 for lack of recorded evidence."
 # (pattern, group holding the count or None to count lines)
 WEIGHT_LINES = (
-    (re.compile(r"compute census key " + KEY + r": (\d+) dispatches"), 2),
+    (re.compile(r"compute census key " + KEY + r": (\d+) dispatches(?:, (?P<translated>\d+) translated)?"), 2),
     (re.compile(r"no RTV translation for " + KEY), None),
     (re.compile(r"translated ExecuteIndirect Draw refused, shader " + KEY), None),
     (re.compile(r"ExecuteIndirect refused, key " + KEY), None),
-    (re.compile(r"key use (?:graphics|compute) " + KEY + r" .* uses (\d+)"), 2),
     (re.compile(r"not drawn key " + KEY + r": (\d+)"), 2),
 )
 NORMALIZE = (
@@ -90,32 +95,47 @@ def load_cache(cache: Path) -> tuple[dict[str, set[str]], dict[str, str]]:
     return extensions, refusals
 
 
-def load_weights(logs: list[Path]) -> collections.Counter[str]:
+def load_weights(logs: list[Path]) -> tuple[collections.Counter[str], collections.Counter[tuple[str, str]]]:
     weights: collections.Counter[str] = collections.Counter()
+    estimates: collections.Counter[str] = collections.Counter()
+    indirect_draw: collections.Counter[tuple[str, str]] = collections.Counter()
     for log in logs:
         per_line: collections.Counter[tuple[int, str]] = collections.Counter()
         with log.open(errors="replace") as lines:
             for line in lines:
                 if "x2w-" not in line:
                     continue
+                if match := INDIRECT_DRAW.search(line):
+                    key, reason, calls = match.groups()
+                    if key != "0" * 16:
+                        pair = (key, reason)
+                        indirect_draw[pair] = max(indirect_draw[pair], int(calls))
+                    continue
+                if match := KEY_USE.search(line):
+                    key, uses = match.groups()
+                    estimates[key] = max(estimates[key], int(uses))
+                    continue
                 for index, (pattern, group) in enumerate(WEIGHT_LINES):
                     match = pattern.search(line)
                     if not match:
                         continue
                     count = int(match[group]) if group else 1
+                    if translated := match.groupdict().get("translated"):
+                        count = max(0, count - int(translated))
                     slot = (index, match[1])
                     # Count lines add up; reported totals are cumulative, so the last (largest) one wins.
                     per_line[slot] = per_line[slot] + count if group is None else max(per_line[slot], count)
                     break
         for (_, key), count in per_line.items():
             weights[key] = max(weights[key], count)
-    return weights
+    for key, count in estimates.items():
+        weights.setdefault(key, count)
+    return weights, indirect_draw
 
 
-def census_rows(cache: Path, logs: list[Path], shareable: bool) -> list[tuple[str, str, str, int]]:
+def census_rows(cache: Path, weights: collections.Counter[str], shareable: bool) -> list[tuple[str, str, str, int]]:
     """(key, stage, class, weight) of every refused key, heaviest first."""
     extensions, refusals = load_cache(cache)
-    weights = load_weights(logs)
     rows = [(key, stage_of(extensions.get(key, set())), refusal_class(line, shareable), weights[key])
             for key, line in refusals.items()]
     return sorted(rows, key=lambda row: (-row[3], row[0]))
@@ -133,10 +153,12 @@ def ranked_classes(rows: list[tuple[str, str, str, int]]) -> list[tuple[str, int
     return [(label, keys, weight, ",".join(sorted(stages))) for label, (keys, weight, stages) in ranked]
 
 
-def markdown(rows: list[tuple[str, str, str, int]], top: int) -> str:
+def markdown(rows: list[tuple[str, str, str, int]], top: int,
+             runtime_rows: list[tuple[str, str, int]]) -> str:
     out = ["# Shader refusal census", "",
-           "Weight = draws/dispatches the stand-in log names for the refused key.", "",
-           "| stage | refused keys | used in the run | blocked weight |", "|---|---|---|---|"]
+           "Weight uses logged failure counts where available, with total-use estimates as a fallback.",
+           MISSING_EVIDENCE, "",
+           "| stage | refused keys | keys with positive weight | blocked weight |", "|---|---|---|---|"]
     by_stage: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
     for _, stage, _, weight in rows:
         by_stage[stage][0] += 1
@@ -146,16 +168,23 @@ def markdown(rows: list[tuple[str, str, str, int]], top: int) -> str:
     out += ["", "| # | first refusal class | keys | blocked weight | stages |", "|---|---|---|---|---|"]
     for rank, (label, keys, weight, stages) in enumerate(ranked_classes(rows)[:top], 1):
         out.append("| %d | %s | %d | %d | %s |" % (rank, label.replace("|", "/"), keys, weight, stages))
+    if runtime_rows:
+        out += ["", "## Runtime indirect-draw refusals", "",
+                "| key | reason | calls |", "|---|---|---|"]
+        out += ["| %s | %s | %d |" % row for row in runtime_rows]
     return "\n".join(out) + "\n"
 
 
-def tsv(rows: list[tuple[str, str, str, int]]) -> str:
+def tsv(rows: list[tuple[str, str, str, int]], runtime_rows: list[tuple[str, str, int]]) -> str:
     lines = ["key\tstage\tclass\tweight"] + ["%s\t%s\t%s\t%d" % row for row in rows]
+    if runtime_rows:
+        lines += ["", "key\tindirect-draw reason\tcalls"]
+        lines += ["%s\t%s\t%d" % row for row in runtime_rows]
     return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=MISSING_EVIDENCE)
     parser.add_argument("--cache", type=Path, required=True, help="X2W_SHADER_CACHE directory")
     parser.add_argument("--log", type=Path, action="append", required=True, help="stand-in stderr (repeatable)")
     parser.add_argument("--out-md", type=Path)
@@ -168,14 +197,17 @@ def main(argv: list[str] | None = None) -> int:
     missing = [str(log) for log in args.log if not log.is_file()]
     if missing:
         parser.error("--log not found: %s" % ", ".join(missing))
-    rows = census_rows(args.cache, args.log, args.shareable)
-    report = markdown(rows, args.top)
+    weights, indirect_draw = load_weights(args.log)
+    rows = census_rows(args.cache, weights, args.shareable)
+    runtime_rows = [(key, reason, count) for (key, reason), count in
+                    sorted(indirect_draw.items(), key=lambda item: (-item[1], item[0]))]
+    report = markdown(rows, args.top, runtime_rows)
     if args.out_md:
         args.out_md.write_text(report)
     else:
         sys.stdout.write(report)
     if args.out_tsv:
-        args.out_tsv.write_text(tsv(rows))
+        args.out_tsv.write_text(tsv(rows, runtime_rows))
     return 0
 
 

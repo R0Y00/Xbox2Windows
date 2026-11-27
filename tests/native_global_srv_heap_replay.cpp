@@ -5,7 +5,7 @@
 //         Native recording path: reads the GPU selector back before the dispatch, captures {select, view types}
 //         into REQ.views, refuses a slot of another view type before the shader runs, otherwise records the
 //         dispatch with x2w_startup::NativeRecording and NativeDispatchStates and compares the fenced output.
-// replay  SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER EXPECT REFERENCE_SLOT
+// replay  SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER EXPECT REFERENCE_SLOT [EXPECTED_WORDS]
 //         Offline request replay: decodes VIEWS, refuses before the dispatch or runs the compiled.cso shader on a
 //         heap rebuilt from the captured slot types and compares with the reference slot data.
 // EXPECT is "ok" or "refused". Exit 0: outcome as expected. 1: output mismatch for an expected-ok case. 3: the
@@ -278,8 +278,14 @@ std::vector<std::uint32_t> reference_output(unsigned slot) {
 }
 
 // 0: the 72 words equal the reference; 1 prints the first mismatch.
-int compare_output(Rig &rig, unsigned reference_slot) {
-    const auto expected = reference_output(reference_slot);
+int compare_output(Rig &rig, unsigned reference_slot, const fs::path &reference_path = {}) {
+    auto expected = reference_output(reference_slot);
+    if (!reference_path.empty()) {
+        std::ifstream input(reference_path, std::ios::binary);
+        if (!input.read(reinterpret_cast<char *>(expected.data()), output_words * sizeof(expected[0])) ||
+            input.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("expected output file must contain exactly 72 dwords");
+    }
     const auto actual = rig.read(rig.output.Get(), output_words);
     for (unsigned i = 0; i < output_words; ++i)
         if (actual[i] != expected[i]) {
@@ -287,8 +293,11 @@ int compare_output(Rig &rig, unsigned reference_slot) {
                         reference_slot);
             return 1;
         }
-    std::printf("output matches slot %u data (%u words) and the %u sentinel words are intact\n", reference_slot,
-                slot_words, output_words - slot_words);
+    if (reference_path.empty())
+        std::printf("output matches slot %u data (%u words) and the %u sentinel words are intact\n", reference_slot,
+                    slot_words, output_words - slot_words);
+    else
+        std::printf("output matches CPU reference (%u words)\n", output_words);
     return 0;
 }
 
@@ -380,7 +389,7 @@ int record(int argc, wchar_t **argv) {
 }
 
 int replay(int argc, wchar_t **argv) {
-    if (argc != 10) return 2;
+    if (argc != 10 && argc != 11) return 2;
     const std::wstring expect = argv[8];
     if (expect != L"ok" && expect != L"refused") return 2;
     const fs::path cdx = argv[4], cso = argv[5], views_path = argv[6];
@@ -426,7 +435,7 @@ int replay(int argc, wchar_t **argv) {
         }
         rig.read_selector(request.selected);
         rig.dispatch(pipeline, compiled.Get(), rig.slots[request.selected].Get());
-        const int result = compare_output(rig, reference_slot);
+        const int result = compare_output(rig, reference_slot, argc == 11 ? fs::path(argv[10]) : fs::path{});
         if (expect == L"refused") return 3; // ran when a refusal was expected
         return result;
     } catch (const std::exception &error) {
@@ -446,6 +455,7 @@ int wmain(int argc, wchar_t **argv) {
         return 4;
     }
     std::fputs("usage: native_global_srv_heap_replay root OUT.root | record SDK CACHE REQ.cdx ADAPTER SELECTOR ok|refused "
-               "[--no-guard] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT\n", stderr);
+               "[--no-guard] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT "
+               "[EXPECTED_WORDS]\n", stderr);
     return 2;
 }

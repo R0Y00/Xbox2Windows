@@ -45,16 +45,22 @@ def write_cache(cache: Path) -> None:
 
 
 class RefusalCensusCli(unittest.TestCase):
-    def run_tool(self, *extra: str) -> tuple[str, list[list[str]]]:
+    def run_tool(self, *extra: str, logs: tuple[str, ...] = (LOG,),
+                 cached_failures: tuple[str, ...] = ()) -> tuple[str, list[list[str]]]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cache = root / "cache"
             cache.mkdir()
             write_cache(cache)
-            log = root / "stderr.txt"
-            log.write_text(LOG)
+            for key in cached_failures:
+                (cache / f"{key}.fail").write_text("unsupported opcode\n")
+            log_args = []
+            for index, content in enumerate(logs):
+                log = root / f"stderr-{index}.txt"
+                log.write_text(content)
+                log_args.extend(["--log", str(log)])
             out_tsv = root / "census.tsv"
-            result = subprocess.run([sys.executable, "-I", str(TOOL), "--cache", str(cache), "--log", str(log),
+            result = subprocess.run([sys.executable, "-I", str(TOOL), "--cache", str(cache), *log_args,
                                      "--out-tsv", str(out_tsv), *extra],
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -90,6 +96,49 @@ class RefusalCensusCli(unittest.TestCase):
                                      str(Path(tmp) / "absent.txt")], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--log not found", result.stderr)
+
+    def test_compute_weights_count_blocked_dispatches(self):
+        log = "\n".join([
+            f"x2w-render compute census key {COMPUTE}: 12 dispatches, 10 translated, first refusal: example",
+            f"x2w-render compute census key {TRANSLATED}: 12 dispatches, 12 translated",
+            f"x2w-render compute census key {UNUSED}: 8 dispatches, first refusal: old format",
+            f"x2w-render compute census key {GRAPHICS_SAME_CLASS}: 4 dispatches, 5 translated",
+            f"x2w-render key use graphics {GRAPHICS} first frame 1 uses 6",
+        ])
+        estimates = "\n".join(f"x2w-render key use compute {key} first frame 1 uses 99"
+                              for key in (COMPUTE, TRANSLATED, UNUSED))
+        _, rows = self.run_tool(logs=(estimates, log), cached_failures=(TRANSLATED,))
+        self.assertEqual({row[0]: int(row[3]) for row in rows[1:]}, {
+            COMPUTE: 2, TRANSLATED: 0, UNUSED: 8, GRAPHICS: 6, GRAPHICS_SAME_CLASS: 0,
+        })
+
+    def test_runtime_refusals_are_cumulative_and_separate(self):
+        def line(key: str, reason: str, calls: int) -> str:
+            return f"x2w-d3d12 indirect-draw refusal 1: key={key} reason={reason} calls={calls}"
+
+        logs = (
+            LOG + "\n".join([
+                *(line(GRAPHICS, "missing_guest_root", calls) for calls in (2, 5, 5)),
+                *(line(GRAPHICS, "missing_pipeline", calls) for calls in (1, 3, 3)),
+                *(line(TRANSLATED, "missing_guest_root", calls) for calls in (1, 4, 4)),
+                *(line("0" * 16, "missing_guest_root", calls) for calls in (2, 8, 8)),
+            ]),
+            "\n".join([line(GRAPHICS, "missing_guest_root", 4),
+                       line(TRANSLATED, "missing_guest_root", 6)]),
+        )
+        report, rows = self.run_tool(logs=logs)
+        _, shader_rows = self.run_tool()
+        self.assertEqual(rows, shader_rows + [
+            [''],
+            ["key", "indirect-draw reason", "calls"],
+            [TRANSLATED, "missing_guest_root", "6"],
+            [GRAPHICS, "missing_guest_root", "5"],
+            [GRAPHICS, "missing_pipeline", "3"],
+        ])
+        self.assertIn("## Runtime indirect-draw refusals", report)
+        self.assertIn(f"| {TRANSLATED} | missing_guest_root | 6 |", report)
+        self.assertIn(f"| {GRAPHICS} | missing_guest_root | 5 |", report)
+        self.assertNotIn("0000000000000000", report)
 
 
 if __name__ == "__main__":
