@@ -82,6 +82,7 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "startup_stubs/xmem_section_buffer.h"
+#include "native_buffer_store_view.h"
 #ifdef X2W_NATIVE_SHADERS  // d3d12_xs_shim only: the C++ shader compiler (startup_stubs/d3d12_compute_dispatch.inl)
 #include "gfx1013_compute_native.h"
 #include "shader_dxil_compiler.h"
@@ -182,6 +183,8 @@ struct alignas(16) WrapperOwn {
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     UploadChunkMask upload_chunks;    // Ring and snapshot chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
+    bool unplaced_srv_backing;  // Resource: synthetic backing for an address-only buffer SRV.
+    bool exact_copy;            // Resource: synthetic backing that starts at the view address.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
@@ -501,6 +504,10 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    // The guest checks device byte +0x18 before using its inline descriptor
+    // writers. Request vtable calls so the shim records the descriptor.
+    static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
+    if (kind == device_kind) w->console_fields[2] = 1;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
@@ -2686,6 +2693,9 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 the ring uses 16 MiB chunks (larger for oversized reservations),
 // up to 512 MiB. A fenced submit releases the list's holds in both pools.
 
+volatile LONG64 upload_ring_reserved_bytes, upload_ring_capacity_bytes;
+volatile LONG upload_ring_reservations, upload_ring_refusals;
+
 // snapshot = true takes the reservation from the title input snapshot pool (128 MiB, chunks numbered after the ring's).
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool snapshot = false)
 {
@@ -2695,6 +2705,11 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool sna
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
+    const auto note_reserved = [snapshot](u64 reserved) {
+        if (snapshot) return;
+        InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(reserved));
+        InterlockedIncrement(&upload_ring_reservations);
+    };
 
     auto& chunks = snapshot ? snapshot_chunks : upload_chunks;
     static unsigned actives[2] = {0, 0};
@@ -2711,7 +2726,10 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool sna
     };
     if (!chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) return finish(active);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(active);
+        }
     }
 
     const bool grow_released_ring = !snapshot && ring_release_at_submit();
@@ -2741,7 +2759,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool sna
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
+                        if (!snapshot) InterlockedAdd64(&upload_ring_capacity_bytes, static_cast<LONG64>(chunk_bytes));
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        note_reserved(rounded);
                         return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
@@ -2758,15 +2778,22 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool sna
     // Allocation failed or the cap was reached. Older unused tails are still safe.
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reserve_upload_chunk(chunks[index], rounded);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reuse_upload_chunk(chunks[index], base + index, rounded, queue_submits);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     ReleaseSRWLockExclusive(&allocator_lock);
+    if (!snapshot) InterlockedIncrement(&upload_ring_refusals);
     static LONG refused[2];
     if (first_calls(refused[snapshot ? 1 : 0], 8))
         log(snapshot ? "x2w-draw snapshot pool reservation refused: no unused capacity"
@@ -4471,15 +4498,14 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     list->Dispatch(x, y, z);
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
-bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        draw_startup_direct(self, vertices, instances, first_vertex, first_instance);
         return;
     }
     if (list && pass.root_heap_flags) {
@@ -4526,7 +4552,6 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
-#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
@@ -5761,6 +5786,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
 // member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
@@ -7397,22 +7423,27 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             root_srv_copies_made);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
+            "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
-            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words,
+            missing_shader_fallback_draws);
     if (render_mode() && frame % 300 == 0 && (pso_recipes_loaded || pso_recipes_precreated || pso_recipe_mismatches || pso_recipe_fallbacks))
         log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
             pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
     if (render_mode() && frame % 300 == 0) {
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, capacity %llu MiB",
+            static_cast<unsigned long long>(upload_ring_reserved_bytes) >> 20, upload_ring_reservations, upload_ring_refusals,
+            static_cast<unsigned long long>(upload_ring_capacity_bytes) >> 20);
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_builder_gate_refusals, compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
