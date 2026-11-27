@@ -4806,6 +4806,9 @@ Native readback remains pending, including the raw miss and disabled-slot
 words. The probe leaves translator behavior and form coverage unchanged.
 The node model and its witness set are described in
 [bvh-node-model.md](experiments/bvh-node-model.md).
+The translator slices that consume the model are the
+[FP32 and binary16 box nodes](experiments/startup-gfx2hlsl-bvh-box32.md) and the
+[triangle nodes](experiments/startup-gfx2hlsl-bvh-triangle.md).
 
 ### gfx1013 2D explicit-LOD image gathers
 
