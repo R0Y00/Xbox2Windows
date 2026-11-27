@@ -297,7 +297,8 @@ int draw_raw_uavs(ID3D12Device* desktop, void* guest, void* list, const std::str
     if (!cpu || !gpu || stride < 32) return 73;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
     view.Buffer.FirstElement = 4;
-    view.Buffer.NumElements = 16;
+    const bool atomic = mode.rfind("raw-atomic", 0) == 0;
+    view.Buffer.NumElements = atomic ? 20 : 16;
     view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&view), cpu);
     if (mode == "raw-short") view.Buffer.NumElements = 8;
@@ -316,6 +317,10 @@ int draw_raw_uavs(ID3D12Device* desktop, void* guest, void* list, const std::str
     std::printf("raw pixel UAV case %s, title descriptor stride %u\n", mode.c_str(), stride);
     invoke(list, 32, 1, ptr(&views));
     if (mode != "raw-no-table") invoke(list, 36, 0, gpu);
+    if (mode == "raw-atomic-edge") {
+        const D3D12_RECT scissor{0, 0, 3, 3};
+        invoke(list, 22, 1, ptr(&scissor));
+    }
     invoke(list, 12, 3, 1);
     return 0;
 }
