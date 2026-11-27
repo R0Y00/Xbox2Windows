@@ -563,6 +563,19 @@ struct DirectCompute {
                 if (i.b & 0xfffff)
                     refuse(i.pc, "heap descriptor load with an immediate offset addresses another slot than the captured selection");
             }
+            if (!root && low.type == Symbol::Type::table && low.value == compute_sampler_heap) {
+                // Reads from the directly indexed sampler heap: one or two samplers at a constant 16-byte aligned offset.
+                if (i.op >= 8)
+                    refuse(i.pc, "scalar buffer load from the sampler heap is not translated");
+                if (so != 125)
+                    refuse(i.pc, "sampler heap load with an SGPR offset (a GPU-selected sampler) is not translated");
+                if (i.op != 2 && i.op != 3)
+                    refuse(i.pc, "sampler heap load must read one or two samplers");
+                if ((i.b & 0xfffff) % 16)
+                    refuse(i.pc, "sampler heap offset is not a multiple of 16");
+                if ((i.b & 0xfffff) / 16 + (i.op == 3 ? 2 : 1) - 1 > 2046)
+                    refuse(i.pc, "sampler heap index beyond 2046 (2047 is the runtime fallback entry)");
+            }
             if (i.op < 8 && !root) {
                 if (s.at(i.src[0]).type != Symbol::Type::table ||
                     s.at(i.src[0] + 1).type != Symbol::Type::constant || s.at(i.src[0] + 1).value != 0)
@@ -981,11 +994,16 @@ struct DirectCompute {
                     analysis.result.sampler_heap = true;
                     sampler = ir.handle({3, 0, 14, 0, 0, 0, 2048, false, 1}, read(sampler_base));
                 } else {
-                    auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
-                                                          implicit || gradient, compare);
-                    if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
+                    const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                                                                    implicit || gradient, compare);
+                    if (i.op == 64 && !sampler_ref.heap &&
+                        (analysis.result.samplers.at(sampler_ref.index - analysis.first_sampler).words[1] & 0xffffff))
                         refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
-                    sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
+                    if (sampler_ref.heap) {
+                        ir.features |= 0x80000000;
+                        sampler = ir.sampler_heap_handle(to_string(sampler_ref.index));
+                    } else
+                        sampler = ir.handle({3, sampler_ref.index, 14, 0, 0, 0, 1, compare});
                 }
                 using Arg = std::pair<string, string>;
                 std::vector<Arg> args{{"%dx.types.Handle", h}, {"%dx.types.Handle", sampler}};

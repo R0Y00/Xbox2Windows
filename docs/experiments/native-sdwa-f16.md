@@ -12,6 +12,8 @@ and UNUSED_PRESERVE, which copies it from the old destination. DWORD and byte
 destinations, UNUSED_SEXT, byte sources, source sext, scalar and constant sources,
 clamp, and output modifiers are refused. SDWA min and max remain refused.
 
+Direct wave32 compute SDWA VOPC compares can write a 32-bit mask to `vcc_hi` and read it as a scalar source.
+
 ## Fixture
 
 The fixture compares the IR and hardware results against the same exact binary16

@@ -826,6 +826,15 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_list_copy_texture_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
+# Stage-by-stage trace and regression for horizontal alternating row bands on textured indexed UI draws (#3132).
+add_executable(startup_ui_texture_bands_check tests/startup_ui_texture_bands_check.cpp)
+target_compile_features(startup_ui_texture_bands_check PRIVATE cxx_std_17)
+target_link_libraries(startup_ui_texture_bands_check PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_ui_texture_bands_${backend} COMMAND startup_ui_texture_bands_check ${backend})
+    set_tests_properties(startup_ui_texture_bands_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
@@ -2013,10 +2022,10 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
     set_tests_properties(native_graphics_wqm_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     foreach(adapter warp hardware)
-        add_test(NAME native_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-            "${CMAKE_SOURCE_DIR}/tests/native_sampler_heap_check.py" "$<TARGET_FILE:compile_dxil>"
+        add_test(NAME native_graphics_sampler_table_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_graphics_sampler_table_check.py" "$<TARGET_FILE:compile_dxil>"
             "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}" ${adapter})
-        set_tests_properties(native_sampler_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(native_graphics_sampler_table_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endforeach()
     add_test(NAME native_graphics_interface_library
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_graphics_interface_library_check.py"
