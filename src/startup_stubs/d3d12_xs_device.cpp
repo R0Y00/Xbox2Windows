@@ -15,6 +15,7 @@
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
+#include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/manifest_retry.h"
@@ -181,6 +182,8 @@ struct alignas(16) WrapperOwn {
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
+    bool unplaced_srv_backing;  // Resource: synthetic backing for an address-only buffer SRV.
+    bool exact_copy;            // Resource: synthetic backing that starts at the view address.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
@@ -500,6 +503,10 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    // The guest checks device byte +0x18 before using its inline descriptor
+    // writers. Request vtable calls so the shim records the descriptor.
+    static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
+    if (kind == device_kind) w->console_fields[2] = 1;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
@@ -2868,6 +2875,7 @@ struct Pass {
     ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
+    u64 sampler_heap_wrapper = 0;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
@@ -4461,15 +4469,14 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     list->Dispatch(x, y, z);
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
-bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        draw_startup_direct(self, vertices, instances, first_vertex, first_instance);
         return;
     }
     if (list && pass.root_heap_flags) {
@@ -4516,7 +4523,6 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
-#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
@@ -5248,6 +5254,45 @@ void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 des
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%d", count, dest, src, type);
 }
 
+// Slot 61 accepts the extended console sampler description; its destination is a CPU handle.
+void __stdcall device_console_sampler(Wrapper* self, const UINT* words, u64 destination)
+{
+    if (!words || !x2w_local::readable(words, 27 * sizeof(UINT))) return;
+    const auto handle = desktop_cpu_handle(destination);
+    if (!handle) return;
+    D3D12_SAMPLER_DESC sampler{};
+    const auto address_valid = [](UINT value) {
+        return value >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && value <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    if (words[1] > 3 || words[2] > 3 || words[3] > 2 || words[5] > 2 ||
+        words[16] > D3D12_COMPARISON_FUNC_ALWAYS || !std::all_of(words + 6, words + 9, address_valid)) {
+        sampler = x2w_startup::border_sampler();
+        device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+        note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
+        static LONG refused;
+        if (first_calls(refused, 4)) log("x2w-d3d12 unsupported console sampler fields; using border sampler");
+        return;
+    }
+    sampler.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[6]);
+    sampler.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[7]);
+    sampler.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[8]);
+    sampler.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>((std::max)(1u, words[16]));
+    const auto reduction = words[5] == 1 ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM :
+        words[5] == 2 ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM :
+        words[16] > 1 && words[16] < 8 ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const bool anisotropic = words[1] >= 2 || words[2] >= 2;
+    sampler.Filter = anisotropic ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction) :
+        D3D12_ENCODE_BASIC_FILTER(words[2] & 1, words[1] & 1, words[3] == 2 ? 1u : 0u, reduction);
+    sampler.MaxAnisotropy = anisotropic ? std::clamp(words[13], 1u, 16u) : 1u;
+    std::memcpy(&sampler.MinLOD, words + 9, sizeof(float));
+    std::memcpy(&sampler.MaxLOD, words + 10, sizeof(float));
+    if (!words[3]) sampler.MaxLOD = sampler.MinLOD;
+    std::memcpy(&sampler.MipLODBias, words + 11, sizeof(float));
+    std::memcpy(sampler.BorderColor, words + 17, sizeof(sampler.BorderColor));
+    device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+    note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
+}
+
 // Device slot 23, desktop CopyDescriptors(destCount, destStarts, destSizes, srcCount, srcStarts, srcSizes, type).
 void __stdcall device_copy_descriptors(Wrapper* self, UINT dest_count, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
                                        const UINT* dest_sizes, UINT src_count, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
@@ -5712,6 +5757,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
 // member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
@@ -7149,7 +7195,25 @@ void report_budget(ID3D12CommandQueue* queue)
         if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
         used += n;
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
+    // System commit and the physical-page pool behind it: a run that ends on a commit limit (error 1455) shows
+    // whether the pool (sections, slots) or the resources above grew (#1199).
+    char commit[80];
+    x2w_local::format_commit(commit, sizeof(commit), x2w_local::system_commit());
+    char job[64];
+    x2w_local::format_job(job, sizeof(job), x2w_local::job_memory());
+    char pool[96] = "sections=n/a slabs=n/a slots=n/a";
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    using SlabStats = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*, ULONGLONG*);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {  // adds a reference: released below
+        ULONGLONG sections = 0, slabs = 0, in_use = 0, free_slots = 0;
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        const auto slab_stats = reinterpret_cast<SlabStats>(GetProcAddress(xmem, "x2w_xmem_slab_stats"));
+        if (page_stats && slab_stats && page_stats(&sections) && slab_stats(&slabs, &in_use, &free_slots))
+            std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
+        FreeLibrary(xmem);
+    }
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7332,7 +7396,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
+            "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
@@ -7341,7 +7406,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
-            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words,
+            missing_shader_fallback_draws);
     if (render_mode() && frame % 300 == 0 && (pso_recipes_loaded || pso_recipes_precreated || pso_recipe_mismatches || pso_recipe_fallbacks))
         log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
             pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
@@ -7489,6 +7555,7 @@ void build_tables()
     tables[device_kind][19] = reinterpret_cast<void*>(&view_slot<19, 3>);  // CreateUnorderedAccessView(res, counter, desc, dest)
     tables[device_kind][20] = reinterpret_cast<void*>(&view_slot<20, 2>);  // CreateRenderTargetView(res, desc, dest)
     tables[device_kind][21] = reinterpret_cast<void*>(&view_slot<21, 2>);  // CreateDepthStencilView(res, desc, dest)
+    tables[device_kind][61] = reinterpret_cast<void*>(&device_console_sampler);
     tables[device_kind][22] = reinterpret_cast<void*>(&view_slot<22, 1>);  // CreateSampler(desc, dest)
     tables[device_kind][23] = reinterpret_cast<void*>(&device_copy_descriptors);
     tables[device_kind][24] = reinterpret_cast<void*>(&device_copy_descriptors_simple);
