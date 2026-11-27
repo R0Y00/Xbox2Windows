@@ -17,6 +17,7 @@ struct StartupBc7Input {
     // holds mip 0 then mip 1 as tight rows; both go through XG slot 8 into memory of exactly the size XG slot 2
     // reports, followed by a no-access guard page. The target is 48x32: mip 0 at the left, mip 1 top right.
     bool small4k = false;
+    bool display64k = false;
 };
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,

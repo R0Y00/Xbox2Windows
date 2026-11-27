@@ -117,6 +117,15 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             return 77;
         }
         debug->EnableDebugLayer();
+        // X2W_TEST_GPU_VALIDATION=1: also check the states of resources reached through descriptor tables.
+        ComPtr<ID3D12Debug1> debug1;
+        if (GetEnvironmentVariableW(L"X2W_TEST_GPU_VALIDATION", nullptr, 0)) {
+            if (FAILED(debug.As(&debug1))) {
+                std::printf("no GPU-based validation: skipped\n");
+                return 77;
+            }
+            debug1->SetEnableGPUBasedValidation(TRUE);
+        }
     }
 
     if (const int rc = pick_stream_adapter(hardware, adapter)) return rc;
@@ -132,7 +141,13 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
     const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, joined_table || vertex_srv_pair ? 2u : 1u, 0, 0, 0};
+    char pixel_uav_mode[32]{};
+    GetEnvironmentVariableA("X2W_TEST_PIXEL_UAV", pixel_uav_mode, sizeof(pixel_uav_mode));
+    const bool raw_pixel = std::strncmp(pixel_uav_mode, "raw-", 4) == 0;
+    if (raw_pixel)
+        std::printf("raw descriptor stride: %llu\n", static_cast<unsigned long long>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+    const D3D12_DESCRIPTOR_RANGE srv{raw_pixel ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        raw_pixel ? 4u : (joined_table || vertex_srv_pair ? 2u : 1u), 0, 0, 0};
     D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
@@ -151,11 +166,13 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
+    // X2W_TEST_ROOT_SRV_DRAW (startup_root_srv_draw.cpp) declares it as a shader resource view as well.
     D3D12_ROOT_PARAMETER root_cbv{};
     char cbv_mode[16]{};
-    if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
-        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
-                                                                          : D3D12_ROOT_PARAMETER_TYPE_CBV;
+    const bool root_srv_draw = GetEnvironmentVariableW(L"X2W_TEST_ROOT_SRV_DRAW", nullptr, 0) != 0;
+    if (!textured && (root_srv_draw || GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode)))) {
+        root_cbv.ParameterType = root_srv_draw || std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                                                                                           : D3D12_ROOT_PARAMETER_TYPE_CBV;
         root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = &root_cbv;

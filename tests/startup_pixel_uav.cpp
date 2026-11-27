@@ -31,15 +31,19 @@ namespace {
 using Microsoft::WRL::ComPtr;
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 
-constexpr UINT side = 4, mips = 2, textures = 4;
+constexpr UINT side = 4, mips = 2, textures = 4, array_slices = 6;
 
 // The sentinel of word c of texel (x, y) of mip m of texture t; tests/startup_pixel_uav_check.py makes the same.
 std::uint32_t sentinel(UINT t, UINT m, UINT texel, UINT c) { return 0xc0000000u | (t << 12) | (m << 8) | (texel << 2) | c; }
+std::uint32_t array_sentinel(UINT s, UINT m, UINT texel, UINT c) { return 0xd0000000u | (s << 12) | (m << 8) | (texel << 2) | c; }
 
 struct Fixture {
     ID3D12Device* desktop = nullptr;
+    bool array_mode = false, raw_mode = false;
     void* resources[textures]{};
     ComPtr<ID3D12Resource> natives[textures];
+    void* array_resources[3]{};
+    ComPtr<ID3D12Resource> array_natives[3];
 } fixture;
 
 ComPtr<ID3D12Resource> native_of(void* guest, void* wrapped)
@@ -61,6 +65,13 @@ D3D12_RESOURCE_DESC texture_desc(UINT t)
     return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, 1, mips,
             t == 3 ? DXGI_FORMAT_R32G32B32A32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0},
             D3D12_TEXTURE_LAYOUT_UNKNOWN, t == 2 ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+}
+
+D3D12_RESOURCE_DESC array_texture_desc(UINT t)
+{
+    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, side, side, array_slices, mips,
+            t == 2 ? DXGI_FORMAT_R32G32B32A32_TYPELESS : DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, t == 1 ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
 }
 
 struct Copier {
@@ -167,6 +178,148 @@ bool copy_all(ID3D12Device* device, bool to_textures, std::vector<std::uint32_t>
     return true;
 }
 
+// Fills every subresource of the 6-slice array texture with its sentinels (to_texture) or copies them all back.
+bool copy_array(ID3D12Device* device, bool to_texture, std::vector<std::uint32_t>* words)
+{
+    constexpr UINT subresources = array_slices * mips;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[subresources]{};
+    UINT64 total = 0;
+    const auto desc = array_texture_desc(0);
+    device->GetCopyableFootprints(&desc, 0, subresources, 0, footprints, nullptr, nullptr, &total);
+    if (!total || total == ~UINT64{0}) return false;
+    auto staging = buffer(device, to_texture ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, total,
+                          to_texture ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
+    Copier copier;
+    if (!staging || !copier.open(device)) return false;
+    unsigned char* memory = nullptr;
+    if (to_texture) {
+        if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
+        for (UINT s = 0; s < array_slices; ++s)
+            for (UINT m = 0; m < mips; ++m) {
+                const UINT sub = s * mips + m, n = side >> m;
+                for (UINT y = 0; y < n; ++y)
+                    for (UINT x = 0; x < n; ++x)
+                        for (UINT c = 0; c < 4; ++c) {
+                            const std::uint32_t value = array_sentinel(s, m, y * n + x, c);
+                            std::memcpy(memory + footprints[sub].Offset + y * footprints[sub].Footprint.RowPitch + (x * 4 + c) * 4,
+                                        &value, 4);
+                        }
+            }
+        staging->Unmap(0, nullptr);
+    }
+    auto* texture = fixture.array_natives[0].Get();
+    const auto state = to_texture ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier(copier.list.Get(), texture, D3D12_RESOURCE_STATE_COMMON, state);
+    for (UINT sub = 0; sub < subresources; ++sub) {
+        D3D12_TEXTURE_COPY_LOCATION placed{staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        placed.PlacedFootprint = footprints[sub];
+        D3D12_TEXTURE_COPY_LOCATION subresource{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        subresource.SubresourceIndex = sub;
+        if (to_texture) copier.list->CopyTextureRegion(&subresource, 0, 0, 0, &placed, nullptr);
+        else copier.list->CopyTextureRegion(&placed, 0, 0, 0, &subresource, nullptr);
+    }
+    barrier(copier.list.Get(), texture, state, D3D12_RESOURCE_STATE_COMMON);
+    if (!copier.run()) return false;
+    if (to_texture) return true;
+    if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&memory)))) return false;
+    for (UINT s = 0; s < array_slices; ++s)
+        for (UINT m = 0; m < mips; ++m) {
+            const UINT sub = s * mips + m, n = side >> m;
+            for (UINT y = 0; y < n; ++y)
+                for (UINT x = 0; x < n * 4; ++x) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, memory + footprints[sub].Offset + y * footprints[sub].Footprint.RowPitch + x * 4, 4);
+                    words->push_back(value);
+                }
+        }
+    staging->Unmap(0, nullptr);
+    return true;
+}
+
+// Two 32-DWORD buffers, distinct sentinels, and an explicit view of words 4..19.
+bool copy_raw(ID3D12Device* device, bool upload, std::vector<std::uint32_t>* words)
+{
+    constexpr UINT bytes = 32 * 4;
+    auto staging = buffer(device, upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_READBACK, 2 * bytes,
+                          upload ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST);
+    Copier copier;
+    if (!staging || !copier.open(device)) return false;
+    std::uint32_t* data = nullptr;
+    if (upload) {
+        if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&data)))) return false;
+        for (UINT i = 0; i < 64; ++i) data[i] = 0xabcd0000u + i;
+        staging->Unmap(0, nullptr);
+    }
+    for (UINT t = 0; t < 2; ++t) {
+        auto* resource = fixture.natives[t].Get();
+        const auto state = upload ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier(copier.list.Get(), resource, D3D12_RESOURCE_STATE_COMMON, state);
+        if (upload) copier.list->CopyBufferRegion(resource, 0, staging.Get(), t * bytes, bytes);
+        else copier.list->CopyBufferRegion(staging.Get(), t * bytes, resource, 0, bytes);
+        barrier(copier.list.Get(), resource, state, D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (!copier.run()) return false;
+    if (upload) return true;
+    if (FAILED(staging->Map(0, nullptr, reinterpret_cast<void**>(&data)))) return false;
+    words->assign(data, data + 64);
+    staging->Unmap(0, nullptr);
+    return true;
+}
+
+int draw_raw_uavs(ID3D12Device* desktop, void* guest, void* list, const std::string& mode)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_6};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model))) ||
+        shader_model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+        std::puts("raw pixel UAV: shader model 6.6 unavailable (skip)");
+        return 77;
+    }
+    using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                     const void*, void*, UINT, const void*, REFIID, void**);
+    const auto create = reinterpret_cast<Create>((*static_cast<void***>(guest))[127]);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    for (UINT t = 0; t < 2; ++t) {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 128, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+            {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, t == 1 && mode == "raw-no-ua" ? D3D12_RESOURCE_FLAG_NONE :
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+        if (FAILED(create(guest, &heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
+                          __uuidof(ID3D12Resource), &fixture.resources[t])) || !fixture.resources[t]) return 70;
+        fixture.natives[t] = native_of(guest, fixture.resources[t]);
+        if (!fixture.natives[t]) return 71;
+    }
+    if (!copy_raw(desktop, true, nullptr)) return 72;
+    struct Extended { D3D12_DESCRIPTOR_HEAP_DESC desc; Word address, bytes; };
+    Extended desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* views = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&views))))) return 73;
+    const Word cpu = invoke(views, 9), gpu = invoke(views, 10);
+    const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (!cpu || !gpu || stride < 32) return 73;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+    view.Buffer.FirstElement = 4;
+    view.Buffer.NumElements = 16;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&view), cpu);
+    if (mode == "raw-short") view.Buffer.NumElements = 8;
+    if (mode == "raw-last") view.Buffer.FirstElement = 16;
+    if (mode == "raw-typed") { view.Format = DXGI_FORMAT_R32_UINT; view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE; }
+    if (mode == "raw-structured") {
+        view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE; view.Buffer.StructureByteStride = 4;
+    }
+    if (mode == "raw-srv") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        srv.Buffer.NumElements = 32; srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        invoke(guest, 18, ptr(fixture.resources[1]), ptr(&srv), cpu + stride);
+    } else if (mode != "raw-missing") {
+        invoke(guest, 19, ptr(fixture.resources[1]), 0, ptr(&view), cpu + stride);
+    }
+    std::printf("raw pixel UAV case %s, title descriptor stride %u\n", mode.c_str(), stride);
+    invoke(list, 32, 1, ptr(&views));
+    if (mode != "raw-no-table") invoke(list, 36, 0, gpu);
+    invoke(list, 12, 3, 1);
+    return 0;
+}
+
 ID3D12InfoQueue* debug_messages()
 {
     static ComPtr<ID3D12InfoQueue> queue;
@@ -181,6 +334,73 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
     GetEnvironmentVariableA("X2W_TEST_PIXEL_UAV", mode, sizeof(mode));
     const std::string which(mode);
     fixture.desktop = desktop;
+    fixture.raw_mode = which.rfind("raw-", 0) == 0;
+    if (fixture.raw_mode) return draw_raw_uavs(desktop, guest, list, which);
+    fixture.array_mode = which.rfind("arr-", 0) == 0;
+    if (fixture.array_mode) {
+        using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT, const void*,
+                                         void*, UINT, const void*, REFIID, void**);
+        const auto create = reinterpret_cast<Create>((*static_cast<void***>(guest))[127]);
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        for (UINT t = 0; t < 3; ++t) {
+            const auto desc = array_texture_desc(t);
+            if (FAILED(create(guest, &heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
+                              __uuidof(ID3D12Resource), &fixture.array_resources[t])) || !fixture.array_resources[t])
+                return 70;
+            fixture.array_natives[t] = native_of(guest, fixture.array_resources[t]);
+            if (!fixture.array_natives[t]) return 71;
+        }
+        const auto plain_desc = texture_desc(0);
+        if (FAILED(create(guest, &heap, 0, &plain_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
+                          __uuidof(ID3D12Resource), &fixture.resources[0])) || !fixture.resources[0])
+            return 70;
+        if (!copy_array(desktop, true, nullptr)) return 72;
+
+        struct Extended {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word address, bytes;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+        void* desc_heap = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&desc_heap)))))
+            return 73;
+        const Word cpu = invoke(desc_heap, 9), gpu = invoke(desc_heap, 10);
+        const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        if (!cpu || !gpu || stride < 32) return 73;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC arr_view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
+        arr_view.Texture2DArray = {0, 1, 4, 0};  // FirstArraySlice=1, ArraySize=4 -> physical slices 1..4
+        invoke(guest, 19, ptr(fixture.array_resources[0]), 0, ptr(&arr_view), cpu + 0 * stride);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC plain_view{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+        invoke(guest, 19, ptr(fixture.resources[0]), 0, ptr(&plain_view), cpu + 1 * stride);
+        invoke(guest, 19, ptr(fixture.array_resources[0]), 0, 0, cpu + 2 * stride);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC mip1 = arr_view;
+        mip1.Texture2DArray.MipSlice = 1;
+        invoke(guest, 19, ptr(fixture.array_resources[0]), 0, ptr(&mip1), cpu + 3 * stride);
+        D3D12_SHADER_RESOURCE_VIEW_DESC arr_srv{DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                                                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        arr_srv.Texture2DArray = {0, 1, 1, 4, 0, 0.0f};
+        invoke(guest, 18, ptr(fixture.array_resources[0]), ptr(&arr_srv), cpu + 4 * stride);
+        invoke(guest, 19, ptr(fixture.array_resources[1]), 0, ptr(&arr_view), cpu + 5 * stride);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC integer = arr_view;
+        integer.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+        invoke(guest, 19, ptr(fixture.array_resources[2]), 0, ptr(&integer), cpu + 6 * stride);
+
+        struct Case { const char* name; int entry; int srv_entry; };
+        static const Case cases[] = {
+            {"arr-ok", 0, -1}, {"arr-2d-view", 1, -1}, {"arr-default", 2, -1}, {"arr-mip1", 3, -1},
+            {"arr-srv-and-uav", 0, 4}, {"arr-no-ua", 5, -1}, {"arr-uint", 6, -1},
+        };
+        const Case* chosen = nullptr;
+        for (const Case& c : cases)
+            if (which == c.name) chosen = &c;
+        if (!chosen) return 74;
+        std::printf("pixel uav case %s: table entry %d, title descriptor stride %u\n", chosen->name, chosen->entry, stride);
+        invoke(list, 32, 1, ptr(&desc_heap));
+        if (chosen->entry >= 0) invoke(list, 36, 0, gpu + Word(chosen->entry) * stride);
+        if (chosen->srv_entry >= 0) invoke(list, 36, 1, gpu + Word(chosen->srv_entry) * stride);
+        invoke(list, 12, 3, 1);
+        return 0;
+    }
     for (UINT t = 0; t < textures; ++t) {
         using Create = HRESULT (WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT, const void*,
                                          void*, UINT, const void*, REFIID, void**);
@@ -272,7 +492,8 @@ int draw_pixel_uavs(ID3D12Device* desktop, void* guest, void* list)
 int report_pixel_uavs(const char* pixels)
 {
     std::vector<std::uint32_t> words;
-    const bool copied = copy_all(fixture.desktop, false, &words);
+    const bool copied = fixture.raw_mode ? copy_raw(fixture.desktop, false, &words) :
+        fixture.array_mode ? copy_array(fixture.desktop, false, &words) : copy_all(fixture.desktop, false, &words);
     if (copied) {
         std::ofstream out(std::string(pixels) + ".uav", std::ios::binary);
         out.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
