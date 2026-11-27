@@ -1965,6 +1965,33 @@ struct DirectCompute {
         auto a = input(0), b = input(1);
         return comparison(i,a,b);
     }
+    string integer_comparison64(const Inst &i, Name op, bool sign) {
+        if (i.subword || i.abs || i.neg || i.clamp || i.scale || (i.wide && (i.a & 0x7800)))
+            refuse(i.pc, "unsupported 64-bit integer comparison modifiers");
+        string predicate(op);
+        if (op == "lt" || op == "le" || op == "gt" || op == "ge")
+            predicate.insert(0, 1, sign ? 's' : 'u');
+        else if (op != "eq" && op != "ne")
+            refuse(i.pc, "direct comparison width");
+
+        auto extend = [&](const char *how, unsigned src) {
+            return ir.value(string(how) + " i32 " + operand32(i, src) + " to i64");
+        };
+        auto input = [&](unsigned src) {
+            if ((src <= 104 && !(src & 1)) || (src >= 256 && src < 511)) {
+                auto low = extend("zext", src), high = extend("zext", src + 1);
+                auto upper = ir.value("shl i64 " + high + ", 32");
+                return ir.value("or i64 " + upper + ", " + low);
+            }
+            // A 64-bit integer operand sign-extends an inline constant for both i64 and u64.
+            if (src >= 128 && src <= 208)
+                return extend("sext", src);
+            refuse(i.pc, "direct 64-bit integer comparison operand");
+        };
+        auto lhs = input(i.src[0]), rhs = input(i.src[1]);
+        ir.features |= 1048576;
+        return ir.value("icmp " + predicate + " i64 " + lhs + ", " + rhs);
+    }
     string comparison(const Inst &i, const string &lhs, const string &rhs) {
         Name n = i.name;
         const auto at = n.rfind('_');
@@ -2385,6 +2412,15 @@ struct DirectCompute {
         }
         if (packed_minmax(i, state) || float_alu(i, permuted))
             return;
+        if (compute && i.enc == Encoding::Vopc && n.size() >= 10) {
+            const auto type = n.substr(n.size() - 4);
+            if (type == "_i64" || type == "_u64") {
+                const auto stem = n.substr(0, n.size() - 4);
+                auto condition = integer_comparison64(i, stem.substr(stem.rfind('_') + 1), type == "_i64");
+                write_ballot(i.dst, condition);
+                return;
+            }
+        }
         if (i.enc == Encoding::Vopc && !i.clamp && !i.scale &&
             (n.find("class") == n.npos || n.find("_f16") != n.npos || n.find("_f32") != n.npos)) {
             auto condition = comparison(i);
