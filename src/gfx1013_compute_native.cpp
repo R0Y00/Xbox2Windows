@@ -87,6 +87,10 @@ struct Inst {
     }
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
+unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
+// Wave32 compute can use both VCC words as scalar data.
+unsigned smem_sgpr_limit(bool wave32_compute) { return wave32_compute ? 108 : 106; }
+
 Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
     Inst i;
@@ -159,9 +163,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.dst = (a >> 6) & 127;
         i.src[0] = (a & 63) * 2;
         const unsigned soffset = i.b >> 25;
+        const unsigned limit = smem_sgpr_limit(direct && !graphics && !wave64);
         if ((i.b & 0x01f00000u) || (a & 0x14000) || (i.op & ~8u) > 4 ||
-            (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset > 105)))
+            (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset >= limit)))
             refuse(pc, "unsupported scalar memory addressing");
+        if (direct && !graphics && i.dst + memory_count(i) > limit)
+            refuse(pc, "unsupported scalar memory destination range");
         i.name = "smem";
     } else if ((a & 0xfc000000u) == 0xf0000000) {
         i.enc = Encoding::Image;
@@ -239,16 +246,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
     } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
-        // FLAT encoding, segment 2 (GLOBAL). Only the one-dword load with an SGPR-pair base (the saddr form,
-        // ADDR = SADDR + zext(VADDR) + sext(OFFSET)) is lowered, as gfx2hlsl.py op_global_load_dword does.
+        // FLAT encoding, segment 2 (GLOBAL), with an SGPR-pair base:
+        // ADDR = SADDR + zext(VADDR) + sext(OFFSET).
         // SADDR 125 is `off` on gfx10. LDS, the other segments and opcodes stay refused.
         i.b = take();
         i.op = (a >> 18) & 127;
         const unsigned saddr = (i.b >> 16) & 127;
-        if (((a >> 14) & 3) != 2 || i.op != 12 || (a & 0x2000u) || saddr == 125 || saddr == 127)
-            refuse(pc, "direct global memory supports only global_load_dword with a scalar address pair");
+        if (((a >> 14) & 3) != 2 || i.op < 12 || i.op > 15 || (a & 0x2000u) || saddr == 125 || saddr == 127)
+            refuse(pc, "direct global memory supports only DWORD loads with a scalar address pair");
         i.enc = Encoding::Mubuf;
-        i.name = "global_load_dword";
+        i.name = encoded.name;
         i.dst = i.b >> 24;
     } else if ((a & 0xfc000000u) == 0xd8000000) {
         i.enc = Encoding::Lds;
@@ -551,7 +558,6 @@ Symbol source(const Inst &i, unsigned code, const State &s) {
         return {Symbol::Type::constant, i.literal};
     return {};
 }
-unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
 // Derive the rewritten byte-address V# symbolically. Each field carries its
 // source table/slot identity. Numeric consumption still requires real bits.
 // heap_window: the direct path under HeapViewContract::raw_buffer also rewrites a
@@ -638,7 +644,7 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.enc == Encoding::Smem) {
         auto base = s[i.src[0]];
         const unsigned offset_reg = i.b >> 25;
-        const Symbol index = offset_reg <= 105 ? s[offset_reg] : Symbol{};
+        const Symbol index = offset_reg < smem_sgpr_limit(!graphics && !wave64) ? s[offset_reg] : Symbol{};
         unsigned n = memory_count(i);
         for (unsigned j = 0; j < n; ++j) {
             Symbol v{};
@@ -915,7 +921,8 @@ struct Emit {
             refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
                                  (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
-                                  (i.name == "buffer_store_raw" ||
+                                  (i.name == "buffer_store_raw" || i.name == "buffer_load_dword" ||
+                                   i.enc == Encoding::Smem ||
                                    (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
@@ -1122,8 +1129,8 @@ struct Emit {
                 body << "if(active) " << reg(256 + dst++) << "=asuint(t." << "xyzw"[k] << ");\n";
             }
     }
-    void require_numeric(const Inst &i, unsigned reg) const {
-        if (reg <= 105 && !program.before[program.at.at(i.pc)][reg].numeric())
+    void require_numeric(const Inst &i, unsigned reg, unsigned limit = 106) const {
+        if (reg < limit && !program.before[program.at.at(i.pc)][reg].numeric())
             refuse(i.pc, "unbound numeric SGPR s" + to_string(reg));
     }
     void scalar(const Inst &i) {
@@ -1737,6 +1744,13 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
+        for (size_t i = 0; i < program.code.size(); ++i) {
+            const auto& inst = program.code[i];
+            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
+            if (symbol.type == Symbol::Type::descriptor)
+                compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);
+        }
         if (threads % (wave64 ? 64 : 32))
             for (const auto &i : program.code)
                 if (i.name == "v_readlane_b32" || i.name == "v_writelane_b32")

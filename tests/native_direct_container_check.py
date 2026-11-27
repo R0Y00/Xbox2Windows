@@ -441,6 +441,22 @@ def main():
         root_vs = vertex(constants=(0,2,1), program=[*root_load, 0x7e00020f, 0xf80008cf, 0, end])
         check("address-vs", "gfx1013-container-vs", root_vs)
         check("address-cs", cs, compute(words(*root_load, end), root_descriptor=True))
+        for offset in (106, 107):
+            check(f"wave64-smem-offset-{offset}", cs,
+                  compute(words(0xf4000200, offset << 25, end), threads=64,
+                          root_descriptor=True, wave32=False), "unsupported scalar memory addressing")
+        check("wave64-smem-vcc-dst", cs,
+              compute(words(0xf4000000 | 107 << 6, 125 << 25, end), threads=64,
+                      root_descriptor=True, wave32=False), "unsupported scalar memory destination range")
+        check("wave32-smem-cross-vcc", cs,
+              compute(words(0xf40c0000 | 104 << 6, 125 << 25, end), root_descriptor=True),
+              "unsupported scalar memory destination range")
+        # A descriptor into s[104:107] must tag both VCC words as nonnumeric.
+        for offset in (106, 107):
+            check(f"wave32-smem-symbolic-offset-{offset}", cs,
+                  compute(words(0xbe810380, 0xf4080000 | 104 << 6, 125 << 25,
+                                0xf4080200, offset << 25, end), table=True),
+                  f"unbound numeric SGPR s{offset}")
         wrong_high = [root_load[0], 0xbe830380, *root_load[1:], end]
         check("bad-address-cs", cs, compute(words(*wrong_high), root_descriptor=True), "mismatched root address high half")
         # Build a zero-stride byte-address descriptor in s[4:7]. The x8

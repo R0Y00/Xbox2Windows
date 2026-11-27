@@ -626,6 +626,8 @@ python3 -B tests/startup_buffer_address_check.py controls
 
 ## Startup translator: SMEM combined register and immediate offsets
 
+Direct C++ wave32 compute accepts numeric `vcc_lo` and `vcc_hi` as SMEM offsets and scalar load destinations through s107.
+
 In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and the signed immediate in `mods` (`offset:0x...` or `offset:-0x...`). Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
 
 `gfx2hlsl.py` now parses and validates SMEM modifiers (`glc`, `dlc` and at most one non-negative 21-bit signed `offset:` up to `0xfffff`), adds the immediate byte offset to register-addressed `s_buffer_load_dword*` and opt-in sampler-heap `s_load_dwordx4` loads, saves an overlapping runtime SGPR `soffset` into `a` before writing destination registers, and validates non-SGPR/`m0` `soffset` operands (`vcc_lo`, `exec_lo`, `ttmp*`, VGPRs, register ranges, or descriptor-holding SGPRs) across `s_buffer_load_dword*` and both sampler-heap modes of `s_load_dwordx4`. Negative 21-bit signed immediates (`0x100000`..`0x1fffff` or negative literals) — which hardware `s_load_*` sign-extends — remain an unlowered translator gap and are refused by name rather than silently reading at `+1`..`2` MiB.
@@ -16740,6 +16742,8 @@ The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` function
 
 Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
 
+Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
 ## Host-CPU RDFSBASE, RDGSBASE, and RDPID lifting in cpu_switch_aot
 
 [The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting read-only `rdfsbase`, `rdgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_rdpid_u32`):
@@ -17041,6 +17045,15 @@ ctest --preset dev --no-tests=error -R '^(cpu_aot_switch_sal|cpu_aot_switch_shif
 The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequences (because ML64 assembles the `sal` mnemonic as `/4` `SHL`) across 24 translated functions covering all 12 `SAL` `Code` encodings (`SAL_RM{8,16,32,64}_{1,CL,IMM8}`), register and memory destinations, count-`1` all-16 `SETcc` checks, count->1 10-condition `SETcc` checks, `Jcc`, `CMOVcc`, narrow returns, and nonvolatile/stack-frame operands, plus 11 negative exports. [The differential check](../tests/cpu/switch_sal_check.py) verifies 28,024 `dev` and 28,024 `/O2` comparisons against native execution and the Python reference, four `/O2` mutated-C++ controls (`shift_dir`, `cf_mask`, `of_mask`, `cl_mask`), 11 MASM, 4 unit, and 7 PE-patched rejection controls, and records decoded mnemonics via `iced_x86.Mnemonic` to `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
+
+## Concurrent calls through a startup debugger hook
+
+The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` turns the holding off. See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
 
 ### Startup shader translator: `v_bfm_b32`
 

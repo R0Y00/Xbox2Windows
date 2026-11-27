@@ -1543,6 +1543,31 @@ cmake --build --preset dev --target startup_trap_header_check
 ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_precedence_control)?$' -V
 ```
 
+## Concurrent calls through a hooked function
+
+The debugger's file, socket and allocation hooks are one patched byte per function. To run the original
+instruction it restores the byte, single-steps the thread that hit it and patches the byte again. A second thread that
+entered the function inside that window ran untraced, so `files.txt` could miss opens and the
+offline mode could miss a refused socket. Now every other thread is held for the step and resumes when the stepping
+thread is done (`tools/startup/hook_window.py`). A thread that had already trapped when it was held goes back to the
+hook address and traps again afterwards, so its call is traced once, not twice. Each window has a 2 s deadline, so a
+thread is never held forever. Per-thread state of a call in flight (the return address and stack pointer it will come back to) is
+keyed by thread id, not shared.
+
+Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+
+`tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
+enter `CreateFileW` together 16 times each on one file, and all 64 opens must show in `files.txt` with their result and
+`unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
@@ -2350,7 +2375,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
-- **Wave reductions.** A whole wave32 reduction chain in a straight-line pixel stage (`s_or_saveexec_b32 sS, -1`,
+- **Wave reductions.** A whole wave32 reduction chain in a pixel stage (`s_or_saveexec_b32 sS, -1`,
   the identity fill `v_cndmask_b32_e64 vT, <identity>, vX, sS`, four `_dpp` steps `quad_perm:[1,0,3,2]`,
   `quad_perm:[2,3,0,1]`, `row_half_mirror`, `row_mirror`, `v_permlanex16_b32 vP, vT, 0, 0`, the combine,
   `s_mov_b32 exec_lo, sS` and `v_readlane_b32 sD, vT, 31`) of `v_or_b32`, `v_min_u32` or `v_max_u32` is recognised
@@ -2358,7 +2383,9 @@ These are measured on one executable; treat them as hypotheses for others.
   program cannot depend on how pixels are packed into waves). The min chain may read its lane later, as the #2125
   censuses show: after its restore, one `v_cndmask_b32_sdwa` (lowered as usual), the saveexec of a max chain, then the
   readlane, carried by that max chain before its fill. The entry EXEC must still hold, without `s_wqm`, so helper
-  lanes are left out on both sides. Other shapes that start like a chain are refused with their reason
+  lanes are left out on both sides. The chain itself stays straight. A uniform branch may sit before it, after it, or
+  both; a branch that is not proven uniform, a branch target inside the chain, and wave64 stay refused. Other shapes
+  that start like a chain are refused with their reason
   ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
@@ -2977,7 +3004,16 @@ The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=
 installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
 must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
 its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
-completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+completions on, a type `3` command then decodes one Opus packet. For a connection with processing kind
+`1`, activate (type `1`) supplies the stream channel count at `+0x18`. The decoder runs at 48 kHz.
+Process skips the leading frames at `+0x20` and returns at most the frame count at `+0x24` and the output
+capacity at `+0x34`. Connection option bit `4` selects planar stereo. The result echoes the first 24
+command bytes, reports kept frames at `+0x30` and byte count at `+0x34`, and returns the output pointer,
+input byte count and input pointer at `+0x38`, `+0x44` and `+0x48`. Pitch conversion and result events
+are outside the tested subset. The source-built stereo check compares both output orders to libopus and
+verifies that a 960-frame packet with a 312-frame prefix produces 648 frames.
+
+The earlier packet-only fixture path uses the following fields:
 `+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
 `+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
 (interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output

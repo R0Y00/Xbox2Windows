@@ -144,11 +144,11 @@ struct DirectCompute {
         } else
             write(r, select(graphics_input ? graphics_predicate : active(), value, read_storage(r)));
     }
-    string operand32(const Inst &i, unsigned n) {
+    string operand32(const Inst &i, unsigned n, unsigned sgpr_limit = 106) {
         if (graphics_input && n == 106)
             refuse(i.pc, "graphics instruction consumes a full wave mask");
         if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || (n >= 256 && n < 512)) {
-            analysis.require_numeric(i, n);
+            analysis.require_numeric(i, n, sgpr_limit);
             return read(n);
         }
         if (n == 253)
@@ -350,12 +350,21 @@ struct DirectCompute {
         ir.features |= 16 | 0x40000000;
         return ir.heap_handle(ir.binary("add", read(base), to_string(symbol.offset / 32)), 11, 0);
     }
+    std::set<std::pair<unsigned,unsigned>> read_write_raw_views;
     string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
                     unsigned *bound_register = nullptr) {
         const auto &symbol = s.at(base);
         const bool indexed = symbol.type == Symbol::Type::indexed_descriptor;
         if (indexed && symbol.value == compute_resource_heap)
             return heap_resource(i, s, base, kind, bytes);
+        if (!indexed && symbol.type == Symbol::Type::descriptor &&
+            (kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::raw_vector_srv ||
+             kind == ComputeViewKind::byte_window_srv) &&
+            read_write_raw_views.count({symbol.value, symbol.offset})) {
+            // Both instructions read the same descriptor table entry. A
+            // second, SRV binding would conflict with its writable resource state.
+            kind = ComputeViewKind::raw_buffer_uav;
+        }
         const unsigned count = indexed ? 1 + symbol.index_mask / 32 : 1;
         analysis.binding(i, s, base, 4, kind, bytes);
         auto it = std::find_if(analysis.result.bindings.begin(), analysis.result.bindings.end(), [&](const auto &b) {
@@ -469,10 +478,13 @@ struct DirectCompute {
 
     // global_load_dword in the saddr form (#2962): ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
     // FLAT/GLOBAL addressing), with SADDR the unadvanced root address of a root SRV, as for the scalar root loads.
-    // The byte offset zext(VADDR) + OFFSET is guarded to [0, 2^32) before it becomes a 32-bit view offset, so a
-    // wrapped address reads zero instead of an in-bounds word (gfx2hlsl.py op_global_load_dword). The low two
-    // address bits are dropped, as for buffer_load_dword in this path (DWORD alignment mode).
+    // Guard the first and last DWORD offsets against 32-bit wrap. The low two address bits are dropped,
+    // as for buffer_load_dword in this path (DWORD alignment mode).
     void global_load(const Inst &i, const State &s) {
+        constexpr unsigned widths[]{1, 2, 4, 3}; // GFX10 opcodes 12..15.
+        const unsigned count = widths[i.op - 12];
+        if (i.dst + count > 256)
+            refuse(i.pc, "global load destination register range");
         const unsigned base = (i.b >> 16) & 127;
         if (base > 104 || (base & 1))
             refuse(i.pc, "global load base must be an aligned SGPR pair");
@@ -485,26 +497,28 @@ struct DirectCompute {
         const int offset = int(Word(i.a) << 20) >> 20;
         if (offset % 4)
             refuse(i.pc, "global load at an unaligned immediate offset");
-        const unsigned span = offset > 0 ? unsigned(offset) + 4 : 4;
+        const unsigned span = static_cast<unsigned>((std::max)(offset, 0)) + count * 4;
         const auto h = root_buffer_handle(low.value, span);
         const auto vaddr = read(256 + (i.b & 255));
-        string in_range, addr = vaddr;
-        if (offset > 0) {
-            in_range = cmp("ule", vaddr, to_string(0xffffffffu - unsigned(offset)));
-            addr = ir.binary("add", vaddr, to_string(offset));
-        } else if (offset < 0) {
+        string in_range;
+        if (offset < 0)
             in_range = cmp("uge", vaddr, to_string(-offset));
-            addr = ir.binary("sub", vaddr, to_string(-offset));
+        const int last_offset = offset + static_cast<int>((count - 1) * 4);
+        if (last_offset > 0) {
+            const auto upper = cmp("ule", vaddr, to_string(0xffffffffu - static_cast<unsigned>(last_offset)));
+            in_range = in_range.empty() ? upper : ir.value("and i1 " + in_range + ", " + upper);
         }
-        addr = ir.binary("and", addr, "4294967292");
-        const auto ret = load_buffer(h, addr, true, 1);
-        auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", 0");
-        if (!in_range.empty())
-            value = ir.value("select i1 " + in_range + ", i32 " + value + ", i32 0");
-        vector_write(256 + i.dst, value);
+        const auto addr = offset ? ir.binary("add", vaddr, to_string(offset)) : vaddr;
+        const auto ret = load_buffer(h, ir.binary("and", addr, "4294967292"), true, count);
+        for (unsigned j = 0; j < count; ++j) {
+            auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(j));
+            if (!in_range.empty())
+                value = ir.value("select i1 " + in_range + ", i32 " + value + ", i32 0");
+            vector_write(256 + i.dst + j, value);
+        }
     }
     void memory(const Inst &i, const State &s) {
-        if (i.name == "global_load_dword") {
+        if (i.name.substr(0, 17) == "global_load_dword") {
             global_load(i, s);
             return;
         }
@@ -518,6 +532,7 @@ struct DirectCompute {
         }
         if (i.enc == Encoding::Smem) {
             unsigned so = i.b >> 25;
+            const unsigned limit = smem_sgpr_limit(!graphics_input && !wave64);
             const auto &low = s.at(i.src[0]);
             if (low.type == Symbol::Type::sampler_heap) {
                 if (i.op != 2 || !(s.at(i.src[0] + 1) == Symbol{Symbol::Type::constant, 0}))
@@ -585,9 +600,9 @@ struct DirectCompute {
                     refuse(i.pc, "direct descriptor address outside bound table");
                 if (so != 125) {
                     const bool pixel_texture = pixel_stage && i.op == 3 && low.value != compute_resource_heap;
-                    if ((!pixel_texture && i.op != 2) || so > 105 || (pixel_texture && i.dst + 8 > 106))
+                    if ((!pixel_texture && i.op != 2) || so >= limit || (pixel_texture && i.dst + 8 > 106))
                         refuse(i.pc, "direct indexed descriptor load shape");
-                    auto index = ir.binary("lshr", operand32(i, so), "5");
+                    auto index = ir.binary("lshr", operand32(i, so, limit), "5");
                     for (unsigned j = 0; j < memory_count(i); ++j)
                         write(i.dst + j, index);
                 }
@@ -610,7 +625,7 @@ struct DirectCompute {
                               !(s.at(i.src[0] + 3) == Symbol{Symbol::Type::constant, stride_one ? 0x11014facu : 0x31016facu})))
                     refuse(i.pc, "unsupported synthesized scalar buffer descriptor fields");
                 unsigned span = off + 4 * n;
-                if (off % 4 || span > 65536 || i.dst + n > 106)
+                if (off % 4 || span > 65536 || i.dst + n > limit)
                     refuse(i.pc, "unsupported root descriptor load range");
                 if (so != 125) {
                     const auto &index = s.at(so);
@@ -625,7 +640,7 @@ struct DirectCompute {
             } else
                 h = resource(i, s, i.src[0], ComputeViewKind::buffer_srv, so == 125 ? off + 4 * n : 4);
             auto addr = so == 125 ? to_string(off)
-                                  : ir.binary("and", ir.binary("add", operand32(i, so), to_string(off)), "4294967292");
+                                  : ir.binary("and", ir.binary("add", operand32(i, so, limit), to_string(off)), "4294967292");
             for (unsigned j = 0; j < n; j += 4) {
                 unsigned width = (std::min)(4u, n - j);
                 auto chunk = so == 125 ? to_string(off + j * 4) :
@@ -2937,8 +2952,8 @@ struct DirectCompute {
             return;
         }
         if (n == "s_bitreplicate_b64_b32") {
-            if ((i.dst > 104 && (graphics_input || i.dst != 106)) || (i.dst & 1))
-                refuse(i.pc, "bitreplicate requires an aligned general scalar pair or compute VCC");
+            if ((i.dst > 104 && (graphics_input || (i.dst != 106 && i.dst != 126))) || (i.dst & 1))
+                refuse(i.pc, "bitreplicate requires an aligned general scalar pair or compute VCC/EXEC");
             // pixel_aot expands each 16-bit half into the even positions,
             // then duplicates each of the original bits into its neighbour.
             auto replicate = [&](string half) {
