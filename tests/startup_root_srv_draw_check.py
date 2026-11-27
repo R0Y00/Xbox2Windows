@@ -4,7 +4,7 @@ tests/startup_root_srv_draw.cpp (X2W_TEST_ROOT_SRV_DRAW=write-after): slot 44 se
 writes green, then draws, and the stand-in's copy counts are printed. Run with X2W_D3D12_ROOT_SRV_AT_DRAW unset and set:
   - both: the translated draw reads the SRV from its title address at the draw and draws green;
   - unset: slot 44 also copies a window into the upload ring for the desktop binding (copied 1);
-  - set: no draw reads that binding, so the copy is deferred and never made (deferred 1, made at a draw 0, copied 0).
+  - set: no draw reads that binding, so slot 44 skips the copy (skipped 1, copied 0).
 The left half of the 8x4 target is drawn, the right half keeps the clear colour.
 """
 import os
@@ -25,7 +25,7 @@ HLSL = (
 CLEAR = bytes((0, 0, 255, 255))
 GREEN = bytes((0, 255, 0, 255))
 SWITCH = "X2W_D3D12_ROOT_SRV_AT_DRAW"
-COUNTS = re.compile(r"root SRV copies: deferred (-?\d+), made at a draw (-?\d+), copied (-?\d+)")
+COUNTS = re.compile(r"root SRV copies: skipped (-?\d+), copied (-?\d+)")
 
 
 def run(directory, consumer, backend, at_draw):
@@ -50,8 +50,8 @@ def run(directory, consumer, backend, at_draw):
 
 def check(directory, consumer, backend):
     expected_pixels = (GREEN * 4 + CLEAR * 4) * 4
-    # (deferred, made at a draw, copied)
-    expected_counts = {False: (0, 0, 1), True: (1, 0, 0)}
+    # (skipped, copied)
+    expected_counts = {False: (0, 1), True: (1, 0)}
     for at_draw in (False, True):
         pixels, counts = run(directory, consumer, backend, at_draw)
         if pixels is None:
@@ -60,10 +60,10 @@ def check(directory, consumer, backend):
         if pixels != expected_pixels:
             raise AssertionError(f"{label}: actual {pixels.hex()} expected {expected_pixels.hex()}")
         if counts != expected_counts[at_draw]:
-            raise AssertionError(f"{label}: copies (deferred, made at a draw, copied) {counts}, "
+            raise AssertionError(f"{label}: copies (skipped, copied) {counts}, "
                                  f"expected {expected_counts[at_draw]}")
         print(f"{backend} {label}: 32 pixels exact (green, read at the draw); "
-              f"deferred {counts[0]}, made at a draw {counts[1]}, copied {counts[2]}")
+              f"skipped {counts[0]}, copied {counts[1]}")
     return 0
 
 

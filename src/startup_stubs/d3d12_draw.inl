@@ -2767,7 +2767,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // The translated root invalidated the desktop arguments of the tracked guest root.
         if (pass.graphics_root) list->SetGraphicsRootSignature(pass.graphics_root);
         pass.srv_bound = 0;
-        pass.srv_pending = 0;
         drawn = true;
     } else if (indexed) {
         u64 offset = 0;

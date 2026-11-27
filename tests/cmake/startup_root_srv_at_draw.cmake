@@ -1,4 +1,4 @@
-# Graphics root SRV copies made only for a draw that reads the desktop binding (opt-in X2W_D3D12_ROOT_SRV_AT_DRAW=1).
+# Graphics root SRV: no desktop copy that no draw reads (opt-in X2W_D3D12_ROOT_SRV_AT_DRAW=1).
 # A translated draw reads a slot 44 root SRV whose title bytes change before the draw; it runs with the switch unset
 # (slot 44 copies) and set (no copy).
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_srv_draw.cpp)
