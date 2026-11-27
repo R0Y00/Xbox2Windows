@@ -908,11 +908,11 @@ pipelines, and the cache can start empty: the request files the stand-in wrote a
 against their key, translated and compiled to DXIL in the process. The compiler's own cache goes to
 `<shader cache>\native`. Nothing is published as `<key>.txt`.
 
-The existing dispatch path records the result, and a program is accepted only with the bindings a
-fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
-and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
-scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
-not lower) is refused. The first 16 refusals of a process are logged as
+The existing dispatch path binds root constants and views in 32-byte table records. Buffer views
+include scalar buffer SRVs (`buffer_srv`), per-lane raw buffer SRVs (`raw_vector_srv`), and raw buffer
+UAVs. Texture views include 2D SRVs and four-channel float 1D, 2D, 2D array, and 3D UAVs
+(`texture_uav` and `half4_texture_uav`). Samplers, typed or indexed buffer views, and instructions
+outside the compiler's supported set are refused. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
@@ -922,6 +922,15 @@ pipelines still need a published translation.
 Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
 ([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
 [route, controls and results](experiments/startup-compute-native-dispatch.md)).
+The #2958/#2993 fixture reads back a 3D float store fed by a scalar buffer SRV and a 2D texture SRV.
+The consumer creates the views with the adapter's descriptor increment and copies their tokens
+into a packed guest table when the increment exceeds 32 bytes. A zero-size W range must translate
+natively, be refused at Dispatch, and leave all 6,144 volume words untouched.
+Targeted in-process readbacks also check a mip-one 1D float store, a 2D-array float store into
+relative slice 1 (physical slice 2), and a packed D16 store into an RGBA16_FLOAT texture with
+round-to-nearest-even input conversion. Each case checks every output value, including sentinels
+outside the store region. On adapters without 32-lane waves the cases check the named refusal
+and untouched output before the test returns 77.
 
 ### Compute pipeline requests
 
@@ -3537,3 +3546,23 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+### Offline compute manifests for 3D and 1D UAVs
+
+The runtime half of #2902 is ported to `cpp-migration`. For offline compute
+requests, the C++ formatter emits `uav N tex3d float table P OFF channels 4` and
+`uav N tex1d float table P OFF channels 4`. The stand-in validates UAV view
+dimensions and mip levels, including the W-slice range within the selected 3D mip.
+
+On an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100), the 3D, 3D NSA and 1D
+store cases matched their mip-one words after `compile_dxil` published the translations. The mismatched-view,
+3D W-range and 1D mip controls were refused with their sentinels intact.
+
+If a published compute PSO fails to create, the refusal stays `pipeline creation failed`, and the stand-in adds
+the adapter's 32-lane wave capability as observed: `(adapter has no 32-lane waves)`, or `(adapter wave capability
+query failed)`. The manifest records no wave size, so this does not say the shader needed one. The test knows its
+native modules declare `WaveSize(32)`, so the native 3D, 3D NSA and 1D cases skip on WARP only for
+`pipeline creation failed (adapter has no 32-lane waves)`. Any other PSO failure fails the test.
+On WARP and hardware, portable `cs_6_0` fixtures publish a hand-written
+manifest and bytecode under the original guest program's request key. These cases require successful 3D and 1D
+mip-one readback and check the same mismatched-view, 3D W-range and 1D mip refusals with sentinels intact.
