@@ -2560,20 +2560,47 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     if (indirect && tr) indirect->shader_key = tr->key;
-    std::uint32_t d16_unorm16[32] = {};
-    FormattedBufferDescriptor formatted_buffers[32] = {};
-    const bool translation_ok = tr && tr->state == 1;
-    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
-    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
-    if (!formatted_ok) {
-        if (indirect && tr)
-            indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
-                                     : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
-                                                     : indirect_refusal_code::formatted_buffer_not_ready;
+    if (!tr || tr->state != 1) {
+        if (indirect) indirect->refusal_code = indirect_refusal_code::translation_not_ready;
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
-    const bool fixed_stream = !tr->fixed_stream.empty();
+    // pipeline_for may replace the native candidate with the published disk translation.
+    // Create the PSO first, then derive every binding from the translation it leaves in tr.
+    bool fixed_stream = !tr->fixed_stream.empty();
+    bool geometry_rect = indexed_rect || (rect && fixed_stream);
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, geometry_rect) : nullptr;
+    if (pipeline) {
+        const bool recovered_fixed_stream = !tr->fixed_stream.empty();
+        const bool recovered_geometry_rect = indexed_rect || (rect && recovered_fixed_stream);
+        if (recovered_geometry_rect != geometry_rect) {
+            pipeline = pipeline_for(*bound, *tr, pass, recovered_geometry_rect);
+            geometry_rect = recovered_geometry_rect;
+        }
+        fixed_stream = recovered_fixed_stream;
+    }
+    if (indirect && indexed_rect && !pipeline) {
+        indirect->set_refusal("translated indexed rectangle geometry unavailable",
+                              indirect_refusal_code::indexed_rect_unavailable);
+    }
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+        if (indirect && !(indexed_rect && !pipeline))
+            indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
+                                               : indirect_refusal_code::sampler_heap_unavailable;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
+    std::uint32_t d16_unorm16[32] = {};
+    FormattedBufferDescriptor formatted_buffers[32] = {};
+    const bool d16_ok = d16_srvs_ready(*tr, pass, d16_unorm16);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    if (!formatted_ok) {
+        if (indirect)
+            indirect->refusal_code = !d16_ok ? indirect_refusal_code::d16_srv_not_ready
+                                             : indirect_refusal_code::formatted_buffer_not_ready;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
     D3D12_VERTEX_BUFFER_VIEW fixed_view{};
     ID3D12Resource* fixed_resource = nullptr;
     if (fixed_stream && (indirect || !fixed_vertex_view(self, pass, *tr, indexed, start, count, fixed_view, fixed_resource))) {
@@ -2635,19 +2662,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
-    }
-    const bool geometry_rect = indexed_rect || (rect && fixed_stream);
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, geometry_rect) : nullptr;
-    if (indirect && indexed_rect && !pipeline) {
-        indirect->set_refusal("translated indexed rectangle geometry unavailable",
-                              indirect_refusal_code::indexed_rect_unavailable);
-    }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
-        if (indirect && !(indexed_rect && !pipeline))
-            indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
-                                               : indirect_refusal_code::sampler_heap_unavailable;
-        ReleaseSRWLockExclusive(&draw_lock);
-        return false;
     }
     PixelUavBinding uav_bindings[pixel_uav_limit];
     if (!resolve_pixel_uavs(*tr, pass, uav_bindings)) {

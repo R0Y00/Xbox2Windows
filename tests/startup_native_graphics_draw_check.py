@@ -93,6 +93,45 @@ def check(folder, consumer, sdk, adapter, compiler):
                for path, expected in published.items())
     print(f"{adapter} PSO: candidate failure recovered the published disk pair, 16 red and 16 clear pixels")
 
+    # An RTV variant is a separate published pair. Draw it natively first so the runtime
+    # publishes req_<key>.rtv, compile that request, then inject the candidate PSO failure.
+    variant_args = args + ["2"]  # DXGI_FORMAT_R32G32B32A32_FLOAT
+    variant_red = bytes.fromhex("0000803f00000000000000000000803f")
+    variant_clear = bytes.fromhex("00000000000000000000803f0000803f")
+    pixels.unlink()
+    run = subprocess.run(variant_args, env=env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0 and "-> drawn;" in run.stderr, run.stderr[-8000:]
+    assert "no RTV translation" not in run.stderr, run.stderr[-8000:]
+    assert pixels.read_bytes() == variant_red, pixels.read_bytes().hex()
+    variant_request, = cache.glob("req_*.rtv")
+    variant_key = variant_request.stem.removeprefix("req_")
+    subprocess.run([compiler, "--watch", sdk, cache, cache, "--once"], check=True, timeout=45)
+    variant_manifest = cache / (variant_key + ".txt")
+    variant_published = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in
+                         (variant_manifest, variant_manifest.with_suffix(".vs.cso"),
+                          variant_manifest.with_suffix(".ps.cso"))}
+    pixels.unlink()
+    run = subprocess.run(variant_args, env=pso_env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stderr
+    assert "candidate pipeline failed 0x80004005 (injected)" in run.stderr, run.stderr[-8000:]
+    assert "published disk pair recovered" in run.stderr and "-> drawn;" in run.stderr, run.stderr[-8000:]
+    assert pixels.read_bytes() == variant_red, pixels.read_bytes().hex()
+    assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
+               for path, expected in variant_published.items())
+    held_variant = Path(str(variant_manifest) + ".hold")
+    variant_manifest.rename(held_variant)
+    try:
+        pixels.unlink()
+        run = subprocess.run(variant_args, env=pso_env, capture_output=True, text=True, timeout=45)
+        assert run.returncode == 0, run.stderr
+        assert "no valid published disk pair" in run.stderr and "-> drawn;" not in run.stderr, run.stderr[-8000:]
+        assert pixels.read_bytes() == variant_clear, pixels.read_bytes().hex()
+        assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
+                   for path, expected in variant_published.items() if path != variant_manifest)
+        print(f"{adapter} RTV variant: candidate failure recovered the disk variant; a missing manifest refused")
+    finally:
+        held_variant.rename(variant_manifest)
+
     # The native path still creates its own pipeline when no fault is injected.
     pixels.unlink()
     run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
@@ -133,6 +172,25 @@ def check(folder, consumer, sdk, adapter, compiler):
         held_manifest.rename(manifest)
     assert all(path.read_bytes() == expected[0] and path.stat().st_mtime_ns == expected[1]
                for path, expected in published.items())
+
+    # The manifest and vertex blob stay valid, but the pixel blob no longer creates a PSO.
+    held_ps = Path(str(ps_cso) + ".hold")
+    ps_cso.rename(held_ps)
+    invalid_ps = b"not a DXIL container"
+    ps_cso.write_bytes(invalid_ps)
+    invalid_mtime = ps_cso.stat().st_mtime_ns
+    try:
+        pixels.unlink()
+        run = subprocess.run(args, env=pso_env, capture_output=True, text=True, timeout=45)
+        assert run.returncode == 0, run.stderr
+        assert "published disk pair pipeline failed" in run.stderr, run.stderr[-8000:]
+        assert "-> drawn;" not in run.stderr, run.stderr[-8000:]
+        assert pixels.read_bytes() == clear * 32, pixels.read_bytes().hex()
+        assert ps_cso.read_bytes() == invalid_ps and ps_cso.stat().st_mtime_ns == invalid_mtime
+        print(f"{adapter} invalid PS blob: disk PSO refused, 32 clear pixels, file unchanged")
+    finally:
+        ps_cso.unlink()
+        held_ps.rename(ps_cso)
     ps.write_bytes(patched_pixel(1, [0xffffffff], export=(0xf800180f, 0x01000001)))
     run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
     assert run.returncode == 0 and "refused:" in run.stderr and "-> drawn;" not in run.stderr, run.stderr
