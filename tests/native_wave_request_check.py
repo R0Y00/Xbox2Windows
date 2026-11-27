@@ -132,30 +132,45 @@ def raw_offset_fixtures(cli_args, gpu, sdk, work, root, sa):
     assert result.returncode and "needs offen" in result.stderr and not (work / "indexed.cso").exists()
 
 
-def global_stride_fixtures(gpu, sdk, work, root, source, sa):
-    source.write_text('#define SIG "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED),'
-                      'DescriptorTable(SRV(t0,numDescriptors=16)),DescriptorTable(UAV(u0,numDescriptors=16)),'
-                      'RootConstants(num32BitConstants=4,b0)"')
-    subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, source], check=True)
-    # GPU input s[40:47] feeds s43. Select a heap slot, then extract descriptor word 1 bits 16..29.
-    # The table index is deliberately unbounded at compile time, and is overwritten before the extract.
-    for selector_offset in (0, 4):
+def global_stride_fixtures(cli_args, gpu, sdk, work, root, source, sa):
+    def program(selector_offset, group_x):
+        # GPU input s[40:47] feeds s43. The unbounded index is overwritten before the stride extract.
+        group_y = group_x + 1
         words = [0xbe940304, 0xbe950380, 0xbe960305, 0xbe970380,
                  0xf4080000 | (24 << 6) | 10, 0xfa000040,
                  0xf40c0000 | (56 << 6) | 11, 0xfa0000e0,
-                 0x80000000 | (0x1e << 23) | (20 << 16) | (133 << 8) | 12,
+                 0x80000000 | (0x1e << 23) | (20 << 16) | (133 << 8) | group_x,
                  0xf42c0000 | (40 << 6) | 12, (20 << 25) | selector_offset,
                  0xbe9e030a, 0xbe9f0380, 0x80000000 | (0x1e << 23) | (43 << 16) | (133 << 8) | 43,
                  0xf4080000 | (48 << 6) | 15, 43 << 25, 0xbeab0380,
                  0x93800000 | (28 << 16) | (255 << 8) | 49, 0x000e0010,
-                 0xd7460008, 12 | (133 << 9) | (256 << 18), 0x7e12020d]
+                 0xd7460008, group_x | (133 << 9) | (256 << 18), 0x7e120200 | group_y]
         words += [0x7e000000 | (v << 17) | (6 << 9) | 28 for v in range(2, 6)]
         words += [0xf0200f08, (14 << 16) | (2 << 8) | 8, 0xbf810000]
-        marker = write_request(work, words, root.read_bytes(), sa)
-        result = subprocess.run([gpu, sdk, marker, work / "cache", "global-stride"], capture_output=True, text=True)
-        print("global-stride", selector_offset, result.stdout.strip(), flush=True)
-        assert result.returncode == int(bool(selector_offset)), (result.stdout, result.stderr)
-        assert f"differing_components={8192 if selector_offset else 0} " in result.stdout
+        return words
+
+    views = "CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED"
+    sa_views = sa[:-4] + struct.pack("<I", 0x196)
+    for flags, registers, group_x in ((views + " | SAMPLER_HEAP_DIRECTLY_INDEXED", sa, 12),
+                                       (views, sa_views, 11)):
+        source.write_text(f'#define SIG "RootFlags({flags}),'
+                          'DescriptorTable(SRV(t0,numDescriptors=16)),DescriptorTable(UAV(u0,numDescriptors=16)),'
+                          'RootConstants(num32BitConstants=4,b0)"')
+        subprocess.run([Path(sdk) / "dxc.exe", "-T", "rootsig_1_1", "-E", "SIG", "-Fo", root, source], check=True)
+        root_blob = root.read_bytes()
+        for selector_offset in (0, 4):
+            marker = write_request(work, program(selector_offset, group_x), root_blob, registers)
+            result = subprocess.run([gpu, sdk, marker, work / "cache", "global-stride"], capture_output=True, text=True)
+            print("global-stride", flags, selector_offset, result.stdout.strip(), flush=True)
+            assert result.returncode == int(bool(selector_offset)), (result.stdout, result.stderr)
+            assert f"differing_components={8192 if selector_offset else 0} " in result.stdout
+
+    # Keep the original twelve-SGPR program so its group ID is still valid at s12.
+    invalid = write_request(work, program(0, 12), root_blob, sa)
+    output = work / "invalid-direct-heap-count.cso"
+    result = subprocess.run([*cli_args, invalid, output], capture_output=True, text=True)
+    assert result.returncode and "direct descriptor address outside bound table" in result.stderr, result.stderr
+    assert not output.exists()
 
 
 def main(cli, gpu, sdk):
@@ -250,7 +265,8 @@ def main(cli, gpu, sdk):
             print(mode, result.stdout.strip(), flush=True)
         sdwa_fixtures(args, gpu, sdk, work, root.read_bytes(), sa)
         raw_offset_fixtures(args, gpu, sdk, work, root.read_bytes(), sa)
-        global_stride_fixtures(gpu, sdk, work, root, source, sa)
+        global_stride_fixtures([cli, sdk, work / "cache", "gfx1013-direct-cs@0"],
+                               gpu, sdk, work, root, source, sa)
         return 0
 
 

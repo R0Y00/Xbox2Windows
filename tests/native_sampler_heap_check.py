@@ -30,6 +30,7 @@ from native_compute_clear_check import write_request
 
 ROOT_RW = "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), DescriptorTable(SRV(t0), UAV(u0))"
 ROOT_VIEWS_ONLY = "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), DescriptorTable(SRV(t0), UAV(u0))"
+ROOT_SAMPLERS_ONLY = "RootFlags(SAMPLER_HEAP_DIRECTLY_INDEXED), DescriptorTable(SRV(t0), UAV(u0))"
 
 REFUSALS = {
     "buffer": "scalar buffer load from the sampler heap is not translated",
@@ -239,7 +240,6 @@ def main():
     with tempfile.TemporaryDirectory(prefix="x2w_sampler_heap_") as scratch:
         base = pathlib.Path(scratch)
         # Sampler heap content, texture and expectations are in the fixture; the requests are written here.
-        sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1, 0, 7 << 1)  # group 32x1x1, 7 user SGPRs
         roots = {}
 
         def root(text):
@@ -259,7 +259,15 @@ def main():
             counter += 1
             folder = base / f"req_{counter}_{name}"
             folder.mkdir()
-            return write_request(folder, PROGRAMS[name], root(root_text), sa)
+            words = PROGRAMS[name]
+            user = 7
+            if root_text == ROOT_SAMPLERS_ONLY:
+                assert name == "sample"
+                words = words.copy()
+                words[2] = 0xbe8a0305  # s_mov_b32 s10, s5
+                user = 6
+            sa = struct.pack("<7I", 0, 0, 0, 32 | (1 << 16), 1, 0, user << 1)
+            return write_request(folder, words, root(root_text), sa)
 
         def compile_request(marker, profile="gfx1013-direct-cs@0", cache=None):
             output = marker.with_suffix(".cso")
@@ -293,17 +301,19 @@ def main():
                       *[f"decoy {n} in place of entry 67 changes result 1" for n in range(3)],
                       "1088 bytes}"],
         }
-        for mode, lines in expected_lines.items():
-            marker = request(mode)
-            cache = base / f"cache_{mode}"
+        cases = [(mode, mode, ROOT_RW) for mode in expected_lines]
+        cases.append(("sampler_only", "sample", ROOT_SAMPLERS_ONLY))
+        for name, mode, root_text in cases:
+            marker = request(mode, root_text)
+            cache = base / f"cache_{name}"
             cache.mkdir()
             code, out, err = run([fixture, sdk, cache, marker, adapter, mode], expect_skip=True)
-            require(code == 0, f"fixture mode {mode} exits 0")
-            for line in lines:
-                require(line in out, f"{mode}: {line}")
+            require(code == 0, f"fixture case {name} exits 0")
+            for line in expected_lines[mode]:
+                require(line in out, f"{name}: {line}")
             require("pass: prepare_direct_compute misses on a fresh cache and hits on the second call" in out,
-                    f"{mode}: frontend cache round trip (miss, then hit)")
-            require("pass: pipeline has sampler_heap_indexed" in out, f"{mode}: pipeline asks for the sampler heap flag only")
+                    f"{name}: frontend cache round trip (miss, then hit)")
+            require("pass: pipeline has sampler_heap_indexed" in out, f"{name}: pipeline asks for the sampler heap flag only")
         code, out, err = run([fixture, sdk, base / "cache_unbound", request("sample"), adapter, "unbound"], expect_skip=True)
         require(code == 0 and "bind without a sampler heap throws" in out, "bind without a sampler heap throws")
 

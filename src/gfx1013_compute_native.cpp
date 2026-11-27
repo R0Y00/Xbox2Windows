@@ -1669,11 +1669,18 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         } else
             refuse(entry, "root-address parameter");
     }
-    // In this compute ABI the two directly indexed heaps follow the user root parameters.
-    // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
-    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
-        initial[next] = {Symbol::Type::table, compute_resource_heap};
-        initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
+    // The enabled direct heaps follow the root parameters, resource heap first.
+    // Bind them only when they account for every remaining user SGPR.
+    const auto flags = layout->Desc_1_1.Flags;
+    const bool resource_heap = (flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) != 0;
+    const bool sampler_heap = (flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) != 0;
+    const unsigned heap_count = unsigned(resource_heap) + unsigned(sampler_heap);
+    if (!stage && heap_count && next + heap_count == user) {
+        unsigned slot = next;
+        if (resource_heap)
+            initial[slot++] = {Symbol::Type::table, compute_resource_heap};
+        if (sampler_heap)
+            initial[slot] = {Symbol::Type::table, compute_sampler_heap};
     }
     const bool wave64 = stage && !stage->wave32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
