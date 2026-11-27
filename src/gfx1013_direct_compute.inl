@@ -1062,8 +1062,128 @@ struct DirectCompute {
         h = select(nan, ir.binary("or", ir.binary("lshr", frac, "13"), "32256"), h);
         return ir.binary("or", h, sign);
     }
+    static bool packed_f16_arithmetic(Name n) {
+        return n == "v_pk_add_f16" || n == "v_pk_mul_f16" || n == "v_pk_fma_f16";
+    }
+    string fused_half_rne(const string &a, const string &b, const string &c) {
+        auto both = [&](const string &x, const string &y) { return ir.value("and i1 " + x + ", " + y); };
+        auto either = [&](const string &x, const string &y) { return ir.value("or i1 " + x + ", " + y); };
+        auto clz = [&](const string &value) {
+            // FirstbitHi counts from the most significant bit. OR-ing in bit
+            // zero leaves every nonzero count unchanged and bounds zero's shift.
+            return ir.invoke("i32", "unaryBits.i32", 33,
+                             {{"i32", ir.binary("or", value, "1")}}, "nounwind readnone");
+        };
+        struct Half { string magnitude, sign, significand, exponent; };
+        auto decode = [&](const string &word) {
+            auto magnitude = ir.binary("and", word, "32767");
+            auto field = ir.binary("lshr", magnitude, "10");
+            auto normal = cmp("ne", field, "0");
+            auto hidden = select(normal, "1024", "0");
+            return Half{magnitude, ir.binary("and", word, "32768"),
+                        ir.binary("or", ir.binary("and", word, "1023"), hidden),
+                        ir.binary("sub", select(normal, field, "1"), "25")};
+        };
+        auto x = decode(a), y = decode(b), z = decode(c);
+        auto product_sign = ir.binary("xor", x.sign, y.sign);
+        auto product = ir.binary("mul", x.significand, y.significand);
+        auto product_exp = ir.binary("add", x.exponent, y.exponent);
+
+        // Normalize both exact terms at bit 30, leaving space for a carry.
+        // The product has at most 22 bits and the addend at most 11. Close
+        // exponents therefore align exactly, including after cancellation.
+        auto normalize = [&](const string &mantissa, const string &exponent) {
+            auto leading = clz(mantissa);
+            return std::pair{
+                ir.binary("shl", mantissa, ir.binary("sub", leading, "1")),
+                select(cmp("eq", mantissa, "0"), "-128",
+                       ir.binary("add", exponent, ir.binary("sub", "31", leading)))};
+        };
+        auto [product_mantissa, product_top] = normalize(product, product_exp);
+        auto [addend_mantissa, addend_top] = normalize(z.significand, z.exponent);
+        auto product_larger = either(cmp("sgt", product_top, addend_top),
+            both(cmp("eq", product_top, addend_top), cmp("uge", product_mantissa, addend_mantissa)));
+        auto big = select(product_larger, product_mantissa, addend_mantissa);
+        auto smaller_mantissa = select(product_larger, addend_mantissa, product_mantissa);
+        auto big_exp = select(product_larger, product_top, addend_top);
+        auto small_exp = select(product_larger, addend_top, product_top);
+        auto sign = select(product_larger, product_sign, z.sign);
+        auto distance = ir.binary("sub", big_exp, small_exp);
+        auto shift = select(cmp("ult", distance, "31"), distance, "31");
+        auto aligned = ir.binary("lshr", smaller_mantissa, shift);
+        // A wide alignment has no significant cancellation. Retain a sticky
+        // bit for discarded data so a nearby midpoint still rounds correctly.
+        auto sticky = cmp("ne", ir.binary("shl", aligned, shift), smaller_mantissa);
+        aligned = ir.binary("or", aligned, ir.value("zext i1 " + sticky + " to i32"));
+        auto same_sign = cmp("eq", product_sign, z.sign);
+        auto magnitude = select(same_sign, ir.binary("add", big, aligned), ir.binary("sub", big, aligned));
+        auto leading = clz(magnitude);
+        auto normalized = ir.binary("shl", magnitude, leading);
+        auto exponent = ir.binary("sub", ir.binary("add", big_exp, "128"), leading);
+
+        // Encode the exact sum rounded to odd at binary32 precision. If any
+        // bits were lost, set the last retained bit. The final binary16
+        // nearest-even conversion then sees the correct side of every tie.
+        auto odd = cmp("ne", ir.binary("and", normalized, "255"), "0");
+        auto significand = ir.binary("or", ir.binary("lshr", normalized, "8"),
+                                    ir.value("zext i1 " + odd + " to i32"));
+        auto binary32 = ir.binary("or", ir.binary("shl", sign, "16"),
+            ir.binary("or", ir.binary("shl", exponent, "23"), ir.binary("and", significand, "8388607")));
+        auto zero = select(both(cmp("eq", product, "0"), cmp("eq", z.magnitude, "0")),
+                           ir.binary("and", product_sign, z.sign), "0");
+        auto finite = select(cmp("eq", magnitude, "0"), zero, packed_half_rne(binary32));
+
+        auto x_inf = cmp("eq", x.magnitude, "31744"), y_inf = cmp("eq", y.magnitude, "31744");
+        auto product_inf = either(x_inf, y_inf), c_inf = cmp("eq", z.magnitude, "31744");
+        auto invalid_product = either(both(x_inf, cmp("eq", y.magnitude, "0")),
+                                      both(y_inf, cmp("eq", x.magnitude, "0")));
+        auto invalid_sum = both(both(product_inf, c_inf), cmp("ne", product_sign, z.sign));
+        auto nan = either(either(cmp("ugt", x.magnitude, "31744"), cmp("ugt", y.magnitude, "31744")),
+                          either(cmp("ugt", z.magnitude, "31744"), either(invalid_product, invalid_sum)));
+        return select(nan, "32256",
+            select(product_inf, ir.binary("or", product_sign, "31744"), select(c_inf, c, finite)));
+    }
+    void packed_f16_alu(const Inst &i) {
+        const bool fused = i.name == "v_pk_fma_f16";
+        if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4))))
+            refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
+        if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+            refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+        std::array<string, 3> words;
+        for (unsigned j = 0; j < (fused ? 3u : 2u); ++j) {
+            unsigned r = i.src[j];
+            if (r > 105 && r < 256 && r != 128 && r != 255)
+                refuse(i.pc, "unsupported packed binary16 arithmetic source");
+            words[j] = operand32(i, r);
+        }
+        auto lane = [&](unsigned selectors, unsigned negate) {
+            auto operand = [&](unsigned j) {
+                auto bits = (selectors & (1u << j)) ? ir.binary("lshr", words[j], "16")
+                                                    : ir.binary("and", words[j], "65535");
+                return (negate & (1u << j)) ? ir.binary("xor", bits, "32768") : bits;
+            };
+            auto a = operand(0), b = operand(1);
+            if (fused)
+                return fused_half_rne(a, b, operand(2));
+            auto widen = [&](const string &bits) {
+                return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+            };
+            const auto op = i.name == "v_pk_mul_f16" ? "fmul" : "fadd";
+            auto result = ir.value(string(op) + " float " + widen(a) + ", " + widen(b));
+            auto bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
+            return select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
+        };
+        // In VOP3P, NEG_HI occupies the ABS field. OP_SEL_HI[2] lives in word 0.
+        auto low = lane((i.a >> 11) & 7, i.neg);
+        auto high = lane(((i.b >> 27) & 3) | ((i.a >> 12) & 4), i.abs);
+        vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+    }
     bool float_alu(const Inst &i, const string *permuted = nullptr) {
         auto n = i.name;
+        if (packed_f16_arithmetic(n)) {
+            packed_f16_alu(i);
+            return true;
+        }
         if ((i.subword || (!i.wide && !i.dpp_control && !permuted)) &&
             (n == "v_cvt_f16_f32" || n == "v_cvt_f32_f16")) {
             if (i.scale || i.clamp || i.src_sext[0])
@@ -3003,6 +3123,8 @@ struct DirectCompute {
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
                 mode_write = true;
+            if (packed_f16_arithmetic(op.name))
+                half_binary = true;
             if (op.branch() && op.op != 2)
                 conditional = true;
         }
