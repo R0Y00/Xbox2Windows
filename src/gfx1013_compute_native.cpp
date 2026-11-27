@@ -769,7 +769,8 @@ struct Emit {
             refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
                                  (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
-                                  (i.name == "buffer_store_raw" ||
+                                  (i.name == "buffer_store_raw" || i.name == "buffer_load_dword" ||
+                                   i.enc == Encoding::Smem ||
                                    (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
@@ -1583,6 +1584,13 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
+        for (size_t i = 0; i < program.code.size(); ++i) {
+            const auto& inst = program.code[i];
+            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
+            if (symbol.type == Symbol::Type::descriptor)
+                compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);
+        }
         if (threads % (wave64 ? 64 : 32))
             for (const auto &i : program.code)
                 if (i.name == "v_readlane_b32" || i.name == "v_writelane_b32")

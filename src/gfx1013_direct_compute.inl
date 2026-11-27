@@ -325,12 +325,21 @@ struct DirectCompute {
         ir.features |= 16 | 0x40000000;
         return ir.heap_handle(ir.binary("add", read(base), to_string(symbol.offset / 32)), 11, 0);
     }
+    std::set<std::pair<unsigned,unsigned>> read_write_raw_views;
     string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
                     unsigned *bound_register = nullptr) {
         const auto &symbol = s.at(base);
         const bool indexed = symbol.type == Symbol::Type::indexed_descriptor;
         if (indexed && symbol.value == compute_resource_heap)
             return heap_resource(i, s, base, kind, bytes);
+        if (!indexed && symbol.type == Symbol::Type::descriptor &&
+            (kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::raw_vector_srv ||
+             kind == ComputeViewKind::byte_window_srv) &&
+            read_write_raw_views.count({symbol.value, symbol.offset})) {
+            // Both instructions read the same descriptor table entry. A
+            // second, SRV binding would conflict with its writable resource state.
+            kind = ComputeViewKind::raw_buffer_uav;
+        }
         const unsigned count = indexed ? 1 + symbol.index_mask / 32 : 1;
         analysis.binding(i, s, base, 4, kind, bytes);
         auto it = std::find_if(analysis.result.bindings.begin(), analysis.result.bindings.end(), [&](const auto &b) {
