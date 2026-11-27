@@ -88,9 +88,11 @@ it. The input is `1 << x` for or and a different word per pixel otherwise, and t
 of the translated stage with the lane index, the lane count and `WaveReadLaneFirst` of the pixel id, reads the target
 back through `offscreen_check --startup-pixel-dump`, groups the covered pixels by wave and compares each result with
 the operation over the inputs of the covered pixels of its wave. The triangle leaves 30 quads partly covered. Planted
-errors in the translated text must fail: another operation, signed for unsigned, the lane's own value and the first
-lane's value for each operation; for the pair, the min readlane lowered after the max, min and max swapped, and the
-`v_cndmask_b32_sdwa` dropped.
+errors in the translated text must fail: another operation, the lane's own value and the first lane's value for
+each operation, and signed for unsigned where that rewrite changes the program (min and max, including the
+uniform-branch-before max; `v_or_b32` has no signed form, so that plant is not applied to the or draws, including
+the uniform-branch-after or chain). For the pair: the min readlane lowered after the max, min and max swapped, and
+the `v_cndmask_b32_sdwa` dropped.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_wave_reduce' -V

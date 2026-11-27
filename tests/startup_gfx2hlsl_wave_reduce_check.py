@@ -41,7 +41,8 @@ is replaced by the lane index, the lane count (WaveGetLaneCount) and the pixel i
 the wave. The readback (offscreen_check --startup-pixel-dump) is grouped by that id and every covered pixel's results
 are compared with OP over the inputs of the covered pixels of its group. The triangle leaves quads partly covered:
 their helper lanes run the stage, are not in the console EXEC (no s_wqm), and must not change the result. Planted
-errors in the translated text (another operation, signed for unsigned, the lane's own value, the first lane's value;
+errors in the translated text (another operation, the lane's own value, the first lane's value; signed for
+unsigned only where that rewrite changes the program, which is min and max, since v_or_b32 has no signed form;
 for the interleaved pair the min's readlane lowered after the max, min and max swapped, the v_cndmask_b32_sdwa
 dropped) must fail.
 """
@@ -693,6 +694,20 @@ def controls():
     text, reason = straight_line_refusal(fixture('v_max_u32')[1])
     check('reverted straight-line guard still lowers the straight-line chain',
           text is not None and 'v2 = %s;' % INTRINSIC['v_max_u32'] in text, str(reason))
+    # Each draw plant must change the translated program, except signed-for-unsigned on v_or_b32, which has no
+    # signed form. That includes the uniform-branch-after or draw, not only the straight-line or draw.
+    for label, words, input_op, channels in DRAWS:
+        text, reason = translate(words)
+        check('%s draw translates for the planted errors' % label, text is not None, str(reason))
+        if text is None:
+            continue
+        single_op = channels[0] == ('reduce', input_op) and all(kind != 'lane' for kind, _arg in channels)
+        hows = ([(how, (lambda t, f=f, op=input_op: f(t, op))) for how, f in MUTATIONS.items()]
+                if single_op else list(PAIR_MUTATIONS.items()))
+        for how, mutate in hows:
+            changed = observed(mutate(text)) != observed(text)
+            expect = not (input_op == 'v_or_b32' and how == 'signed for unsigned')
+            check('%s %s %s the program' % (label, how, 'changes' if expect else 'leaves'), changed is expect)
     # Not a chain: s_or_saveexec_b32 with -1 and no mirror or permlane after it keeps its own handler.
     _source, words = program(START_MUL, [saveexec(0)], export('v1', 'v1', 'v1'))
     text, reason = translate(words)
@@ -847,8 +862,8 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             for how, mutate in [(None, None)] + hows:
                 source = observed(text if how is None else mutate(text))
                 if how is not None and source == observed(text):
-                    if label == 'v_or_b32' and how == 'signed for unsigned':
-                        continue   # v_or_b32 has no signedness
+                    if input_op == 'v_or_b32' and how == 'signed for unsigned':
+                        continue   # v_or_b32 has no signed form; the plant does not change the program
                     check('%s %s %s: the planted error applies' % (adapter, label, how), False)
                     continue
                 tag = re.sub(r'\W+', '_', label + ('' if how is None else '_' + how))
