@@ -57,11 +57,28 @@ struct Inst {
     Name name;
     unsigned abs = 0, neg = 0, scale = 0;
     bool clamp = false, wide = false, subword = false;
-    // 0..255 selects within a quad. The two mirror controls cross quads.
+    // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
+    enum class DppRowOp { None, Shl, Shr, Ror };
+    struct DppRow {
+        DppRowOp op;
+        unsigned amount;
+    };
+    DppRow dpp_row() const {
+        const unsigned control = dpp_control.value_or(0);
+        const unsigned amount = control & 15;
+        if (amount) {
+            switch (control & ~15u) {
+            case 0x100: return {DppRowOp::Shl, amount};
+            case 0x110: return {DppRowOp::Shr, amount};
+            case 0x120: return {DppRowOp::Ror, amount};
+            }
+        }
+        return {DppRowOp::None, 0};
+    }
     std::array<unsigned, 2> src_select{6, 6};
     std::array<bool, 2> src_sext{};
     unsigned dst_select = 6, dst_unused = 0;
@@ -347,11 +364,11 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             auto control=take();
             // DPP_CTRL[8] selects patterns outside a quad; bit 17 is
             // reserved. FI and BOUND_CTRL are independent of the pattern.
-            if ((control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank quad permutation");
+            if ((control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
             if (control & (1u << 17)) refuse(pc,"reserved DPP16 control bit");
             const auto pattern = (control >> 8) & 0x1ff;
             i.dpp_control = pattern;
-            if (pattern > 255 && !i.mirror_mask())
+            if (pattern > 255 && !i.mirror_mask() && i.dpp_row().op == Inst::DppRowOp::None)
                 refuse(pc,"unsupported DPP lane selection");
             i.dpp_fetch_inactive = (control & (1u << 18)) != 0;
             i.dpp_bound_zero = (control & (1u << 19)) != 0;

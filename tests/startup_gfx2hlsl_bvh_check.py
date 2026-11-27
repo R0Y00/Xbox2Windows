@@ -4,9 +4,8 @@ The instruction is RDNA 2 MIMG opcode 230. This check covers the translator path
 box model only: a constant inline BVH T#[12:15], an 11-dword packed address, a constant
 node base whose low three bits are 5, and the four child results. Triangle nodes, 16-bit
 box nodes, the 64-bit form, A16, NSA and every dynamic descriptor or node base are refused
-by name before any HLSL is emitted. The CPU box reference is the one in
-tests/gfx1030_bvh_box/check.py; the sort network is the five compare-exchange stages of
-Mesa 25.1.0 radv_nir_rt_common.c (MIT).
+by name before any HLSL is emitted. The independent CPU box reference is
+tests/gfx1030_bvh_box/bvh_model.py; the Windows dispatch exercises the actual emitted helper.
 """
 import math
 import os
@@ -24,6 +23,7 @@ sys.path.insert(0, str(ROOT / "tools" / "startup"))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
 import startup_gfx2hlsl_compute_check as C  # noqa: E402
+from gfx1030_bvh_box import bvh_model as B  # noqa: E402
 
 INVALID = 0xffffffff
 SORT_ENABLE = 1 << 31
@@ -40,6 +40,9 @@ NODES = {
     0: (box(0x25, 4), box(0x1d, 1), box(0x2d, 2, x=32), box(INVALID, 3)),
     256: (box(0x45, 7), box(0x3d, 5), box(0x35, 3), box(0x0d, 1)),
     384: (box(0x25, 4), box(INVALID, 1), box(0x2d, 2), box(0x35, 3)),
+    # A finite hit at FLT_MAX must sort ahead of misses (key +infinity).
+    512: (box(INVALID, 1), (0x4d, (FLT_MAX,) * 3, (FLT_MAX,) * 3),
+          box(0x55, 2, x=32), box(INVALID, 3)),
 }
 ORIGIN = (0.5, -0.5, -1.0)
 FORWARD = (0.25, -0.125, 0.5)
@@ -49,10 +52,23 @@ RAYS = (
     ("all_miss", 0, 2.0, ORIGIN, FORWARD, (INVALID,) * 4),
     ("all_four", 256, 19.0, ORIGIN, FORWARD, (0x0d, 0x35, 0x3d, 0x45)),
     ("reverse", 0, 21.0, (0.0, 0.0, 10.0), (0.25, -0.125, -0.5), (0x25, 0x1d, INVALID, INVALID)),
+    ("finite_max", 512, math.inf, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0x4d, INVALID, INVALID, INVALID)),
+    ("encoded_base_low_bits", 0, 19.0, ORIGIN, FORWARD, (0x1d, 0x25, INVALID, INVALID)),
+    ("encoded_base_high_byte", 256, 19.0, ORIGIN, FORWARD, (0x0d, 0x35, 0x3d, 0x45)),
 )
 UNSORTED_RAYS = (
-    ("unsorted_three_hits", 384, 19.0, ORIGIN, FORWARD, (0x25, 0x2d, 0x35, INVALID)),
+    ("unsorted_three_hits", 384, 19.0, ORIGIN, FORWARD, (0x25, INVALID, 0x2d, 0x35)),
+    ("unsorted_mixed", 0, 19.0, ORIGIN, FORWARD, (0x25, 0x1d, INVALID, INVALID)),
+    ("unsorted_finite_max", 512, math.inf, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+     (INVALID, 0x4d, INVALID, INVALID)),
 )
+DESCRIPTOR_BASES = {
+    "encoded_base_low_bits": (0x1008, 0),
+    "encoded_base_high_byte": (0, 0x81),
+}
+RESULT_OFFSET = max(NODES) + 128
+RESULT_WORD = RESULT_OFFSET // 4
+BUFFER_SIZE = RESULT_OFFSET + 16 * (len(RAYS) + len(UNSORTED_RAYS))
 
 failures = []
 
@@ -65,22 +81,21 @@ def check(label, ok, detail=""):
             print("  " + detail)
 
 
-def reference(nodes, extent, origin, direction, sort_boxes):
-    """The fixture reference: slab test, extent clip, compact misses, sort only when asked."""
-    hits = []
-    for child, lo, hi in nodes:
-        if child == INVALID:
-            continue
-        near, far = 0.0, extent
-        for lower, upper, start, step in zip(lo, hi, origin, direction, strict=True):
-            first, second = (lower - start) / step, (upper - start) / step
-            near, far = max(near, min(first, second)), min(far, max(first, second))
-        if near <= far and near < extent:
-            hits.append((near, child))
-    if sort_boxes:
-        hits.sort()
-    result = tuple(child for _, child in hits)
-    return result + (INVALID,) * (4 - len(result))
+def node_bytes():
+    data = bytearray(RESULT_OFFSET)
+    for offset, nodes in NODES.items():
+        struct.pack_into("<4I", data, offset, *(child for child, _, _ in nodes))
+        for i, (_, lo, hi) in enumerate(nodes):
+            struct.pack_into("<6f", data, offset + 16 + 24 * i, *lo, *hi)
+    return data
+
+
+def reference(offset, extent, origin, direction, sort_boxes):
+    """Use the independent model on bytes relative to the bound allocation."""
+    return tuple(B.intersect(
+        node_bytes(), B.descriptor(sort=sort_boxes), (offset >> 3) | 5,
+        extent=extent, origin=origin, direction=direction,
+        inverse=tuple(1.0 / c for c in direction)))
 
 
 def model(nodes, extent, origin, direction, sort_boxes):
@@ -89,7 +104,7 @@ def model(nodes, extent, origin, direction, sort_boxes):
     items = []
     for child, lo, hi in nodes:
         if child == INVALID:
-            items.append([INVALID, FLT_MAX])
+            items.append([INVALID, math.inf])
             continue
         bound0 = [(lo[i] - origin[i]) * inv[i] for i in range(3)]
         bound1 = [(hi[i] - origin[i]) * inv[i] for i in range(3)]
@@ -99,17 +114,16 @@ def model(nodes, extent, origin, direction, sort_boxes):
         if hit:
             items.append([child, tmin if sort_boxes else 0.0])
         else:
-            items.append([INVALID, FLT_MAX])
+            items.append([INVALID, math.inf])
     if not sort_boxes:
-        ordered = [child for child, _key in items if child != INVALID]
-        return tuple(ordered) + (INVALID,) * (4 - len(ordered))
+        return tuple(child for child, _key in items)
     for a, b in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
         if items[b][1] < items[a][1]:
             items[a], items[b] = items[b], items[a]
     return tuple(item[0] for item in items)
 
 
-def translate_program(*, node=0x05, sort_boxes=True, word0=0x00100000, word1=None, word2=0x0b,
+def translate_program(*, node=0x05, sort_boxes=True, word0=0x1000, word1=None, word2=0x0b,
                       word3=RESOURCE_TYPE, loaded_descriptor=False, modifier="", opcode="image_bvh_intersect_ray",
                       constant_node=True, stage_kind="cs"):
     """A straight-line compute program with a constant inline T# and a constant node pointer."""
@@ -154,11 +168,11 @@ def translate_program(*, node=0x05, sort_boxes=True, word0=0x00100000, word1=Non
 def controls():
     bad = None
     for name, offset, extent, origin, direction, expected in RAYS:
-        actual = reference(NODES[offset], extent, origin, direction, True)
+        actual = reference(offset, extent, origin, direction, True)
         if actual != expected:
             bad = (name, actual, expected)
             break
-    check("CPU reference matches the gfx1030 box fixture", bad is None, str(bad))
+    check("independent public box model matches sorted fixture expectations", bad is None, str(bad))
 
     bad = None
     for name, offset, extent, origin, direction, expected in RAYS:
@@ -166,25 +180,25 @@ def controls():
         if actual != expected:
             bad = (name, actual, expected)
             break
-    check("emitted sort network matches the CPU reference", bad is None, str(bad))
+    check("transcribed helper model matches independent CPU reference", bad is None, str(bad))
 
     # Negative control: sort disabled keeps child order. The sorted ray's first word changes.
-    unsorted = reference(NODES[0], 19.0, ORIGIN, FORWARD, False)
-    sorted_result = reference(NODES[0], 19.0, ORIGIN, FORWARD, True)
+    unsorted = reference(0, 19.0, ORIGIN, FORWARD, False)
+    sorted_result = reference(0, 19.0, ORIGIN, FORWARD, True)
     check("sort bit negative control changes word 0",
           unsorted[0] == 0x25 and sorted_result[0] == 0x1d, str((unsorted, sorted_result)))
     check("model without the sort bit matches the unsorted reference",
           model(NODES[0], 19.0, ORIGIN, FORWARD, False) == unsorted,
           str((model(NODES[0], 19.0, ORIGIN, FORWARD, False), unsorted)))
     for name, offset, extent, origin, direction, expected in UNSORTED_RAYS:
-        actual = reference(NODES[offset], extent, origin, direction, False)
+        actual = reference(offset, extent, origin, direction, False)
         check("CPU reference keeps child order with the sort bit clear (%s)" % name, actual == expected,
               str((actual, expected)))
         actual = model(NODES[offset], extent, origin, direction, False)
         check("helper keeps child order with the sort bit clear (%s)" % name, actual == expected,
               str((actual, expected)))
     check("all-miss result is four 0xffffffff words",
-          reference(NODES[0], 2.0, ORIGIN, FORWARD, True) == (INVALID,) * 4, "")
+          reference(0, 2.0, ORIGIN, FORWARD, True) == (INVALID,) * 4, "")
 
     pipe, hlsl, refusals = translate_program()
     check("constant box32 program translates", pipe is not None and not refusals, str(refusals))
@@ -197,14 +211,54 @@ def controls():
         check("the call carries the sort-enabled T# word and four child results",
               "0x80000000u" in hlsl and all("v%d = bt" % reg in hlsl for reg in range(32, 36)),
               "")
-        call_line = next(line for line in hlsl.splitlines() if "x2w_bvh_intersect_box32(r0" in line)
+        call_line = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_box32(r0" in line), "")
         check("constant T# passes literals, not descriptor SGPRs",
-              "s12" not in call_line and "s13" not in call_line, call_line)
+              "0x00001000u, 0x80000000u, 0x0000000bu, 0x80000000u" in call_line
+              and "s12" not in call_line and "s13" not in call_line, call_line)
 
     pipe, hlsl, refusals = translate_program(sort_boxes=False)
     check("sort-disabled program translates", pipe is not None and not refusals, str(refusals))
     if pipe is not None:
-        check("sort-disabled call uses a zero sort word", "0x00000000u" in hlsl, "")
+        call = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_box32(r0" in line), "")
+        check("sort-disabled call uses a zero sort word",
+              "0x00001000u, 0x00000000u, 0x0000000bu, 0x80000000u" in call, call)
+
+    # Independently decode the 40-bit unit field; test the same raw DWORDs in
+    # the emitted call and the decoded byte-address binding in the manifest.
+    for units, high, base in ((0x1000, 0, 0x100000), (0x1008, 0, 0x100800),
+                              (0, 0x81, 0x810000000000)):
+        words = (units, high | SORT_ENABLE, 0x0b, RESOURCE_TYPE)
+        check("public model decodes base %#x" % base,
+              B.node_address(words, 5) == (5, base), str(B.node_address(words, 5)))
+        pipe, hlsl, refusals = translate_program(node=0x25, word0=words[0], word1=words[1])
+        check("encoded base %#x translates" % base, pipe is not None and not refusals, str(refusals))
+        if pipe is not None:
+            manifest = pipe.manifest()
+            call = next((line for line in hlsl.splitlines() if "x2w_bvh_intersect_box32(r0" in line), "")
+            literal_words = ", ".join("0x%08xu" % word for word in words)
+            check("manifest uses byte base %#x" % base, "srv 0 bvh base %#x size 0xb" % base in manifest, manifest)
+            check("call preserves all four descriptor DWORDs at %#x" % base, literal_words in call, call)
+
+    # The model wraps the absolute node address at 48 bits. The raw-bound
+    # helper cannot represent that wrap, so the translator must refuse it.
+    words = (0xffffffff, SORT_ENABLE | 0xff, 0x0b, RESOURCE_TYPE)
+    check("public model wraps the node address", B.node_address(words, 0x25) == (5, 0),
+          str(B.node_address(words, 0x25)))
+    pipe, boundary_hlsl, refusals = translate_program(node=0x15, word0=words[0], word1=words[1])
+    check("node ending exactly at the 48-bit boundary translates",
+          pipe is not None and not refusals, str(refusals))
+    pipe, wrap_hlsl, refusals = translate_program(node=0x25, word0=words[0], word1=words[1])
+    check("refuses 48-bit wrap before resource binding",
+          refusals == ["image_bvh_intersect_ray node address wraps the 48-bit address space"]
+          and " bvh base " not in pipe.manifest()
+          and "x2w_bvh_intersect_box32" not in wrap_hlsl and "uint4 bt" not in wrap_hlsl, str(refusals))
+
+    # Portable checks ensure the actual emitted helper and every negative
+    # mutation are present even when a GPU dispatch is unavailable.
+    helpers = "\n".join(G.BVH_HELPERS)
+    check("translated shader embeds the dispatch-tested helper", hlsl is not None and helpers in hlsl, "")
+    for mutation in MUTATIONS:
+        dispatch_hlsl(mutation)
 
     # Every refusal must happen before a helper call or a result VGPR is emitted.
     cases = [
@@ -219,7 +273,7 @@ def controls():
         ("loaded descriptor", dict(loaded_descriptor=True), "loaded at run time"),
         ("descriptor type", dict(word3=0x60000000), "descriptor type 6 is not 8"),
         ("box growing", dict(word1=SORT_ENABLE | (2 << 23)), "box growing amount 2"),
-        ("base alignment", dict(word0=0x00100008), "not 256-byte aligned"),
+        ("reserved word 1", dict(word1=SORT_ENABLE | 0x100), "reserved word 1"),
         ("size zero", dict(word2=0), "does not cover a 128-byte node"),
         ("node outside size", dict(node=0x25, word2=3), "outside descriptor size"),
         ("absolute base", dict(word0=0, word1=0), "absolute node base"),
@@ -289,11 +343,31 @@ def fbits(value):
     return "0x%08xu" % struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-def dispatch_hlsl(mutate_miss=False):
+MUTATIONS = {
+    "miss_fill": ("all_miss", tuple(
+        ("c%d = h%d ? c%d : X2W_BVH_MISS;" % (i, i, i), "c%d = c%d;" % (i, i)) for i in range(4))),
+    "compact": ("unsorted_three_hits", (
+        ("if (!sort_boxes) return uint4(c0, c1, c2, c3);",
+         "if (!sort_boxes) { uint4 ordered = miss; uint n = 0u; "
+         "if (h0) ordered[n++] = c0; if (h1) ordered[n++] = c1; "
+         "if (h2) ordered[n++] = c2; if (h3) ordered[n++] = c3; return ordered; }"),)),
+    "finite_miss": ("finite_max", tuple(
+        ("float k%d = h%d ? d%d : asfloat(0x7f800000u);" % (i, i, i),
+         "float k%d = h%d ? d%d : 3.402823466e+38;" % (i, i, i)) for i in range(4))),
+    "base_alignment": ("encoded_base_low_bits", (
+        ("return (word1 & 0x7fffff00u) == 0u &&",
+         "return (word0 & 0xffu) == 0u && (word1 & 0x7fffff00u) == 0u &&"),)),
+    "high_byte": ("encoded_base_high_byte", (
+        ("(word0 != 0u || (word1 & 0x000000ffu) != 0u)", "(word0 != 0u)"),)),
+}
+
+
+def dispatch_hlsl(mutation=None):
     helpers = "\n".join(G.BVH_HELPERS).replace("ByteAddressBuffer", "RWByteAddressBuffer")
-    if mutate_miss:
-        for i in range(4):
-            helpers = helpers.replace("c%d = h%d ? c%d : X2W_BVH_MISS;" % (i, i, i), "c%d = c%d;" % (i, i))
+    if mutation:
+        for old, new in MUTATIONS[mutation][1]:
+            assert helpers.count(old) == 1, (mutation, old)
+            helpers = helpers.replace(old, new)
     lines = [helpers, "RWByteAddressBuffer data : register(u0);", "[numthreads(1, 1, 1)]", "void main() {"]
     for base_offset, children in NODES.items():
         for i, (child, lo, hi) in enumerate(children):
@@ -306,29 +380,30 @@ def dispatch_hlsl(mutate_miss=False):
     lines.append("    DeviceMemoryBarrierWithGroupSync();")
     for case, (_name, offset, extent, origin, direction, _expected) in enumerate(RAYS + UNSORTED_RAYS):
         inv = tuple(1.0 / c for c in direction)
-        sort_word = "0x80000000u" if case < len(RAYS) else "0x00000000u"
+        base0, base1 = DESCRIPTOR_BASES.get(_name, (0x1000, 0))
+        word1 = base1 | (SORT_ENABLE if case < len(RAYS) else 0)
         lines.append(
-            "    uint4 r%d = x2w_bvh_intersect_box32(data, 0x%08xu, 0x00100000u, %s, "
+            "    uint4 r%d = x2w_bvh_intersect_box32(data, 0x%08xu, 0x%08xu, 0x%08xu, "
             "0x0000000bu, 0x80000000u, %s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
-                case, (offset >> 3) | 5, sort_word, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
+                case, (offset >> 3) | 5, base0, word1, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
                 ffloat(origin[2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
         for word in range(4):
-            lines.append("    data.Store(%du, r%d.%s);" % (512 + 16 * case + 4 * word, case, "xyzw"[word]))
+            lines.append("    data.Store(%du, r%d.%s);" % (RESULT_OFFSET + 16 * case + 4 * word, case, "xyzw"[word]))
     lines.append("}")
     return "\n".join(lines) + "\n"
 
 
-def run_dispatch(dxc, runner, adapter, directory, mutate=False):
-    name = "bvh_dispatch_mut" if mutate else "bvh_dispatch"
+def run_dispatch(dxc, runner, adapter, directory, mutation=None):
+    name = "bvh_dispatch_" + mutation if mutation else "bvh_dispatch"
     source = directory / (name + ".hlsl")
     cso = directory / (name + ".cso")
     output = directory / (name + ".bin")
-    source.write_text(dispatch_hlsl(mutate), encoding="ascii")
+    source.write_text(dispatch_hlsl(mutation), encoding="ascii")
     compiled = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
                               capture_output=True, text=True)
     if compiled.returncode or compiled.stderr:
         raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
-    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", "608", str(output)],
+    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", str(BUFFER_SIZE), str(output)],
                             capture_output=True, text=True)
     print(result.stdout, end="")
     if result.returncode == 77:
@@ -336,11 +411,14 @@ def run_dispatch(dxc, runner, adapter, directory, mutate=False):
     if result.returncode or result.stderr:
         raise AssertionError(result.stderr or "offscreen_check exited with %d" % result.returncode)
     data = output.read_bytes()
+    assert len(data) == BUFFER_SIZE, (len(data), BUFFER_SIZE)
     return 0, struct.unpack("<%dI" % (len(data) // 4), data)
 
 
 def check_dispatch(dxc, runner, adapter):
     controls()
+    if failures:
+        return 1
     if not dxc or not runner:
         print("dispatch: skip (no dxc or offscreen_check)")
         return 77
@@ -352,22 +430,22 @@ def check_dispatch(dxc, runner, adapter):
         if status == 77:
             print("dispatch: skip (adapter unavailable)")
             return 77
-        for case, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(RAYS):
-            got = tuple(words[128 + 4 * case:132 + 4 * case])
+        cases = RAYS + UNSORTED_RAYS
+        for case, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(cases):
+            start = RESULT_WORD + 4 * case
+            got = tuple(words[start:start + 4])
             check("dispatch case %d %s" % (case, _name), got == expected,
                   "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
-        for extra, (_name, _offset, _extent, _origin, _direction, expected) in enumerate(UNSORTED_RAYS):
-            case = len(RAYS) + extra
-            got = tuple(words[128 + 4 * case:132 + 4 * case])
-            check("dispatch case %d %s" % (case, _name), got == expected,
-                  "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in expected]))
-        status, mutant = run_dispatch(dxc, runner, adapter, directory, mutate=True)
-        if status == 77:
-            print("dispatch control: skip (adapter unavailable)")
-            return 77
-        changed = mutant[136:140]
-        check("dispatch miss-fill control decays case 2", tuple(changed) != (INVALID,) * 4,
-              "got %s" % ["%08x" % w for w in changed])
+        for mutation, (witness, _replacements) in MUTATIONS.items():
+            status, mutant = run_dispatch(dxc, runner, adapter, directory, mutation=mutation)
+            if status == 77:
+                print("dispatch control: skip (adapter unavailable)")
+                return 77
+            case = next(i for i, ray in enumerate(cases) if ray[0] == witness)
+            start = RESULT_WORD + 4 * case
+            changed = tuple(mutant[start:start + 4])
+            check("dispatch %s control changes %s" % (mutation, witness), changed != cases[case][-1],
+                  "got %s" % ["%08x" % w for w in changed])
     if failures:
         print("FAILED: %s" % ", ".join(failures))
         return 1

@@ -1828,6 +1828,28 @@ struct DirectCompute {
                 vector_write(i.dst, place_subword(i, count ? ir.binary("add", value, b) : value));
             return;
         }
+        if (n == "s_bcnt0_i32_b32" || n == "s_bcnt1_i32_b32") {
+            auto bits = n == "s_bcnt0_i32_b32" ? ir.binary("xor", a, "4294967295") : a;
+            auto count = ir.invoke("i32", "unaryBits.i32", 31, {{"i32", bits}}, "nounwind readnone");
+            write(i.dst, count);
+            write(128, ir.value("zext i1 " + cmp("ne", count, "0") + " to i32"));
+            return;
+        }
+        if (n == "s_ff0_i32_b32" || n == "s_ff1_i32_b32" || n == "v_ffbl_b32" || n == "s_flbit_i32_b32" ||
+            n == "v_ffbh_u32" || n == "s_flbit_i32" || n == "v_ffbh_i32") {
+            // DXIL FirstbitLo (32) counts from bit 0; FirstbitHi (33) and FirstbitSHi (34) count from bit 31,
+            // as these gfx10 scans do. All three return ~0 when no bit qualifies, and none of the scans writes SCC.
+            bool low = n == "s_ff0_i32_b32" || n == "s_ff1_i32_b32" || n == "v_ffbl_b32";
+            bool sign = n == "s_flbit_i32" || n == "v_ffbh_i32";
+            auto bits = n == "s_ff0_i32_b32" ? ir.binary("xor", a, "4294967295") : a;
+            auto index = ir.invoke("i32", "unaryBits.i32", low ? 32 : sign ? 34 : 33, {{"i32", bits}},
+                                   "nounwind readnone");
+            if (scalar)
+                write(i.dst, index);
+            else
+                vector_write(i.dst, place_subword(i, index));
+            return;
+        }
         if (n == "v_swap_b32") {
             if (i.wide || i.src[0] < 256)
                 refuse(i.pc, "invalid vector swap source");
@@ -1864,7 +1886,11 @@ struct DirectCompute {
             z = select(cmp("ne", ir.binary("and", wave64 ? select(upper_half, pair_high(i, i.src[2]), val(2)) : val(2), lane_bit), "0"), b, a);
         } else if (n == "v_mov_b32")
             z = a;
-        else if (n == "s_mul_i32" || n == "v_mul_lo_u32" || n == "v_mul_lo_i32")
+        else if (n == "s_absdiff_i32") {
+            // D = S0 - S1 wrapped to 32 bits, negated when negative, so 0x80000000 stays; SCC = D != 0 below.
+            auto difference = ir.binary("sub", a, b);
+            z = select(cmp("slt", difference, "0"), ir.binary("sub", "0", difference), difference);
+        } else if (n == "s_mul_i32" || n == "v_mul_lo_u32" || n == "v_mul_lo_i32")
             z = ir.binary("mul", a, b);
         else if (n == "v_mul_hi_u32" || n == "v_mul_hi_i32" || n == "s_mul_hi_u32" || n == "s_mul_hi_i32") {
             // Accumulate 16-bit partial products without requiring Int64ShaderOps.
@@ -1926,6 +1952,39 @@ struct DirectCompute {
                 if (n[5] == '3')
                     z = bound(z, val(2), minimum);
             }
+        } else if (!scalar && (n == "v_mad_u16" || n == "v_mad_i16" ||
+                               n == "v_min3_u16" || n == "v_min3_i16" ||
+                               n == "v_max3_u16" || n == "v_max3_i16" ||
+                               n == "v_med3_u16" || n == "v_med3_i16")) {
+            // Three-operand 16-bit integer VOP3 operations (#669): each computes D[15:0] from
+            // S0[15:0], S1[15:0] and S2[15:0], and D[31:16] keeps its value (measured on RDNA 2
+            // silicon; LLVM GCNSubtarget: "On gfx10, all 16-bit instructions preserve the high bits").
+            // op_sel would select other halves and stays refused. Modifiers (clamp, scale, neg, abs)
+            // are refused by the path's common rule.
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " op_sel");
+            auto low = [&](const string &x) { return ir.binary("and", x, "65535"); };
+            auto sext = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "16"), "16"); };
+            auto c = val(2);
+            string r;
+            if (n == "v_mad_u16" || n == "v_mad_i16") {
+                r = ir.binary("add", ir.binary("mul", low(a), low(b)), low(c));
+            } else {
+                const bool signed_order = n.substr(n.size() - 4) == "_i16";
+                auto bound = [&](const string &x, const string &y, bool minimum) {
+                    return select(cmp(signed_order ? (minimum ? "slt" : "sgt") : (minimum ? "ult" : "ugt"), x, y), x, y);
+                };
+                auto x = signed_order ? sext(a) : low(a);
+                auto y = signed_order ? sext(b) : low(b);
+                auto z_val = signed_order ? sext(c) : low(c);
+                if (n.substr(2, 4) == "med3") {
+                    r = bound(bound(x, y, true), bound(bound(x, y, false), z_val, true), false);
+                } else {
+                    bool minimum = n.substr(2, 3) == "min";
+                    r = bound(bound(x, y, minimum), z_val, minimum);
+                }
+            }
+            z = ir.binary("or", ir.binary("and", read(i.dst), "4294901760"), low(r));
         } else if (n == "v_sad_u8" || n == "v_sad_hi_u8" || n == "v_sad_u16" || n == "v_sad_u32" || n == "v_msad_u8") {
             // Sums of unsigned absolute differences plus S2, modulo 2^32 (#2987), as gfx2hlsl.py's sad_u8, sad4_u8,
             // sad_u16 and sad_u32 helpers and tools/pixel_aot.py compute them. v_msad_u8 skips each byte whose S1
@@ -1960,6 +2019,29 @@ struct DirectCompute {
                                            : ir.binary("shl", ir.binary("and", val(2), "3"), "3");
             auto joined = ir.binary("or", shift("lshr", b, k), shift("shl", a, ir.binary("sub", "32", k)));
             z = select(cmp("eq", k, "0"), b, joined);
+        } else if (n == "v_perm_b32" || n == "v_lerp_u8") {
+            // Byte-wise (RDNA 2 ISA V_PERM_B32 and V_LERP_U8; gfx2hlsl.py #2875 and #2873). v_perm_b32: selector byte
+            // S2[8i+7:8i] picks byte 0..7 of {S0, S1} (S1 low), 8..11 the sign of bit 15 or 31 of S1 or S0 as 0x00 or
+            // 0xff, 12 gives 0x00 and 13..255 give 0xff. v_lerp_u8: (S0 + S1 + S2[8i]) >> 1 for each byte i.
+            auto byte = [&](const string &x, const string &at) { return ir.binary("and", ir.binary("lshr", x, at), "255"); };
+            for (unsigned i = 0; i < 4; ++i) {
+                const string at = to_string(8 * i);
+                string v;
+                if (n == "v_lerp_u8") {
+                    auto round = ir.binary("and", ir.binary("lshr", val(2), at), "1");
+                    v = ir.binary("lshr", ir.binary("add", ir.binary("add", byte(a, at), byte(b, at)), round), "1");
+                } else {
+                    auto sel = byte(val(2), at);
+                    auto picked = byte(select(cmp("ult", sel, "4"), b, a), ir.binary("shl", ir.binary("and", sel, "3"), "3"));
+                    auto sign = ir.binary("and", ir.binary("lshr", select(cmp("ult", sel, "10"), b, a),
+                                                           ir.binary("or", ir.binary("shl", ir.binary("and", sel, "1"), "4"), "15")), "1");
+                    v = select(cmp("ult", sel, "8"), picked,
+                               select(cmp("ult", sel, "12"), ir.binary("mul", sign, "255"),
+                                      select(cmp("eq", sel, "12"), "0", "255")));
+                }
+                v = i ? ir.binary("shl", v, at) : v;
+                z = i ? ir.binary("or", z, v) : v;
+            }
         } else if (n == "v_bfm_b32")
             z = shift("shl", ir.binary("sub", shift("shl", "1", a), "1"), b);  // like s_bfm_b32 (#2985)
         else if (n == "v_bfi_b32")
@@ -1996,16 +2078,24 @@ struct DirectCompute {
             auto field = shift("ashr", a, b);
             z = select(cmp("eq", width, "0"), "0", shift("ashr", shift("shl", field, pad), pad));
         } else if (n == "v_cvt_pk_u8_f32") {
-            // (S2 & ~(0xff << 8 * S1[1:0])) | (flt32_to_uint8(S0) << 8 * S1[1:0]) (#2997), with the conversion
-            // gfx2hlsl.py measured on RDNA 2: round to nearest even, saturate to [0, 255], zero for NaN, both zeros
-            // and negatives. (bits - 1) < 0x7f800000 holds exactly from the smallest subnormal to +inf, as an integer
-            // test that fast-math cannot fold.
+            // Round and saturate the binary32 bits directly. Literal 0.5 through DXIL Round_ne
+            // and fptoui read back as 1 on some NVIDIA drivers (#3052).
+            constexpr auto half_bits = "1056964608";      // 0x3f000000
+            constexpr auto max_byte_bits = "1132396544";  // 0x437f0000 (255.0)
+            auto positive = cmp("ult", ir.binary("sub", a, "1"), "2139095040");  // subnormal through +inf
+            auto bounded = select(cmp("ugt", a, max_byte_bits), max_byte_bits, a);
+            // Values at or below 0.5 yield zero, so clamp them and invalid inputs to
+            // exactly 0.5 to keep the significand shift in the range 16..24.
+            auto in_range = ir.value("and i1 " + positive + ", " + cmp("uge", bounded, half_bits));
+            bounded = select(in_range, bounded, half_bits);
+            auto discard = ir.binary("sub", "150", ir.binary("lshr", bounded, "23"));  // 23 + exponent bias
+            auto significand = ir.binary("or", ir.binary("and", bounded, "8388607"), "8388608");
+            auto truncated = ir.binary("lshr", significand, discard);
+            auto halfway = ir.binary("shl", "1", ir.binary("sub", discard, "1"));
+            // Bias by halfway - 1, then add the low retained bit so only odd ties round up.
+            auto bias = ir.binary("add", ir.binary("sub", halfway, "1"), ir.binary("and", truncated, "1"));
+            auto byte = ir.binary("lshr", ir.binary("add", significand, bias), discard);
             auto amount = ir.binary("shl", ir.binary("and", b, "3"), "3");
-            auto positive = cmp("ult", ir.binary("sub", a, "1"), "2139095040");
-            auto bounded = ir.invoke("float", "binary.f32", 36, {{"float", ir.value("bitcast i32 " + a + " to float")},
-                                     {"float", "2.550000e+02"}}, "nounwind readnone");
-            auto rounded = ir.invoke("float", "unary.f32", 26, {{"float", bounded}}, "nounwind readnone");
-            auto byte = select(positive, ir.binary("and", ir.value("fptoui float " + rounded + " to i32"), "255"), "0");
             auto keep = ir.binary("xor", ir.binary("shl", "255", amount), "4294967295");
             z = ir.binary("or", ir.binary("and", val(2), keep), ir.binary("shl", byte, amount));
         } else if (n == "s_orn2_b32")
@@ -2034,6 +2124,37 @@ struct DirectCompute {
                                : high ? "0" : before;
             auto lower = ir.binary("and", a, mask);
             z = ir.binary("add", b, ir.invoke("i32", "unaryBits.i32", 31, {{"i32", lower}}, "nounwind readnone"));
+        } else if (!scalar && (n == "v_add_nc_u16" || n == "v_sub_nc_u16" || n == "v_add_nc_i16" || n == "v_sub_nc_i16" ||
+                               n == "v_mul_lo_u16" || n == "v_lshlrev_b16" || n == "v_lshrrev_b16" ||
+                               n == "v_ashrrev_i16" || n == "v_min_u16" || n == "v_max_u16" || n == "v_min_i16" ||
+                               n == "v_max_i16")) {
+            // Non-packed 16-bit integer VOP3 (#669): the result is D[15:0], computed from S0[15:0] and S1[15:0],
+            // and D[31:16] keeps its value (measured on RDNA 2 silicon; LLVM: "On gfx10, all 16-bit instructions
+            // preserve the high bits"). op_sel would select other halves and stays refused.
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " op_sel");
+            auto low = [&](const string &x) { return ir.binary("and", x, "65535"); };
+            auto sext = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "16"), "16"); };
+            const bool sign = n.substr(n.size() - 3) == "i16";
+            string r;
+            if (n == "v_add_nc_u16" || n == "v_add_nc_i16")
+                r = ir.binary("add", a, b);
+            else if (n == "v_sub_nc_u16" || n == "v_sub_nc_i16")
+                r = ir.binary("sub", a, b);
+            else if (n == "v_mul_lo_u16")
+                r = ir.binary("mul", a, b);
+            else if (n == "v_lshlrev_b16" || n == "v_lshrrev_b16" || n == "v_ashrrev_i16") {
+                // D = S1 shifted by S0[3:0].
+                auto amount = ir.binary("and", a, "15");
+                r = n == "v_lshlrev_b16"   ? ir.binary("shl", b, amount)
+                    : n == "v_lshrrev_b16" ? ir.binary("lshr", low(b), amount)
+                                           : ir.binary("ashr", sext(b), amount);
+            } else {
+                auto x = sign ? sext(a) : low(a), y = sign ? sext(b) : low(b);
+                const bool minimum = n.substr(2, 3) == "min";
+                r = select(cmp(sign ? (minimum ? "slt" : "sgt") : (minimum ? "ult" : "ugt"), x, y), x, y);
+            }
+            z = ir.binary("or", ir.binary("and", read(i.dst), "4294901760"), low(r));
         } else if (i.enc == Encoding::Sopc || i.enc == Encoding::Vopc || n.substr(0, 6) == "v_cmpx" ||
                    n.substr(0, 6) == "v_cmp_") {
             auto condition = comparison(i, a, b);
@@ -2056,21 +2177,34 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, z));
     }
     void lower_dpp(const Inst &i, const State &state, unsigned threads) {
-        // Both lane selections stay in one physical wave32 for split guest wave64.
+        // All lane selections stay in one physical wave32 for split guest wave64.
         // Shader control flow stays wave-uniform. Guest EXEC predicates VGPR
         // writes, so FI can fetch the last VGPR value from a disabled thread.
         const unsigned mask = i.mirror_mask();
-        const unsigned group_size = mask ? mask + 1 : 4;
+        const auto row = i.dpp_row();
+        const bool row_op = row.op != Inst::DppRowOp::None;
+        const unsigned group_size = row_op ? 16 : mask ? mask + 1 : 4;
         if (threads % group_size)
-            refuse(i.pc, mask ? "DPP mirror needs complete source lane groups"
+            refuse(i.pc, row_op ? "DPP row shift or rotate needs a thread count divisible by 16"
+                              : mask ? "DPP mirror needs complete source lane groups"
                               : "DPP quad_perm needs a thread count divisible by four");
         const auto rule = alu_rules.find(i.name);
         if (rule == alu_rules.end() || rule->second.arity > 2)
             refuse(i.pc, "unsupported DPP arithmetic");
         if (i.enc == Encoding::Vop1 && ((i.neg | i.abs) & 2))
             refuse(i.pc, "unexpected second DPP source modifier");
-        string source_lane;
-        if (mask)
+        string source_lane, source_usable;
+        if (row_op) {
+            auto row_base = ir.binary("and", lane, "4294967280");
+            auto row_lane = ir.binary("and", lane, "15");
+            auto amount = to_string(row.amount);
+            const bool shl = row.op == Inst::DppRowOp::Shl;
+            auto peer = ir.binary(shl ? "add" : "sub", row_lane, amount);
+            if (row.op != Inst::DppRowOp::Ror)
+                source_usable = cmp("ult", peer, "16");
+            // Keep the physical lane index safe even when the shift is out of row.
+            source_lane = ir.binary("or", row_base, ir.binary("and", peer, "15"));
+        } else if (mask)
             source_lane = ir.binary("xor", lane, to_string(mask));
         else {
             auto quad_base = ir.binary("and", lane, "4294967292");
@@ -2081,16 +2215,20 @@ struct DirectCompute {
         }
         auto src = operand32(i, i.src[0]);
         auto word = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32",src},{"i32",source_lane}}, "nounwind");
-        string source_enabled, previous;
+        string previous;
         if (!i.dpp_fetch_inactive) {
             auto exec = wave64 ? select(upper_half, read(127), read(126)) : read(126);
-            source_enabled = cmp("ne", ir.binary("and", exec, ir.binary("shl", "1", source_lane)), "0");
-            if (i.dpp_bound_zero) word = select(source_enabled, word, "0");
+            auto source_enabled = cmp("ne", ir.binary("and", exec, ir.binary("shl", "1", source_lane)), "0");
+            source_usable = source_usable.empty() ? source_enabled
+                          : ir.value("and i1 " + source_usable + ", " + source_enabled);
+        }
+        if (!source_usable.empty()) {
+            if (i.dpp_bound_zero) word = select(source_usable, word, "0");
             else previous = read(i.dst);
         }
         arithmetic(i, state, &word);
         if (!previous.empty())
-            write(i.dst, select(source_enabled, read(i.dst), previous));
+            write(i.dst, select(source_usable, read(i.dst), previous));
     }
     // Returns true when the instruction is a MODE write this path has accepted
     // (including a no-op that leaves the implemented contract in place).

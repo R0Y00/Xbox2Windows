@@ -26,6 +26,11 @@ DPP16 quad permutations reuse the row mirror's EXEC and operand handling.
 The compute fixture checks arithmetic, lane selection and disabled sources.
 [Experiment and reproduction commands](experiments/native-dpp-quad-compute.md)
 
+## Guest DPP16 row shifts and rotates in direct compute
+
+Full-mask row shifts and rotates stay inside each 16-lane row and apply
+BOUND_CTRL to unusable sources. [Experiment and reproduction commands](experiments/native-dpp-row.md)
+
 ## Guest lane reads and writes in direct compute
 
 `v_readlane_b32` and `v_writelane_b32` lower with a constant or SGPR lane; lane writes ignore EXEC.
@@ -15960,6 +15965,30 @@ guarded block and take the latch until the counter reaches 4. The translator rep
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
+### Scalar run before the EXEC restore at a compute exit target (#2645 T3)
+
+The 104-byte gfx1013 fixture `EXIT_RUN_*` in `tests/startup_gfx2hlsl_compute_check.py` narrows
+EXEC to lanes with `tid.x < 6` before a guarded block. Inside it, `s_andn2_b32` removes the
+breaking lanes from a saved EXEC mask and `s_cbranch_scc0` tests that mask. The staying path
+installs the same mask into EXEC before its vector work. Both paths reach a scalar descriptor
+load and wait, followed by `s_mov_b32 exec_lo, s21` to restore EXEC.
+
+For groups of up to 32 threads (`x * y * z <= 32`; larger workgroups are rejected and left for
+follow-up work), the translator accepts this straight exit when the staying path's vector work is
+lane-local and predicated off for exiting lanes. The shared run allows scalar ALU, loads and waits
+with regular SGPRs. It must reach a restore from an unchanged copy of EXEC, and the two paths must
+agree on the run's inputs and any scalar state used afterward.
+The wave and singleton traces both produce `[9, 9, 9, KEY^3, KEY^4, KEY^5, KEY^6, KEY^7]`.
+With three threads, the whole wave also takes the exit and both traces produce `[9, 9, 9]`.
+
+The wrong remask and a bypassed scalar write produce different values for lane 0 and are
+refused. Additional controls cover unsafe scalar effects, incoming EXEC and live SCC, clobbered
+and missing restores, invalid targets, and control flow or vector work in the run. The T2 loop
+keeps its backward-latch diagnostic. Removing its latch still leaves two different remasks and
+scalar counter work on the staying path, outside this proof. Run
+`python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
@@ -17053,9 +17082,11 @@ With a device slot 67 placeholder bound, command-list slot 14 looks up the trans
 
 `tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The two entry values arrive through slot 37 and slot 39, with other values written through slot 40 in between; `dispatch-same-root` must still give the expected words, and five refused modes must log their reason and keep the sentinels: a missing word, another compute root set and the first set again, a list reset, a compute root that is not the pipeline's, and one buffer named as input and output. `tests/startup_compute_dispatch_texture_check.py` does the same for a program that stores to a 32x8 RGBA16_FLOAT texture (1024 halves read back through CopyTextureRegion; controls: before translation, without a Dispatch, a texture without unordered access) and for the raw buffer program with a level-zero sample of a 1x1 texture XORed into each stored word (control: no view at the table entry). The texture output program is also bound under a manifest edited to declare no entry values.
 
+`startup_compute_dispatch_two_mips_` writes two distinct patterns through two UAVs of one RGBA16_FLOAT texture in the same translated Dispatch. The test compares all 1,280 half values in the 32×8 and 16×4 subresources, including the sentinel values outside the written rectangles. Before translation both mips keep their sentinels. Exchanging the two views moves the patterns to opposite mips and changes 64 half values relative to the ordered case.
+
 The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>` follows the render totals; "not modelled" counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
 
-Measured on three fixture programs. The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
+The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
 The `startup_compute_live_retry_warp` and `startup_compute_live_retry_hardware` tests keep the device and
 slot 67 pipeline alive across two fenced Dispatch calls. The first observes the missing translation and

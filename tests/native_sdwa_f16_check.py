@@ -48,7 +48,7 @@ class Case:
 
     def matches(self, got):
         return (got & ~self.mask == self.want & ~self.mask and
-                fixture.same_half((got & self.mask) >> self.shift, (self.want & self.mask) >> self.shift))
+                fixture.same_binary16((got & self.mask) >> self.shift, (self.want & self.mask) >> self.shift))
 
 
 def cases():
@@ -76,6 +76,8 @@ def check_mutants(items):
     def swap(control):
         return control ^ 1 if (control & 7) in (WORD_0, WORD_1) else control
 
+    # Without this, a comparator that rejects every word would pass the mutant checks below.
+    assert all(case.matches(case.want) for case in items)
     assert any(not case.matches(case.expected(swap(case.src0), case.src1, case.unused)) for case in items)
     assert any(not case.matches(case.expected(case.src0, swap(case.src1), case.unused)) for case in items)
     assert any(not case.matches(case.expected(case.src0, case.src1, PAD)) for case in items)

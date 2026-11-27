@@ -16,13 +16,13 @@ The arithmetic and modifier checks are shared with the row mirror lowering.
 ## Refused forms
 
 Compute requires a group size divisible by four for quad permutations.
-Controls above 255 still require a supported row mirror pattern. Row shifts,
-rotates, broadcasts, row_share and row_xmask are refused.
+Controls above 255 require a supported row mirror, shift or rotate.
+[Row shift and rotate coverage](native-dpp-row.md)
 
 ## Verification
 
 `native_dpp_quad_controls` checks compilation of a valid swap and named
-refusals for row_shl:1 and a 30-thread group.
+refusals for row_share:0 and a 30-thread group.
 `native_dpp_quad_hardware` compares both workgroups and buffer guards against
 an independent CPU model. The fixtures cover integer OR and float add with
 pairwise swaps, reverse subtraction with quad-local broadcast, identity,
@@ -36,6 +36,6 @@ ctest --preset dev --no-tests=error -R '^native_dpp_quad_(controls|hardware)$'
 ```
 
 On an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100) both tests passed: all eight
-hardware programs matched the CPU reference for both groups and the guard words, and the controls refused
-`row_shl:1` and a 30-thread group. Reading the permutation in reversed lane order fails the first case, and
+hardware programs matched the CPU reference for both groups and the guard words. At the time of that run,
+the controls refused `row_shl:1` and a 30-thread group. Reading the permutation in reversed lane order fails the first case, and
 ignoring BOUND_CTRL fails the disabled-source zero case.
