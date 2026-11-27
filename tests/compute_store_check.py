@@ -5597,7 +5597,12 @@ def shared_controls():
     atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
     for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
         assert f"Interlocked{method}(lds[" in atomics, method
-    assert "(0u - tid.x)" in atomics
+    # ds_sub_u32 is two additions, ~v then 1, on the same word. A single InterlockedAdd of a negated word on
+    # groupshared memory fails compute PSO creation on NVIDIA GeForce RTX 5080 (driver 32.0.16.2124).
+    sub = ("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], ~(tid.x));\n"
+           "    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n")
+    assert sub in atomics, atomics
+    assert "0u - " not in atomics, atomics
     lines = programs["shared_exchange"]
     # A barrier with no DS instruction before it is kept.
     assert aot.lower(SHARED_PREFIX + ["s_barrier"] + lines[len(SHARED_PREFIX):], 64,
@@ -5665,8 +5670,15 @@ def shared_draw(directory, compiler, renderer, backend):
             execution = subprocess.run(run)
             if execution.returncode:
                 return execution.returncode
-        for mutated, mismatched_word in shared_mutants(name, lines, binding):
-            src.write_text(aot.lower(mutated, 64, **binding), encoding="ascii")
+        mutants = [(aot.lower(mutated, 64, **binding), word) for mutated, word in shared_mutants(name, lines, binding)]
+        if name == "shared_atomics":
+            # Without the second addition ds_sub_u32 adds ~v, so the difference read as lane 0's second word
+            # is 64 short, one for each lane.
+            dropped = source.replace("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n", "")
+            assert dropped != source
+            mutants.append((dropped, 1))
+        for mutated, mismatched_word in mutants:
+            src.write_text(mutated, encoding="ascii")
             subprocess.run(compile, check=True)
             bad = subprocess.run(run, capture_output=True, text=True)
             if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:

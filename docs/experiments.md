@@ -5627,7 +5627,8 @@ size, times 64 for the `st64` forms), and accesses word `(address >> 2) + i`. Th
 - `ds_write2_b32`, `ds_read2_b32`, `ds_write2st64_b32`, `ds_read2st64_b32`, `ds_write2_b64`,
   `ds_read2_b64`, `ds_write2st64_b64` and `ds_read2st64_b64`, with two different offsets;
 - the non-returning `ds_add_u32`, `ds_sub_u32`, `ds_and_b32`, `ds_or_b32`, `ds_xor_b32`, `ds_min_u32` and
-  `ds_max_u32`, as HLSL `Interlocked*` operations (`ds_sub_u32` adds the negated value);
+  `ds_max_u32`, as HLSL `Interlocked*` operations (`ds_sub_u32` is two `InterlockedAdd` calls on the same
+  word, `~v` and then `1`, see below);
 - `s_barrier`.
 
 The profile is one guest wave per group. A group of at most 32 threads is one wave at either guest wave
@@ -5666,8 +5667,8 @@ writes its own words, and after a barrier reads another lane's:
 
 A counter program sets seven words, has every lane add, subtract, AND, OR, XOR, take the minimum and take
 the maximum of its index or a mixed word, and reads them back. With two groups, each group's sums cover
-only its own threads, which shows that each group has its own LDS. Three mutations of the programs must
-mismatch at the first word they change:
+only its own threads, which shows that each group has its own LDS. Three mutations of the programs, and
+one of the HLSL described below, must mismatch at the first word they change:
 - the next-but-one lane, at word 0;
 - an `st64` read spelled as a plain `read2`, at word 1;
 - `ds_min_u32` in place of `ds_max_u32`, at word 11.
@@ -5688,6 +5689,27 @@ Measured on `b96960b` with this change, Windows 10 build 19045:
 The mutations mismatched at their expected words on both adapters. Of the gfx1013 forms in
 `tools/form_coverage.py`, the test adds only `s_barrier`, because the gfx1030 private-LDS fixtures already
 record the DS mnemonics.
+
+`ds_sub_u32` used to be one `InterlockedAdd(lds[i], (0u - v))`. On an NVIDIA GeForce RTX 5080 (driver
+32.0.16.2124, Windows 11 build 26300.9974, debug layer unavailable) `CreateComputePipelineState` refused that
+program with `E_OUTOFMEMORY`, so `compute_store_aot_lds_shared_hardware` failed. The DXIL is valid, and WARP
+and an AMD Radeon iGPU (driver 32.0.11034.2) ran it. A reduction to a 64-thread shader isolates the case. The
+PSO fails whenever an `InterlockedAdd` on groupshared memory takes `sub i32 0, x` for a runtime `x`. DXC
+folds every tried spelling to that instruction, including `~x + 1u`, `x * 0xffffffffu`, `-(int)x` and
+`-Od`. The same negation does not fail with `InterlockedAdd` on a UAV, with `InterlockedExchange`, `Xor` or
+`Max` on groupshared memory, or with a plain groupshared store. Neither does `5u - x`, `0u - x * 3u` or a
+constant addend. The translator now emits two additions on the word, `~v` and then `1u`. That is
+`mem - v` modulo 2^32. The step has no return value and ends with a barrier, so no lane reads the
+intermediate word. A fourth mutation of the HLSL drops the second addition and must mismatch at word 1. The
+translation controls require the two additions and no `0u - ` in the counter program.
+
+On this change, with the hardware run on the RTX 5080 and then with `XBOX2WINDOWS_ADAPTER=Radeon`:
+
+| Adapter | Result | Debug layer |
+|---|---|---|
+| Microsoft Basic Render Driver (WARP), 10.0.26100.9818 | passed | unavailable |
+| NVIDIA GeForce RTX 5080, driver 32.0.16.2124 | passed (failed before: `E_OUTOFMEMORY`) | unavailable |
+| AMD Radeon(TM) Graphics, driver 32.0.11034.2 | passed | unavailable |
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -15043,7 +15065,7 @@ ctest --preset dev --no-tests=error -R '^startup_image_sample_b' -V
 
 The guest sampler's MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) clamp the LOD of every sample form. `tools/startup/gfx2hlsl.py` now carries them for `image_sample`, `image_sample_l` and `image_sample_lz` when the sampler is a constant, through the `smpl` manifest line and `decode_sampler` that `image_sample_b` introduced (#2051); the slice is #2177, split from the run-time heap case (#2221). The three forms share one validation with `image_sample_b`: a descriptor LOD bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused, with the form's own name in the message. Behavior change: a constant sampler with either of those fields set used to translate for these forms (limits ignored) and is now refused. A mip filter of 0 (mipmapping disabled) is not refused for these forms, unlike `image_sample_b` where the bias would count: such a sampler keeps its ordinary `smp` line and its previous behavior. Refusing it would drop every pipeline with an all-zero inline sampler (seven existing check scripts build one); `image_sample_lz` and `_l` with level 0 would be harmless anyway. The one-argument switch is `mip_filter_none_ok` in `Stage.lod_sampler_words`. Also changed: a constant sampler with a non-zero MAX_LOD now clamps the level (it was unbounded before), which is the intended fix.
 
-Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). Since then the run-time heap table applies each entry's MIN_LOD and MAX_LOD (`dynamic_sampler()` in `src/startup_stubs/translated_sampler_bindings.h`, checked by `startup_sampler_lod_*`); the entry's LOD bias is not carried, a MIN_LOD above MAX_LOD is passed through unchanged, and the default-sampler shortcut keeps a static sampler with an unbounded LOD range. A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
+Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). Since then the run-time heap table applies each entry's MIN_LOD and MAX_LOD (`dynamic_sampler()` in `src/startup_stubs/translated_sampler_bindings.h`, checked by `startup_sampler_lod_*`); the entry's LOD bias is not carried, a MIN_LOD above MAX_LOD is passed through unchanged, and the default-sampler shortcut keeps a static sampler with an unbounded LOD range. Other nonconstant samplers remain refused except for the [proven two-sampler explicit-LOD join](experiments/startup-sampler-join.md). `image_sample_c` keeps its MAX_LOD rule.
 
 `tests/startup_image_sample_lod_check.py` draws each form on its own (`startup_image_sample_lod_warp`, `startup_image_sample_lod_hardware`) against the 4x4, two-slice, three-mip array, point sampler with mip filter point, where all six cells differ. Each form's control is the same program through the ordinary `smp` line, which must read a different mip: `image_sample_l` with explicit level 2 and MAX_LOD 1 reads mip 1 (`smp`: mip 2); `image_sample` with MIN_LOD 2 above the implicit level 1 reads mip 2 (`smp`: mip 1); `image_sample_lz` with MIN_LOD 1 reads mip 1 (`smp`: mip 0). The implicit level 1 comes from the technique of the bias check: only the `u` initialiser of the translated HLSL is replaced by `0.75 + 0.5 * (SV_Position.x - 0.5)`, the `Sample` call is untouched. Refusal controls per form: bias, secondary bias and MIN_LOD 3 above MAX_LOD 2; accepted controls per form: mip filter 0 (`smp` line) and a heap sampler (table and default-sampler shortcut, logged once). The three `image_sample_b` discriminators are unchanged. Not covered: a fractional MIN_LOD or MAX_LOD, a linear mip filter, 1D, 3D and packed `a16` draws, the run-time heap sampler's LOD fields (#2221), and compute stages.
 
@@ -15067,6 +15089,15 @@ and linear mip filtering gives `(0.75, 2)`. Switching only the latter manifest t
 The two adapters and WARP [measured on the desktop](https://github.com/R0Y00/Xbox2Windows/pull/2311#issuecomment-7162845528)
 differed at exact half-mip boundaries with point mip filtering. The regression uses linear
 filtering for the fractional lower clamp. Native console readback remains open.
+
+The same startup lowering admits 2D arrays with three guest address registers.
+DXIL `CalculateLOD` takes just the two spatial coordinates for a `Texture2DArray`;
+the slice is not part of the level calculation. The portable controls verified
+both dimensions, including a non-sequential address with a different slice register,
+and retained the existing derivative, sampler and mask refusals.
+The array-view fixture compares raw translated and direct HLSL readbacks for
+two encoded slice values and two gradients against the independent LOD reference.
+The array GPU lane was not run on Apple Silicon.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_image_get_lod_view_' -V
@@ -15576,6 +15607,26 @@ existing behavior. This is a static translation proof, not GPU readback.
 ```bash
 python3 -B tests/startup_gfx2hlsl_calculated_target_check.py
 python3 -B tests/startup_gfx2hlsl_calculated_target_check.py binary llvm-mc-15
+```
+
+### Statically resolved far early-outs through the two-exit profile
+
+The gfx1013 pixel two-exit extractor accepts a single proven forward calculated transfer onto an
+instruction-aligned terminating continuation containing only `s_nop`/`v_nop` and a plain `s_endpgm`.
+The contiguous `s_getpc_b64`/`s_add_u32`/`s_addc_u32`/`s_setpc_b64` chain uses a fresh aligned scalar
+pair and a constant displacement with matching sign extension. The repository and LLVM instruction
+inventories must agree, and no branch may enter the chain interior. Observable continuation effects
+remain refused. The standalone `pixel_aot.lower()` retains its single-export, single-exit scope.
+
+The source-built fixture compares short direct, short calculated and far calculated transfers using
+both selector outcomes and an independent arithmetic reference. The far displacement exceeds the
+131068-byte positive SOPP range. The bounded FSSM extraction check requires LLVM 15; its absence is
+reported separately from translation. Refusal controls cover malformed chains, escaping scratch
+words or SCC, effectful continuations and unaligned or out-of-range destinations.
+
+```bash
+python3 -B tests/startup_gfx2hlsl_far_early_out_check.py
+python3 -B tests/startup_gfx2hlsl_far_early_out_check.py binary llvm-mc-15
 ```
 
 ## Compute stage in the startup translator

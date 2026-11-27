@@ -326,6 +326,18 @@ to a real present. The contract under the switch:
 
   Neither line is the composited window picture.
 
+The diagnostic readback publishes pixels only after its queue fence reaches
+the submitted value without reporting device removal. A timeout, a failed
+event registration or an incomplete fence after the event registers a drain:
+a threadpool wait on the submitted fence value that releases the held surface
+and queue references once the fence completes and publishes no pixels, so a
+final sample no longer keeps them for the module lifetime. The drain releases
+only the submission it was registered for (a later sample owns its own) and
+never releases pending, failed-signal or device-removed work; a failed signal
+or removed device disables further diagnostic readback for the module
+lifetime. `startup_present_readback` exercises the completion policy and the
+ownership retirement without a GPU.
+
 The first presents and every 300th log each plane:
 
 ```text
@@ -516,6 +528,17 @@ makes a new copy and logs one `frame copy of ... refreshed` line (the first four
 one address between two draws of a frame, such as a dynamic constant buffer, gave the second draw the first draw's
 data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
 `startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
+
+A table buffer view (an SRV read from the title's descriptor table) is copied the same way, at most 16 MiB of it.
+For a large view the comparison costs a full read of the kept bytes on every draw, under `draw_lock`. With
+`X2W_D3D12_TABLE_ALIAS=1` (opt-in, render mode), a table buffer whose whole range lies in a slot 133 placed buffer
+that aliases title memory binds that alias instead, as vertex streams and live indices already do: no copy, no
+comparison, and no 16 MiB cut. The GPU then reads the bytes as they are when the list runs, not as they were when
+the draw was recorded, so a title write between recording and submission becomes visible to the draw (on the
+console, the GPU also reads the shared memory at execution). Formatted loads, views over other memory and
+unaligned offsets keep the copy. `startup_table_alias_{warp,hardware}` writes a record, draws, rewrites it, draws
+again and rewrites it after recording: unset, the halves show the first two values; set, both show the third. See
+[the experiment note](experiments/startup-table-srv-alias.md).
 
 ## Root signature changes and dropped root constants
 
@@ -1481,6 +1504,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
+| `X2W_D3D12_TABLE_ALIAS=1` | opt-in, render mode: a translated draw's table buffer view whose whole range lies in a slot 133 placed buffer that aliases title memory binds that alias instead of a per-draw frame copy, so the GPU reads the bytes at execution and the view is not cut at 16 MiB (`startup_table_alias_*`). Unset, every table buffer view is copied as before. See [Copies of title memory within a frame](#copies-of-title-memory-within-a-frame) |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |

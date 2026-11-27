@@ -507,6 +507,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_VIEW", nullptr, 0)) {
         extern int draw_formatted_view(void*, void*);
         if (const int result = draw_formatted_view(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_TABLE_ALIAS_WRITE", nullptr, 0)) {
+        extern int draw_table_alias_writes(ID3D12Device*, void*, void*);
+        if (const int result = draw_table_alias_writes(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV", nullptr, 0)) {
         extern int draw_copied_vertex_buffer_srv(void*, void*);
         if (const int result = draw_copied_vertex_buffer_srv(guest, list)) return result;
@@ -725,6 +728,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_report();
         if (const int rc = root_heap_report()) return rc;
+    }
+    if (GetEnvironmentVariableW(L"X2W_TEST_TABLE_ALIAS_WRITE", nullptr, 0)) {
+        extern void table_alias_debug_report();
+        table_alias_debug_report();
     }
 
     return read_stream_target(desktop.Get(), frame, pixels);
