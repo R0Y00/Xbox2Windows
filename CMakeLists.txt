@@ -3300,13 +3300,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
     set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
     # `cmake --build --preset runtime` builds the eight DLLs run.ps1 copies and no executable.
+    # It deletes and rebuilds the DLLs other tests load, so it must not run beside them (RUN_SERIAL).
     add_test(NAME startup_runtime_target COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_runtime_target_check.py" "${CMAKE_COMMAND}" "${CMAKE_BINARY_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/startup/run.ps1"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>"
         "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
         "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>")
-    set_tests_properties(startup_runtime_target PROPERTIES TIMEOUT 300)
+    set_tests_properties(startup_runtime_target PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
     add_test(NAME startup_storage_directory_batch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_storage_directory_batch.py" "$<TARGET_FILE:startup_stub_consumer>")
     set_tests_properties(startup_storage_directory_batch PROPERTIES TIMEOUT 30)
