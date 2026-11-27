@@ -498,7 +498,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32;
-    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w";
+    const bool native_inputs = mode == "texture-volume-native-inputs";
+    const bool volume = native_inputs || mode == "texture-volume" || mode == "texture-volume-bad-w";
     const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
     const UINT mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
@@ -547,6 +548,28 @@ static int texture_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
+    void* input_texture = nullptr;
+    if (native_inputs) {
+        // A hardware buffer descriptor in record 0 and a 2D SRV token in record 1.
+        auto* input = static_cast<UINT*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!input) return 70;
+        input[0] = 0x3f200000u; // 0.625f, not a value the store fixture writes
+        void* placed = nullptr;
+        const D3D12_RESOURCE_DESC input_buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(UINT), 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(input), word(&input_buffer), D3D12_RESOURCE_STATE_COMMON,
+                0, word(&__uuidof(ID3D12Resource)), word(&placed))))) return 71;
+        const auto address = reinterpret_cast<UINT64>(input);
+        const UINT descriptor[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 1, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptor, sizeof(descriptor));
+        const D3D12_RESOURCE_DESC input_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0}};
+        input_texture = make(D3D12_HEAP_TYPE_DEFAULT, input_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!input_texture) return 71;
+        D3D12_SHADER_RESOURCE_VIEW_DESC input_view{format, D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        input_view.Texture2D.MipLevels = 1;
+        invoke(device, 18, word(input_texture), word(&input_view), cpu + 32);
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (volume) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
@@ -589,6 +612,14 @@ static int texture_slot67(void* device, const std::string& mode)
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
+    if (input_texture) {
+        D3D12_TEXTURE_COPY_LOCATION input_image{static_cast<ID3D12Resource*>(input_texture),
+            D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION input_source{static_cast<ID3D12Resource*>(upload),
+            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        input_source.PlacedFootprint = {0, {format, 1, 1, 1, pitch}};
+        invoke(list, 16, word(&input_image), 0, 0, 0, word(&input_source), 0);
+    }
     for (UINT subresource = 0; subresource < subresources; ++subresource) {
         image.SubresourceIndex = subresource + mip;
         source.PlacedFootprint.Offset = UINT64{subresource} * slice_bytes;

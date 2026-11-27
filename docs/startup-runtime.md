@@ -943,11 +943,11 @@ pipelines, and the cache can start empty: the request files the stand-in wrote a
 against their key, translated and compiled to DXIL in the process. The compiler's own cache goes to
 `<shader cache>\native`. Nothing is published as `<key>.txt`.
 
-The existing dispatch path records the result, and a program is accepted only with the bindings a
-fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
-and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
-scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
-not lower) is refused. The first 16 refusals of a process are logged as
+The existing dispatch path binds root constants and views in 32-byte table records. Buffer views
+include scalar buffer SRVs (`buffer_srv`), per-lane raw buffer SRVs (`raw_vector_srv`), and raw buffer
+UAVs. Texture views include 2D SRVs and four-channel float 1D, 2D, 2D array, and 3D UAVs
+(`texture_uav` and `half4_texture_uav`). Samplers, typed or indexed buffer views, and instructions
+outside the compiler's supported set are refused. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process

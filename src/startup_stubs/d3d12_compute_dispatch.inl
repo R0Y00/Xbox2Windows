@@ -218,8 +218,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
 
 // X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>: the first Dispatch of a slot 67 request translates
 // it in this process with the C++ compiler (src/gfx1013_compute_native.cpp), before a published <key>.txt is read
-// and with no offline translator running. The dispatch path below binds the result, so a program is accepted only
-// with root constants, raw table buffers it loads per lane (buffer_load_dword) and raw table buffers it stores to.
+// and with no offline translator running. The dispatch path below binds root constants and supported table views.
 // A refusal is logged and leaves the key to the published translations. draw_lock held. Returns whether tr is ready.
 bool translate_compute_natively(ComputeTranslation& tr)
 {
@@ -238,14 +237,32 @@ bool translate_compute_natively(ComputeTranslation& tr)
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {
-            // The two kinds a fixture has run through this path: a raw buffer read per lane, and one written.
-            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav;
+            using Kind = x2w::ComputeViewKind;
+            // Match the float texture and buffer slots in format_compute_runtime_manifest.
+            const bool texture_output = view.kind == Kind::texture_uav || view.kind == Kind::half4_texture_uav;
+            const bool output = texture_output || view.kind == Kind::raw_buffer_uav;
+            const bool texture_input = view.kind == Kind::texture_srv && view.image_dimension == 1;
+            auto dimension = D3D12_UAV_DIMENSION_UNKNOWN;
+            if (texture_output) {
+                switch (view.image_dimension) {
+                case 0: dimension = D3D12_UAV_DIMENSION_TEXTURE1D; break;
+                case 1: dimension = D3D12_UAV_DIMENSION_TEXTURE2D; break;
+                case 2: dimension = D3D12_UAV_DIMENSION_TEXTURE3D; break;
+                case 5: dimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; break;
+                }
+            }
             auto& slots = output ? tr.uavs : tr.srvs;
-            if ((!output && view.kind != x2w::ComputeViewKind::raw_vector_srv) || view.array_count != 1 ||
+            const bool supported = view.kind == Kind::raw_buffer_uav || view.kind == Kind::raw_vector_srv ||
+                                   view.kind == Kind::buffer_srv || texture_input ||
+                                   dimension != D3D12_UAV_DIMENSION_UNKNOWN;
+            if (!supported || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
                 throw std::runtime_error("view kind " + std::to_string(static_cast<unsigned>(view.kind)) +
                                          " is not bound for a natively translated program");
-            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset)});
+            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset),
+                             texture_input || texture_output});
+            if (texture_output)
+                slots.back().uav_dimension = dimension;
         }
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
