@@ -1600,6 +1600,34 @@ struct DirectCompute {
             vector_write(i.dst, i.clamp ? saturated_add(dot, acc, sign) : dot);
             return;
         }
+        const bool signed_add_sub = n == "v_add_nc_i32" || n == "v_sub_nc_i32";
+        if (signed_add_sub || (i.clamp && (n == "v_add_nc_u32" || n == "v_sub_nc_u32" || n == "v_subrev_nc_u32"))) {
+            // AMD RDNA 2 ISA: the VOP3-only signed forms wrap like the unsigned ones, and clamp saturates the
+            // result: signed for v_*_nc_i32, unsigned for v_*_nc_u32. LLVM 15 selects these clamp forms for
+            // llvm.sadd.sat, llvm.ssub.sat, llvm.uadd.sat and llvm.usub.sat (#3009).
+            if ((signed_add_sub && !i.wide) || i.subword || i.dpp_control || permuted || i.abs || i.neg || i.scale ||
+                (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            if (n == "v_subrev_nc_u32") std::swap(a, b);
+            const bool add = n.substr(0, 5) == "v_add";
+            auto result = ir.binary(add ? "add" : "sub", a, b);
+            if (i.clamp) {
+                if (signed_add_sub) {
+                    // Overflow when the operands' signs make the true result leave the i32 range; it saturates
+                    // toward the sign of the first operand.
+                    auto overflow = add ? ir.binary("and", ir.binary("xor", a, result), ir.binary("xor", b, result))
+                                        : ir.binary("and", ir.binary("xor", a, b), ir.binary("xor", a, result));
+                    result = select(cmp("slt", overflow, "0"),
+                                    select(cmp("slt", a, "0"), "2147483648", "2147483647"), result);
+                } else if (add)
+                    result = select(cmp("ult", result, a), "4294967295", result);
+                else
+                    result = select(cmp("ult", a, b), "0", result);
+            }
+            vector_write(i.dst, result);
+            return;
+        }
         if (n == "v_mad_u32_u16" || n == "v_mad_i32_i16") {
             // AMD RDNA 2 ISA, VOP3A opcodes 883/885. Only the two
             // multiplicands are halfwords. The addend and result are dwords.
