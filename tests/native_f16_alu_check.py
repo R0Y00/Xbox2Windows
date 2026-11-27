@@ -73,10 +73,16 @@ def same_half(got, want):
     matches any NaN."""
     if got >> 16 != HI_A >> 16 or want >> 16 not in (0, HI_A >> 16):
         return False
-    left, right = got & 0xffff, want & 0xffff
-    if M.is_nan(left) or M.is_nan(right):
-        return M.is_nan(left) and M.is_nan(right)
-    return left == right
+    return same_binary16(got & 0xffff, want & 0xffff)
+
+
+def same_binary16(got, want):
+    """Bit equality of two binary16 values (16 bits each). Any NaN matches any NaN."""
+    if got >> 16 or want >> 16:
+        return False
+    if M.is_nan(got) or M.is_nan(want):
+        return M.is_nan(got) and M.is_nan(want)
+    return got == want
 
 
 def _u32(value):
