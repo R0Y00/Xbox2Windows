@@ -1894,6 +1894,33 @@ struct DirectCompute {
                 if (n[5] == '3')
                     z = bound(z, val(2), minimum);
             }
+        } else if (n == "v_sad_u8" || n == "v_sad_hi_u8" || n == "v_sad_u16" || n == "v_sad_u32" || n == "v_msad_u8") {
+            // Sums of unsigned absolute differences plus S2, modulo 2^32 (#2987), as gfx2hlsl.py's sad_u8, sad4_u8,
+            // sad_u16 and sad_u32 helpers and tools/pixel_aot.py compute them. v_msad_u8 skips each byte whose S1
+            // byte is zero; v_sad_hi_u8 places the byte sum in the high half.
+            auto absdiff = [&](const string &x, const string &y) {
+                return select(cmp("ult", x, y), ir.binary("sub", y, x), ir.binary("sub", x, y));
+            };
+            auto field = [&](const string &x, unsigned at, unsigned mask) {
+                return ir.binary("and", at ? ir.binary("lshr", x, to_string(at)) : x, to_string(mask));
+            };
+            string sum;
+            if (n == "v_sad_u32")
+                sum = absdiff(a, b);
+            else {
+                const bool half = n == "v_sad_u16";
+                for (unsigned at = 0; at < 32; at += half ? 16 : 8) {
+                    const unsigned mask = half ? 65535 : 255;
+                    auto x = field(a, at, mask), y = field(b, at, mask);
+                    auto term = absdiff(x, y);
+                    if (n == "v_msad_u8")
+                        term = select(cmp("eq", y, "0"), "0", term);
+                    sum = sum.empty() ? term : ir.binary("add", sum, term);
+                }
+                if (n == "v_sad_hi_u8")
+                    sum = ir.binary("shl", sum, "16");
+            }
+            z = ir.binary("add", sum, val(2));
         } else if (n == "v_bfi_b32")
             z = ir.binary("or", ir.binary("and", a, b), ir.binary("and", ir.binary("xor", a, "4294967295"), val(2)));
         else if (n == "s_bfe_u32" || n == "s_bfe_i32") {
