@@ -28,6 +28,7 @@ from native_scalar_lds_check import scalar, sop1, vmove
 
 GROUPS = 2
 WORDS = 2064
+SENTINEL = 0x69696969  # native_store_replay fills untouched words with 0x69
 BASE = 8
 STRIDE = 128
 SHIFT = 9
@@ -565,7 +566,7 @@ def run_gpu(gpu, sdk):
             sys.exit(77)
         run.check_returncode()
         offsets = group_offsets(len(want))
-        expected = [0x69696969] * WORDS
+        expected = [SENTINEL] * WORDS
         results = {}
         for group in range(GROUPS):
             for slot, value in zip(offsets[group], want):

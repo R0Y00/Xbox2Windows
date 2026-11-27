@@ -37,6 +37,8 @@ BOUND_CTRL to unusable sources. [Experiment and reproduction commands](experimen
 Lane reads may refill `vcc_lo` and, in wave32, `vcc_hi` as ordinary scalar data.
 [Experiment and reproduction commands](experiments/native-lane-access-compute.md)
 
+[Descriptor lane spill experiment](experiments/native-lane-spill-descriptor.md)
+
 ## 64-bit scalar operations in direct compute
 
 `s_bfm_b64`, `s_cselect_b64` and `s_not_b64` lower to two scalar words.
@@ -186,7 +188,9 @@ written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordin
 frame that recorded it, `x=` and `y=` name the texel, `key=` is the translated manifest key, and
 `rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
 The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
-name the one that last changed the texel.
+name the one that last changed the texel. [`tools/startup/scene_color_report.py`](../tools/startup/scene_color_report.py)
+turns a dump directory into a bounded Markdown report that selects a frame and pixel and names the
+first retained change as well as the last writer; see [the report note](experiments/startup-scene-color-report.md).
 
 `startup_pixel_history` builds three draws on a 4x4 target. The first and third are scissored to the
 top-left texel; only the second covers the watched texel (1, 1). The report must name draw 2 with its
@@ -621,6 +625,8 @@ python3 -B tests/startup_buffer_address_check.py controls
 ```
 
 ## Startup translator: SMEM combined register and immediate offsets
+
+Direct C++ wave32 compute accepts numeric `vcc_lo` and `vcc_hi` as SMEM offsets and scalar load destinations through s107.
 
 In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and the signed immediate in `mods` (`offset:0x...` or `offset:-0x...`). Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
 
@@ -4806,6 +4812,9 @@ Native readback remains pending, including the raw miss and disabled-slot
 words. The probe leaves translator behavior and form coverage unchanged.
 The node model and its witness set are described in
 [bvh-node-model.md](experiments/bvh-node-model.md).
+The translator slices that consume the model are the
+[FP32 and binary16 box nodes](experiments/startup-gfx2hlsl-bvh-box32.md) and the
+[triangle nodes](experiments/startup-gfx2hlsl-bvh-triangle.md).
 
 ### gfx1013 2D explicit-LOD image gathers
 
@@ -16733,6 +16742,8 @@ The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` function
 
 Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
 
+Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
 ## Host-CPU RDFSBASE, RDGSBASE, and RDPID lifting in cpu_switch_aot
 
 [The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting read-only `rdfsbase`, `rdgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_rdpid_u32`):
@@ -17035,6 +17046,15 @@ The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequenc
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
 
+## Concurrent calls through a startup debugger hook
+
+The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` turns the holding off. See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
+
 ### Startup shader translator: `v_bfm_b32`
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 bit-field mask `v_bfm_b32` (a VOP3-only instruction: the bare and `_e64` spellings translate, `_e32` is refused) that it used to refuse. The result is a mask of S0[4:0] ones shifted left by S1[4:0], emitted as `(((1u << (a & 31)) - 1) << (b & 31))`, so a width of 0 gives 0 and a shift past the top drops the bits. `v_bfm_b32` is a row of `tests/startup_gfx2hlsl_bit_alu_check.py`: the emitted text runs on its integer evaluator over 1368 width/offset pairs against a plain-integer reference, a swapped width/offset mutation must read other words, and the `draw` mode renders the translated pixel stage on the adapter (FXC 5_1 and DXC 6_0) and reads the words back. Source modifiers, `clamp` and output modifiers are refused with `Unsupported`, as for the sibling integer operations. The WARP draw of the same formula is the existing `pixel_aot_bfm_<adapter>` test.
@@ -17170,9 +17190,9 @@ ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_entry_" -V
 
 ### Static samplers with a LOD clamp
 
-The translator writes a constant sampler of `image_sample`, `_l` or `_lz` whose mip filter is not 0 as an `smpl` line (#2482): a static sampler whose MinLOD and MaxLOD come from the descriptor's word 1. The compute Dispatch now reads `smpl` lines as the draw path does, through the same `TranslatedSamplers::read_manifest_line` and `create_translated_root`; the only difference for compute is that the root signature is set with `SetComputeRootSignature`, and static samplers need nothing else. A comparison sampler (`smpc`) and the run-time sampler heap table (`smpheap`) are still refused, as "a comparison sampler" and "a sampler from the sampler heap". Binding the heap table for compute would need the draw path's sampler snapshot (`snapshot_samplers`, `create_sampler_snapshot_heap`) taken from the compute root's sampler heap pointer, the sampler heap set with `SetDescriptorHeaps` and its table set with `SetComputeRootDescriptorTable`.
+The translator writes a constant sampler of `image_sample`, `_l` or `_lz` whose mip filter is not 0 as an `smpl` line (#2482): a static sampler whose MinLOD and MaxLOD come from the descriptor's word 1. The compute Dispatch now reads `smpl` lines as the draw path does, through the same `TranslatedSamplers::read_manifest_line` and `create_translated_root`; the only difference for compute is that the root signature is set with `SetComputeRootSignature`, and static samplers need nothing else. The run-time sampler heap table (`smpheap`) is still refused, as "a sampler from the sampler heap". An `smpc` line is read since #3075: see [comparison samplers in a published compute manifest](experiments/startup-compute-comparison-sampler.md). Binding the heap table for compute would need the draw path's sampler snapshot (`snapshot_samplers`, `create_sampler_snapshot_heap`) taken from the compute root's sampler heap pointer, the sampler heap set with `SetDescriptorHeaps` and its table set with `SetComputeRootDescriptorTable`.
 
-`tests/startup_compute_dispatch_texture_check.py` adds a filtered case: the texture input program with a wrap, linear sampler (`smpl 0 0x0 0xc00000 0x18500000 0x0`) reads a 2x1 RGBA8 texture whose left texel has red 0 and right texel red 1.0, at the left edge. Only a linear filter that wraps reads 0.5 there. On WARP and on a physical adapter, every thread read red 0.5, and the debug layer reported no error. The control is the same program with the manifest's sampler changed to clamp: it reads red 0, which the check refuses. The `smpc` and `smpheap` lines refuse with their reasons and leave the output untouched. Without the new `smpl` reading, the Dispatch refuses with "a sampler that is not a plain static one" and the case fails. The texture has one mip, so the LOD clamp itself is not exercised here.
+`tests/startup_compute_dispatch_texture_check.py` adds a filtered case: the texture input program with a wrap, linear sampler (`smpl 0 0x0 0xc00000 0x18500000 0x0`) reads a 2x1 RGBA8 texture whose left texel has red 0 and right texel red 1.0, at the left edge. Only a linear filter that wraps reads 0.5 there. On WARP and on a physical adapter, every thread read red 0.5, and the debug layer reported no error. The control is the same program with the manifest's sampler changed to clamp: it reads red 0, which the check refuses. The `smpheap` line refuses with its reason and leaves the output untouched. Without the new `smpl` reading, the Dispatch refuses with "a sampler that is not a plain static one" and the case fails. The texture has one mip, so the LOD clamp itself is not exercised here.
 
 In a local census, 7 compute programs (about 135 thousand Dispatch calls) had an `smpl` line as their first refusal, each with one or two `smpl` lines and no other sampler form. Read against the classifier, all 7 manifests now load; their next refusal, if any, comes from the bindings at Dispatch and has not been measured.
 
@@ -17781,3 +17801,21 @@ python -B tests/docs_links_check.py
 
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
+
+## Binary16 normalized integer conversions (`v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`) across VOP1/VOP3/DPP16/DPP8/SDWA in pixel_aot
+
+[The pixel shader translator](../tools/pixel_aot.py) adds 10 exact binary16 normalized integer conversion forms across all 5 encodings (counted in both `docs/coverage/gfx1013.tsv` and `docs/coverage/rdna2.tsv`):
+
+- `v_cvt_norm_i16_f16` (`VOP1`, `VOP3` `_e64`, `DPP16`, `DPP8`, `SDWA` — 5 forms)
+- `v_cvt_norm_u16_f16` (`VOP1`, `VOP3` `_e64`, `DPP16`, `DPP8`, `SDWA` — 5 forms)
+
+All 10 require explicit `half_denorm="preserve"`, refuse `HALF_RTZ`, enforce the static finite-proof contract (`#839`), and tag plain/e64/DPP/SDWA-DWORD destinations as `("low16", alu)` (readable only by audited 16-bit integer readers). `cvt_norm_i16_f16` (`round_rne(clamp(x, -1, 1) * 32767)`) and `cvt_norm_u16_f16` (`round_rne(clamp(x, 0, 1) * 65535)`) compute the exact rational product in 32-bit unsigned integer arithmetic, avoiding binary32 double-rounding on `0x3801..0x3804` / `0xb801..0xb802` and preserving subnormal inputs (`0x0100`, `0x03ff`, `0x83ff`) under `-denorm ftz`.
+
+```powershell
+python3 tests/pixel_aot_check.py
+ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_cvt_norm_warp|pixel_aot_f16_cvt_norm_hardware|pixel_aot_binary)$' -V
+```
+
+Linux controls (including exhaustive verification against `fractions.Fraction` across all 63,488 finite binary16 values and single-instruction DPP16/DPP8 permutation-to-intrinsic checks pinning `QuadReadAcross{X,Y,Diagonal}` and `QuadReadLaneAt` lane order), `form_coverage_check.check_f16_cvt_norm_forms`, and Python mutation checks ran locally; Ubuntu LLVM 15 `pixel_aot_binary` round-trips run on PR CI, while `pixel_aot_f16_cvt_norm_{warp,hardware}` runs in `dev`/`release` presets and `main` CI (not `ctest --preset pr`). The draw harness compiles each fixture both optimized (`-denorm preserve`) and unoptimized (`-Od -denorm ftz`) so DXC retains the pure-`uint` conversion arithmetic in DXIL rather than constant-folding `plain_e32`/`plain_e64`/`sdwa` to immediate stores (note: because no binary32 float ops are emitted in `cvt_norm_{i16,u16}_f16`, `-denorm ftz` produces the same integer instructions as `-denorm preserve`).
+
+Independent Windows 11 (`26200.9974`, DXC `1.9.2602.17`, `debug_layer=unavailable`) measurements on `bd8f6f42` ([comment 1](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7196200555)) and `3100f363` ([comment 2](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7200844836)) passed `pixel_aot_f16_cvt_norm_hardware` (`AMD Radeon RX 9070 XT` `1002:7550`, driver `32.0.32029.2010`) and `pixel_aot_f16_cvt_norm_warp` with `max_absolute_error=0`, all 20 mutation draws mismatching, and DXIL disassembly confirming the `-Od` pass retains the `mul`/`lshr`/`shl` integer path. Scope limits: under `#839`'s static finite-proof contract (`half16_arith_source` / `half16_dpp_source`), operands are statically known per-lane uniform values, so device draw readbacks do not distinguish lane-routing changes on `dpp16`/`dpp8` (the permutation-to-intrinsic mapping is pinned statically in `check_f16_cvt_norm_controls`), mutation draws compile optimized rather than `-Od`, and the exhaustive 63,488-value check runs in Python rather than on-device.
