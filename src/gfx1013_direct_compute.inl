@@ -1941,6 +1941,21 @@ struct DirectCompute {
             auto narrow = ir.binary(sign ? "ashr" : "lshr", ir.binary("shl", shifted, pad), pad);
             z = select(cmp("eq", width, "0"), "0", select(cmp("uge", width, "32"), shifted, narrow));
         }
+        else if (n == "v_cvt_pk_u16_u32" || n == "v_cvt_pk_i16_i32") {
+            // Saturate S0 and S1 to 16 bits and pack S0 low, S1 high (#2995, gfx2hlsl.py's VOP3 table). The
+            // instructions have two sources; like gfx2hlsl.py, refuse a nonzero unused SRC2 field.
+            if (i.src[2] != 0)
+                refuse(i.pc, string(n) + " with unused src2 field set");
+            if (i.a & 0x7800)
+                refuse(i.pc, string(n) + " with op_sel");
+            auto narrow = [&](const string &x) {
+                if (n == "v_cvt_pk_u16_u32")
+                    return select(cmp("ugt", x, "65535"), "65535", x);
+                auto low = select(cmp("slt", x, "-32768"), "-32768", x);
+                return ir.binary("and", select(cmp("sgt", low, "32767"), "32767", low), "65535");
+            };
+            z = ir.binary("or", narrow(a), ir.binary("shl", narrow(b), "16"));
+        }
         else if (n == "v_bfe_u32")
             z = ir.binary("and", shift("lshr", a, b), ir.binary("sub", shift("shl", "1", val(2)), "1"));
         else if (n == "v_bfe_i32") {
