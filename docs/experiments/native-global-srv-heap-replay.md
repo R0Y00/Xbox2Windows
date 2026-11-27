@@ -56,6 +56,8 @@ selection, so the guard checks the slot the GPU input actually selects, before t
 
 ## Fixture
 
+The wave32 replay covers direct raw dword through dwordx4 loads with `off` and SGPR offsets, plus immediate, inline, and `offen` address cases.
+
 `tests/native_global_srv_heap_replay.cpp` with `tests/native_global_srv_heap_replay_check.py`. A source-built compute
 container (two root inputs: a descriptor table in s[0:1], the descriptor heap in s[2:3]; instruction words assembled with
 LLVM 15 `clang -cc1as -triple amdgcn-amd-amdhsa -target-cpu gfx1013 -show-encoding`) loads the selector from t0, loads

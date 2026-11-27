@@ -770,7 +770,31 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     raw.view.Buffer.FirstElement = 0;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(5);
+
+    // An unplaced structured view whose address is not a whole number of 12-byte elements past its 64 KiB page start
+    // (page offset 0x104): published from a copy that starts at the address, so the shader reads 201 at element 0.
+    static auto* const suballoc = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!suballoc) return 56;
+    auto* const odd = reinterpret_cast<std::uint32_t*>((reinterpret_cast<std::uintptr_t>(suballoc) & ~std::uintptr_t{0xffff}) + 65536 + 0x104);
+    odd[0] = 201;
+    *reinterpret_cast<std::uint32_t*>(reinterpret_cast<unsigned char*>(odd) - 4) = 55;  // read by the raw view at page + 0x100 below
+    structured.view.Buffer.FirstElement = 0;
+    structured.view.Buffer.StructureByteStride = 12;
+    structured.address = ptr(odd);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
     draw(6);
+
+    // An unplaced raw view at page + 1 is refused as before (the exact-start copy is only for structured and typed views):
+    // the previous descriptor stays, so column 7 still reads 201.
+    raw.view.Buffer.FirstElement = 0;
+    raw.address = ptr(reinterpret_cast<unsigned char*>(odd) - 0x103);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(7);
+
+    // A raw view that overlaps the copy made for the structured view above (page + 0x100) takes its own backing of the page.
+    raw.address = ptr(reinterpret_cast<unsigned char*>(odd) - 4);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(8);
 
     // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
     // upload copy must still publish the bytes at the address.
@@ -781,7 +805,71 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     raw.address = ptr(large);
     raw.view.Buffer.FirstElement = 4;
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
-    draw(7);
+    draw(9);
+
+    // Use fresh pages in the large allocation to exercise the upload path on every adapter.
+    auto* const raw_first = reinterpret_cast<unsigned char*>(large) + 65536;
+    *reinterpret_cast<std::uint32_t*>(raw_first + 0x100) = 55;
+    *reinterpret_cast<std::uint32_t*>(raw_first + 0x104) = 201;
+    raw.address = ptr(raw_first + 0x100);
+    raw.view.Buffer.FirstElement = 0;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(10);
+    structured.address = ptr(raw_first + 0x104);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(11);
+
+    auto* const refused_first = raw_first + 65536;
+    auto* const structured_only = refused_first + 65536;
+    *reinterpret_cast<std::uint32_t*>(refused_first + 0x10c) = 173;
+    *reinterpret_cast<std::uint32_t*>(structured_only + 0x10c) = 173;
+    raw.address = ptr(refused_first + 1);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(12);
+    structured.view.Buffer.StructureByteStride = 16;
+    structured.address = ptr(refused_first + 0x10c);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(13);
+    structured.address = ptr(structured_only + 0x10c);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(14);
+
+    constexpr UINT half = 65536;
+    auto wide = desc;
+    wide.Width = half;
+    raw.view.Buffer.NumElements = half / sizeof(std::uint32_t);
+
+    // Move the commitment within one reservation. The allocation base, size and committed total stay the same.
+    // Use a fresh destination so the first successful write has its own diagnostic.
+    static auto* const moved = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * half, MEM_RESERVE, PAGE_READWRITE));
+    if (!moved || !VirtualAlloc(moved + half, half, MEM_COMMIT, PAGE_READWRITE)) return 57;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    raw.address = ptr(moved);
+    auto start = GetTickCount64();
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    if (!VirtualFree(moved + half, half, MEM_DECOMMIT) || !VirtualAlloc(moved, half, MEM_COMMIT, PAGE_READWRITE))
+        return 58;
+    *reinterpret_cast<std::uint32_t*>(moved) = 219;
+    if (GetTickCount64() - start >= 250) return 59;  // Keep the retry within the refusal cache lifetime.
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    draw(15);
+
+    // A live narrow placement prevents fallback to the full allocation. Its release changes placement
+    // generation while leaving the allocation and the request intact.
+    static auto* const retired = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, half, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!retired) return 60;
+    retired[0] = 227;
+    void* narrow = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(retired), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&narrow)))) || !narrow) return 61;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    raw.address = ptr(retired);
+    start = GetTickCount64();
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    if (invoke(narrow, 2) != 0 || GetTickCount64() - start >= 250) return 62;
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    draw(16);
     return 0;
 }
 

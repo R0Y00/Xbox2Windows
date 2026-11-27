@@ -36,7 +36,8 @@
         "xmem_page_runs_device_check", "linear_buffer_backing_check"
       ]
     },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "runtime", "configurePreset": "release", "targets": ["startup_runtime"] }
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },

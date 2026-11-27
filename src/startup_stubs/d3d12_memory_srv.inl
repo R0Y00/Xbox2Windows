@@ -189,7 +189,8 @@ bool address_resource_overlap(u64 address, u64 span)
     bool found = false;
     AcquireSRWLockShared(&note_lock);
     resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
-        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+        if (wrapper->own().tiled_address_srv || wrapper->own().unplaced_srv_backing ||
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
         const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
@@ -238,7 +239,7 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
         const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||
-            info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            wrapper->own().exact_copy || info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
             return false;
@@ -266,6 +267,7 @@ struct UnplacedBufferEntry {
     u64 page_start = 0;
     u64 page_span = 0;
     bool is_upload = false;
+    bool exact = false;  // starts at the view address (a structured view whose stride does not divide the page offset)
     x2w_startup::ComPtr<ID3D12Resource> resource;
     Wrapper* wrapper = nullptr;
 };
@@ -294,12 +296,9 @@ void clear_unplaced_buffers(Wrapper* device)
     }
 }
 
-// refusal (out, optional): when a nullptr answer is exactly provable, the proof that keeps a cached copy of it exact
-// (srv_refusal_cache.h): decided by the request and stand-in state alone (independent), by a fully committed
-// allocation the buffer does not fit (fully_committed), or by one page that is not committed (witness_page).
-// A nullptr from a later step carries no proof (proven stays false).
+// A refusal proof describes a failure determined by the request, placement, or memory state.
 Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, const D3D12_RESOURCE_DESC& requested_desc,
-                                x2w_startup::SrvRefusalProof* refusal = nullptr)
+                                u64 elem_bytes, bool raw, x2w_startup::SrvRefusalProof* refusal)
 {
     if (refusal) *refusal = x2w_startup::SrvRefusalProof{};
     const auto prove = [&](x2w_startup::SrvRefusalKind kind, u64 witness = 0, u64 base = 0) {
@@ -331,12 +330,21 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         return nullptr;
     }
 
+    // A buffer view addresses whole elements from its base. When the base is the 64 KiB page start and the view address is not
+    // a multiple of the element size past it, no FirstElement can name the address: back the view with an upload copy that
+    // starts at the address itself (checked above to lie inside memory the title owns).
+    const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page_start, elem_bytes, raw);
+    if (exact) {
+        page_start = address;
+        page_span = span_bytes;
+    }
+
     auto* desktop = device_of(device);
     if (!desktop) return nullptr;
 
     std::lock_guard lock(unplaced_buffer_mutex);
     for (auto& entry : unplaced_buffers) {
-        if (entry.device == device && entry.allocation_base == memory.base &&
+        if (entry.device == device && entry.allocation_base == memory.base && entry.exact == exact &&
             x2w_startup::unplaced_buffer_covers(entry.page_start, entry.page_span, address, span_bytes)) {
             x2w_startup::PlacedBufferRange verify{};
             if (!x2w_startup::measure_placed_buffer(reinterpret_cast<void*>(entry.page_start), entry.page_span, verify) ||
@@ -365,7 +373,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &existing_support, sizeof(existing_support))) &&
         existing_support.Supported;
 
-    if (existing_heaps_supported && memory.type == MEM_PRIVATE) {
+    if (existing_heaps_supported && memory.type == MEM_PRIVATE && !exact) {
         std::lock_guard placed_lock(placed_mutex);
         for (const auto& [known, h] : existing_heaps) {
             if (known == memory.base) {
@@ -448,6 +456,8 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
     rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     rdesc.Flags = is_upload ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
 
+    w->own().unplaced_srv_backing = true;
+    w->own().exact_copy = exact;
     note_resource(w, &rdesc, page_span);
     if (!is_upload) {
         w->own().budget = x2w_budget::resource(desktop, native_resource.Get(), x2w_budget::placed);
@@ -457,7 +467,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
         w->own().budget = x2w_budget::committed(desktop, native_resource.Get(), D3D12_HEAP_TYPE_UPLOAD);
     }
 
-    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, native_resource, w});
+    unplaced_buffers.push_back(UnplacedBufferEntry{device, memory.base, page_start, page_span, is_upload, exact, native_resource, w});
     x2w_startup::note_placement_change();
     return w;
 }
@@ -736,16 +746,23 @@ x2w_startup::SrvRefusalStamp buffer_refusal_stamp(u64 address)
 {
     x2w_startup::SrvRefusalStamp stamp;
     stamp.generation = x2w_startup::srv_placement_generation().load(std::memory_order_acquire);
-    stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size, stamp.commit, stamp.flags);
+    x2w_local::outside_run_breaks([&] {
+        stamp.valid = x2w_startup::region_stamp(reinterpret_cast<const void*>(address), stamp.base, stamp.size,
+                                                stamp.commit, stamp.flags);
+    });
     return stamp;
 }
 
 // A cached witness_page refusal still holds while its page is not committed in the allocation the walk started from.
 bool buffer_refusal_page_still_uncommitted(const x2w_startup::SrvRefusalProof& proof)
 {
-    MEMORY_BASIC_INFORMATION page{};
-    if (VirtualQuery(reinterpret_cast<const void*>(proof.witness), &page, sizeof(page)) != sizeof(page)) return true;
-    return page.State != MEM_COMMIT || (proof.base != 0 && reinterpret_cast<u64>(page.AllocationBase) != proof.base);
+    bool still_uncommitted = false;
+    x2w_local::outside_run_breaks([&] {
+        MEMORY_BASIC_INFORMATION page{};
+        still_uncommitted = VirtualQuery(reinterpret_cast<const void*>(proof.witness), &page, sizeof(page)) != sizeof(page) ||
+            page.State != MEM_COMMIT || (proof.base != 0 && reinterpret_cast<u64>(page.AllocationBase) != proof.base);
+    });
+    return still_uncommitted;
 }
 
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
@@ -786,18 +803,25 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                               destination);
             return;
         }
+        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        const auto resolve = [&](Wrapper* candidate) {
+            const auto* info = candidate ? resource_info(candidate) : nullptr;
+            return info && x2w_startup::resolve_buffer_srv_desc(
+                reinterpret_cast<u64>(candidate->own().title_memory), info->console.Width,
+                input->address, input->view, adjusted);
+        };
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         x2w_startup::SrvRefusalProof refusal_proof;
-        if (!buffer) {
-            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, &refusal_proof);
+        bool resolved = resolve(buffer);
+        if (!buffer || (!resolved && buffer->own().unplaced_srv_backing)) {
+            buffer = unplaced_memory_buffer(self, input->address, span_bytes, *resource, elem_bytes,
+                                            input->view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW, &refusal_proof);
+            resolved = resolve(buffer);
         }
-        const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
-        D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        if (!buffer || !info ||
-            !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
-                                                  info->console.Width, input->address, input->view, adjusted)) {
-            // A buffer that was found (placed or unplaced) and does not fit the view is decided by its recorded size.
-            if (buffer) refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
+        if (!resolved) {
+            // A backing that cannot represent the view is rejected by its recorded extent and the view layout.
+            if (buffer && resource_info(buffer))
+                refusal_proof = x2w_startup::SrvRefusalProof{x2w_startup::SrvRefusalKind::independent, 0, 0, true};
             buffer_refusal_cache().note(refusal_key, refusal_stamp, GetTickCount64(), refusal_proof);
             refuse_memory_srv(refused, "unavailable buffer at the supplied address", "buffer_unavailable", resource, input,
                               destination);
