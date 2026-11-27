@@ -1248,12 +1248,13 @@ struct DirectCompute {
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
+        const bool off_i4_to_float = n == "v_cvt_off_f32_i4";
         const bool round = n == "v_fract_f32" || n == "v_trunc_f32" || n == "v_ceil_f32";
         const bool to_integer = n == "v_cvt_i32_f32" || n == "v_cvt_u32_f32" ||
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
-        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
+        if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -1328,9 +1329,13 @@ struct DirectCompute {
             }
             return true;
         }
-        if (byte_to_float || (rule != alu_rules.end() && rule->second.type == AluType::ToFloat)) {
+        if (byte_to_float || off_i4_to_float || (rule != alu_rules.end() && rule->second.type == AluType::ToFloat)) {
             if (i.abs || i.neg)
                 refuse(i.pc, "integer conversion source modifier");
+            if (off_i4_to_float && i.wide && (i.src[1] != 0 || i.src[2] != 0))
+                refuse(i.pc, "v_cvt_off_f32_i4 with unused src1/src2 field set");
+            if (off_i4_to_float && i.wide && (i.a & 0x7800))
+                refuse(i.pc, "v_cvt_off_f32_i4 with op_sel");
             auto a = source(0);
             if (byte_to_float) {
                 unsigned shift_bits = 8u * (n.back() - '0');
@@ -1338,7 +1343,13 @@ struct DirectCompute {
                     a = ir.binary("lshr", a, to_string(shift_bits));
                 a = ir.binary("and", a, "255");
             }
-            result = ir.value(string(n == "v_cvt_f32_i32" ? "sitofp" : "uitofp") + " i32 " + a + " to float");
+            if (off_i4_to_float) {
+                auto nibble = ir.binary("ashr", ir.binary("shl", a, "28"), "28");
+                auto f = ir.value("sitofp i32 " + nibble + " to float");
+                result = ir.value("fmul float " + f + ", 0.0625");
+            } else {
+                result = ir.value(string(n == "v_cvt_f32_i32" ? "sitofp" : "uitofp") + " i32 " + a + " to float");
+            }
         } else {
             auto a = fp(0);
             if (n == "v_fma_f32" || n == "v_fmac_f32" || n == "v_fmamk_f32" || n == "v_fmaak_f32") {
@@ -1603,6 +1614,43 @@ struct DirectCompute {
             auto addend = operand32(i, i.src[2]);
             auto sum = i.clamp ? saturated_add(product, addend, sign) : ir.binary("add", product, addend);
             vector_write(i.dst, sum);
+            return;
+        }
+        if (compute && (n == "v_pk_mul_lo_u16" || n == "v_pk_mad_u16" || n == "v_pk_mad_i16")) {
+            const bool mad = n != "v_pk_mul_lo_u16";
+            const bool sign = n == "v_pk_mad_i16";
+            if (i.enc != Encoding::Mix || (i.a & 0x0700) || (i.b >> 29) ||
+                (!mad && (i.clamp || (i.a & 0x2000) || i.src[2])))
+                refuse(i.pc, "unsupported packed 16-bit mul/mad operand modifiers");
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            string c = mad ? operand32(i, i.src[2]) : string();
+            auto half = [&](const string &word, bool hi, bool sext) {
+                if (sext)
+                    return hi ? ir.binary("ashr", word, "16")
+                              : ir.binary("ashr", ir.binary("shl", word, "16"), "16");
+                return hi ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+            };
+            auto lane = [&](bool hi_out) {
+                const bool sel_a = hi_out ? ((i.b >> 27) & 1) != 0 : ((i.a >> 11) & 1) != 0;
+                const bool sel_b = hi_out ? ((i.b >> 28) & 1) != 0 : ((i.a >> 12) & 1) != 0;
+                const bool sel_c = hi_out ? ((i.a >> 14) & 1) != 0 : ((i.a >> 13) & 1) != 0;
+                const bool sext = i.clamp && sign;
+                auto res = ir.binary("mul", half(a, sel_a, sext), half(b, sel_b, sext));
+                if (mad) {
+                    res = ir.binary("add", res, half(c, sel_c, sext));
+                    if (i.clamp) {
+                        if (sign) {
+                            res = select(cmp("sgt", res, "32767"), "32767", res);
+                            res = select(cmp("slt", res, "-32768"), "-32768", res);
+                        } else {
+                            res = select(cmp("ugt", res, "65535"), "65535", res);
+                        }
+                    }
+                }
+                return ir.binary("and", res, "65535");
+            };
+            auto lo = lane(false), hi = lane(true);
+            vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
             return;
         }
         if (auto dst = carry_destination(i)) {
@@ -2198,10 +2246,35 @@ struct DirectCompute {
             z = ir.binary(op, ir.binary(op, a, b), val(2));
         } else if (n == "v_add_lshl_u32")
             z = shift("shl", ir.binary("add", a, b), val(2));
-        else if (n == "v_mad_i32_i24") {
-            // sext(S0[23:0]) * sext(S1[23:0]) + S2 modulo 2^32 (#2991, gfx2hlsl.py's VOP3 table).
+        else if (n == "v_mul_i32_i24" || n == "v_mad_i32_i24") {
+            if (n == "v_mul_i32_i24" && i.wide && i.src[2] != 0)
+                refuse(i.pc, "v_mul_i32_i24 with unused src2 field set");
+            if (n == "v_mul_i32_i24" && i.wide && (i.a & 0x7800))
+                refuse(i.pc, "v_mul_i32_i24 with op_sel");
+            // sext(S0[23:0]) * sext(S1[23:0]) (+ S2) modulo 2^32.
             auto sext24 = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "8"), "8"); };
-            z = ir.binary("add", ir.binary("mul", sext24(a), sext24(b)), val(2));
+            z = ir.binary("mul", sext24(a), sext24(b));
+            if (n == "v_mad_i32_i24")
+                z = ir.binary("add", z, val(2));
+        } else if (n == "v_mul_hi_i32_i24" || n == "v_mul_hi_u32_u24") {
+            if (i.wide && i.src[2] != 0)
+                refuse(i.pc, string(n) + " with unused src2 field set");
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, string(n) + " with op_sel");
+            const bool sign = n == "v_mul_hi_i32_i24";
+            // Split each 24-bit operand as top * 2^12 + low (low in 0..4095, top signed or unsigned 12-bit).
+            // All intermediates stay inside 32 bits; floor division nests exactly for both signs.
+            auto top = [&](const string &x) {
+                return sign ? ir.binary("ashr", ir.binary("shl", x, "8"), "20")
+                            : ir.binary("and", ir.binary("lshr", x, "12"), "4095");
+            };
+            auto low = [&](const string &x) { return ir.binary("and", x, "4095"); };
+            auto ah = top(a), al = low(a), bh = top(b), bl = low(b);
+            auto hh = ir.binary("mul", ah, bh);
+            auto mid = ir.binary("add", ir.binary("mul", ah, bl), ir.binary("mul", al, bh));
+            auto t = ir.binary("add", mid, ir.binary("lshr", ir.binary("mul", al, bl), "12"));
+            const char *rshift = sign ? "ashr" : "lshr";
+            z = ir.binary(rshift, ir.binary("add", hh, ir.binary(rshift, t, "12")), "8");
         } else if (n == "v_mul_u32_u24" || n == "v_mad_u32_u24") {
             z = ir.binary("mul", ir.binary("and", a, "16777215"), ir.binary("and", b, "16777215"));
             if (n == "v_mad_u32_u24")
