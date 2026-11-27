@@ -122,6 +122,8 @@ PRIVATE_SHADER_FAILS = [
     "undecodable word at +0x10: AcmeTitle shader text",
     "image_load_mip tfe AcmeTitle",
     "image_load_mip tfe",
+    "native compute +0x1a: unsupported instruction v_acme_widget_7f3a 0xdeadbeefu",
+    "native compute +0x1c: AcmeTitle secret reason",
 ]
 PRIVATE_NEEDLES = [
     "Acme", "acme", "ACME", "Private", "secret", "leak", "widget", "7f3a", "exploded",
@@ -159,6 +161,10 @@ def check_private_text_never_echoed(failures: list[str]) -> None:
         ]:
             if want not in report:
                 failures.append(f"missing grouped allowlist row: {want!r}")
+        if "| 4 | `other (text omitted)` |" not in report:
+            failures.append("unknown shader .fail lines were not grouped as other (text omitted)")
+        if "| 1 | `v_* instruction` |" not in report:
+            failures.append("native unsupported instruction .fail line was not grouped under its mnemonic family")
         if "| 1 | other (text omitted) | ? | ? | ? | ? | ? | ? |" not in report:
             failures.append("unknown slot70 reason/values were not grouped as other/?")
 
@@ -208,6 +214,9 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unavailable acceleration structure at the supplied address", "as_wrong_state"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+        ("unavailable texture at the supplied base and layout", "texture_no_resource"),
+        ("unavailable texture at the supplied base and layout", "texture_unreadable"),
+        ("unavailable texture at the supplied base and layout", "texture_over_64mib"),
         ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
         ("unavailable texture at the supplied base and layout", "partial_tile_beyond_xg_size"),
         ("unavailable texture at the supplied base and layout", "unsupported_desktop_format"),
@@ -491,6 +500,19 @@ def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
     # text changed, folds a known cause into "other" without failing anything else. The samples are
     # matched back to the table so a new entry without a sample fails here.
     samples = (
+        ("native compute +0x14: unsupported instruction v_add3_u32 0xd76d0002u", "v_* instruction"),
+        ("native compute +0x8: unsupported opcode 0xdeadbeefu", "unsupported opcode"),
+        ("native compute +0x10: unsupported pixel entry VGPR 2", "unsupported pixel entry VGPR"),
+        ("native compute +0x1c: unproven resource descriptor s12", "unproven resource descriptor"),
+        ("native compute +0x20: unbound numeric SGPR s0", "unbound numeric SGPR"),
+        ("unknown gfx1013 instruction format at byte 24", "undecodable word"),
+        ("graphics request key mismatch or missing root", "graphics request key mismatch"),
+        ("compute request key mismatch", "compute request key mismatch"),
+        ("stale pixel input description: graphics request key mismatch", "stale pixel input description"),
+        ("pixel input description names another pipeline", "pixel input description names another pipeline"),
+        ("contradictory pixel input enable/address masks", "contradictory pixel input enable/address masks"),
+        ("pixel input enable mask missing from the stream description", "invalid pixel input description"),
+        ("invalid pixel input description", "invalid pixel input description"),
         ("image_load_mip tfe", "image_load_mip tfe"),
         ("image_load_mip a16", "image_load_mip a16"),
         ("buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL", "buffer_* instruction"),
@@ -574,11 +596,15 @@ def check_indirect_outcomes(failures: list[str]) -> None:
 
 
 def check_gpu_memory_budget(failures: list[str]) -> None:
-    def sample(local, texture):
+    def sample(local, texture, commit=""):
         return (
             f'x2w-budget local={local} nonlocal=2/8 placed=10000/2+20000/3 texture={texture} '
-            'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0'
+            f'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0{commit}'
         )
+
+    # The system commit and pool counters report_budget() appends (known, and unavailable).
+    with_commit = " commit=14335/16100 avail=1765 sections=113609 slabs=3 slots=113000/609 job_peak=14250 job_limit=14336"
+    commit_n_a = " commit=n/a avail=n/a sections=n/a slabs=n/a slots=n/a job_peak=n/a job_limit=none"
 
     high_usage = sample("2500/3000", "100/5+40/2")
     high_ratio = sample("1800/1000", "150/7+50/3")
@@ -587,12 +613,14 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
         sample("4000/1", "500/7+950/4").replace(" unmeasured=0", ""),
         sample("9000/1", "900/1+999/1").replace(" buffer=1/1+0/0", r" buffer=C:\Users\alice"),
         sample("9000/1", "900/1+999/1") + " path=secret.exe",
+        sample("9000/1", "900/1+999/1", " commit=14335/x avail=1765 sections=1 slabs=1 slots=1/1"),
+        sample("9000/1", "900/1+999/1", with_commit + " path=secret.exe"),
     )
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         log = root / "stderr.txt"
-        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4"), high_retained,
-                   sample("5000/0", "300/9+10/3"), sample("1000/1000", "90/6+20/1"), *malformed)
+        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4", with_commit), high_retained,
+                   sample("5000/0", "300/9+10/3", commit_n_a), sample("1000/1000", "90/6+20/1"), *malformed)
         log.write_text("\n".join(samples), encoding="utf-8")
         (root / "trap.log").write_text(high_ratio + "\n", encoding="utf-8")
         report = triage_run.triage_run(root)
