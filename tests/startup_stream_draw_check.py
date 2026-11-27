@@ -151,6 +151,21 @@ def check(directory, consumer, backend):
     assert green_recipe.read_text(encoding="ascii").count("x2w-pso-recipe 1") == 64, \
         "a full recipe file accepted a 65th record"
     print(f"{backend}: 63+1 records precreate; 64 records refuse the 65th")
+
+    # A record without its final LF still parses, but appending would join `end` and the next
+    # header on one line. The draw must render and leave the parseable file byte-for-byte intact.
+    no_final_lf = green_recipe.read_bytes()
+    assert no_final_lf.rstrip(b"\r\n").endswith(b"end"), no_final_lf[-40:]
+    green_recipe.write_bytes(no_final_lf[:-1])
+    before = green_recipe.read_bytes()
+    run = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_bytes() == observations[1]
+    assert green_recipe.read_bytes() == before, "a no-LF recipe file was modified by the refused append"
+    replay = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+    assert replay.returncode == 0, replay.stderr
+    assert output.read_bytes() == observations[1]
+    print(f"{backend}: a recipe without a final LF stays readable and refuses the append")
     return 0
 
 

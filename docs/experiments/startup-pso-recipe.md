@@ -26,7 +26,9 @@ is counted and ignored.
 The writer applies the same parser before it appends. It refuses to add a record when the file
 already holds 64 complete records, when any existing line is rejected, or when the new record
 would cross 64 KiB. A 65th record would never be read back, so refusing it keeps the cache and the
-parser at the same boundary.
+parser at the same boundary. It also refuses when a non-empty file does not end in LF: the parser
+accepts such a final record, but appending would join its `end` to the next header on one line. The
+file is left unchanged.
 
 The read, count/size check and append share one exclusive file handle. A second process that
 reaches the append path while the file is owned keeps the PSO it already created and skips the
@@ -49,8 +51,9 @@ precreates it, and all 32 RGBA bytes match. It also holds the recipe file exclus
 draw and checks that the draw still renders with exact pixels while the file size stays unchanged.
 It then seeds 63 valid records for another translation key, checks that the next draw appends the
 matching record as number 64 and the following process logs `precreated 1`, and seeds 64 records to
-check that the draw still renders while the file stays at 64. That test covers the unused
-depth-stencil normalisation as well.
+check that the draw still renders while the file stays at 64. It removes the final LF from that
+parseable file, runs another draw and checks that the file is byte-for-byte unchanged and still
+readable. That test covers the unused depth-stencil normalisation as well.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_pso_recipe$' -V

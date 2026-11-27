@@ -640,6 +640,9 @@ inline PsoRecipeParseResult parse_pso_recipe_file(std::string_view text)
 inline bool pso_recipe_append_allowed(std::string_view existing, std::string_view record)
 {
     if (record.empty() || record.size() > pso_recipe_file_limit) return false;
+    // A parseable last record may still lack its final LF. Appending then joins its `end` to the
+    // next header on one line, so the next read loses both records. Refuse without writing.
+    if (!existing.empty() && existing.back() != '\n') return false;
     if (existing.size() > pso_recipe_file_limit || record.size() > pso_recipe_file_limit - existing.size())
         return false;
     const PsoRecipeParseResult parsed = parse_pso_recipe_file(existing);

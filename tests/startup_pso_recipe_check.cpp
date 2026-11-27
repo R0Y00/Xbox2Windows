@@ -157,6 +157,17 @@ int main()
     expect(!pso_recipe_append_allowed(std::string(pso_recipe_file_limit, 'x'), text),
            "an unparseable full-size file is not appended to");
 
+    // A record without its final LF still parses, but appending would put `end` and the next
+    // header on one line. The writer refuses and leaves the parseable record intact.
+    const std::string no_final_lf = text.substr(0, text.size() - 1);
+    const PsoRecipeParseResult parsed_no_lf = parse_pso_recipe_file(no_final_lf);
+    expect(parsed_no_lf.rejected == 0 && parsed_no_lf.recipes.size() == 1,
+           "a record without a final LF still parses");
+    expect(!pso_recipe_append_allowed(no_final_lf, text), "a file without a final LF refuses an append");
+    const PsoRecipeParseResult after_refusal = parse_pso_recipe_file(no_final_lf);
+    expect(after_refusal.rejected == 0 && after_refusal.recipes.size() == 1,
+           "the earlier record remains readable after the refused append");
+
     std::printf("startup pso recipe checks: %d failed\n", failures);
     return failures ? 1 : 0;
 }
