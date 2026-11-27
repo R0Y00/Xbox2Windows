@@ -83,6 +83,7 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "startup_stubs/xmem_section_buffer.h"
+#include "native_buffer_store_view.h"
 #ifdef X2W_NATIVE_SHADERS  // d3d12_xs_shim only: the C++ shader compiler (startup_stubs/d3d12_compute_dispatch.inl)
 #include "gfx1013_compute_native.h"
 #include "gfx1013_pixel.h"

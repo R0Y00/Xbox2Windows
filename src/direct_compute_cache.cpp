@@ -1030,6 +1030,14 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
         const auto &b = bindings.views[bindings.srv_count + j];
         if (b.root_parameter >= 16 || b.array_count != 1)
             return std::nullopt;
+        if (b.kind == ComputeViewKind::raw_buffer_uav) {
+            // First slice: one pixel UAV with no other resource views. Vertex stores,
+            // mixed views and aliases need their own runtime acceptance.
+            if (uav_count != 1 || bindings.srv_count || !pair.vertex.bindings.empty())
+                return std::nullopt;
+            uav_lines << "uav " << j << " raw table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+            continue;
+        }
         if (b.kind != ComputeViewKind::texture_uav && b.kind != ComputeViewKind::half4_texture_uav)
             return std::nullopt;
         if (b.image_dimension != 1 && b.image_dimension != 5)
