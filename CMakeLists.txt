@@ -1228,6 +1228,10 @@ target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 # The DLL the probe calls for the debugger's call-hook case (--trace-calls).
 add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
 add_dependencies(startup_debug_probe startup_debug_calls)
+# A visible window that changes its picture at a known time: input for the --capture-every check (tests/startup_debug_window_check.py).
+add_executable(startup_window_probe tests/startup_window_probe.cpp)
+target_compile_features(startup_window_probe PRIVATE cxx_std_17)
+target_link_libraries(startup_window_probe PRIVATE user32 gdi32)
 # Input for tests/startup_inflate_check.py: the DirectStorage stand-in's zlib decoder on one stream.
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
@@ -1260,6 +1264,11 @@ target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
 target_include_directories(startup_overlay_window PRIVATE src)
 target_link_libraries(startup_overlay_window PRIVATE user32)
 add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
+# Text of the x2w-budget commit fields and the commit-exhausted line (src/startup_stubs/commit_state.h).
+add_executable(startup_commit_state_check tests/startup_commit_state_check.cpp)
+target_compile_features(startup_commit_state_check PRIVATE cxx_std_17)
+target_include_directories(startup_commit_state_check PRIVATE src)
+add_test(NAME startup_commit_state COMMAND startup_commit_state_check)
 # WASAPI render sink (Refs #1145); exit 77 when the machine has no usable render endpoint. The sink is
 # compiled once for this check and the pacing control below.
 add_library(startup_audio_sink_obj OBJECT src/startup_stubs/audio_sink.cpp)
@@ -4443,6 +4452,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl compute stage: entry registers, numthreads and the offen buffer store, dispatched on a plain device (#1412).
     add_test(NAME startup_gfx2hlsl_compute_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py")
+    # The shared one-device case runner of the GPU draw checks (tests/gpu_case_runner.py, issue #448).
+    add_test(NAME gpu_case_runner COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/gpu_case_runner_check.py")
+    set_tests_properties(gpu_case_runner PROPERTIES TIMEOUT 120)
     # The GPU check package replays these cases on a contributor's adapter (tools/record_gpu_cases.py).
     add_test(NAME gpu_case_recorder COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/gpu_case_recorder_check.py" "${DXC_EXECUTABLE}")
@@ -4727,6 +4739,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:startup_debug_calls>" ${group})
         set_tests_properties(${startup_debug_test} PROPERTIES TIMEOUT 300)
     endforeach()
+    # Periodic window pictures (--capture-every): the pure parts, then a real window that turns red to blue.
+    add_test(NAME startup_window_capture_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_window_capture_check.py")
+    set_tests_properties(startup_window_capture_check PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_debug_window COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_window_check.py" "$<TARGET_FILE:startup_window_probe>")
+    set_tests_properties(startup_debug_window PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
@@ -10797,6 +10816,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_f16_exact_extra_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_exact_extra_${adapter}.txt")
+        add_test(NAME pixel_aot_f16_cvt_norm_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-f16-cvt-norm "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_f16_cvt_norm_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_f16_cvt_norm_${adapter}.txt")
         add_test(NAME pixel_aot_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sdwa-cvt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

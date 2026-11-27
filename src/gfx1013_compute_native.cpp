@@ -87,7 +87,7 @@ struct Inst {
     }
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
-Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false) {
+Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
     Inst i;
     i.pc = pc;
@@ -270,6 +270,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
+        const unsigned sdwa_mask_limit = direct && !graphics && !wave64 ? 107 : 106;
         if (direct && i.src[0] == 249 && (sdwa_compare || i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2)) {
             // Operand profiles from disasm_rdna2's GFX10 VOP1/VOP2 SDWA
             // decoder. Admit only profiles with a direct result placement.
@@ -293,7 +294,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             const Word ext = take();
             const unsigned sources = i.enc == Encoding::Vop1 ? 1 : 2;
             if (sdwa_compare) {
-                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > 106))
+                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > sdwa_mask_limit))
                     refuse(pc, "invalid SDWA compare destination");
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
             } else {
@@ -339,7 +340,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             } else {
                 // VOPC has a scalar mask destination in the same bits that VOP2 uses for placement.
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
-                if ((ext & 0x70480000u) || (i.dst > 105 && i.dst != 106))
+                if ((ext & 0x70480000u) || i.dst > sdwa_mask_limit)
                     refuse(pc, "invalid SDWA class modifiers or mask destination");
                 i.neg = (ext >> 20) & 1;
                 i.abs = (ext >> 21) & 1;
@@ -563,8 +564,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
+               i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
@@ -664,7 +665,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
             if (pc >= code.size() || (next != instructions.begin() && std::prev(next)->second.next > pc))
                 refuse(pc, "branch outside code or into an instruction");
             const auto fetch = fixed.find(pc);
-            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics);
+            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics,wave64);
             if (next != instructions.end() && instruction.next > next->first)
                 refuse(pc, "overlapping instruction boundaries");
             instructions.emplace_hint(next, pc, instruction);
@@ -896,7 +897,7 @@ struct Emit {
     void image(const Inst &i, const State &state) {
         unsigned mask = (i.a >> 8) & 15, base = ((i.b >> 16) & 31) * 4, addr = i.b & 255;
         const bool half_store = i.op == 8 && (i.b & 0x80000000u);
-        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3e000000u))
+        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3c000000u))
             refuse(i.pc, "unsupported image flags");
         bool store = i.op == 8, lod = i.op == 39, gather = i.op == 71;
         if (i.op != 0 && !store && !lod && !gather)
