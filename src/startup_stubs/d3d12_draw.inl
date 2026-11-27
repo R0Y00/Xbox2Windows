@@ -9,11 +9,17 @@
 // buffers named by the hardware descriptors in its tables, textures behind view tokens) into an
 // upload ring / a private descriptor heap.
 
-// A pixel-stage image store (#1996 item F): tools/startup/gfx2hlsl.py writes 'uav N tex2d table P O' for the
-// RWTexture2D<float4> at u<N>, whose descriptor is at byte O of the title's root table P. Only that form is
-// read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+#include "startup_stubs/typed_uav_load.h"
+
+// A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
+// for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
+// root table P. Only that form is read; a view qualifier or a 'channels' field, as in the compute line, is refused.
+// A trailing 'typedload' means the binding must also support a typed UAV load. The translator does not emit it
+// for a component store, which does not read the texel.
 struct PixelUav {
     unsigned index = 0, parameter = 0, offset = 0;
+    bool array = false;
+    bool needs_typed_load = false;
 };
 constexpr unsigned pixel_uav_limit = 8;
 
@@ -34,13 +40,15 @@ const char* read_pixel_uav_line(const std::string& line, PixelUav& out)
     if (w.size() < 2 || w[0] != "uav" || !number(w[1], out.index)) return "malformed view index";
     if (w.size() < 3) return "missing view kind";
     if (w[2] == "raw" || w[2] == "table") return "buffer view (raw uav) is not bound";
-    if (w[2] != "tex2d") return "only tex2d views are bound";
+    if (w[2] != "tex2d" && w[2] != "tex2da") return "only tex2d and tex2da views are bound";
+    out.array = w[2] == "tex2da";
     if (w.size() > 3 && (w[3] == "float" || w[3] == "uint" || w[3] == "sint")) return "a view qualifier is not read for pixel stores";
     if (w.size() < 4 || w[3] != "table") return "view source is not a table";
     if (w.size() < 6) return "missing table parameter or offset";
-    if (w.size() > 6) return "unexpected field after the table offset";
+    if (w.size() > 7 || (w.size() == 7 && w[6] != "typedload")) return "unexpected field after the table offset";
     if (!number(w[4], out.parameter) || out.parameter >= 16) return "table parameter out of range";
     if (!number(w[5], out.offset)) return "malformed table offset";
+    out.needs_typed_load = w.size() == 7;
     return nullptr;
 }
 
@@ -84,18 +92,29 @@ bool srgb_uav_format(DXGI_FORMAT format)
            format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
-// The view of mip 0 of a 2D texture for a pixel UAV. resource is the desktop description, title_view the title's
-// own view (nullptr when it passed none) with console format values already mapped. Returns nullptr and fills
-// out, or the reason the binding is refused.
+// The view of mip 0 of a 2D or 2D-array texture for a pixel UAV. resource is the desktop description, title_view
+// the title's own view (nullptr when it passed none) with console format values already mapped, and array is true
+// for a manifest 'tex2da' view. Returns nullptr and fills out, or the reason the binding is refused.
 const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& resource,
-                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+                           const D3D12_UNORDERED_ACCESS_VIEW_DESC* title_view, bool array,
+                           D3D12_UNORDERED_ACCESS_VIEW_DESC& out, bool needs_typed_load = false)
 {
     if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return "resource is not a 2D texture";
-    if (resource.DepthOrArraySize != 1) return "resource is a texture array";
+    if (!array && resource.DepthOrArraySize != 1) return "resource is a texture array";
     if (resource.SampleDesc.Count != 1) return "resource is multisampled";
     if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return "resource lacks ALLOW_UNORDERED_ACCESS";
     DXGI_FORMAT format = resource.Format;
-    if (title_view) {
+    if (array) {
+        if (!title_view || title_view->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+            return "view is not a 2D array texture view";
+        const auto& a = title_view->Texture2DArray;
+        if (a.MipSlice != 0) return "view names a mip other than 0";
+        if (a.PlaneSlice != 0) return "view names a plane other than 0";
+        if (a.FirstArraySlice >= resource.DepthOrArraySize || !a.ArraySize ||
+            a.ArraySize > resource.DepthOrArraySize - a.FirstArraySlice)
+            return "array view slice range is outside the resource";
+        if (title_view->Format != DXGI_FORMAT_UNKNOWN) format = title_view->Format;
+    } else if (title_view) {
         if (title_view->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D) return "view is not a 2D texture view";
         if (title_view->Texture2D.MipSlice != 0) return "view names a mip other than 0";
         if (title_view->Texture2D.PlaneSlice != 0) return "view names a plane other than 0";
@@ -108,9 +127,25 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
         !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
         return "format has no typed UAV store on this device";
+    // Before the view is filled, and therefore before the draw. A component store does not set
+    // needs_typed_load: it never reads the texel. A binding that does is refused when this device
+    // cannot load the format.
+    if (needs_typed_load) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        const bool additional = SUCCEEDED(device->CheckFeatureSupport(
+                                    D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+                                options.TypedUAVLoadAdditionalFormats;
+        if (const char* load = typed_uav_load_refusal(format, support.Support2, additional))
+            return load;
+    }
     out = {};
     out.Format = format;
-    out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    if (array) {
+        out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        out.Texture2DArray = title_view->Texture2DArray;
+    } else {
+        out.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    }
     return nullptr;
 }
 
@@ -119,7 +154,7 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
-    ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
+    x2w_startup::ManifestRetry manifest_retry;  // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
@@ -247,18 +282,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!read_text(path, manifest)) {
-        if (!tr.retry_manifest_at) {
+        if (!tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
         }
-        tr.retry_manifest_at = GetTickCount64() + 1000;
+        tr.manifest_retry.missed(GetTickCount64());
         return;
     }
     // The writer publishes this marker last. A malformed published result stays rejected.
-    const bool previously_missing = tr.retry_manifest_at != 0;
-    tr.retry_manifest_at = 0;
+    const bool previously_missing = tr.manifest_retry.pending();
+    tr.manifest_retry.found();
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -353,7 +388,7 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-18";
+    constexpr char revision[] = "x2w-startup-shader-29";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
@@ -474,7 +509,7 @@ u64 publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-18cs";  // tools/startup/gfx2hlsl.py compute_key
+    constexpr char compute_revision[] = "x2w-startup-shader-29cs";  // tools/startup/gfx2hlsl.py compute_key
     u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
@@ -878,7 +913,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+        if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
         return base;
     }
@@ -895,7 +930,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
-    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
+    } else if (entry->manifest_retry.due(GetTickCount64())) {
         load_translation(*entry, request);
     }
     return entry;
@@ -1053,8 +1088,7 @@ std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static s
 u64 address_upload_revision;
 
 // A texture published in a newly supported console layout is not filled through the shared upload ring.
-// The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
-// recorded copy long after later uploads have passed over its source bytes. Each such upload owns
+// The bounded ring can fill while a queue waits on a fence. Each such upload owns
 // its upload buffer instead. The buffer and the texture it fills stay referenced by the recording,
 // and by every submit of that recording until the queue it went to has completed the submit, as
 // for the sampler heaps above.
@@ -1206,14 +1240,14 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
 // upload ring is write-combined memory that is slow to read, so the comparison is against this copy, not the ring.
 struct FrameCopy {
     u64 address = 0;
-    u64 offset = 0;
+    UploadReservation slice;
     std::vector<unsigned char> content;
 };
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
-bool frame_copy(u64 address, std::size_t bytes, u64* offset)
+bool frame_copy(Wrapper* self, u64 address, std::size_t bytes, u64* offset, ID3D12Resource** resource)
 {
     if (frame_copies_frame != frame_number) {
         frame_copies().clear();
@@ -1224,29 +1258,40 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
-        *offset = found->second.offset;
-        return true;
+        const auto& slice = found->second.slice;
+        AcquireSRWLockExclusive(&allocator_lock);
+        for (unsigned i = 0; i < upload_chunks.size(); ++i) {
+            auto& chunk = upload_chunks[i];
+            if (chunk.resource == slice.resource && chunk.generation == slice.generation) {
+                chunk.hold(self->own().upload_chunks, i);
+                ReleaseSRWLockExclusive(&allocator_lock);
+                *offset = slice.offset;
+                if (resource) *resource = slice.resource;
+                return true;
+            }
+        }
+        ReleaseSRWLockExclusive(&allocator_lock);
     }
-    u64 fresh = 0;
-    auto* ring = reserve_upload_ring(bytes, &fresh);
-    if (!ring) return false;
+    const auto slice = reserve_upload_ring(self, bytes);
+    if (!slice.mapped) return false;
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
         std::vector<unsigned char> content(title, title + bytes);
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
-        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, std::move(content)});
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, slice, std::move(content)});
         source = entry.first->second.content.data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
-    std::memcpy(ring, source, bytes);
+    std::memcpy(slice.mapped, source, bytes);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
             log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
     }
-    *offset = fresh;
+    *offset = slice.offset;
+    if (resource) *resource = slice.resource;
     return true;
 }
 
@@ -1409,19 +1454,20 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
                 u64 offset = owned.cursor;
+                ID3D12Resource* chunk = nullptr;
                 unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
                 if (owned.cpu) {
                     owned.cursor += (bytes + placement - 1) & ~(placement - 1);
                 } else {
-                    rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-                    if (!rows) {
+                    rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    if (!rows || !chunk) {
                         state.done = false;
                         return false;
                     }
                     std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 }
                 console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : upload_ring, mips, slices, slice, i, offset);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : chunk, mips, slices, slice, i, offset);
             }
         }
         if (dedicated) {
@@ -1434,36 +1480,39 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
-                auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-                if (!rows) {
+                ID3D12Resource* chunk = nullptr;
+                auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                if (!rows || !chunk) {
                     state.done = false;
                     return true;
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, upload_ring, mips, slices, slice, i, offset);
+                plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
             }
         }
     } else if (tiled && !single) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
-        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-        if (!rows) {
+        ID3D12Resource* chunk = nullptr;
+        auto* rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+        if (!rows || !chunk) {
             state.done = false;
             return true;
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
-        plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
+        plan.upload(list, texture, chunk, 1, 1, 0, 0, offset);
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
                 const auto& fp = plan.placed[i];
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
+                ID3D12Resource* chunk = nullptr;
                 if (is_compact) {
-                    auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-                    if (!rows) {
+                    auto* const rows = reserve_upload_ring(self, static_cast<std::size_t>(bytes), &offset, &chunk);
+                    if (!rows || !chunk) {
                         state.done = false;
                         return true;
                     }
@@ -1471,11 +1520,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     for (u64 y = 0; y < level.rows; ++y)
                         std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
                                     static_cast<std::size_t>(level.row_bytes));
-                } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                } else if (!ring_copy(self, reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk) || !chunk) {
                     state.done = false;
                     return true;
                 }
-                plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+                plan.upload(list, texture, chunk, mips, slices, s, i, offset);
             }
     }
     state.hash = hash;
@@ -1506,18 +1555,48 @@ LONG draw_dump_frame()
     }();
     return frame;
 }
+struct DrawDumpPixel {
+    bool enabled{};
+    UINT x{}, y{};
+};
+// X2W_DRAW_DUMP_PIXEL=<x>,<y>: keep one texel after each translated draw of the dumped frame
+// instead of the whole target. The report names the draw ordinal, the manifest key and the value.
+DrawDumpPixel draw_dump_pixel()
+{
+    static const DrawDumpPixel pixel = [] {
+        DrawDumpPixel value{};
+        char text[64]{};
+        if (!GetEnvironmentVariableA("X2W_DRAW_DUMP_PIXEL", text, sizeof(text))) return value;
+        unsigned x = 0, y = 0;
+        char trailing = 0;
+        if (std::sscanf(text, "%u,%u%c", &x, &y, &trailing) != 2) return value;
+        value.enabled = true;
+        value.x = x;
+        value.y = y;
+        return value;
+    }();
+    return pixel;
+}
 void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT count)
 {
     Pass& pass = pass_of(self);
     const LONG wanted = draw_dump_frame();
+    const DrawDumpPixel pixel = draw_dump_pixel();
     if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().full()) return;
     const D3D12_RESOURCE_DESC desc = pass.target0->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-        !x2w_draw_bmp::supported(desc.Format)) return;
+        (!x2w_draw_bmp::supported(desc.Format) && !(pixel.enabled && x2w_startup::pixel_history_supported(desc.Format)))) return;
+    if (pixel.enabled && (pixel.x >= desc.Width || pixel.y >= desc.Height)) return;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
     UINT64 row_bytes = 0, total = 0;
-    device_of(the_device)->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+    if (pixel.enabled) {
+        footprint.Footprint = {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        rows = 1;
+        total = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    } else {
+        device_of(the_device)->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+    }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1538,13 +1617,22 @@ void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UI
     dump.key = key;
     dump.count = count;
     dump.format = desc.Format;
+    dump.frame = frame_number;
+    dump.pixel = pixel.enabled;
+    dump.pixel_x = pixel.x;
+    dump.pixel_y = pixel.y;
     if (!draw_dumps().record(list, std::move(dump))) return;
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION target{readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     target.PlacedFootprint = footprint;
     D3D12_TEXTURE_COPY_LOCATION source{pass.target0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     source.SubresourceIndex = 0;
-    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    if (pixel.enabled) {
+        const D3D12_BOX box{pixel.x, pixel.y, 0, pixel.x + 1, pixel.y + 1, 1};
+        list->CopyTextureRegion(&target, 0, 0, 0, &source, &box);
+    } else {
+        list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    }
     require_state(self, pass.target0, D3D12_RESOURCE_STATE_RENDER_TARGET);
 }
 void draw_dump_flush()
@@ -1554,6 +1642,30 @@ void draw_dump_flush()
     if (completed.empty()) return;
     char folder[MAX_PATH] = ".";
     GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", folder, sizeof(folder));
+    if (draw_dump_pixel().enabled) {
+        static std::vector<x2w_startup::PixelHistorySample> samples;
+        std::sort(completed.begin(), completed.end(), [](const DrawDump& a, const DrawDump& b) { return a.index < b.index; });
+        for (const DrawDump& dump : completed) {
+            void* mapped = nullptr;
+            if (FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
+            x2w_startup::PixelHistorySample sample{};
+            sample.draw = dump.index;
+            sample.frame = dump.frame;
+            sample.x = dump.pixel_x;
+            sample.y = dump.pixel_y;
+            sample.key = dump.key;
+            sample.count = dump.count;
+            sample.format = dump.format;
+            x2w_startup::pixel_history_decode(sample, static_cast<const unsigned char*>(mapped) + dump.footprint.Offset);
+            const D3D12_RANGE no_writes{};
+            dump.buffer->Unmap(0, &no_writes);
+            samples.push_back(sample);
+        }
+        std::sort(samples.begin(), samples.end(), [](const auto& a, const auto& b) { return a.draw < b.draw; });
+        const bool written = x2w_startup::pixel_history_write(folder, samples.data(), samples.size());
+        log("x2w-draw pixel history: %s %zu samples at %s", written ? "wrote" : "could not write", samples.size(), folder);
+        return;
+    }
     int written = 0;
     for (const DrawDump& dump : completed) {
         const int index = static_cast<int>(dump.index);
@@ -1855,12 +1967,20 @@ struct IndirectBufferView {
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
-IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false)
+// why, when given, receives the condition an empty result failed on.
+IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
+                                         const char** why = nullptr,
+                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP)
 {
-    constexpr u64 limit = 16u << 20;
+    const auto refuse = [why](const char* reason) {
+        if (why) *why = reason;
+        return IndirectBufferView{};
+    };
     u64 address = 0, offset = 0, bytes = 0;
     UINT stride = 0;
     const Wrapper* owner = nullptr;
+    bool own_memory = false;
+    if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
         AcquireSRWLockShared(&note_lock);
@@ -1876,7 +1996,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             std::memcpy(&view, record.desc, 40);
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
-                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return {};
+                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
             const bool raw = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && !view.Buffer.StructureByteStride &&
                 view.Format == DXGI_FORMAT_R32_TYPELESS;
             const bool structured = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && view.Buffer.StructureByteStride &&
@@ -1884,57 +2004,81 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             const bool typed = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && !view.Buffer.StructureByteStride;
             const UINT element = raw ? 4 : structured ? view.Buffer.StructureByteStride :
                 typed ? x2w_startup::typed_buffer_format_bytes(view.Format) : 0;
-            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return {};
+            if (!element || view.Buffer.FirstElement > UINT64_MAX / element) return refuse("an input buffer view has no element size or overflows");
             offset = view.Buffer.FirstElement * element;
             bytes = u64{view.Buffer.NumElements} * element;
             stride = raw ? 0 : element;
             if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
-                if (offset > UINT64_MAX - base) return {};
-                address = base + offset;
+                // A buffer on a custom heap outside the placement index (the memory view path places it in the title's
+                // own heap) is that memory: the view offset is bound in the token's own desktop resource.
+                const auto* info = resource_info(owner);
+                D3D12_HEAP_PROPERTIES props{};
+                D3D12_HEAP_FLAGS flags{};
+                own_memory = info && info->placement == Placement::none &&
+                    SUCCEEDED(static_cast<ID3D12Resource*>(owner->own().real)->GetHeapProperties(&props, &flags)) &&
+                    props.Type == D3D12_HEAP_TYPE_CUSTOM;
+                if (offset > UINT64_MAX - base) return refuse("an input buffer view has no element size or overflows");
+                if (!own_memory) address = base + offset;
             }
+        } else {
+            return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
-    if (!bytes || bytes > limit || bytes % 4) return {};
+    if (!bytes) return refuse("an input buffer descriptor has zero records");
+    if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
+        ? "an input buffer range is over 16 MiB or not whole dwords"
+        : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
             if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
-            return {};
+            return refuse("an input buffer view token names the list's upload memory");
         }
         const auto placed = placed_buffer_range(device, address, bytes);
-        if (placed.reject || (owner && owner != placed.owner)) return {};
+        if (placed.reject) return refuse("an input range crosses the end of a placed buffer");
+        if (owner && owner != placed.owner) return refuse("an input buffer view token's resource does not hold its range");
         if (!placed.owner) {
-            const auto alias = allow_address_alias && !list_upload_range(self, address, 1).resource
-                ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            const bool in_upload = list_upload_range(self, address, 1).resource != nullptr;
+            const auto alias = allow_address_alias && !in_upload && bytes <= (16u << 20) ? indirect_address_alias(device, address, bytes) : IndirectAddressAlias{};
+            if (!alias.resource)
+                return refuse(in_upload ? "an input range crosses the end of its upload allocation"
+                                        : "an input is in title memory outside any placed buffer");
             return {alias.resource, alias.offset, bytes, stride};
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes))) return {};
+        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
+            return refuse("an input is in a placed buffer that does not alias title memory");
+    } else if (own_memory) {
+        native = static_cast<ID3D12Resource*>(owner->own().real);
     } else if (owner && !owner->own().title_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
         D3D12_HEAP_PROPERTIES props{};
         D3D12_HEAP_FLAGS flags{};
         if (FAILED(native->GetHeapProperties(&props, &flags)) ||
-            (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD)) return {};
+            (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD))
+            return refuse("an input buffer view token's resource is not on a default or upload heap");
         upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
     }
-    if (!native || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
-        !InterlockedCompareExchange(&owner->own().refs, 0, 0)) return {};
+    if (!native) return refuse("an input buffer descriptor has a null address");
+    if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return refuse("an input buffer range is not 16-byte aligned in its resource");
+    if (!InterlockedCompareExchange(&owner->own().refs, 0, 0)) return refuse("an input buffer's resource is released");
     const auto* info = resource_info(owner);
-    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON) return {};
+    if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+        return refuse("an input buffer's resource was not created in the common state");
     x2w_startup::ComPtr<ID3D12Device> native_device;
-    if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device)) return {};
+    if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device))
+        return refuse("an input buffer's resource is on another device");
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
-        offset > desc.Width || bytes > desc.Width - offset) return {};
+        offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
     return {native, offset, bytes, stride, upload};
 }
 
@@ -1942,6 +2086,29 @@ struct FormattedBufferDescriptor {
     u64 entry = 0;
     std::uint32_t words[8] = {};
 };
+
+// Word 3 of a buffer descriptor as a formatted load decodes it (words[3]): the title's hardware word, or for a typed
+// buffer view the title created (words[0] its token) the word the driver builds from its format and component
+// mapping. Returns the refusal, with an unsupported FORMAT in format. Draws and compute Dispatch share it.
+const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
+{
+    if (words[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        const bool known = words[1] < view_records().size();
+        if (known) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::memcpy(&view, record.desc, 40);
+        return x2w_startup::view_word3(view, words[3]);
+    }
+    if (const auto code = x2w_startup::formatted_buffer_code(words[3]); !x2w_startup::formatted_buffer_supported(code)) {
+        format = code;
+        return "unsupported FORMAT";
+    }
+    return x2w_startup::descriptor_word3_refusal(words[3]);
+}
 
 bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedBufferDescriptor (&descriptors)[32])
 {
@@ -1965,25 +2132,8 @@ bool formatted_buffers_ready(const Translation& tr, const Pass& pass, FormattedB
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(descriptor.words)))
             return refuse(ud.a, "missing hardware descriptor");
         std::memcpy(descriptor.words, reinterpret_cast<const void*>(entry), sizeof(descriptor.words));
-        if (descriptor.words[0] == view_token_magic) {
-            // A typed buffer view the title created: the driver builds word 3 from its format and component mapping.
-            ViewRecord record{};
-            AcquireSRWLockShared(&note_lock);
-            const bool known = descriptor.words[1] < view_records().size();
-            if (known) record = view_records()[descriptor.words[1]];
-            ReleaseSRWLockShared(&note_lock);
-            if (!known || record.slot != 18 || record.desc_bytes < 40)
-                return refuse(ud.a, "missing hardware descriptor");
-            D3D12_SHADER_RESOURCE_VIEW_DESC view;
-            std::memcpy(&view, record.desc, 40);
-            if (const char* reason = x2w_startup::view_word3(view, descriptor.words[3])) return refuse(ud.a, reason);
-            descriptor.entry = entry;
-            continue;
-        }
-        const auto format = x2w_startup::formatted_buffer_code(descriptor.words[3]);
-        if (!x2w_startup::formatted_buffer_supported(format))
-            return refuse(ud.a, "unsupported FORMAT", format);
-        if (const char* reason = x2w_startup::descriptor_word3_refusal(descriptor.words[3])) return refuse(ud.a, reason);
+        std::uint32_t format = 0;
+        if (const char* reason = formatted_buffer_word3(descriptor.words, format)) return refuse(ud.a, reason, format);
         descriptor.entry = entry;
     }
     return true;
@@ -2034,7 +2184,8 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             title_view.Format = desktop_format(title_view.Format);
         }
         const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr, out[i].view);
+        const char* reason = pixel_uav_view(device_of(the_device), desc, described ? &title_view : nullptr,
+                                            uav.array, out[i].view, uav.needs_typed_load);
         if (reason) {
             static LONG refused_view;
             if (first_calls(refused_view, 16))
@@ -2179,13 +2330,26 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
     D3D12_INDEX_BUFFER_VIEW live_indices{};
     ID3D12Resource* live_index_resource = nullptr;
+    bool index_read_as_table = false;  // live_index_resource is also bound as a table SRV (X2W_D3D12_TABLE_ALIAS)
+    const auto stream_needs_slicing = [&](const Translation::Srv& srv) {
+        if (srv.source != 1) return false;
+        if (srv.a < 0 || srv.a >= 8) return true;
+        const auto bytes = pass.vb[srv.a].SizeInBytes;
+        if (!bytes) return false;
+        const auto& placed = pass.placed_vb[srv.a];
+        const u64 address = pass.vb[srv.a].BufferLocation;
+        if (!placed.alias || placed.reject || !placed.owner) return true;
+        if (!InterlockedCompareExchange(&placed.owner->own().refs, 0, 0)) return true;
+        if (address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT != 0 || bytes % 4 != 0) return true;
+        return false;
+    };
     // A vertex-stream SRV uses the recording-time index scan to size and rebase its view.
     // For other draws, a live alias lets IA observe legal CPU writes made before submission.
     if (indices_ok && index_total && index_address >= pass.ib.BufferLocation &&
         (pass.ib.Format == DXGI_FORMAT_R16_UINT || pass.ib.Format == DXGI_FORMAT_R32_UINT) &&
         index_address % index_bytes == 0 && index_start <= pass.ib.SizeInBytes &&
         index_total <= pass.ib.SizeInBytes - index_start &&
-        std::none_of(tr->srvs.begin(), tr->srvs.end(), [](const Translation::Srv& srv) { return srv.source == 1; })) {
+        std::none_of(tr->srvs.begin(), tr->srvs.end(), stream_needs_slicing)) {
         const auto placed = placed_buffer_range(self->own().list_device, index_address, index_total);
         if (!placed.reject && placed.alias && InterlockedCompareExchange(&placed.owner->own().refs, 0, 0)) {
             const auto base = reinterpret_cast<u64>(placed.owner->own().title_memory);
@@ -2231,6 +2395,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 const u64 wanted = u64{vertex_count} * strides[i];
                 address += skip;
                 bytes = static_cast<std::size_t>(wanted < bytes - skip ? wanted : bytes - skip);
+            }
+            if (live_index_resource && placed.alias) {
+                retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(placed.alias));
             }
         } else if (srv.source == 2 && srv.a < 16) {
             address = pass.root_address[srv.a];
@@ -2411,6 +2578,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
+        const std::size_t view_bytes = bytes;  // before the 16 MiB copy cap
         if (bytes > (16u << 20)) {
             bytes = 16u << 20;
             // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
@@ -2433,6 +2601,31 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_facts.bound = bound;
             count_null_binding(x2w_local::classify_null_binding(buffer_facts));
         };
+        // X2W_D3D12_TABLE_ALIAS=1: a table buffer whose whole range lies in a placed buffer that aliases title memory
+        // binds that alias, as vertex streams do, instead of a frame copy. The GPU then reads the bytes at execution,
+        // not as they were when the draw was recorded, and the range is not cut at 16 MiB.
+        static const bool table_alias = x2w_local::env_on("X2W_D3D12_TABLE_ALIAS");
+        // The raw view covers whole DWORDs, so the alias must hold the rounded range.
+        const std::size_t raw_bytes = (view_bytes + 3) & ~std::size_t{3};
+        if (table_alias && srv.source == 0 && !formatted.entry && address && view_bytes && raw_bytes <= (512u << 20)) {
+            const auto table_placed = placed_buffer_range(self->own().list_device, address, raw_bytes);
+            if (!table_placed.reject && table_placed.alias && table_placed.owner &&
+                InterlockedCompareExchange(&table_placed.owner->own().refs, 0, 0)) {
+                const u64 view_offset = address - reinterpret_cast<u64>(table_placed.owner->own().title_memory);
+                if (view_offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 &&
+                    retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(table_placed.alias))) {
+                    // The same alias can also be this draw's live index buffer; it then keeps both read states.
+                    const bool shared_index = table_placed.alias == live_index_resource;
+                    index_read_as_table |= shared_index;
+                    require_state(self, table_placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                  (shared_index ? D3D12_RESOURCE_STATE_INDEX_BUFFER : D3D12_RESOURCE_STATE_COMMON));
+                    buffer_view(dest, table_placed.alias, view_offset, raw_bytes);
+                    count_buffer(true);
+                    continue;
+                }
+            }
+        }
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
             buffer_view(dest, nullptr, 0, 0);
             count_buffer(false);
@@ -2442,12 +2635,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // Preserve tight byte-sized streams. The desktop raw view is rounded
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(padded, &offset) : nullptr;
+            ID3D12Resource* chunk = nullptr;
+            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
             }
-            buffer_view(dest, target ? upload_ring : nullptr, offset, padded);
+            buffer_view(dest, target ? chunk : nullptr, offset, padded);
             count_buffer(target != nullptr);
             continue;
         }
@@ -2456,7 +2650,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
         }
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
+        ID3D12Resource* chunk = nullptr;
+        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
@@ -2474,9 +2669,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
             address = reinterpret_cast<u64>(identity);
             bytes = sizeof(identity);
-            have = frame_copy(address, bytes, &offset);
+            have = frame_copy(self, address, bytes, &offset, &chunk);
         }
-        buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
+        buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
         if (first_calls(tr->logged_bindings, 8)) {
             char head[3 * 48 + 1] = "";
@@ -2491,9 +2686,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         require_state(self, uav_bindings[j].resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         device_of(the_device)->CreateUnorderedAccessView(uav_bindings[j].resource, nullptr, &uav_bindings[j].view, dest);
         static LONG shown;
-        if (first_calls(shown, 6))
-            log("x2w-draw   %016llx uav %u: resource %p format %d mip 0", tr->key, j, static_cast<void*>(uav_bindings[j].resource),
-                uav_bindings[j].view.Format);
+        if (first_calls(shown, 6)) {
+            if (uav_bindings[j].view.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+                log("x2w-draw   %016llx uav %u: resource %p format %d array [%u..%u) mip 0", tr->key, j,
+                    static_cast<void*>(uav_bindings[j].resource), uav_bindings[j].view.Format,
+                    uav_bindings[j].view.Texture2DArray.FirstArraySlice,
+                    uav_bindings[j].view.Texture2DArray.FirstArraySlice + uav_bindings[j].view.Texture2DArray.ArraySize);
+            else
+                log("x2w-draw   %016llx uav %u: resource %p format %d mip 0", tr->key, j,
+                    static_cast<void*>(uav_bindings[j].resource), uav_bindings[j].view.Format);
+        }
     }
     static LONG checks;
     if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
@@ -2568,11 +2770,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     } else if (indexed) {
         u64 offset = 0;
+        ID3D12Resource* index_chunk = nullptr;
         auto view = live_indices;
         if (live_index_resource) {
-            require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
-        } else if (indices_ok && frame_copy(index_address, index_total, &offset)) {
-            view = {upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
+            require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                          (index_read_as_table ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                               : D3D12_RESOURCE_STATE_COMMON));
+        } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
+            view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         }
         if (view.BufferLocation) {

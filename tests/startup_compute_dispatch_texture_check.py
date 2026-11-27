@@ -13,12 +13,17 @@ runs share one cache:
 4. texture-store-denied (a texture without unordered access, whose view the stand-in does not create): refused
    with one logged reason, every half keeps its sentinel.
 A fifth run binds the same program under a manifest edited to declare no entry values.
+The 1D and 3D float texture cases check mip-one readback, a mismatched view, and an invalid 3D W range.
 
 Texture input: case A of startup_gfx2hlsl_compute_check.py with a level-zero sample of a 2D texture XORed into the
 stored word (a static sampler, a texture view at table byte 64). The consumer adds a 1x1 RGBA8 texture whose red
 is 1.0 and a shader resource view of it (device slot 18). After translation all 320 words equal the case's
 expectation XOR the bits of 1.0f; dispatch-sampled-unbound (no view created) is refused with one logged reason and
 every word keeps the sentinel.
+
+Filtered input: the texture input case with a constant wrap, linear sampler that the translator writes as `smpl`
+and a 2x1 texture (dispatch-sampled-2x1): red 0.5 at the left edge. The same program with the manifest's sampler
+changed to clamp reads red 0 (the control); `smpc` and `smpheap` lines are refused with their reasons.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -30,6 +35,7 @@ import tempfile
 
 import startup_compute_image_store_d16_check as S
 import startup_gfx2hlsl_compute_check as C
+import startup_gfx2hlsl_image_store_3d1d_check as V
 from startup_compute_dispatch_check import lines
 from startup_compute_request_check import DATA, prepare
 from startup_compute_translate_check import state_a
@@ -100,6 +106,18 @@ def store(directory, consumer, dxc, env):
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an output texture view was not created on the desktop' in refused[0], result.stderr[-3000:]
 
+    # A refused creation over a descriptor that holds a live view keeps that view: the Dispatch still writes the texture.
+    got, result = run(directory, consumer, env, 'texture-store-occupied', layout)
+    wrong = [i for i in range(halves) if got[i] != expected[i]]
+    assert not wrong, 'occupied slot: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+
+    # The same when the live token reached the slot by a memory copy in title memory instead of a creation there.
+    got, result = run(directory, consumer, env, 'texture-store-copied', layout)
+    wrong = [i for i in range(halves) if got[i] != expected[i]]
+    assert not wrong, 'copied token: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+
     # Refusals the runtime already had, each with its one logged reason and an untouched texture: an integer view
     # format, another manifest version, another stage, and (with a manifest line added here for a view the consumer
     # creates) the output texture named as an input too.
@@ -130,6 +148,54 @@ def store(directory, consumer, dxc, env):
     clean(result)
     print(f'texture output: all {halves} halves match after translation (64 changed) and without entry values; '
           f'untouched before translation, without a Dispatch and for a refused view; debug layer: {layer}')
+
+
+def store_3d1d(directory, consumer, dxc, env, form):
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    (directory / 'compute_root').write_bytes(C.root_blob(3, table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    (directory / 'program').write_bytes(V.program(form))
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(V.group(form), V.A.RSRC2))
+
+    volume = form != 'line'
+    mode = 'texture-volume' if volume else 'texture-line'
+    width, height, depth = 32, 8 if volume else 1, 6 if volume else 1
+    plane_words = width * height * 4
+    initial = [0xbf000000 | (z << 12) | i for z in range(depth) for i in range(plane_words)]
+    expected = initial.copy()
+    for y in range(V.group(form)[1]):
+        # The 3D view starts at W slice 1 and the shader writes relative z=1.
+        start = (2 * plane_words if volume else 0) + y * width * 4
+        expected[start:start + 32] = V.VALUES * 8
+    layout = '<%dI' % len(initial)
+    got, result = run(directory, consumer, env, mode, layout)
+    assert got == initial and len(lines(result, 'Dispatch(2, 1, 1) refused: no translation')) == 1
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+    manifest = (cache / f'{key:016x}.txt').read_text().splitlines()
+    dim = '3d' if volume else '1d'
+    assert f'uav 0 tex{dim} float table 1 64 channels 4' in manifest, manifest
+    got, result = run(directory, consumer, env, mode, layout)
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+    assert got == expected, (form, sum(a != b for a, b in zip(got, expected, strict=True)))
+    clean(result)
+
+    mismatch = initial[:32 * 8 * 4] if volume else [0xbf000000 | i for i in range(32 * 8 * 4)]
+    cases = [('texture-array-2d', mismatch, f'an output texture view or resource is not {dim.upper()}')]
+    if volume:
+        # Manual mutant: skipping the mip-relative W-range check must fail the required refusal.
+        cases.append(('texture-volume-bad-w', initial, 'an output 3D texture W range is outside the mip'))
+    else:
+        # Manual mutant: dropping the 1D mip check before `created` must fail this required refusal.
+        cases.append(('texture-line-bad-mip', initial, 'an output 1D texture mip is outside the resource'))
+    for bad_mode, untouched, reason in cases:
+        got, result = run(directory, consumer, env, bad_mode, '<%dI' % len(untouched))
+        refusal = lines(result, 'Dispatch(2, 1, 1) refused:')
+        assert len(refusal) == 1 and refusal[0].endswith(reason), result.stderr[-3000:]
+        assert got == untouched and not lines(result, 'Dispatch(2, 1, 1) translated')
+    print(f'{form}: {len(expected)} mip-one words match; incompatible views refused with sentinels intact')
 
 
 # v_xor_b32 v5, v5, v12: the assembled `v_xor_b32 v5, v5, v6` of case A with its second source register changed
@@ -187,13 +253,76 @@ def sample(directory, consumer, dxc, env):
           f'view; debug layer: {layer}')
 
 
+# The texture input case with a constant sampler instead of the zero one: s21 MAX_LOD 12, s22 linear min, mag and mip
+# filters, s20 wrap in U, V and W. A mip filter makes the translator write it as `smpl` (its LOD clamp carried over).
+WRAP_LINEAR = (0x0, 0xc00000, 0x18500000, 0x0)
+LOD_SAMPLED = SAMPLED[:2] + ('s_mov_b32 s21, 0xc00000', 's_mov_b32 s22, 0x18500000') + SAMPLED[2:]
+
+
+def filtered(directory, consumer, dxc, env):
+    """The sampler bound is the manifest's: a 2x1 texture (red 0, 1.0) read at the left edge (the coordinates are the
+    bits of the thread ids, 0 or a denormal) gives red 0.5 only through a linear filter that wraps; clamp gives 0."""
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    _, _, rsrc2, group, _ = C.CASES['A']
+    C.SPLICE.update({XOR: '05190a3a', LOD_SAMPLED[2]: 'ff0395be0000c000', LOD_SAMPLED[3]: 'ff0396be00005018'})
+    code = C.splice(*LOD_SAMPLED)
+    line = 'smpl 0 %s' % ' '.join('0x%x' % w for w in WRAP_LINEAR)
+    assert C.translate('A', code=code).manifest().endswith(line + '\n'), C.translate('A', code=code).manifest()
+    (directory / 'program').write_bytes(code)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    written = 24 * 3 * 2 * 2
+    plain = C.expected('A')
+    layout = '<%dI' % C.WORDS
+
+    def reds(got):
+        assert got[written:] == plain[written:], 'a word past the threads changed'
+        return {struct.unpack('<f', struct.pack('<I', g ^ p))[0] for g, p in zip(got[:written], plain[:written])}
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    assert got == [C.SENTINEL] * C.WORDS, 'a Dispatch without a translation wrote the output'
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+    red = reds(got)
+    # 8-bit filter weights may round the half: one step of an 8-bit channel is the tolerance.
+    assert len(red) == 1 and abs(next(iter(red)) - 0.5) <= 1 / 255, (sorted(red), result.stderr[-3000:])
+    layer = clean(result)
+
+    # Control: the same program under the manifest's sampler changed to clamp in U, V and W reads red 0, which the
+    # check above refuses; a comparison sampler and a sampler heap table stay refused, each with its reason.
+    manifest = cache / f'{key:016x}.txt'
+    original = manifest.read_text()
+    assert original.count(line) == 1, original
+    manifest.write_bytes(original.replace(line, line.replace('smpl 0 0x0 ', 'smpl 0 0x92 ')).encode())
+    got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+    assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and reds(got) == {0.0}, result.stderr[-3000:]
+    for new, reason in ((line.replace('smpl', 'smpc'), 'a comparison sampler'),
+                        (line + '\nsmpheap 2048 1 fallback 2047', 'a sampler from the sampler heap')):
+        manifest.write_bytes(original.replace(line, new).encode())
+        got, result = run(directory, consumer, env, 'dispatch-sampled-2x1', layout)
+        refused = lines(result, 'refused: ')
+        assert got == [C.SENTINEL] * C.WORDS and len(refused) == 1 and refused[0].endswith('refused: ' + reason), (
+            reason, refused, result.stderr[-3000:])
+    print(f'filtered input: an smpl wrap and linear sampler reads red 0.5 at the left edge of a 2x1 texture; the same '
+          f'program with a clamp sampler reads 0; comparison and heap samplers refused; debug layer: {layer}')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
         store(Path(temporary) / 'store', consumer, dxc, env)
+        for form in V.FORMS:
+            store_3d1d(Path(temporary) / form, consumer, dxc, env, form)
         sample(Path(temporary) / 'sample', consumer, dxc, env)
+        filtered(Path(temporary) / 'filtered', consumer, dxc, env)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 

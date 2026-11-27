@@ -794,21 +794,21 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
+OperationResult run_check_pixel_compare_mips(const OperationContext& ctx)
 {
 // Windows SDK 10.0.22621 does not declare the SM 6.8 capability query.
 #if defined(__ID3D12Device14_INTERFACE_DEFINED__)
-    const bool bias = std::strcmp(ctx.argv[2], "--check-pixel-compare-bias") == 0;
-    const D3D_SHADER_MODEL required = bias ? D3D_SHADER_MODEL_6_8 : D3D_SHADER_MODEL_6_7;
+    const bool level = std::strcmp(ctx.argv[2], "--check-pixel-compare-level") == 0;
+    const D3D_SHADER_MODEL required = level ? D3D_SHADER_MODEL_6_7 : D3D_SHADER_MODEL_6_8;
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{required};
     if (FAILED(check_feature(ctx.device, D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))) ||
         shaderModel.HighestShaderModel < required)
-        return {OutcomeKind::skip, bias ? "Comparison bias requires SM 6.8" : "Comparison LOD requires SM 6.7"};
-    if (bias) {
+        return {OutcomeKind::skip, level ? "Comparison LOD requires SM 6.7" : "Comparison bias/gradient requires SM 6.8"};
+    if (!level) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
             !options.SampleCmpGradientAndBiasSupported)
-            return {OutcomeKind::skip, "Comparison bias requires SampleCmpGradientAndBiasSupported"};
+            return {OutcomeKind::skip, "Comparison bias/gradient requires SampleCmpGradientAndBiasSupported"};
     } else {
         D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
@@ -819,7 +819,7 @@ OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 #else
     (void)ctx;
-    return {OutcomeKind::skip, "Comparison LOD/bias fixture requires Windows SDK 10.0.26100 headers"};
+    return {OutcomeKind::skip, "Comparison mip fixture requires Windows SDK 10.0.26100 headers"};
 #endif
 }
 
@@ -945,6 +945,16 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                    ctx.argv[6]));
+}
+
+OperationResult run_mesh_shader_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, false));
+}
+
+OperationResult run_mesh_shader_pipeline_fallback(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_shader_pipeline(ctx.device, true));
 }
 
 OperationResult run_mesh_heap_sampler(const OperationContext& ctx)
@@ -1354,15 +1364,25 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] prints one RGBA32F pixel.
+// The optional selector is forwarded as the existing second root constant.
+// --startup-image-2d-array-view takes the identical args; argv[2] selects the two-slice 2D-array renderer.
 OperationResult run_startup_image_2d_view(const OperationContext& ctx)
 {
     const std::string_view window = ctx.argv[6];
     if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
         window[2] < '1' || window[2] > '3')
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array-view") == 0;
+    float selector = 0.0f;
+    if (ctx.argc == 8) {
+        if (std::strcmp(ctx.argv[7], "1") == 0)
+            selector = 1.0f;
+        else if (std::strcmp(ctx.argv[7], "0") != 0)
+            return {OutcomeKind::fail, "view selector must be 0 or 1"};
+    }
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], selector, color, ctx.argv[5], array, 3, false, !array,
                            UINT(window[0] - '0'), UINT(window[2] - '0'));
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
@@ -1406,18 +1426,29 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
-// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits> [coverage]: the translated pixel
+// stage stores to u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and
+// every other texel -1.0. Coverage is 1 (one pixel) or 2 (two pixels in one draw).
 OperationResult run_startup_image_store(const OperationContext& ctx)
 {
-    unsigned x = 0, y = 0;
+    unsigned x = 0, y = 0, coverage = 1;
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
-    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+    if (ctx.argc == 8 && (std::sscanf(ctx.argv[7], "%u", &coverage) != 1 || (coverage != 1 && coverage != 2)))
+        return {OutcomeKind::fail, "coverage is not 1 or 2"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected, coverage))
         return {OutcomeKind::fail, "image store readback differs"};
     return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-store-reject-load: a colour format without typed UAV load is refused before any draw.
+OperationResult run_startup_image_store_reject_load(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_image_store_typed_load(ctx.device))
+        return {OutcomeKind::fail, reason};
+    return {OutcomeKind::fail, "typed UAV load negative control found no refusal"};
 }
 
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
@@ -1508,6 +1539,23 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "pixel readback differs"};
     }
     std::printf("all %lu pixels matched\n", width * height);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-pixel-dump <vs.cso> <ps.cso> <width> <height> <out.bin>: the draw of --startup-pixel-words, but the
+// readback is written to the file (width * height * 4 little-endian words, row by row) for the caller to check.
+// Gated on wave operations: the caller's pixel stage reads its own lane and wave (tests that need a reference
+// per desktop wave, which only the readback can tell).
+OperationResult run_startup_pixel_dump(const OperationContext& ctx)
+{
+    const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
+    std::vector<std::uint32_t> pixels(size_t(width) * height * 4);
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    std::ofstream file(ctx.argv[7], std::ios::binary);
+    file.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(std::uint32_t)));
+    if (!file)
+        return {OutcomeKind::fail, "cannot write the readback file"};
+    std::printf("wrote %lu pixels\n", width * height);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1690,9 +1738,11 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-array-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store", 7, 8, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store-reject-load", 3, 3, nullptr, kNoGate, run_startup_image_store_reject_load},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
@@ -1702,6 +1752,7 @@ const OperationSpec kOperations[] = {
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1735,8 +1786,9 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
-    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
+    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-grad", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
@@ -1756,6 +1808,8 @@ const OperationSpec kOperations[] = {
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
+    {"--mesh-shader-pipeline", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline},
+    {"--mesh-shader-pipeline-fallback", 3, 3, nullptr, kNoGate, run_mesh_shader_pipeline_fallback},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-heap-sampler", 6, 6, nullptr, kNoGate, run_mesh_heap_sampler},

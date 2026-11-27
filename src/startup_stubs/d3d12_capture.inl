@@ -88,6 +88,18 @@ std::size_t view_census_format(char* out, std::size_t capacity, const char* what
     return n < 0 ? 0 : (std::min)(static_cast<std::size_t>(n), capacity - 1);
 }
 
+// Fixture only (x2w_d3d12_fail_view_allocations, startup_view_alloc): the next `count` allocations at a site fail as an
+// exhausted heap would. The vector sites fail only when the vector has to grow; view_ids fails before any insertion,
+// because each new entry allocates.
+enum ViewAllocation { view_records_site, view_materialized_site, view_ids_site, view_allocation_sites };
+volatile LONG view_allocations_to_fail[view_allocation_sites];
+
+void view_allocation_gate(ViewAllocation site)
+{
+    for (LONG n = view_allocations_to_fail[site]; n > 0; n = view_allocations_to_fail[site])
+        if (InterlockedCompareExchange(&view_allocations_to_fail[site], n - 1, n) == n) throw std::bad_alloc();
+}
+
 // The shadow entry for a desktop CPU descriptor handle (note_lock held), or null.
 std::uint32_t* shadow_slot(u64 desktop_handle, std::uint32_t* room = nullptr)
 {
@@ -108,6 +120,38 @@ std::uint32_t shadow_id(u64 desktop_handle)
     return id;
 }
 
+// A descriptor slot that names a desktop resource: 18 SRV, 19 UAV, 20 RTV, 21 DSV. Slot 19 names two resources, the
+// view resource and the counter resource it may be paired with; slots 17 (CBV) and 22 (sampler) name none.
+bool view_slot_names_resource(std::uint32_t slot)
+{
+    return slot >= 18 && slot <= 21;
+}
+// The refs a materialized view record holds in a tracked descriptor slot: one for the slot's resource and, for a
+// slot-19 UAV, one more for its counter resource. One ref per slot, so the draw drain (retire_view_refs == 0) frees the
+// resource only once no tracked slot names it; repeated writes of the same view add nothing (note_view compares ids).
+void view_refs_add(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_add_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_add_view_ref(reinterpret_cast<const void*>(counter));
+}
+// Drops exactly the refs view_refs_add added for a materialized record: the overwrite in note_view, a copy that moves
+// another view over the slot (note_copy), and the destruction of the slot's heap (retire_drop_heap_views).
+void view_refs_release(std::uint32_t slot, u64 resource, u64 counter)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_release_view_ref(reinterpret_cast<const void*>(resource));
+    if (slot == 19 && counter) retire_release_view_ref(reinterpret_cast<const void*>(counter));
+}
+// The untracked-descriptor fallback: no slot can hold the resource for a view in a heap the shim does not shadow, so
+// the use takes the resource (and a slot-19 counter) out of the retire class for good, as before.
+void view_refs_leave_class(std::uint32_t slot, u64 resource, u64 counter, RetireLeft why)
+{
+    if (!view_slot_names_resource(slot)) return;
+    if (resource) retire_leave_class(reinterpret_cast<const void*>(resource), why);
+    if (slot == 19 && counter) retire_leave_class(reinterpret_cast<const void*>(counter), why);
+}
+
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
 
 bool title_backed(u64 title_handle, u64 bytes)
@@ -118,6 +162,26 @@ bool title_backed(u64 title_handle, u64 bytes)
         if (title_handle >= r.title && bytes <= r.bytes && title_handle - r.title <= r.bytes - bytes) inside = true;
     ReleaseSRWLockShared(&descriptor_lock);
     return inside;
+}
+// True when the descriptor already holds a view created on the desktop: by its desktop shadow entry, or by a
+// materialized token the title copied into title memory with its own memory copy.
+bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
+{
+    AcquireSRWLockShared(&note_lock);
+    const std::uint32_t* slot = shadow_slot(desktop_handle);
+    std::uint32_t id = slot ? *slot : 0;
+    bool live = id && id - 1 < view_records().size() && view_materialized()[id - 1];
+    ReleaseSRWLockShared(&note_lock);
+    if (live || title_handle == desktop_handle || !title_backed(title_handle, 32) ||
+        !x2w_local::readable(reinterpret_cast<const void*>(title_handle), 32))
+        return live;
+    std::uint32_t words[8];
+    std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
+    if (words[0] != view_token_magic) return false;
+    AcquireSRWLockShared(&note_lock);
+    live = words[1] < view_records().size() && view_materialized()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    return live;
 }
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
@@ -304,6 +368,62 @@ void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT incre
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
+
+// Room for one more element, with the 1.5x growth push_back would use: reserve(size + 1) would copy on every insert.
+template<class T>
+void reserve_one_view_entry(std::vector<T>& v, ViewAllocation site)
+{
+    if (v.size() < v.capacity()) return;
+    view_allocation_gate(site);
+    v.reserve(v.capacity() + v.capacity() / 2 + 1);
+}
+
+// Adds a new record to the three view containers, or to none of them (note_lock held). Everything that can allocate
+// comes first: the two reservations change no size, and a failed try_emplace leaves the map unchanged. The two
+// push_back calls then have room and cannot fail. Returns the name of the container that could not allocate, or null.
+const char* store_view(const ViewRecord& record, std::uint8_t created, u64 hash)
+{
+    const char* growing = "view_records";
+    try {
+        reserve_one_view_entry(view_records(), view_records_site);
+        growing = "view_materialized";
+        reserve_one_view_entry(view_materialized(), view_materialized_site);
+        growing = "view_ids";
+        view_allocation_gate(view_ids_site);
+        view_ids().try_emplace(hash, record.id);
+    } catch (const std::bad_alloc&) {
+        return growing;
+    }
+    view_records().push_back(record);
+    view_materialized().push_back(created);
+    return nullptr;
+}
+
+// A new view could not be recorded. The desktop descriptor already holds it, so the destination must stop naming the
+// view it held before: the slot and its title token are cleared, and a draw refuses the descriptor instead of binding
+// the old view. Nothing records the new view's use of its resource, so the resource leaves the retire class and is not
+// released early. Allocates nothing. Enters with note_lock held and releases it.
+void drop_unrecorded_view(const ViewRecord& record, bool materialized, const char* container)
+{
+    if (std::uint32_t* slot_ptr = shadow_slot(record.dest_desktop)) {
+        const std::uint32_t prev = *slot_ptr;
+        *slot_ptr = 0;
+        if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
+            view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
+                              view_records()[prev - 1].counter);
+    }
+    if (materialized) view_refs_leave_class(record.slot, record.resource, record.counter, RetireLeft::view);
+    ReleaseSRWLockExclusive(&note_lock);
+    const std::size_t token_bytes = record.slot == 22 ? x2w_startup::title_sampler_stride : 32u;
+    if (record.dest_title != record.dest_desktop && title_backed(record.dest_title, token_bytes) &&
+        x2w_local::writable(reinterpret_cast<void*>(record.dest_title), token_bytes))
+        std::memset(reinterpret_cast<void*>(record.dest_title), 0, token_bytes);
+    static LONG failed;
+    if (first_calls(failed, 8))
+        log("x2w-d3d12 note_view: out of memory in %s -> view of slot %u not recorded, destination descriptor untracked",
+            container, record.slot);
+}
+
 // A view is created: remembered by id; the id is also written into title-owned descriptor memory so
 // that copies the title makes there itself can be followed.
 void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop,
@@ -355,9 +475,10 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
                 log("%s (new slot %u)", line, record.slot);
             }
         }
-        view_records().push_back(record);
-        view_materialized().push_back(created);
-        view_ids()[hash] = record.id;
+        if (const char* container = store_view(record, created, hash)) {
+            drop_unrecorded_view(record, materialized, container);
+            return;
+        }
         ++views_distinct;
         if (census) {
             if (record.slot >= 17 && record.slot <= 22) ++view_census.distinct[record.slot - 17];
@@ -368,13 +489,17 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
         const std::uint32_t prev = *slot_ptr;
         *slot_ptr = record.id + 1;
+        // The same view written to the same slot again keeps its id and changes no reference count. A different view
+        // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
         if (prev != record.id + 1) {
-            if (slot == 18 && resource && materialized) retire_add_view_ref(reinterpret_cast<const void*>(resource));
-            if (prev && prev - 1 < view_records().size() && view_records()[prev - 1].slot == 18 && view_materialized()[prev - 1])
-                retire_release_view_ref(reinterpret_cast<const void*>(view_records()[prev - 1].resource));
+            if (materialized) view_refs_add(static_cast<std::uint32_t>(slot), resource, counter);
+            if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
+                view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
+                                  view_records()[prev - 1].counter);
         }
-    } else if (slot == 18 && resource) {
-        retire_leave_class(reinterpret_cast<const void*>(resource), RetireLeft::view);
+    } else if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource) {
+        // A descriptor no shadow slot tracks cannot hold the view: the use takes the resource out of the class.
+        view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
     }
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
@@ -394,34 +519,37 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
     const std::uint32_t* from = shadow_slot(src_desktop, &src_room);
     if (to && count <= dest_room) {
         if (from && count <= src_room) {
+            // Every copied-in view is now named by one more tracked slot; every view the destination named before is
+            // replaced. Slots 18-21 count one ref (slot 19 one for the resource and one for its counter).
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t src_id = from[i];
-                if (src_id && src_id - 1 < view_records().size() &&
-                    view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
-                    retire_add_view_ref(reinterpret_cast<const void*>(view_records()[src_id - 1].resource));
+                if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                    view_refs_add(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                  view_records()[src_id - 1].counter);
             }
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t old_id = to[i];
-                if (old_id && old_id - 1 < view_records().size() &&
-                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
-                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
             }
             std::memmove(to, from, u64{count} * 4);
         } else {
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t old_id = to[i];
-                if (old_id && old_id - 1 < view_records().size() &&
-                    view_records()[old_id - 1].slot == 18 && view_materialized()[old_id - 1])
-                    retire_release_view_ref(reinterpret_cast<const void*>(view_records()[old_id - 1].resource));
+                if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
+                    view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
+                                      view_records()[old_id - 1].counter);
             }
             std::memset(to, 0, u64{count} * 4);
         }
     } else if (from && count <= src_room) {
+        // The destination is not tracked: the copy puts the views where no shadow slot can hold them.
         for (UINT i = 0; i < count; ++i) {
             const std::uint32_t src_id = from[i];
-            if (src_id && src_id - 1 < view_records().size() &&
-                view_records()[src_id - 1].slot == 18 && view_materialized()[src_id - 1])
-                retire_leave_class(reinterpret_cast<const void*>(view_records()[src_id - 1].resource), RetireLeft::view_copy);
+            if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
+                view_refs_leave_class(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
+                                      view_records()[src_id - 1].counter, RetireLeft::view_copy);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);

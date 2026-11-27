@@ -3729,6 +3729,34 @@ def mac_f32_controls():
         rejects("Unsupported compute instruction", aot.lower,
                 variant(MAC_F32, ("v_mac_f32_e32 v10, 0x45800800, v5", bad_line)),
                 64, **MAC_F32_BINDING)
+    # The mad() fusion probe against a simulated renderer whose mutated shader reads back `readback`.
+    class Case:
+        def write_bytes(self, data):
+            self.words = list(struct.unpack("<321I", data)[1:])
+
+    def probe(readback, code=None):
+        case = Case()
+
+        def run():
+            diff = next((i for i, (a, b) in enumerate(zip(case.words, readback)) if a != b), None)
+            if code is not None or diff is None:
+                return subprocess.CompletedProcess([], code or 0, "", "")
+            return subprocess.CompletedProcess([], 1, "", f"word={diff} expected={case.words[diff]:08x} "
+                                               f"actual={readback[diff]:08x}\nCompute readback differs\n")
+        fusion = mac_f32_mad_fusion(run, case, expected)
+        assert case.words == expected
+        return fusion
+    expected, fused = mac_f32_words(), mac_f32_words(fused=True)
+    folded = [e if i % 4 == 0 else f for i, (e, f) in enumerate(zip(expected, fused))]
+    assert probe(expected) == "unfused"  # no FMad fusion, as on an RX 5700 XT (#2730)
+    assert probe(folded) == "fused"  # fused FMad, word 0 folded unfused by DXC, as on an RTX 4090 (#2883)
+    for readback, code, message in ((fused, None, "neither model alone"), (expected, 3, "failed (exit 3)")):
+        try:
+            probe(readback, code)
+        except AssertionError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError(f"mac_f32: mad() fusion probe accepted a readback that must fail: {message}")
 
 
 def mac_f32_binary(directory, assembler, objcopy, library):
@@ -3737,6 +3765,40 @@ def mac_f32_binary(directory, assembler, objcopy, library):
     assert [line for line in decoded if line.startswith("v_mac_f32")] == [
         line for line in MAC_F32 if line.startswith("v_mac_f32")], decoded
     assert aot.lower(decoded, 64, **MAC_F32_BINDING) == aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+
+
+def mac_f32_mad_fusion(run_mutated, case, expected):
+    """Whether this target fuses the `precise mad()` mutation: 'fused' or 'unfused' (#2730).
+
+    The mutated shader is read back against the fused and the unfused model. Word 0, the cancellation
+    4097 * 4097 - 16785408, has only constant operands, and DXC 1.9.2602.17 folds it at compile time to the
+    unfused +0, so a target that fuses FMad fuses only the thread-dependent words (#2883). The fused model
+    therefore keeps word 0 unfused and differs from the unfused model at words 2, 10, 18, ... Exactly one model
+    must match all 320 words; a compile, dispatch or readback failure, or any other readback, fails the test.
+    A DXC that leaves word 0 to the driver would read back neither model on a fusing target and fail here.
+    """
+    fused = mac_f32_words(fused=True)
+    fused[0::4] = expected[0::4]
+    assert next(i for i, (a, b) in enumerate(zip(expected, fused)) if a != b) == 2
+    matches, first = {}, {}
+    for name, model in (("fused", fused), ("unfused", expected)):
+        case.write_bytes(struct.pack("<321I", 1, *model))
+        run = run_mutated()
+        if run.returncode == 0:
+            matches[name] = True
+        elif run.returncode == 1 and "Compute readback differs" in run.stderr:
+            matches[name] = False
+            first[name] = next((line for line in run.stderr.splitlines() if line.startswith("word=")), "")
+        else:
+            raise AssertionError(f"mac_f32: mad() fusion probe against the {name} model failed "
+                                 f"(exit {run.returncode})\n{run.stdout}{run.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    if matches == {"fused": True, "unfused": False}:
+        return "fused"
+    if matches == {"fused": False, "unfused": True}:
+        return "unfused"
+    raise AssertionError(f"mac_f32: mad() fusion probe read back neither model alone: {matches}, "
+                         f"first mismatch: {first}")
 
 
 def mac_f32_draw(directory, compiler, renderer, backend):
@@ -3779,7 +3841,17 @@ def mac_f32_draw(directory, compiler, renderer, backend):
         msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
         msrc.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
-        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        run_mutated = lambda: subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if label.startswith("fused mad()"):
+            # FMad may be fused or not (DXIL leaves it to the driver). Where it reads back the unfused model,
+            # as on an RX 5700 XT and an RX 9070 XT, this mutation equals the lowering and cannot be caught.
+            fusion = mac_f32_mad_fusion(run_mutated, case, expected)
+            print(f"mac_f32: mad() fusion probe ({backend}): {fusion}")
+            if fusion == "unfused":
+                print(f"mac_f32: mutation '{label}' is inapplicable on this adapter: "
+                      "mad() reads back the unfused model on all 320 words")
+                continue
+        bad = run_mutated()
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"mac_f32: mutation '{label}' escaped detection")
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
@@ -5561,7 +5633,12 @@ def shared_controls():
     atomics = aot.lower(programs["shared_atomics"], 64, **SHARED_BINDING)
     for method in ("Add", "And", "Or", "Xor", "Min", "Max"):
         assert f"Interlocked{method}(lds[" in atomics, method
-    assert "(0u - tid.x)" in atomics
+    # ds_sub_u32 is two additions, ~v then 1, on the same word. A single InterlockedAdd of a negated word on
+    # groupshared memory fails compute PSO creation on NVIDIA GeForce RTX 5080 (driver 32.0.16.2124).
+    sub = ("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], ~(tid.x));\n"
+           "    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n")
+    assert sub in atomics, atomics
+    assert "0u - " not in atomics, atomics
     lines = programs["shared_exchange"]
     # A barrier with no DS instruction before it is kept.
     assert aot.lower(SHARED_PREFIX + ["s_barrier"] + lines[len(SHARED_PREFIX):], 64,
@@ -5629,8 +5706,15 @@ def shared_draw(directory, compiler, renderer, backend):
             execution = subprocess.run(run)
             if execution.returncode:
                 return execution.returncode
-        for mutated, mismatched_word in shared_mutants(name, lines, binding):
-            src.write_text(aot.lower(mutated, 64, **binding), encoding="ascii")
+        mutants = [(aot.lower(mutated, 64, **binding), word) for mutated, word in shared_mutants(name, lines, binding)]
+        if name == "shared_atomics":
+            # Without the second addition ds_sub_u32 adds ~v, so the difference read as lane 0's second word
+            # is 64 short, one for each lane.
+            dropped = source.replace("    if (lds_a5 < 256u) InterlockedAdd(lds[lds_a5], 1u);\n", "")
+            assert dropped != source
+            mutants.append((dropped, 1))
+        for mutated, mismatched_word in mutants:
+            src.write_text(mutated, encoding="ascii")
             subprocess.run(compile, check=True)
             bad = subprocess.run(run, capture_output=True, text=True)
             if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
@@ -6314,6 +6398,177 @@ def mubuf_float_draw(directory, compiler, renderer, backend):
     return 0
 
 
+# Only the four forms not already covered by mubuf_float_cases(). Low words differ
+# even when the high words agree, so a truncated comparison or an exchanged pair fails.
+MUBUF_FLOAT_EXTRA = (
+    ("fcmpswap", False, 0xbf812345, 0x3f865432),
+    ("fcmpswap", True, 0xbff2345676543210, 0x3ff6543212345678),
+    ("fmin", True, 0xc000000012345678, 0xc000000087654321),
+    ("fmax", True, 0xc000000076543210, 0x4000000087654321),
+)
+
+
+def mubuf_float_extra_cases():
+    for op, wide, initial, value in MUBUF_FLOAT_EXTRA:
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        width = 2 if wide else 1
+        operands = (value, initial) if op == "fcmpswap" else (value,)
+        words = [operand >> (32 * i) & 0xffffffff for operand in operands for i in range(width)]
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30", "s_waitcnt lgkmcnt(0)"]
+        lines += [f"v_mov_b32_e32 v{10 + i}, {word:#x}" for i, word in enumerate(words)]
+        lines += [f"{name} v[10:{9 + len(words)}], off, s[20:23], 0 offset:8", "s_endpgm"]
+        yield name, op, wide, initial, value, lines, {
+            k: v for k, v in DS_BINDING.items() if k != "stride"
+        } | {"buffer_float_domain": MUBUF_FLOAT_DOMAIN}
+
+
+def mubuf_float_extra_reference(op, wide, initial, value, compare):
+    def number(bits):
+        integer, real = ("<Q", "<d") if wide else ("<I", "<f")
+        return struct.unpack(real, struct.pack(integer, bits))[0]
+
+    old, candidate = number(initial), number(value)
+    if op == "fcmpswap":
+        return value if old == number(compare) else initial
+    return value if (candidate < old if op == "fmin" else candidate > old) else initial
+
+
+def mubuf_float_extra_controls():
+    for _, op, wide, initial, value, lines, binding in mubuf_float_extra_cases():
+        atomic = lines[-2]
+        domain = "require a finite-normal domain and no glc"
+        rejects(domain, aot.lower, lines, 32, **(binding | {"buffer_float_domain": None}))
+        rejects(domain, aot.lower, variant(lines, (atomic, atomic + " glc")), 32, **binding)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (atomic, atomic.replace("off,", "v0,") + " offen")), 32, **binding)
+        rejects("Unverified atomic reduction address", aot.lower,
+                variant(lines, ("offset:8", "offset:4" if wide else "offset:2")), 32, **binding)
+        rejects("Unverified atomic reduction data range", aot.lower,
+                variant(lines, (atomic, atomic.replace(atomic.split()[1], "v10,"))), 32, **binding)
+        high_moves = [lines[5 if wide else 4]]
+        if op == "fcmpswap":
+            high_moves.append(lines[7 if wide else 5])
+        for move in high_moves:
+            inf = 0x7ff00000 if wide else 0x7f800000
+            sign = 0x80000000
+            for word in ("0", "1", hex(sign), hex(inf), hex(inf | 0x80000)):
+                rejects("operands must be finite-normal constants", aot.lower,
+                        variant(lines, (move, f"{move.split(',')[0]}, {word}")), 32, **binding)
+            dynamic = f"v_lshl_add_u32 v18, s11, 5, v0\n{move.split(',')[0]}, v18"
+            rejects("operands must be finite-normal constants", aot.lower,
+                    variant(lines, (move, dynamic)), 32, **binding)
+        assert mubuf_float_extra_reference(op, wide, initial, value, initial) == value
+        if op == "fcmpswap":
+            miss = initial ^ 1
+            assert mubuf_float_extra_reference(op, wide, miss, value, initial) == miss
+        wrong = (mubuf_float_extra_reference(op, wide, initial, initial, value) if op == "fcmpswap" else
+                 mubuf_float_extra_reference("fmax" if op == "fmin" else "fmin", wide, initial, value, initial))
+        assert wrong == initial
+
+
+def mubuf_float_extra_binary_rejections(directory, assembler, objcopy, library):
+    cases = {name: (lines, binding) for name, _, _, _, _, lines, binding in mubuf_float_extra_cases()}
+    lines, binding = cases["buffer_atomic_fcmpswap"]
+    wide, wide_binding = cases["buffer_atomic_fcmpswap_x2"]
+    missing_domain = {key: value for key, value in binding.items() if key != "buffer_float_domain"}
+    domain = "Float buffer compare-swap and _x2 require a finite-normal domain and no glc"
+    for name, program, options, diagnostic in (
+        ("missing-domain", lines, missing_domain, domain),
+        ("glc", variant(lines, (lines[-2], lines[-2] + " glc")), binding, domain),
+        ("fp64-compare-inf", variant(wide, (wide[7], "v_mov_b32_e32 v13, 0x7ff00000")), wide_binding,
+         "Float buffer atomic operands must be finite-normal constants"),
+        ("fp64-misaligned", variant(wide, ("offset:8", "offset:4")), wide_binding,
+         "Unverified atomic reduction address"),
+    ):
+        code = assemble(directory, assembler, objcopy, program, cpu="gfx1030", features=DS_FEATURES)
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert [line for line in decoded if line.startswith("buffer_atomic_")] == [program[-2]]
+        rejects(diagnostic, aot.lower, decoded, 32, **options)
+        archive, output = (directory / f"float-reject-{name}.{ext}" for ext in ("dxbc", "hlsl"))
+        archive.write_bytes(store_container(code, aot.checked_group(32)))
+        args = [part for key, value in options.items() for part in ("--" + key.replace("_", "-"), str(value))]
+        result = subprocess.run([sys.executable, "-B", aot.__file__, archive, "--output", output,
+                                 "--llvm", library, *args], capture_output=True, text=True)
+        assert result.returncode == 1 and result.stderr.splitlines()[-1] == f"ValueError: {diagnostic}", result
+        assert not output.exists(), output
+        print(f"assembled rejection {name}: {diagnostic}")
+
+
+def mubuf_float_extra_binary(directory, assembler, objcopy, library):
+    mubuf_float_extra_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, binding) for name, _, _, _, _, lines, binding in mubuf_float_extra_cases()],
+                   "buffer_atomic_")
+    mubuf_float_extra_binary_rejections(directory, assembler, objcopy, library)
+
+
+def mubuf_float_extra_draw(directory, compiler, renderer=None, backend=None, *, wide):
+    record = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
+    if record:
+        Path(record).unlink(missing_ok=True)
+    mubuf_float_extra_controls()
+    src, cso, case = (directory / f"mubuf-float-extra.{ext}" for ext in ("hlsl", "cso", "case"))
+    profile = "cs_6_6" if wide else "cs_6_0"
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
+    accepted = []
+    for name, op, is_wide, initial, value, lines, binding in mubuf_float_extra_cases():
+        if wide != is_wide:
+            continue
+
+        def compile_source(program):
+            src.write_text(aot.lower(program, 32, **binding), encoding="ascii")
+            subprocess.run([compiler, "-T", profile, "-E", "main", "-Fo", cso, src], check=True)
+
+        def output_words(bits):
+            words = [SENTINEL] * 320
+            words[2] = bits & 0xffffffff
+            if wide:
+                words[3] = bits >> 32
+            return words
+
+        compile_source(lines)
+        # Flipping one low bit produces a distinct finite-normal seed and a compare miss.
+        if renderer:
+            for seed in (initial, initial ^ 1):
+                expected = mubuf_float_extra_reference(op, wide, seed, value, initial)
+                for groups in (1, 2):
+                    case.write_bytes(mubuf_float_case_bytes(groups, output_words(expected), output_words(seed)))
+                    result = subprocess.run(run)
+                    if result.returncode:
+                        return result.returncode
+        if op == "fcmpswap":
+            width = 2 if wide else 1
+            moves = lines[4:4 + 2 * width]
+            mutant = [*lines[:4], *(f"v_mov_b32_e32 v{10 + i}, {move.split(', ')[1]}"
+                                   for i, move in enumerate(moves[width:] + moves[:width])), *lines[-2:]]
+        else:
+            opposite = "fmax" if op == "fmin" else "fmin"
+            mutant = variant(lines, (name, name.replace(op, opposite)))
+        compile_source(mutant)
+        before, after = output_words(initial), output_words(value)
+        first = next(i for i, (wanted, actual) in enumerate(zip(after, before)) if wanted != actual)
+        diagnostic = f"word={first} expected={after[first]:08x} actual={before[first]:08x}"
+        if renderer:
+            case.write_bytes(mubuf_float_case_bytes(2, before, before))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+            case.write_bytes(mubuf_float_case_bytes(2, after, before))
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or diagnostic not in bad.stderr:
+                raise AssertionError(f"{name}: atomic mutation escaped detection\n{bad.stderr}")
+            accepted.append(name)
+        print(f"{name}: {'readback' if renderer else 'CPU predicted'} negative control {diagnostic}")
+    if record:
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(sorted(accepted)) + "\n", encoding="utf-8")
+    return 0
+
+
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
     src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
@@ -6395,6 +6650,7 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, binding) for name, _, _, lines, binding in mubuf_float_cases()],
                    "buffer_atomic_")
+    mubuf_float_extra_binary(directory, assembler, objcopy, library)
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -9742,6 +9998,11 @@ if __name__ == "__main__":
                  "draw-mubuf-reduction": mubuf_reduction_draw,
                  "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
                  "draw-mubuf-float": mubuf_float_draw,
+                 "binary-mubuf-float-extra": mubuf_float_extra_binary,
+                 "compile-mubuf-float-cmpswap": lambda d, c: mubuf_float_extra_draw(d, c, wide=False),
+                 "compile-mubuf-float-x2": lambda d, c: mubuf_float_extra_draw(d, c, wide=True),
+                 "draw-mubuf-float-cmpswap": lambda d, *a: mubuf_float_extra_draw(d, *a, wide=False),
+                 "draw-mubuf-float-x2": lambda d, *a: mubuf_float_extra_draw(d, *a, wide=True),
                  "draw-mubuf-counter": mubuf_counter_draw,
                  "draw-mubuf-counter-x2": lambda d, *a: mubuf_counter_draw(d, *a, wide=True),
                  "draw-mubuf-exchange": mubuf_exchange_draw,
