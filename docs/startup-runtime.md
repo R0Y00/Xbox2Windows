@@ -3537,3 +3537,23 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+### Offline compute manifests for 3D and 1D UAVs
+
+The runtime half of #2902 is ported to `cpp-migration`. For offline compute
+requests, the C++ formatter emits `uav N tex3d float table P OFF channels 4` and
+`uav N tex1d float table P OFF channels 4`. The stand-in validates UAV view
+dimensions and mip levels, including the W-slice range within the selected 3D mip.
+
+On an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100), the 3D, 3D NSA and 1D
+store cases matched their mip-one words after `compile_dxil` published the translations. The mismatched-view,
+3D W-range and 1D mip controls were refused with their sentinels intact.
+
+If a published compute PSO fails to create, the refusal stays `pipeline creation failed`, and the stand-in adds
+the adapter's 32-lane wave capability as observed: `(adapter has no 32-lane waves)`, or `(adapter wave capability
+query failed)`. The manifest records no wave size, so this does not say the shader needed one. The test knows its
+native modules declare `WaveSize(32)`, so the native 3D, 3D NSA and 1D cases skip on WARP only for
+`pipeline creation failed (adapter has no 32-lane waves)`. Any other PSO failure fails the test.
+On WARP and hardware, portable `cs_6_0` fixtures publish a hand-written
+manifest and bytecode under the original guest program's request key. These cases require successful 3D and 1D
+mip-one readback and check the same mismatched-view, 3D W-range and 1D mip refusals with sentinels intact.

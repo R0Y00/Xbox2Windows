@@ -734,8 +734,16 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
-                       (b.image_dimension == 1 || b.image_dimension == 5) && b.array_count == 1) {
-                uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
+                       b.array_count == 1) {
+                const char *tex;
+                switch (b.image_dimension) {
+                case 0: tex = "tex1d"; break;
+                case 1: tex = "tex2d"; break;
+                case 2: tex = "tex3d"; break;
+                case 5: tex = "tex2da"; break;
+                default: return std::nullopt;
+                }
+                uav_lines << "uav " << b.shader_register << ' ' << tex
                           << " float table " << b.root_parameter << ' ' << b.byte_offset << " channels 4\n";
             } else {
                 return std::nullopt;

@@ -407,9 +407,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 // handle, which keeps the first view; texture-store-self also creates a shader resource view of the texture at table byte 0.
 static int texture_slot67(void* device, const std::string& mode)
 {
-    constexpr UINT width = 32, height = 8;
-    const bool fp32 = mode == "texture-array" || mode == "texture-array-2d";
-    const UINT layers = mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
+    constexpr UINT width = 32;
+    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w";
+    const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
+    const UINT mip = volume || line ? 1 : 0;
+    const UINT height = line ? 1 : 8;
+    const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
+    const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
+    const UINT subresources = volume ? 1 : layers;
     const UINT pitch = width * (fp32 ? 16 : 8), slice_bytes = pitch * height, bytes = slice_bytes * layers;
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
@@ -417,7 +422,10 @@ static int texture_slot67(void* device, const std::string& mode)
     };
     const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, static_cast<UINT16>(layers), 1, format,
+    const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const D3D12_RESOURCE_DESC texture_desc{dimension, 0, width << mip, line ? 1 : height << mip,
+        static_cast<UINT16>(volume ? layers << mip : layers), static_cast<UINT16>(mip + 1), format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -450,7 +458,14 @@ static int texture_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
-    if (layers > 1) {
+    if (volume) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        // At mip 1 the depth is six. The bad count fits only if the binder uses the base mip's depth.
+        view.Texture3D = {mip, 1, mode == "texture-volume-bad-w" ? layers : ~0u};
+    } else if (line) {
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        view.Texture1D.MipSlice = mode == "texture-line-bad-mip" ? mip + 1 : mip;  // bad-mip: one past the last mip
+    } else if (layers > 1) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray = {0, 1, 4, 0}; // four selected slices, with untouched neighbors on both sides
     }
@@ -478,15 +493,15 @@ static int texture_slot67(void* device, const std::string& mode)
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
     D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
+    source.PlacedFootprint = {0, {format, width, height, volume ? layers : 1, pitch}};
     D3D12_TEXTURE_COPY_LOCATION result = source;
     result.pResource = static_cast<ID3D12Resource*>(readback);
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
-    for (UINT layer = 0; layer < layers; ++layer) {
-        image.SubresourceIndex = layer;
-        source.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
+    for (UINT subresource = 0; subresource < subresources; ++subresource) {
+        image.SubresourceIndex = subresource + mip;
+        source.PlacedFootprint.Offset = UINT64{subresource} * slice_bytes;
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
     }
     invoke(list, 25, word(slot67_pipeline));
@@ -494,9 +509,9 @@ static int texture_slot67(void* device, const std::string& mode)
     invoke(list, 39, 0, 3, word(constants), 0);
     invoke(list, 35, 1, gpu);
     if (mode != "texture-store-none") invoke(list, 14, 2, 1, 1);
-    for (UINT layer = 0; layer < layers; ++layer) {
-        image.SubresourceIndex = layer;
-        result.PlacedFootprint.Offset = UINT64{layer} * slice_bytes;
+    for (UINT subresource = 0; subresource < subresources; ++subresource) {
+        image.SubresourceIndex = subresource + mip;
+        result.PlacedFootprint.Offset = UINT64{subresource} * slice_bytes;
         invoke(list, 16, word(&result), 0, 0, 0, word(&image), 0);
     }
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;

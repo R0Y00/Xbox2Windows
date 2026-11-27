@@ -1,8 +1,8 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
-// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d/tex2da float table <param> <byte> channels 4` outputs) named
+// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and textures
+// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -10,6 +10,15 @@
 // unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
 // binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
 // syncs content).
+
+const char* volume_uav_range_error(const D3D12_RESOURCE_DESC& resource, const D3D12_TEX3D_UAV& view)
+{
+    if (view.MipSlice >= resource.MipLevels) return "an output 3D texture mip is outside the resource";
+    const UINT depth = (std::max)(1u, UINT{resource.DepthOrArraySize} >> (std::min)(view.MipSlice, 15u));
+    if (view.FirstWSlice >= depth || !view.WSize || (view.WSize != ~0u && view.WSize > depth - view.FirstWSlice))
+        return "an output 3D texture W range is outside the mip";
+    return nullptr;
+}
 
 struct ComputeTranslation {
     // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
@@ -23,7 +32,7 @@ struct ComputeTranslation {
         int word_param = -1, word_byte = 0;
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
-        bool array = false;
+        D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -65,6 +74,15 @@ bool float_output_format(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+
+// Whether the adapter runs 32-lane waves: 1 yes, 0 no, -1 the capability query failed.
+int adapter_32_lane_waves()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+    if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))))
+        return -1;
+    return waves.WaveOps && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 32;
+}
 
 // The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
 // unavailable, or null when it is ready.
@@ -120,6 +138,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
                 if (!std::strcmp(name, names[s])) return static_cast<ComputeTranslation::Source>(s + 1);
             return ComputeTranslation::root_constant;
         };
+        const auto uav_dimension = [&] {
+            if (!std::strcmp(name, "tex1d")) return D3D12_UAV_DIMENSION_TEXTURE1D;
+            if (!std::strcmp(name, "tex2d")) return D3D12_UAV_DIMENSION_TEXTURE2D;
+            if (!std::strcmp(name, "tex2da")) return D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            if (!std::strcmp(name, "tex3d")) return D3D12_UAV_DIMENSION_TEXTURE3D;
+            return D3D12_UAV_DIMENSION_UNKNOWN;
+        };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
@@ -140,13 +165,10 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
-        else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
-                 i == tr.uavs.size())
+        else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels 4%n", &i, name, &a, &b, &used) == 4 && whole() &&
+                 i == tr.uavs.size() && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
             tr.uavs.push_back({a, b, true});
-        else if (std::sscanf(line.c_str(), "uav %u tex2da float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
-                 i == tr.uavs.size()) {
-            tr.uavs.push_back({a, b, true});
-            tr.uavs.back().array = true;
+            tr.uavs.back().uav_dimension = uav_dimension();
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
@@ -159,7 +181,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D/2D-array float texture"
+                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D/2D/2D-array/3D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
@@ -173,7 +195,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
     }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
-    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) return failure;
+    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) {
+        // The manifest carries no wave size, so the failure stays the reason and the adapter's 32-lane wave
+        // capability is only reported next to it, as observed. It does not say the shader needed that wave size.
+        if (!std::strcmp(failure, "pipeline creation failed")) {
+            const int waves = adapter_32_lane_waves();
+            if (waves < 0) return "pipeline creation failed (adapter wave capability query failed)";
+            if (!waves) return "pipeline creation failed (adapter has no 32-lane waves)";
+        }
+        return failure;
+    }
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
@@ -213,9 +244,7 @@ bool translate_compute_natively(ComputeTranslation& tr)
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
         // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
-        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
-        if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))) ||
-            !waves.WaveOps || waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32)
+        if (adapter_32_lane_waves() != 1)
             throw std::runtime_error("the adapter has no 32-lane waves");
         // Never released: a static destructor would release DXC after its module may have detached.
         static x2w::ShaderDxilCompiler* const compiler =
@@ -379,9 +408,28 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
             words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
             if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
-            else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            else if (slot.uav_dimension == D3D12_UAV_DIMENSION_TEXTURE3D &&
+                     texture && (resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+                const auto& view = desc.Texture3D;
+                if (!described || desc.ViewDimension != slot.uav_dimension || resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                    reason = "an output texture view or resource is not 3D";
+                else {
+                    // Slot 19 can retain a rejected range as an unmaterialized view.
+                    reason = volume_uav_range_error(resource, view);
+                    if (!reason && !created) reason = "an output texture view was not created on the desktop";
+                }
+            } else if (slot.uav_dimension == D3D12_UAV_DIMENSION_TEXTURE1D &&
+                       texture && (resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+                // Checked before `created`, as for 3D: slot 19 records a 1D view with an out-of-range mip as refused.
+                if (!described || desc.ViewDimension != slot.uav_dimension || resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+                    reason = "an output texture view or resource is not 1D";
+                else if (desc.Texture1D.MipSlice >= resource.MipLevels)
+                    reason = "an output 1D texture mip is outside the resource";
+                else if (!created)
+                    reason = "an output texture view was not created on the desktop";
+            } else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
                 reason = "an output texture view was not created on the desktop";
-            else if (slot.array) {
+            else if (slot.uav_dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) {
                 // The layer in HLSL is relative to FirstArraySlice: retain the caller's complete view.
                 const auto& a = desc.Texture2DArray;
                 if (!described || desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
