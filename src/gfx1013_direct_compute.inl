@@ -2011,6 +2011,37 @@ struct DirectCompute {
                                : high ? "0" : before;
             auto lower = ir.binary("and", a, mask);
             z = ir.binary("add", b, ir.invoke("i32", "unaryBits.i32", 31, {{"i32", lower}}, "nounwind readnone"));
+        } else if (!scalar && (n == "v_add_nc_u16" || n == "v_sub_nc_u16" || n == "v_add_nc_i16" || n == "v_sub_nc_i16" ||
+                               n == "v_mul_lo_u16" || n == "v_lshlrev_b16" || n == "v_lshrrev_b16" ||
+                               n == "v_ashrrev_i16" || n == "v_min_u16" || n == "v_max_u16" || n == "v_min_i16" ||
+                               n == "v_max_i16")) {
+            // Non-packed 16-bit integer VOP3 (#669): the result is D[15:0], computed from S0[15:0] and S1[15:0],
+            // and D[31:16] keeps its value (measured on RDNA 2 silicon; LLVM: "On gfx10, all 16-bit instructions
+            // preserve the high bits"). op_sel would select other halves and stays refused.
+            if (i.wide && (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " op_sel");
+            auto low = [&](const string &x) { return ir.binary("and", x, "65535"); };
+            auto sext = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "16"), "16"); };
+            const bool sign = n.substr(n.size() - 3) == "i16";
+            string r;
+            if (n == "v_add_nc_u16" || n == "v_add_nc_i16")
+                r = ir.binary("add", a, b);
+            else if (n == "v_sub_nc_u16" || n == "v_sub_nc_i16")
+                r = ir.binary("sub", a, b);
+            else if (n == "v_mul_lo_u16")
+                r = ir.binary("mul", a, b);
+            else if (n == "v_lshlrev_b16" || n == "v_lshrrev_b16" || n == "v_ashrrev_i16") {
+                // D = S1 shifted by S0[3:0].
+                auto amount = ir.binary("and", a, "15");
+                r = n == "v_lshlrev_b16"   ? ir.binary("shl", b, amount)
+                    : n == "v_lshrrev_b16" ? ir.binary("lshr", low(b), amount)
+                                           : ir.binary("ashr", sext(b), amount);
+            } else {
+                auto x = sign ? sext(a) : low(a), y = sign ? sext(b) : low(b);
+                const bool minimum = n.substr(2, 3) == "min";
+                r = select(cmp(sign ? (minimum ? "slt" : "sgt") : (minimum ? "ult" : "ugt"), x, y), x, y);
+            }
+            z = ir.binary("or", ir.binary("and", read(i.dst), "4294901760"), low(r));
         } else if (i.enc == Encoding::Sopc || i.enc == Encoding::Vopc || n.substr(0, 6) == "v_cmpx" ||
                    n.substr(0, 6) == "v_cmp_") {
             auto condition = comparison(i, a, b);
