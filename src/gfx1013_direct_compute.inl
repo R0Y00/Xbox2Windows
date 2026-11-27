@@ -1930,7 +1930,16 @@ struct DirectCompute {
                     sum = ir.binary("shl", sum, "16");
             }
             z = ir.binary("add", sum, val(2));
-        } else if (n == "v_bfi_b32")
+        } else if (n == "v_alignbit_b32" || n == "v_alignbyte_b32") {
+            // Bits [k + 31 : k] of the 64-bit value {S0, S1}, with k = S2[4:0] or 8 * S2[1:0] (#2985, the
+            // gfx2hlsl.py VOP3 table). A zero k returns S1; the masked shift keeps the other arm in range.
+            auto k = n == "v_alignbit_b32" ? ir.binary("and", val(2), "31")
+                                           : ir.binary("shl", ir.binary("and", val(2), "3"), "3");
+            auto joined = ir.binary("or", shift("lshr", b, k), shift("shl", a, ir.binary("sub", "32", k)));
+            z = select(cmp("eq", k, "0"), b, joined);
+        } else if (n == "v_bfm_b32")
+            z = shift("shl", ir.binary("sub", shift("shl", "1", a), "1"), b);  // like s_bfm_b32 (#2985)
+        else if (n == "v_bfi_b32")
             z = ir.binary("or", ir.binary("and", a, b), ir.binary("and", ir.binary("xor", a, "4294967295"), val(2)));
         else if (n == "s_bfe_u32" || n == "s_bfe_i32") {
             const bool sign = n == "s_bfe_i32";
