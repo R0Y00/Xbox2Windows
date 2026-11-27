@@ -8,6 +8,7 @@ import math
 import re
 import struct
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -50,6 +51,9 @@ def source(name):
     taken = arm(CLAMP_XY | 0x8000 if name == 'invalid mode' else CLAMP_XY)
     if name == 'l_word1':
         taken = arm(0, 0)
+    if name == 'high word1':
+        # Bit 24 of word1 sits above the translator's whole-word1 mask; a sampler keeping it must be refused.
+        taken = arm(CLAMP_XY, 0x200000 | (1 << 24))
     if name == 'partial':
         taken = f's_mov_b32 s24, {CLAMP_XY:#x}\n'
     tail = 's_mov_b32 s24, s9\n' if name == 'overwrite' else ''
@@ -70,6 +74,7 @@ WORDS = {
     'partial': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe010082bf920398be7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'overwrite': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe090398be7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'invalid mode': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe070082bfff0398be12800000ff0399be00002000ff039abe0000000480039bbe7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
+    'high word1': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002001ff039abe0000000480039bbe7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
     'implicit bias': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe7fc08cbf080f94f00004c400703f8cbf0f1800f804050607000081bf',
     'extra branch': '04040cf4000000fa800398be800399beff039abe0000000480039bbeff02007e0000903fff02027e0000c03ef202047e098007bf070085bf800398beff0399be00002000ff039abe0000000480039bbe060082bf920398beff0399be00002000ff039abe0000000480039bbe000085bf7fc08cbf080f90f00004c400703f8cbf0f1800f804050607000081bf',
 }
@@ -78,6 +83,7 @@ REFUSALS = {
     'partial': 'descriptor operand s[24:27]',
     'overwrite': 'descriptor operand s[24:27]',
     'invalid mode': 'unsupported joined sampler words',
+    'high word1': 'unsupported joined sampler words',
     'implicit bias': 'image_sample_b with a sampler that is not constant',
     'extra branch': 'descriptor operand s[24:27]',
 }
