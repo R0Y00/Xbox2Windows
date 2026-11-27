@@ -46,7 +46,7 @@ Not covered: a desktop draw that reads the binding, because none can be built (s
 
 Local diagnostic runs, Windows 10 22H2 (19045), RTX 3080 Ti, NVIDIA driver 32.0.16.1047, i7-4790K, 16 GB, release
 build on `main` `98e4a2ee`, warm shader cache (revision 29), scripted input, 250 s. One build; only the switches
-differ. Aggregates only; logs stay local. The tables were measured with the first revision of this change
+differ. Aggregates only; logs stay local. The first two tables were measured with the first revision of this change
 (`bedfcafc`), which kept the address pending for a desktop draw instead of skipping the copy; no run made a copy at
 a draw, so slot 44 did the same work as now.
 
@@ -78,5 +78,23 @@ reverse order:
 - Without the table alias the frame rate barely changes (5.9 → 6.1 fps): the draw path is then bound by `frame_copy`
   under `draw_lock`.
 - Every run read `deferred N, made at a draw 0`: no draw in these runs read the desktop binding.
+
+Retest of this revision (merged with `main` `3b6c38a8`), same machine, cache and input, ring and alias set in every
+run, two pairs, the second in reverse order:
+
+| | switch unset | switch set |
+|---|---|---|
+| mean fps 150–240 s, pair 1 / pair 2 | 6.3 / 6.5 | 13.9 / 13.4 |
+| frames presented, pair 1 / pair 2 | 3,839 / 3,706 | 4,798 / 4,960 |
+| executes, pair 1 / pair 2 | 24,065 / 33,220 | 69,730 / 54,789 |
+| slot 44 time 150–240 s (threads; µs per call) | 1.17 / 1.11; 52 / 48 | 0.29 / 0.29; 5 / 6 |
+| copies skipped / copied (render totals) | n/a | 6.9 / 4.9 million; 0 |
+| null bindings `token` per 1,000 translated draws | 23.4 / 29.8 | 24.2 / 33.0 |
+| null bindings `wrapper`, pair 1 / pair 2 | 0 / 40 | 107 / 101 |
+| null bindings `buffer`, ring refusals, device removal | 0, none, none | 0, none, none |
+| process commit peak | 18.7 / 18.5 GiB | 18.7 / 18.7 GiB |
+
+- `wrapper` null bindings also appear in an unset run (40). Per 1,000 translated draws they are 0 / 0.26 unset and
+  0.37 / 0.40 set: few, but not explained here.
 
 Not established: desktop graphics pipelines that read a root SRV (none can be built today), and other adapters.
