@@ -1514,6 +1514,41 @@ struct DirectCompute {
             write_ballot(i.dst, condition);
             return;
         }
+        if (compute && (n == "v_dot2_i32_i16" || n == "v_dot2_u32_u16")) {
+            // These VOP3P dot forms consume both halfwords as-is.
+            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+                refuse(i.pc, "unsupported packed halfword dot operand modifiers");
+            const bool sign = n == "v_dot2_i32_i16";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            auto low_half = [&](const string &word) {
+                return sign ? ir.binary("ashr", ir.binary("shl", word, "16"), "16")
+                            : ir.binary("and", word, "65535");
+            };
+            auto low_product = ir.binary("mul", low_half(a), low_half(b));
+            auto high_half = sign ? "ashr" : "lshr";
+            auto high_product = ir.binary("mul", ir.binary(high_half, a, "16"), ir.binary(high_half, b, "16"));
+            auto pair = ir.binary("add", low_product, high_product);
+            auto sum = ir.binary("add", pair, acc);
+            if (i.clamp) {
+                // Accumulate both carries and the three sign extensions in
+                // the upper word. Clamp only after the accumulator is added.
+                auto carry = [&](const string &result, const string &left) {
+                    return ir.value("zext i1 " + cmp("ult", result, left) + " to i32");
+                };
+                auto upper = ir.binary("add", carry(pair, low_product), carry(sum, pair));
+                if (sign) {
+                    for (const auto &word : {low_product, high_product, acc})
+                        upper = ir.binary("add", upper, ir.binary("ashr", word, "31"));
+                    auto fits = cmp("eq", upper, ir.binary("ashr", sum, "31"));
+                    auto bound = select(cmp("slt", upper, "0"), "2147483648", "2147483647");
+                    sum = select(fits, sum, bound);
+                } else {
+                    sum = select(cmp("eq", upper, "0"), sum, "4294967295");
+                }
+            }
+            vector_write(i.dst, sum);
+            return;
+        }
         const bool select_mods = n == "v_cndmask_b32" && i.wide && !((i.abs | i.neg) & 4);
         if ((i.subword && i.enc != Encoding::Vop1 && i.enc != Encoding::Vop2) || ((i.abs || i.neg) && !select_mods) || i.clamp || i.scale)
             refuse(i.pc, "direct ALU operand modifiers");
