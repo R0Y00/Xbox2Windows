@@ -2145,6 +2145,36 @@ struct DirectCompute {
                 refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }
         }
+        if (compute && (n == "s_cmp_eq_u64" || n == "s_cmp_lg_u64" || n == "s_bitcmp0_b64" || n == "s_bitcmp1_b64")) {
+            // Issue #3078: lower 64-bit SOPC scalar comparisons to pure 32-bit DXIL writes of SCC.
+            auto scalar64 = [&](unsigned src) -> std::pair<string, string> {
+                if (src == 125)
+                    return {"0", "0"};
+                if (src == 106 || src == 126)
+                    refuse(i.pc, "invalid " + string(n) + " source");
+                return {operand32(i, src), pair_high(i, src)};
+            };
+            auto [a_lo, a_hi] = scalar64(i.src[0]);
+            string cond;
+            if (n == "s_cmp_eq_u64" || n == "s_cmp_lg_u64") {
+                auto [b_lo, b_hi] = scalar64(i.src[1]);
+                const bool eq = n == "s_cmp_eq_u64";
+                const auto op = eq ? "eq" : "ne";
+                const auto combine = eq ? "and" : "or";
+                cond = ir.value(string(combine) + " i1 " + cmp(op, a_lo, b_lo) + ", " + cmp(op, a_hi, b_hi));
+            } else {
+                const unsigned index_src = i.src[1];
+                if (!(index_src <= 105 || (index_src >= 128 && index_src <= 208) || index_src == 255))
+                    refuse(i.pc, "invalid " + string(n) + " bit index");
+                auto idx = operand32(i, index_src);
+                auto upper = cmp("ne", ir.binary("and", idx, "32"), "0");
+                auto word = select(upper, a_hi, a_lo);
+                auto bit = ir.binary("and", shift("lshr", word, idx), "1");
+                cond = cmp(n == "s_bitcmp0_b64" ? "eq" : "ne", bit, "0");
+            }
+            write(128, ir.value("zext i1 " + cond + " to i32"));
+            return;
+        }
         if (compute && n == "s_bfm_b64") {
             if ((i.dst & 1) || i.dst > 104)
                 refuse(i.pc, "invalid s_bfm_b64 destination");
