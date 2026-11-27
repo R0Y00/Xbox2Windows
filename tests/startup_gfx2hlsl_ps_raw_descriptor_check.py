@@ -1,6 +1,6 @@
 """Pixel-stage structured-to-raw buffer loads in tools/startup/gfx2hlsl.py.
 
-  (no arguments)                         translation controls and the CPU model, pure Python
+  (no arguments)                         translation controls, the CPU model and the udsrc parser
   draw <dxc> <offscreen_check> <warp|hardware> [fxc]
                                          translate, compile and draw one pixel. The readback must match the
                                          CPU model of a raw byte-address load bounded by NUM_RECORDS * stride.
@@ -9,6 +9,8 @@
 The fixture is source-built. A pixel stage loads one table descriptor, clears its stride, scales NUM_RECORDS
 by the extracted stride and sets OOB_SELECT to raw, then reads four dwords with buffer_load_dword offen.
 """
+import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -382,43 +384,59 @@ def check_udsrc():
     assert 'return {allocation.resource' not in compute and 'return {native, offset, bytes, 0, false}' not in compute
     assert 'ud.kind == Translation::num_records && ud.a >= 0 && ud.a < 32 ? record_counts[ud.a]' in draw
     assert 'x2w-draw unsupported udsrc' in draw
-    driver = r"""
-#include "udsrc_line.h"
-int main() {
-    UdSrcParsed parsed{};
-    if (!accept_udsrc_line("udsrc 0 rect", 0, false, &parsed) || !parsed.is_udsrc || parsed.kind != udsrc_rect)
-        return 1;
-    if (!accept_udsrc_line("udsrc 4 numrecords 0", 4, false, &parsed) || parsed.kind != udsrc_num_records || parsed.a != 0)
-        return 2;
-    if (accept_udsrc_line("udsrc 5 notakind 0", 5, false, &parsed))
-        return 3;
-    if (accept_udsrc_line("udsrc 6 stride 0", 5, false, &parsed))
-        return 4;
-    if (!accept_udsrc_line("udsrc 5 stride 0", 5, false, &parsed) || parsed.kind != udsrc_stride)
-        return 5;
-    if (!accept_udsrc_line("srv 0 buf table 0 0", 0, false, &parsed) || parsed.is_udsrc)
-        return 6;
-    if (accept_udsrc_line("udsrc 0 mrtbits", 0, false, &parsed))
-        return 7;
-    if (!accept_udsrc_line("udsrc 0 mrtbits", 0, true, &parsed) || parsed.kind != udsrc_mrt_bits)
-        return 8;
-    return 0;
-}
-"""
+    run_udsrc_driver(root)
+    print('udsrc: numrecords is stored, and an unknown kind or a gap refuses the manifest')
+
+
+def compiler_is_msvc(compiler):
+    return Path(compiler).name.lower() in ('cl', 'cl.exe')
+
+
+def udsrc_compiler():
+    """CMake passes cl on Windows. A direct run uses cl there and g++ elsewhere. Neither is optional."""
+    chosen = os.environ.get('X2W_CXX')
+    if chosen:
+        return chosen
+    if os.name == 'nt':
+        found = shutil.which('cl')
+        if not found:
+            raise AssertionError('udsrc parser check needs cl.exe (set X2W_CXX to the MSVC compiler)')
+        return found
+    for name in ('g++', 'c++'):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise AssertionError('udsrc parser check needs g++')
+
+
+def run_udsrc_driver(root):
+    """Run tests/startup_udsrc_line_check.cpp. CTest passes the binary it just built; otherwise compile it."""
+    ready = os.environ.get('X2W_UDSRC_CHECK')
+    if ready:
+        binary = Path(ready)
+        if not binary.is_file():
+            raise AssertionError('udsrc check executable is missing: %s' % binary)
+        run = subprocess.run([str(binary)], capture_output=True, text=True)
+        if run.returncode:
+            raise AssertionError('udsrc driver exit %s\n%s%s' % (run.returncode, run.stdout, run.stderr))
+        return
+    compiler = udsrc_compiler()
+    source = HERE / 'startup_udsrc_line_check.cpp'
+    include = root / 'src' / 'startup_stubs'
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        source = directory / 'udsrc_main.cpp'
-        source.write_text(driver, encoding='ascii')
-        binary = directory / 'udsrc_main'
-        built = subprocess.run(
-            ['g++', '-std=c++17', '-Wall', '-Wextra', '-I', str(root / 'src/startup_stubs'), str(source), '-o', str(binary)],
-            capture_output=True, text=True)
+        binary = directory / ('udsrc_main.exe' if compiler_is_msvc(compiler) else 'udsrc_main')
+        if compiler_is_msvc(compiler):
+            command = [compiler, '/nologo', '/std:c++17', '/EHsc', '/W4', '/I', str(include),
+                       str(source), '/Fe%s' % binary, '/Fo%s' % (directory / 'udsrc_main.obj')]
+        else:
+            command = [compiler, '-std=c++17', '-Wall', '-Wextra', '-I', str(include), str(source), '-o', str(binary)]
+        built = subprocess.run(command, cwd=directory, capture_output=True, text=True)
         if built.returncode:
-            raise AssertionError(built.stderr)
+            raise AssertionError(built.stdout + built.stderr)
         run = subprocess.run([str(binary)], capture_output=True, text=True)
         if run.returncode:
             raise AssertionError('udsrc driver exit %s' % run.returncode)
-    print('udsrc: numrecords is stored, and an unknown kind or a gap refuses the manifest')
 
 
 def main():

@@ -3807,14 +3807,22 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_buffer_store COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_buffer_store_check.py")
     # Pixel-stage structured-to-raw buffer loads: translation controls, then a one-pixel draw on WARP and hardware.
+    # The udsrc cases are a compiled target (MSVC here, the same source rebuilt by the Python check elsewhere).
+    add_executable(startup_udsrc_line_check tests/startup_udsrc_line_check.cpp)
+    target_compile_features(startup_udsrc_line_check PRIVATE cxx_std_17)
+    target_include_directories(startup_udsrc_line_check PRIVATE src/startup_stubs)
+    add_test(NAME startup_gfx2hlsl_ps_raw_descriptor_udsrc COMMAND startup_udsrc_line_check)
+    set(udsrc_check_env "X2W_UDSRC_CHECK=$<TARGET_FILE:startup_udsrc_line_check>;X2W_CXX=${CMAKE_CXX_COMPILER}")
     add_test(NAME startup_gfx2hlsl_ps_raw_descriptor COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_ps_raw_descriptor_check.py")
+    set_tests_properties(startup_gfx2hlsl_ps_raw_descriptor PROPERTIES ENVIRONMENT "${udsrc_check_env}")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_gfx2hlsl_ps_raw_descriptor_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_ps_raw_descriptor_check.py" draw
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter}
             $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
-        set_tests_properties(startup_gfx2hlsl_ps_raw_descriptor_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_gfx2hlsl_ps_raw_descriptor_${adapter} PROPERTIES
+            TIMEOUT 180 SKIP_RETURN_CODE 77 ENVIRONMENT "${udsrc_check_env}")
     endforeach()
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B

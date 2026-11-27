@@ -417,7 +417,7 @@ A non-indexed `buffer_load_dword` in a pixel stage lowers a descriptor that went
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ps_raw_descriptor$' --output-on-failure
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ps_raw_descriptor_(warp|hardware)$' --output-on-failure
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_ps_raw_descriptor_(warp|hardware|udsrc)$' --output-on-failure
 ```
 
 The draw runs on the Windows test PC. A capability skip (77) is separate from a pass.
