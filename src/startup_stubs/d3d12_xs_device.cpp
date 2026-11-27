@@ -3340,6 +3340,7 @@ bool root_srv_at_draw()
     return on;
 }
 LONG root_srv_copies_deferred, root_srv_copies_at_draw;
+void bind_root_srv_copy(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pass, UINT parameter, u64 address);
 void bind_pending_root_srvs(Wrapper* self, UINT skip);
 
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
@@ -4144,6 +4145,35 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     }
 }
 
+// List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
+void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
+{
+    auto* list = recording(self);
+    Pass& pass = pass_of(self);
+    if (parameter < 32) pass.srv_bound &= ~(1u << parameter);
+    if (parameter < 32) pass.srv_pending &= ~(1u << parameter);
+    if (parameter < 16) pass.root_address[parameter] = address;
+    // Under a deferred heap-indexed root the desktop list holds another root signature; only the title address is kept.
+    if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
+        (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
+        return;
+    if (pass.indirect_graphics.cached_mesh && pass.indirect_graphics.cached_srv_root == parameter)
+        return; // The slot 61 draw binds the validated lease rather than an upload snapshot.
+    if (const auto gpu = list_upload_gpu(self, address, 1)) {
+        if (gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
+        list->SetGraphicsRootShaderResourceView(parameter, gpu);
+        pass.srv_bound |= 1u << parameter;
+        return;
+    }
+    if (root_srv_at_draw()) {
+        pass.srv_pending |= 1u << parameter;
+        pass.srv_pending_address[parameter] = address;
+        InterlockedIncrement(&root_srv_copies_deferred);
+        return;
+    }
+    bind_root_srv_copy(self, list, pass, parameter, address);
+}
+
 // A graphics root SRV at a title address without an upload mapping: a 64 KiB window of title memory is copied into the
 // upload ring and bound on the recording's desktop list.
 void bind_root_srv_copy(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pass, UINT parameter, u64 address)
@@ -4181,34 +4211,6 @@ void bind_pending_root_srvs(Wrapper* self, UINT skip)
     }
 }
 
-// List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
-void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
-{
-    auto* list = recording(self);
-    Pass& pass = pass_of(self);
-    if (parameter < 32) pass.srv_bound &= ~(1u << parameter);
-    if (parameter < 32) pass.srv_pending &= ~(1u << parameter);
-    if (parameter < 16) pass.root_address[parameter] = address;
-    // Under a deferred heap-indexed root the desktop list holds another root signature; only the title address is kept.
-    if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
-        (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
-        return;
-    if (pass.indirect_graphics.cached_mesh && pass.indirect_graphics.cached_srv_root == parameter)
-        return; // The slot 61 draw binds the validated lease rather than an upload snapshot.
-    if (const auto gpu = list_upload_gpu(self, address, 1)) {
-        if (gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
-        list->SetGraphicsRootShaderResourceView(parameter, gpu);
-        pass.srv_bound |= 1u << parameter;
-        return;
-    }
-    if (root_srv_at_draw()) {
-        pass.srv_pending |= 1u << parameter;
-        pass.srv_pending_address[parameter] = address;
-        InterlockedIncrement(&root_srv_copies_deferred);
-        return;
-    }
-    bind_root_srv_copy(self, list, pass, parameter, address);
-}
 // List slot 42 (desktop 38 + 4), SetGraphicsRootConstantBufferView(parameter, title GPU address).
 // A translated shader reads a root CBV through the same pointer source as a root SRV (root_address). Nothing
 // is forwarded to the desktop list and srv_bound is left alone: bit 0 means a vertex-fetch SRV is bound.
@@ -7106,6 +7108,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
+        log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): deferred %ld, made at a draw %ld",
+            root_srv_copies_deferred, root_srv_copies_at_draw);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
@@ -7120,9 +7125,6 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
-    if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
-        log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): deferred %ld, made at a draw %ld",
-            root_srv_copies_deferred, root_srv_copies_at_draw);
     if (render_mode() && frame % 300 == 0) {
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
