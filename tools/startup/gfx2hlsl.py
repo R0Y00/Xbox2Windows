@@ -6876,7 +6876,7 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods, *, is_formatted=False):
+    def buffer_address(self, ops, mods, *, is_formatted=False, raw_conversion_ok=None):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -6891,8 +6891,11 @@ class Stage:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         idxen, offen = 'idxen' in mods, 'offen' in mods
         what = 'indexed load' if idxen else 'buffer load'
+        # A typed MTBUF load does not use the raw bound (raw_conversion_ok is False there). Leaving the
+        # conversion accepted would read past NUM_RECORDS * stride as an ordinary Load.
+        allow_raw = (not idxen) if raw_conversion_ok is None else bool(raw_conversion_ok) and not idxen
         if not is_formatted:
-            key = self.load_descriptor(ops[2], what, stride0_ok=not idxen, raw_conversion_ok=not idxen)
+            key = self.load_descriptor(ops[2], what, stride0_ok=not idxen, raw_conversion_ok=allow_raw)
         else:
             key = self.descriptor(ops[2])
         buf = self.pipe.resource(key, 'buf')
@@ -6932,6 +6935,7 @@ class Stage:
         if soffset is not None:
             terms.append(soffset)
         terms.append('%d' % offset)
+        self.address_terms = terms
         return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
@@ -6942,23 +6946,28 @@ class Stage:
             raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
-        self.emit('a = %s;' % address)
         # A pixel load through the full conversion is a raw byte-address read. The hardware compares the address
         # against the converted NUM_RECORDS, which is the 32-bit product of the original record count and stride
         # (at least 1 when the extract was clamped). The entry constants are that view's stride and record count.
+        # Each term of the address is added first: a wrapped sum is out of range even when the truncated value
+        # would have landed inside the buffer.
         bound = getattr(self, 'raw_load_bound', None) if getattr(self, 'kind', None) == 'ps' else None
         if bound:
             index = self.pipe.resources[bound[0]]['index']
             stride = self.pipe.ud(('stride', index))
             records = self.pipe.ud(('numrecords', index))
             factor = 'max(ud%d, 1u)' % stride if bound[1] else 'ud%d' % stride
-            self.emit('{ uint lim = %s * ud%d;' % (factor, records))
+            self.emit('{ uint lim = %s * ud%d; uint base = 0; bool ok = true;' % (factor, records))
+            for term in self.address_terms:
+                self.emit('ok = ok && base + (%s) >= base; base += %s;' % (term, term))
+            self.emit('a = base;')
             for i in range(count):
                 end = 4 * (i + 1)
                 self.set_v(dst[1] + i,
-                           '(a + %du >= a && a + %du <= lim) ? %s.Load(a + %d) : 0u' % (end, end, buf, 4 * i))
+                           '(ok && a + %du >= a && a + %du <= lim) ? %s.Load(a + %d) : 0u' % (end, end, buf, 4 * i))
             self.emit('}')
         else:
+            self.emit('a = %s;' % address)
             for i in range(count):
                 self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i))
 
@@ -7353,7 +7362,8 @@ class Stage:
         dst = reg_range(ops[0])
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
-        buf, address = self.buffer_address(ops, [m for m in mods if not m.startswith('format:')])
+        buf, address = self.buffer_address(
+            ops, [m for m in mods if not m.startswith('format:')], raw_conversion_ok=False)
         self.emit('a = %s;' % address)
         self.load_format(fmt, buf, dst[1], count)
 

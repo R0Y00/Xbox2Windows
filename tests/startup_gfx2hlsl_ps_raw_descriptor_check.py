@@ -56,19 +56,36 @@ def sop2(op, sdst, ssrc0, ssrc1, literal=None):
     return word if literal is None else word + struct.pack('<I', literal)
 
 
-def encode_mubuf(op, *, imm=0, offen=0, idxen=0, vaddr=0, vdata=1, srsrc=DESC):
+def encode_mubuf(op, *, imm=0, offen=0, idxen=0, vaddr=0, vdata=1, srsrc=DESC, soffset=128):
     w0 = (0b111000 << 26) | ((op & 0xff) << 18) | ((idxen & 1) << 13) | ((offen & 1) << 12) | (imm & 0xfff)
-    w1 = (128 << 24) | (((srsrc // 4) & 0x1f) << 16) | ((vdata & 0xff) << 8) | (vaddr & 0xff)
+    w1 = ((soffset & 0xff) << 24) | (((srsrc // 4) & 0x1f) << 16) | ((vdata & 0xff) << 8) | (vaddr & 0xff)
     return struct.pack('<II', w0, w1)
 
 
-def smem_load_x4(sdst, sbase):
+def encode_mtbuf(op, fmt, *, imm=0, offen=1, vaddr=0, vdata=1, srsrc=DESC, soffset=128):
+    # MTBUF: [31:26] is 0b111010, the format is [25:19], and the low three opcode bits are [18:16].
+    # The high opcode bit is word 1 bit 21. BUF_FMT_32_FLOAT is format 22.
+    w0 = 0xe8000000 | ((fmt & 0x7f) << 19) | ((op & 7) << 16) | ((offen & 1) << 12) | (imm & 0xfff)
+    w1 = ((soffset & 0xff) << 24) | (((op >> 3) & 1) << 21) | (((srsrc // 4) & 0x1f) << 16)
+    w1 |= ((vdata & 0xff) << 8) | (vaddr & 0xff)
+    return struct.pack('<II', w0, w1)
+
+
+def smem_load_x4(sdst, sbase, offset=0):
     w0 = 0xf4000000 | (0x02 << 18) | (sdst << 6) | (sbase // 2)
-    return struct.pack('<II', w0, 125 << 25) + struct.pack('<I', 0xbf8cc07f)
+    return struct.pack('<II', w0, (125 << 25) | (offset & 0x1fffff)) + struct.pack('<I', 0xbf8cc07f)
 
 
 def v_mov(dst, inline):
     return struct.pack('<I', 0x7e000000 | (dst << 17) | (1 << 9) | (128 + inline))
+
+
+def v_mov_lit(dst, word):
+    return struct.pack('<II', 0x7e000000 | (dst << 17) | (1 << 9) | 255, word & 0xffffffff)
+
+
+def s_mov(dst, src):
+    return struct.pack('<I', 0xbe800000 | (dst << 16) | (3 << 8) | (src & 0xff))
 
 
 def exp_mrt0(*regs):
@@ -76,37 +93,63 @@ def exp_mrt0(*regs):
     return struct.pack('<II', 0xf800180f, w1) + struct.pack('<I', 0xbf810000)
 
 
-def conversion(clamp=False):
-    words = [sop2('s_bfe_u32', TMP, DESC + 1, 255, 0xe0010)]
+def conversion(clamp=False, base=DESC, tmp=TMP):
+    words = [sop2('s_bfe_u32', tmp, base + 1, 255, 0xe0010)]
     if clamp:
-        words.append(sop2('s_max_u32', TMP, TMP, 129))
-    words += [sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff),
-              sop2('s_mul_i32', DESC + 2, DESC + 2, TMP),
-              sop2('s_and_b32', DESC + 3, DESC + 3, 255, 0xcfffffff),
-              sop2('s_or_b32', DESC + 3, DESC + 3, 255, 0x30000000)]
+        words.append(sop2('s_max_u32', tmp, tmp, 129))
+    words += [sop2('s_and_b32', base + 1, base + 1, 255, 0xc000ffff),
+              sop2('s_mul_i32', base + 2, base + 2, tmp),
+              sop2('s_and_b32', base + 3, base + 3, 255, 0xcfffffff),
+              sop2('s_or_b32', base + 3, base + 3, 255, 0x30000000)]
     return b''.join(words)
 
 
-def loads(idxen=False):
-    return b''.join(encode_mubuf(0x0c, imm=offset, offen=0 if idxen else 1, idxen=int(idxen), vdata=1 + i)
-                    for i, offset in enumerate(OFFSETS))
+def loads(idxen=False, srsrc=DESC, offsets=OFFSETS, soffset=128):
+    return b''.join(encode_mubuf(0x0c, imm=offset, offen=0 if idxen else 1, idxen=int(idxen),
+                                 vdata=1 + i, srsrc=srsrc, soffset=soffset)
+                    for i, offset in enumerate(offsets))
 
 
-def program(middle, idxen=False):
-    return smem_load_x4(DESC, 8) + middle + v_mov(0, 0) + loads(idxen) + struct.pack('<I', 0xbf8c3f70) + exp_mrt0(1, 2, 3, 4)
+def finish(body, exports=(1, 2, 3, 4)):
+    return body + struct.pack('<I', 0xbf8c3f70) + exp_mrt0(*exports)
+
+
+def program(middle, idxen=False, v0=0, offsets=OFFSETS, srsrc=DESC, soffset=128):
+    mov = v_mov(0, v0) if isinstance(v0, int) and 0 <= v0 <= 64 else v_mov_lit(0, v0)
+    return finish(smem_load_x4(DESC, 8) + middle + mov + loads(idxen, srsrc, offsets, soffset))
 
 
 def translate(ps):
     return G.Pipeline(VS, ps, ROOT)
 
 
+def add_u32(parts):
+    """Add byte-address terms the way the bounded load does: a wrapped term makes the address unusable."""
+    base, ok = 0, True
+    for part in parts:
+        part &= 0xffffffff
+        total = base + part
+        ok = ok and total <= 0xffffffff and (total & 0xffffffff) >= base
+        base = total & 0xffffffff
+    return ok, base
+
+
+def raw_dwords(parts, count, stride=STRIDE, records=RECORDS):
+    ok, address = add_u32(parts)
+    limit = (stride * records) & 0xffffffff
+    words = []
+    for i in range(count):
+        end = (address + 4 * (i + 1)) & 0xffffffff
+        if not ok or end < address or end > limit:
+            words.append(0)
+        else:
+            words.append(SOURCE[address // 4 + i])
+    return tuple(words)
+
+
 def cpu_load(address, stride=STRIDE, records=RECORDS):
     """One raw dword: in range when the 32-bit end byte does not wrap and is at or before the product."""
-    limit = (stride * records) & 0xffffffff
-    end = (address + 4) & 0xffffffff
-    if end < address or end > limit:
-        return 0
-    return SOURCE[address // 4]
+    return raw_dwords((address,), 1, stride, records)[0]
 
 
 def expected_words():
@@ -132,29 +175,98 @@ def must_refuse(label, ps, message):
     raise AssertionError('%s: translated' % label)
 
 
+def bound_open(stride, records, clamped=False):
+    factor = 'max(ud%d, 1u)' % stride if clamped else 'ud%d' % stride
+    return '{ uint lim = %s * ud%d; uint base = 0; bool ok = true;' % (factor, records)
+
+
+def assert_bounded(ps, stride, records, offsets, count=1, clamped=False, terms=None):
+    assert bound_open(stride, records, clamped) in ps, ps
+    assert 'a = v0 +' not in ps, ps
+    for term in terms or ('v0',):
+        assert 'ok = ok && base + (%s) >= base; base += %s;' % (term, term) in ps, ps
+    for index, offset in enumerate(offsets):
+        assert 'ok = ok && base + (%d) >= base; base += %d;' % (offset, offset) in ps, ps
+        for lane in range(count):
+            end = 4 * (lane + 1)
+            line = 'v%d = (ok && a + %du >= a && a + %du <= lim) ? r0.Load(a + %d) : 0u;' % (
+                1 + index * count + lane, end, end, 4 * lane)
+            assert line in ps, ps
+
+
 def controls():
     pipe = translate(program(conversion()))
     ps, manifest = pipe.hlsl_ps(), pipe.manifest()
     stride, records = ud_index(manifest, 'stride'), ud_index(manifest, 'numrecords')
     assert 'ByteAddressBuffer r0 : register(t0);' in ps, ps
     assert 'srv 0 buf table 0 0' in manifest, manifest
-    limit = '{ uint lim = ud%d * ud%d;' % (stride, records)
-    for index, offset in enumerate(OFFSETS):
-        # The immediate is part of the address. A one-dword load then reads a + 0 inside the bound.
-        line = 'v%d = (a + 4u >= a && a + 4u <= lim) ? r0.Load(a + 0) : 0u;' % (1 + index)
-        assert limit in ps and ('a = v0 + %d;' % offset) in ps and line in ps, ps
+    assert_bounded(ps, stride, records, OFFSETS)
     print('raw conversion: four offen loads bounded by ud%d * ud%d' % (stride, records))
 
     clamped = translate(program(conversion(clamp=True)))
     cps, cmanifest = clamped.hlsl_ps(), clamped.manifest()
     cstride, crecords = ud_index(cmanifest, 'stride'), ud_index(cmanifest, 'numrecords')
-    assert '{ uint lim = max(ud%d, 1u) * ud%d;' % (cstride, crecords) in cps, cps
+    assert_bounded(cps, cstride, crecords, OFFSETS, clamped=True)
     print('clamped raw conversion: bound is max(stride, 1) * NUM_RECORDS')
 
     stride0 = program(sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff))
     text = translate(stride0).hlsl_ps()
     assert 'v1 = r0.Load(a + 0);' in text and 'uint lim' not in text, text
     print('stride clear only: unbounded raw load')
+
+    # A dwordx2 at byte 28 covers bytes 28 and 32. Only the first dword is inside the 32-byte limit.
+    cross2 = finish(smem_load_x4(DESC, 8) + conversion() + v_mov(0, 0)
+                    + encode_mubuf(0x0d, imm=28, offen=1, vdata=1))
+    x2 = translate(cross2)
+    assert_bounded(x2.hlsl_ps(), ud_index(x2.manifest(), 'stride'), ud_index(x2.manifest(), 'numrecords'),
+                   (28,), count=2)
+    assert raw_dwords((0, 28), 2) == (SOURCE[7], 0)
+    print('dwordx2: the dword that crosses NUM_RECORDS * stride is zero')
+
+    # A dwordx4 at byte 24 covers 24, 28, 32 and 36. The last two dwords are out.
+    cross4 = finish(smem_load_x4(DESC, 8) + conversion() + v_mov(0, 0)
+                    + encode_mubuf(0x0e, imm=24, offen=1, vdata=1))
+    x4 = translate(cross4)
+    assert_bounded(x4.hlsl_ps(), ud_index(x4.manifest(), 'stride'), ud_index(x4.manifest(), 'numrecords'),
+                   (24,), count=4)
+    assert raw_dwords((0, 24), 4) == (SOURCE[6], SOURCE[7], 0, 0)
+    print('dwordx4: two dwords inside the limit, then two zeros')
+
+    assert raw_dwords((0,), 1, stride=0, records=4) == (0,)
+    assert raw_dwords((4,), 1, stride=0, records=4) == (0,)
+    print('stride 0: the product is zero, so every positive end is out of range')
+
+    # soffset is an inline 8 in s21. v0 is 0, so the addresses are 8+4 and 8+28.
+    shifted = finish(smem_load_x4(DESC, 8) + conversion() + s_mov(21, 128 + 8) + v_mov(0, 0)
+                     + encode_mubuf(0x0c, imm=4, offen=1, vdata=1, soffset=21)
+                     + encode_mubuf(0x0c, imm=28, offen=1, vdata=2, soffset=21),
+                     exports=(1, 2, 1, 2))
+    shifted_ps = translate(shifted).hlsl_ps()
+    assert 'base + (0x00000008u)' in shifted_ps and 'base + (4)' in shifted_ps and 'base + (28)' in shifted_ps, shifted_ps
+    assert raw_dwords((0, 8, 4), 1) == (SOURCE[3],)
+    assert raw_dwords((0, 8, 28), 1) == (0,)
+    print('non-zero soffset: byte 12 is in range and byte 36 is not')
+
+    # The conversion runs on a copy of the loaded words, not on the registers the load wrote.
+    copied = b''.join(s_mov(24 + i, DESC + i) for i in range(4))
+    copy_ps = translate(program(copied + conversion(base=24, tmp=28), srsrc=24)).hlsl_ps()
+    assert 'uint lim' in copy_ps and 'r0.Load(a + 0)' in copy_ps, copy_ps
+    print('copied descriptor: the bound follows the s_mov copies')
+
+    # v0 is 0xfffffffc. Adding 12, 28 or 32 wraps before the range test, so those loads are zero
+    # rather than the words at the truncated addresses 8, 24 and 28.
+    wrapped = program(conversion(), v0=0xfffffffc, offsets=(12, 28, 32, 0))
+    wrapped_ps = translate(wrapped).hlsl_ps()
+    assert 'ok = ok && base + (v0) >= base; base += v0;' in wrapped_ps, wrapped_ps
+    assert raw_dwords((0xfffffffc, 12), 1) == (0,)
+    assert raw_dwords((0xfffffffc, 28), 1) == (0,)
+    assert raw_dwords((0xfffffffc, 32), 1) == (0,)
+    assert (SOURCE[2], SOURCE[6], SOURCE[7]) == (0x40400000, 0x40e00000, 0x41000000)
+    print('address wrap: a term that overflows the 32-bit sum reads zero')
+
+    typed = finish(smem_load_x4(DESC, 8) + conversion() + v_mov(0, 0)
+                   + encode_mtbuf(0, 22, imm=32, offen=1, vdata=1), exports=(1, 1, 1, 1))
+    must_refuse('typed buffer load', typed, MODIFIED)
 
     missing_count = (sop2('s_bfe_u32', TMP, DESC + 1, 255, 0xe0010)
                      + sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff)
@@ -163,16 +275,40 @@ def controls():
     missing_oob = (sop2('s_bfe_u32', TMP, DESC + 1, 255, 0xe0010)
                    + sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff)
                    + sop2('s_mul_i32', DESC + 2, DESC + 2, TMP))
+    wrong_mask = conversion().replace(struct.pack('<I', 0xc000ffff), struct.pack('<I', 0xc000fff0), 1)
+    oob_select_2 = conversion().replace(struct.pack('<I', 0x30000000), struct.pack('<I', 0x20000000), 1)
+    scaled_by_constant = (sop2('s_bfe_u32', TMP, DESC + 1, 255, 0xe0010)
+                          + sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff)
+                          + sop2('s_mul_i32', DESC + 2, DESC + 2, 128 + 4)
+                          + sop2('s_and_b32', DESC + 3, DESC + 3, 255, 0xcfffffff)
+                          + sop2('s_or_b32', DESC + 3, DESC + 3, 255, 0x30000000))
+    and_first = (sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff)
+                 + sop2('s_bfe_u32', TMP, DESC + 1, 255, 0xe0010)
+                 + sop2('s_mul_i32', DESC + 2, DESC + 2, TMP)
+                 + sop2('s_and_b32', DESC + 3, DESC + 3, 255, 0xcfffffff)
+                 + sop2('s_or_b32', DESC + 3, DESC + 3, 255, 0x30000000))
+    # The stride comes from a second descriptor, and the scaled count is written into the first.
+    other = (smem_load_x4(24, 8, 32)
+             + sop2('s_bfe_u32', TMP, 25, 255, 0xe0010)
+             + sop2('s_and_b32', DESC + 1, DESC + 1, 255, 0xc000ffff)
+             + sop2('s_mul_i32', DESC + 2, DESC + 2, TMP)
+             + sop2('s_and_b32', DESC + 3, DESC + 3, 255, 0xcfffffff)
+             + sop2('s_or_b32', DESC + 3, DESC + 3, 255, 0x30000000))
     must_refuse('missing byte count', program(missing_count), MODIFIED)
     must_refuse('missing OOB step', program(missing_oob), MODIFIED)
-    must_refuse('in-place word rewrite', program(sop2('s_and_b32', DESC + 2, DESC + 2, 128)), MODIFIED)
+    must_refuse('word overwritten with zero', program(sop2('s_and_b32', DESC + 2, DESC + 2, 128)), MODIFIED)
+    must_refuse('wrong stride mask', program(wrong_mask), MODIFIED)
+    must_refuse('OOB select 2', program(oob_select_2), MODIFIED)
+    must_refuse('scaled by a constant', program(scaled_by_constant), MODIFIED)
+    must_refuse('steps out of order', program(and_first), MODIFIED)
+    must_refuse('stride from a second descriptor', finish(smem_load_x4(DESC, 8) + other + v_mov(0, 0) + loads()), MODIFIED)
     must_refuse('idxen load', program(conversion(), idxen=True), INDEXED)
 
     model = expected_words()
     assert model == (SOURCE[0], SOURCE[3], SOURCE[7], 0), model
-    assert cpu_load(32, stride=0, records=4) == 0
     assert cpu_load(0xffffffff) == 0
     print('CPU model: %s' % ','.join('%08x' % word for word in model))
+    check_udsrc()
 
 
 def compile_hlsl(compiler, kind, source, out, profile, directory):
@@ -228,6 +364,56 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if failed.returncode == 0 or 'deadbeef' not in failed.stderr:
                 raise AssertionError('%s unbound control\n%s\n%s' % (kind, failed.stdout, failed.stderr))
             print('%s: dropping the bound reads the word past NUM_RECORDS * stride' % kind)
+
+
+def check_udsrc():
+    """The draw stand-in accepts numrecords and refuses an unknown kind instead of skipping the rest."""
+    root = HERE.parent
+    header = (root / 'src/startup_stubs/udsrc_line.h').read_text(encoding='utf-8')
+    draw = (root / 'src/startup_stubs/d3d12_draw.inl').read_text(encoding='utf-8')
+    assert 'else if (!std::strcmp(source, "numrecords")) kind = udsrc_num_records;' in header
+    assert 'record_counts[i] = words[2];' in draw
+    assert 'records = words[2];' in draw
+    assert 'record_counts[i] = view.records;' in draw
+    assert 'ud.kind == Translation::num_records && ud.a >= 0 && ud.a < 32 ? record_counts[ud.a]' in draw
+    assert 'x2w-draw unsupported udsrc' in draw
+    driver = r"""
+#include "udsrc_line.h"
+int main() {
+    UdSrcParsed parsed{};
+    if (!accept_udsrc_line("udsrc 0 rect", 0, false, &parsed) || !parsed.is_udsrc || parsed.kind != udsrc_rect)
+        return 1;
+    if (!accept_udsrc_line("udsrc 4 numrecords 0", 4, false, &parsed) || parsed.kind != udsrc_num_records || parsed.a != 0)
+        return 2;
+    if (accept_udsrc_line("udsrc 5 notakind 0", 5, false, &parsed))
+        return 3;
+    if (accept_udsrc_line("udsrc 6 stride 0", 5, false, &parsed))
+        return 4;
+    if (!accept_udsrc_line("udsrc 5 stride 0", 5, false, &parsed) || parsed.kind != udsrc_stride)
+        return 5;
+    if (!accept_udsrc_line("srv 0 buf table 0 0", 0, false, &parsed) || parsed.is_udsrc)
+        return 6;
+    if (accept_udsrc_line("udsrc 0 mrtbits", 0, false, &parsed))
+        return 7;
+    if (!accept_udsrc_line("udsrc 0 mrtbits", 0, true, &parsed) || parsed.kind != udsrc_mrt_bits)
+        return 8;
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        source = directory / 'udsrc_main.cpp'
+        source.write_text(driver, encoding='ascii')
+        binary = directory / 'udsrc_main'
+        built = subprocess.run(
+            ['g++', '-std=c++17', '-Wall', '-Wextra', '-I', str(root / 'src/startup_stubs'), str(source), '-o', str(binary)],
+            capture_output=True, text=True)
+        if built.returncode:
+            raise AssertionError(built.stderr)
+        run = subprocess.run([str(binary)], capture_output=True, text=True)
+        if run.returncode:
+            raise AssertionError('udsrc driver exit %s' % run.returncode)
+    print('udsrc: numrecords is stored, and an unknown kind or a gap refuses the manifest')
 
 
 def main():
