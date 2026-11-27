@@ -1937,6 +1937,29 @@ struct DirectCompute {
                                            : ir.binary("shl", ir.binary("and", val(2), "3"), "3");
             auto joined = ir.binary("or", shift("lshr", b, k), shift("shl", a, ir.binary("sub", "32", k)));
             z = select(cmp("eq", k, "0"), b, joined);
+        } else if (n == "v_perm_b32" || n == "v_lerp_u8") {
+            // Byte-wise (RDNA 2 ISA V_PERM_B32 and V_LERP_U8; gfx2hlsl.py #2875 and #2873). v_perm_b32: selector byte
+            // S2[8i+7:8i] picks byte 0..7 of {S0, S1} (S1 low), 8..11 the sign of bit 15 or 31 of S1 or S0 as 0x00 or
+            // 0xff, 12 gives 0x00 and 13..255 give 0xff. v_lerp_u8: (S0 + S1 + S2[8i]) >> 1 for each byte i.
+            auto byte = [&](const string &x, const string &at) { return ir.binary("and", ir.binary("lshr", x, at), "255"); };
+            for (unsigned i = 0; i < 4; ++i) {
+                const string at = to_string(8 * i);
+                string v;
+                if (n == "v_lerp_u8") {
+                    auto round = ir.binary("and", ir.binary("lshr", val(2), at), "1");
+                    v = ir.binary("lshr", ir.binary("add", ir.binary("add", byte(a, at), byte(b, at)), round), "1");
+                } else {
+                    auto sel = byte(val(2), at);
+                    auto picked = byte(select(cmp("ult", sel, "4"), b, a), ir.binary("shl", ir.binary("and", sel, "3"), "3"));
+                    auto sign = ir.binary("and", ir.binary("lshr", select(cmp("ult", sel, "10"), b, a),
+                                                           ir.binary("or", ir.binary("shl", ir.binary("and", sel, "1"), "4"), "15")), "1");
+                    v = select(cmp("ult", sel, "8"), picked,
+                               select(cmp("ult", sel, "12"), ir.binary("mul", sign, "255"),
+                                      select(cmp("eq", sel, "12"), "0", "255")));
+                }
+                v = i ? ir.binary("shl", v, at) : v;
+                z = i ? ir.binary("or", z, v) : v;
+            }
         } else if (n == "v_bfm_b32")
             z = shift("shl", ir.binary("sub", shift("shl", "1", a), "1"), b);  // like s_bfm_b32 (#2985)
         else if (n == "v_bfi_b32")
