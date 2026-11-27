@@ -229,8 +229,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     constexpr UINT words = 320;
     const bool shared_uav = mode == "dispatch-read-write-uav";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
+    const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
+    const bool write_zero = mode == "dispatch-indirect-pixel-zero";
     const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
-    const UINT groups = mode == "dispatch-indirect-zero" ? 0u : mode == "dispatch-indirect-2" ? 2u : 5u;
+    const UINT groups = mode == "dispatch-indirect-zero" || write_zero || mode == "dispatch-indirect-pixel-omit" ? 0u :
+                        mode == "dispatch-indirect-2" || mode == "dispatch-indirect-pixel-2" ? 2u : 5u;
     auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, (indirect || root_srv) ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
@@ -348,8 +351,37 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
     };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    const auto submit = [&](UINT64 value) -> int {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+        invoke(queue, 10, 1, word(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), value)))) return 76;
+        // Render mode publishes the guest fence value after desktop queue completion.
+        const ULONGLONG deadline = GetTickCount64() + 10000;
+        for (;;) {
+            const auto completed = invoke(fence, 8);
+            const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
+            if (completed == ~UINT64{0} || FAILED(removed)) {
+                std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
+                return 78;
+            }
+            if (completed == value) break;
+            if (GetTickCount64() >= deadline) {
+                std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
+                return 78;
+            }
+            Sleep(1);
+        }
+        return 0;
+    };
     Slot67Indirect record;
-    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups);
+    if (indirect) record.prepare(adapter, device, list, memory + 0x20000 / sizeof(UINT), groups, write_zero,
+                                 pixel ? queue : nullptr, pixel ? placed[1] : nullptr);
+    if (pixel) {
+        if (const int rc = submit(1)) return rc;
+        std::printf("guest queue=%p writer fence=1 completed\n", queue);
+        if (!record.check_record(groups, write_zero)) return 80;
+        if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    }
     bind();
     if (mode.rfind("dispatch-sampled", 0) == 0 || mode == "dispatch-input-token") {
         const bool depth = mode == "dispatch-sampled-depth";
@@ -465,31 +497,20 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(list, 39, 0, 1, word(&constants[1]), 1);
     }
     if (mode == "dispatch-table-offset") invoke(list, 32, 1, word(&heap));  // same heap keeps the offset table
+    if (pixel) record.capture_before_consumer(adapter, device, list);
     if (indirect) record.execute(list, mode == "dispatch-indirect-multi" ? 2 : 1,
                                  mode == "dispatch-indirect-counted", mode == "dispatch-indirect-outside");
     else if (mode == "dispatch-reference-2" || mode == "dispatch-reference-5")
         invoke(list, 14, mode == "dispatch-reference-2" ? 2 : 5, 1, 1);
     else if (mode != "dispatch-none" && mode != "dispatch-root-srv-none") invoke(list, 14, 3, 2, 2);
-    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
-    invoke(queue, 10, 1, word(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
-    // Render mode publishes the guest fence value after desktop queue completion.
-    const ULONGLONG deadline = GetTickCount64() + 10000;
-    for (;;) {
-        const auto completed = invoke(fence, 8);
-        const HRESULT removed = static_cast<HRESULT>(invoke(device, 37));
-        if (completed == ~UINT64{0} || FAILED(removed)) {
-            std::fprintf(stderr, "slot 67 Dispatch fence: device removed (0x%08lx)\n", static_cast<unsigned long>(removed));
-            return 78;
-        }
-        if (completed == 1) break;
-        if (GetTickCount64() >= deadline) {
-            std::fputs("slot 67 Dispatch fence: timed out\n", stderr);
-            return 78;
-        }
-        Sleep(1);
+    if (const int rc = submit(pixel ? 2 : 1)) return rc;
+    if (pixel) {
+        std::printf("guest queue=%p consumer fence=2 completed\n", queue);
+        if (!record.check_record(groups, write_zero, true)) return 80;
+        const bool stale = mode == "dispatch-indirect-pixel-5-stale";
+        record.draw_pixels(adapter, device, queue, placed[stale ? 0 : 1], stale);
     }
-    if (indirect && !record.check_record(groups)) return 80;
+    if (indirect && !pixel && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();

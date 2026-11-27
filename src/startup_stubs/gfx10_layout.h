@@ -5,8 +5,8 @@
 //
 // A console resource description carries its swizzle mode in the Layout field as 0x100 + mode. The
 // modes handled here are 256 B, 4 KiB and 64 KiB blocks in the standard (S) and display (D) orders:
-// 0x101, 0x102, 0x105, 0x106, 0x109 and 0x10a. The address equations, block dimensions and mip-tail
-// rules follow AMD addrlib as Mesa carries it under src/amd/addrlib, at the revision
+// 0x101, 0x102, 0x105, 0x106, 0x109 and 0x10a, and the linear mode 0x100. The address equations,
+// block dimensions and mip-tail rules follow AMD addrlib as Mesa carries it under src/amd/addrlib, at the revision
 // tools/fetch_addrlib.py pins: Mesa 25.1.0, commit 5c142e46f3f6e752ed745fd48912ebb8fad67145. The three
 // files used carry this notice:
 //   Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
@@ -16,7 +16,9 @@
 // - src/core/addrlib2.cpp: ComputeThinBlockDimension (a block is 2^ceil(n/2) by 2^floor(n/2) elements)
 //   and GetMipTailDim (the tail holds mips up to half a block wide and one block high).
 // - src/gfx10/gfx10addrlib.cpp: ComputeSurfaceInfoMacroTiled (the tail block comes first in a slice,
-//   then the mips from the smallest to the largest; offsets and origins inside the tail block).
+//   then the mips from the smallest to the largest; offsets and origins inside the tail block), and
+//   HwlComputeSurfaceInfoLinear (ADDR_SW_LINEAR: each mip is rows of a pitch rounded up to 256 bytes,
+//   the mips stored from the smallest to the largest, with no tail).
 // The rules are restated here; no addrlib code is included.
 // Measurements are in elements: one texel, or one 4x4 block of a block-compressed format.
 
@@ -55,6 +57,9 @@ inline UINT swizzle_mode(const D3D12_RESOURCE_DESC& d)
     return (layout & ~0xffu) == 0x100 ? layout & 0xff : ~0u;
 }
 
+// ADDR_SW_LINEAR: rows, not blocks.
+constexpr UINT linear_mode = 0;
+
 inline UINT block_log2(UINT mode)
 {
     switch (mode) {
@@ -81,20 +86,22 @@ inline bool supports_volume(const D3D12_RESOURCE_DESC& d)
 inline bool supports(const D3D12_RESOURCE_DESC& d)
 {
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) return supports_volume(d);
-    const UINT log2 = block_log2(swizzle_mode(d));
-    if (!log2 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !element_of(d.Format).bytes) return false;
+    const UINT mode = swizzle_mode(d), log2 = block_log2(mode);
+    if ((!log2 && mode != linear_mode) || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !element_of(d.Format).bytes) return false;
     if (!d.Width || !d.Height || d.Width > 16384 || d.Height > 16384 || !d.DepthOrArraySize) return false;
     if (!d.MipLevels || d.MipLevels > max_mips || d.SampleDesc.Count != 1) return false;
-    return log2 >= 12 || d.MipLevels == 1; // a 256 B block has no mip tail here
+    return mode == linear_mode || log2 >= 12 || d.MipLevels == 1; // a 256 B block has no mip tail here
 }
 
 struct Layout {
     UINT bytes_per_element = 0, texels = 1, width = 0, height = 0, mips = 0, slices = 0;
     UINT block_bytes = 0, block_width = 0, block_height = 0;
+    bool is_linear = false;  // rows of row_pitch[mip] elements; block_* then describe one 256-byte row step
     UINT first_tail = 0;  // first mip inside the shared tail block; mips when there is none
     std::uint64_t slice_size = 0;
     std::array<std::uint64_t, max_mips> start{};          // byte offset of a mip in its slice
     std::array<UINT, max_mips> blocks_wide{}, origin_x{}, origin_y{};
+    std::array<UINT, max_mips> row_pitch{};               // elements per row of a linear mip
     std::array<UINT, 256> x_bits{}, y_bits{};             // in-block byte offset contributed by a coordinate
     // A volume (supports_volume): its depth, the depth of a thick block, the in-block offset contributed by z,
     // and the bytes of one layer of blocks, which holds that layer of every mip. Its one slice holds every
@@ -114,6 +121,25 @@ struct Layout {
             return;
         }
         const UINT mode = swizzle_mode(d), log2 = block_log2(mode);
+        const auto shifted = [](UINT v, UINT mip) { return (std::max)(1u, (v + (1u << mip) - 1) >> mip); };
+        const UINT columns0 = (width + texels - 1) / texels, rows0 = (height + texels - 1) / texels;
+        if (mode == linear_mode) {
+            // HwlComputeSurfaceInfoLinear: the pitch of each mip is its width (rounded up, GetMipSize)
+            // aligned to 256 bytes, and the smallest mip comes first.
+            is_linear = true;
+            first_tail = mips;
+            block_bytes = 256;
+            block_width = 256 / bytes_per_element;
+            block_height = 1;
+            std::uint64_t offset = 0;
+            for (UINT mip = mips; mip-- > 0;) {
+                row_pitch[mip] = (shifted(columns0, mip) + block_width - 1) / block_width * block_width;
+                start[mip] = offset;
+                offset += std::uint64_t{row_pitch[mip]} * shifted(rows0, mip) * bytes_per_element;
+            }
+            slice_size = offset;
+            return;
+        }
         UINT element_log2 = 0;
         while ((1u << element_log2) < bytes_per_element) ++element_log2;
         const UINT count_log2 = log2 - element_log2, width_log2 = (count_log2 + 1) / 2;
@@ -149,8 +175,6 @@ struct Layout {
             }
 
         // Mip sizes for the layout round up at every level (addrlib GetMipSize).
-        const UINT columns0 = (width + texels - 1) / texels, rows0 = (height + texels - 1) / texels;
-        const auto shifted = [](UINT v, UINT mip) { return (std::max)(1u, (v + (1u << mip) - 1) >> mip); };
         const UINT tail_mips = log2 - 4; // most mips one tail block holds, for 4 KiB and 64 KiB blocks
         first_tail = mips;
         std::array<std::uint64_t, max_mips> size{};
@@ -282,6 +306,7 @@ struct Layout {
                    (x_bits[x % block_width] | y_bits[y % block_height] | in_z);
         }
         const std::uint64_t base = slice * slice_size;
+        if (is_linear) return base + start[mip] + (std::uint64_t{y} * row_pitch[mip] + x) * bytes_per_element;
         if (mip >= first_tail) return base + (x_bits[(origin_x[mip] + x) & 255] | y_bits[(origin_y[mip] + y) & 255]);
         const std::uint64_t block = std::uint64_t{y / block_height} * blocks_wide[mip] + x / block_width;
         return base + start[mip] + block * block_bytes + (x_bits[x % block_width] | y_bits[y % block_height]);

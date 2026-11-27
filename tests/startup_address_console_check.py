@@ -1,6 +1,6 @@
 """Draw textures published by address (device slot 70) whose texels are in a console layout.
 
-  <consumer> <backend>               seven textures and six volume mips, each drawn once; every pixel of the
+  <consumer> <backend>               eleven textures and six volume mips, each drawn once; every pixel of the
                                      512x128 target is compared with the texel the view names; then three
                                      held descriptions and one texture whose address is announced as XG
                                      rows after it was published
@@ -17,9 +17,12 @@
                                      chunks at its fenced submit, so B draws payload 32; A submitted again afterwards
                                      would read reused chunks, so it is refused before the execute: the target, read
                                      back after that submit, still holds payload 32 on the right (not A's payload 31)
+  <consumer> <backend> linear-unpadded  the control described at check_linear_unpadded
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
-equations of AMD addrlib's GFX10 pattern tables, written out below. Reference: addrlib as Mesa carries it
+equations of AMD addrlib's GFX10 pattern tables, written out below, and for the linear mode (0x100) from
+HwlComputeSurfaceInfoLinear: rows whose pitch is the mip's rounded-up width aligned to 256 bytes, the mips
+stored from the smallest to the largest. Reference: addrlib as Mesa carries it
 under src/amd/addrlib at the revision tools/fetch_addrlib.py pins (Mesa 25.1.0, commit
 5c142e46f3f6e752ed745fd48912ebb8fad67145), files src/gfx10/gfx10SwizzlePattern.h, src/gfx10/gfx10addrlib.cpp
 and src/core/addrlib2.cpp, each with the notice "Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All
@@ -43,9 +46,22 @@ MICRO = {4: (8, 8), 8: (8, 4)}
 
 
 class Console:
-    def __init__(self, width, height, mips, element, texels, layout):
+    def __init__(self, width, height, mips, element, texels, layout, unpadded=False):
         self.width, self.height, self.mips, self.element, self.texels = width, height, mips, element, texels
         mode = layout & 0xff
+        columns, rows = -(-width // texels), -(-height // texels)
+        size = lambda v, mip: max(1, (v + (1 << mip) - 1) >> mip)
+        self.linear = mode == 0
+        if self.linear:
+            # unpadded: rows exactly one mip wide, for the control at check_linear_unpadded.
+            align = 1 if unpadded else 256 // element
+            self.pitch, self.start, offset = {}, {}, 0
+            for mip in range(mips - 1, -1, -1):
+                self.pitch[mip] = -(-size(columns, mip) // align) * align
+                self.start[mip] = offset
+                offset += self.pitch[mip] * size(rows, mip) * element
+            self.bytes = offset
+            return
         self.log2 = {1: 8, 2: 8, 5: 12, 6: 12, 9: 16, 10: 16}[mode]
         bits = (DISPLAY if mode in (2, 6, 10) else STANDARD)[element].split()
         x_next, y_next = (sum(b[0] == axis for b in bits) for axis in "XY")
@@ -58,8 +74,6 @@ class Console:
                 y_next += 1
         self.bits = bits
         self.block_w, self.block_h = 1 << x_next, 1 << y_next
-        columns, rows = -(-width // texels), -(-height // texels)
-        size = lambda v, mip: max(1, (v + (1 << mip) - 1) >> mip)
         tail_mips = self.log2 - 4
         self.first_tail = mips
         if mips > 1:
@@ -96,6 +110,8 @@ class Console:
         return -(-max(1, self.height >> mip) // self.texels)
 
     def address(self, mip, x, y):
+        if self.linear:
+            return self.start[mip] + (y * self.pitch[mip] + x) * self.element
         if mip >= self.first_tail:
             ox, oy = self.origin[mip]
             return self.in_block(ox + x, oy + y)
@@ -171,6 +187,11 @@ CASES = [
     ("RGBA8 256x256 chain 64 KiB display, tail mip 2", 256, 256, 4, RGBA8, 0x10a, 2),
     ("RGBA8 256x256 chain 64 KiB display, tail mip 3", 256, 256, 4, RGBA8, 0x10a, 3),
     ("RGBA8 40x24 256 B standard", 40, 24, 1, RGBA8, 0x101, 0),
+    # Linear: 100 texels are 400 bytes, so each row is padded to 512; 200 BC1 texels are 50 blocks, padded to 64.
+    ("RGBA8 100x40 linear", 100, 40, 1, RGBA8, 0x100, 0),
+    ("RGBA8 100x40 linear chain, mip 0", 100, 40, 4, RGBA8, 0x100, 0),
+    ("RGBA8 100x40 linear chain, mip 2", 100, 40, 4, RGBA8, 0x100, 2),
+    ("BC1 200x96 linear", 200, 96, 1, BC1, 0x100, 0),
 ]
 
 
@@ -265,12 +286,12 @@ HELD_VOLUME = (("RGBA8 volume 64x8x40 4 KiB standard past the XG size", 64, 8, 4
                "console_layout_beyond_xg_size")
 
 
-def build(width, height, mips, fmt, layout):
+def build(width, height, mips, fmt, layout, unpadded=False):
     """Backing bytes and, per mip, the RGBA texels a correct detile shows."""
     texels = 4 if fmt == BC1 else 1
     element = 8 if fmt == BC1 else 4
     images = []
-    console = Console(width, height, mips, element, texels, layout)
+    console = Console(width, height, mips, element, texels, layout, unpadded)
     backing = bytearray(console.bytes)
     seen = set()
     for mip in range(mips):
@@ -311,9 +332,9 @@ LATE = (("RGBA8 96x40 4 KiB standard, XG rows after publication", 96, 40, 1, RGB
         {"X2W_TEST_CONSOLE_XG_ROWS": "after"})
 
 
-def check(directory, consumer, backend, case, extra=None, held=None, late=False):
+def check(directory, consumer, backend, case, extra=None, held=None, late=False, unpadded=False):
     name, width, height, mips, fmt, layout, viewed = case
-    backing, images = build(width, height, mips, fmt, layout)
+    backing, images = build(width, height, mips, fmt, layout, unpadded)
     source = directory / "texels.bin"
     source.write_bytes(backing)
     w, h = max(1, width >> viewed), max(1, height >> viewed)
@@ -344,16 +365,31 @@ def check(directory, consumer, backend, case, extra=None, held=None, late=False)
         print(f"{backend} {name}: published, then {TARGET_W * TARGET_H} pixels read the null view")
         return 0
     image = images[viewed]
+    wrong = 0
     for y in range(TARGET_H):
         for x in range(TARGET_W):
             pixel = actual[4 * (y * TARGET_W + x):4 * (y * TARGET_W + x) + 4]
             expect = image[4 * ((y % h) * w + x % w):4 * ((y % h) * w + x % w) + 4]
-            if pixel != expect:
+            if pixel != expect and not unpadded:
                 raise AssertionError(f"{name}: pixel ({x},{y}) actual {pixel.hex()} expected {expect.hex()}")
+            wrong += pixel != expect
     if "slot70 texture kind 1: published console layout" not in log:
         raise AssertionError(f"{name}: no 'published console layout' line in the log")
+    if unpadded:
+        if not wrong:
+            raise AssertionError(f"{name}: rows written without the 256-byte pitch drew exactly; the pitch is not checked")
+        print(f"{backend} {name}, rows without the 256-byte pitch: published, {wrong} of {TARGET_W * TARGET_H} pixels differ")
+        return 0
     print(f"{backend} {name}: {TARGET_W * TARGET_H} RGBA pixels exact")
     return 0
+
+
+def check_linear_unpadded(directory, consumer, backend):
+    """The linear cases' negative control: the first linear texture with its rows written one mip wide
+    (400 bytes) instead of at the 256-byte pitch (512). The runtime reads the padded pitch, so the draw must
+    differ from the texels; an exact draw means the linear cases do not test the pitch."""
+    case = next(c for c in CASES if c[5] == 0x100)
+    return check(directory, consumer, backend, case, unpadded=True)
 
 
 GATE_PAYLOADS = 18
@@ -468,9 +504,13 @@ def check_gate(directory, consumer, backend, mode):
 GATES = ("gate", "gate-ring", "gate-ring-reuse", "gate-ring-keep", "gate-ring-keep-release")
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in GATES):
-        usage = "usage: startup_address_console_check.py <consumer> <backend> [gate | gate-ring | gate-ring-reuse | gate-ring-keep | gate-ring-keep-release]\n"
+    modes = GATES + ("linear-unpadded",)
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in modes):
+        usage = "usage: startup_address_console_check.py <consumer> <backend> [" + " | ".join(modes) + "]\n"
         sys.exit(usage + "\n\n".join(__doc__.split("\n\n")[:2]))
+    if len(sys.argv) == 4 and sys.argv[3] == "linear-unpadded":
+        with tempfile.TemporaryDirectory() as temporary:
+            sys.exit(check_linear_unpadded(Path(temporary), sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 4:
         with tempfile.TemporaryDirectory() as temporary:
             sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3]))
