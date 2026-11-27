@@ -398,10 +398,27 @@ def controls():
           and " bvh base " not in pipe.manifest()
           and "x2w_bvh_intersect_box16" not in wrap_hlsl and "uint4 bt" not in wrap_hlsl, str(refusals))
 
+    # Size is a count minus one in 64-byte units. These are exact fits and one unit short.
+    for node, word2, label in ((0x04, 0, "box16 at offset zero in a one-unit span"),
+                               (0x05, 1, "box32 at offset zero in a two-unit span"),
+                               (0x0c, 1, "box16 in the last unit of a two-unit span")):
+        pipe, hlsl, refusals = translate_program(node=node, word2=word2)
+        check("exact-fit %s translates" % label, pipe is not None and not refusals, str(refusals))
+    for node, word2, label in ((0x05, 0, "box32 at offset zero in a one-unit span"),
+                               (0x0c, 0, "box16 in the last unit of a one-unit span")):
+        pipe, hlsl, refusals = translate_program(node=node, word2=word2)
+        check("too-short %s refuses" % label,
+              len(refusals) == 1 and "outside descriptor size" in refusals[0], str(refusals))
+    pipe, hlsl, refusals = translate_program(node=0x04, word2=0x03ffffff)
+    check("largest decoded extent translates", pipe is not None and not refusals, str(refusals))
+    pipe, hlsl, refusals = translate_program(node=0x04, word2=0x04000000)
+    check("extent above 4 GiB refuses", len(refusals) == 1 and "above 4 GiB" in refusals[0], str(refusals))
+
     # Portable checks ensure the actual emitted helpers and every negative
     # mutation are present even when a GPU dispatch is unavailable.
+    pipe, hlsl, refusals = translate_program(node=0x04)
     helpers = "\n".join(G.BVH_HELPERS)
-    check("translated shader embeds both dispatch-tested helpers", hlsl is not None and helpers in hlsl, "")
+    check("translated shader embeds both dispatch-tested helpers", pipe is not None and helpers in hlsl, "")
     for mutation in MUTATIONS:
         dispatch_hlsl(mutation)
 
@@ -418,9 +435,9 @@ def controls():
         ("descriptor type", dict(word3=0x60000000), "descriptor type 6 is not 8"),
         ("box growing", dict(word1=SORT_ENABLE | (2 << 23)), "box growing amount 2"),
         ("reserved word 1", dict(word1=SORT_ENABLE | 0x100), "reserved word 1"),
-        ("size zero", dict(word2=0), "does not cover the node"),
+        ("box32 size zero", dict(word2=0), "outside descriptor size"),
         ("node outside size", dict(node=0x25, word2=3), "outside descriptor size"),
-        ("box16 node outside size", dict(node=0x54, word2=10), "outside descriptor size"),
+        ("box16 node outside size", dict(node=0x54, word2=9), "outside descriptor size"),
         ("absolute base", dict(word0=0, word1=0), "absolute node base"),
         ("size high bits", dict(word3=RESOURCE_TYPE | 0x100), "size above 4 GiB"),
     ]
@@ -544,13 +561,81 @@ def dispatch_hlsl(mutation=None):
     return "\n".join(lines) + "\n"
 
 
+BOUNDARY_BOX32_OFFSET = 128
+BOUNDARY_RESULT_OFFSET = 256
+BOUNDARY_BUFFER_SIZE = 320
+
+
+def boundary_hlsl():
+    helpers = "\n".join(G.BVH_HELPERS).replace("ByteAddressBuffer", "RWByteAddressBuffer")
+    lines = [helpers, "RWByteAddressBuffer data : register(u0);", "[numthreads(1, 1, 1)]", "void main() {"]
+    for i, (child, lo, hi) in enumerate(HALF_NODES[0]):
+        lines.append("    data.Store(%du, 0x%08xu);" % (4 * i, child))
+        packed = struct.unpack("<3I", struct.pack("<6e", *lo, *hi))
+        for j, word in enumerate(packed):
+            lines.append("    data.Store(%du, 0x%08xu);" % (16 + 12 * i + 4 * j, word))
+    for i, (child, lo, hi) in enumerate(NODES[0]):
+        base = BOUNDARY_BOX32_OFFSET
+        lines.append("    data.Store(%du, 0x%08xu);" % (base + 4 * i, child))
+        for j in range(3):
+            lines.append("    data.Store(%du, %s);" % (base + 16 + 24 * i + 4 * j, fbits(lo[j])))
+            lines.append("    data.Store(%du, %s);" % (base + 16 + 24 * i + 12 + 4 * j, fbits(hi[j])))
+        for j in range(4):
+            lines.append("    data.Store(%du, 0u);" % (base + 112 + 4 * j))
+    lines.append("    DeviceMemoryBarrierWithGroupSync();")
+    box16_ray = HALF_RAYS[0]
+    box32_ray = RAYS[0]
+    cases = (
+        (0, "x2w_bvh_intersect_box16", 0x04, 0, box16_ray[2:5], box16_ray[-1]),
+        (1, "x2w_bvh_intersect_box16", 0x0c, 0, box16_ray[2:5], (INVALID,) * 4),
+        (2, "x2w_bvh_intersect_box32", 0x15, 3, box32_ray[2:5], box32_ray[-1]),
+        (3, "x2w_bvh_intersect_box32", 0x15, 2, box32_ray[2:5], (INVALID,) * 4),
+    )
+    expected = []
+    for case, helper, pointer, word2, ray, result in cases:
+        extent, origin, direction = ray
+        inv = tuple(1.0 / c for c in direction)
+        lines.append(
+            "    uint4 b%d = %s(data, 0x%08xu, 0x1000u, 0x80000000u, 0x%08xu, 0x80000000u, "
+            "%s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
+                case, helper, pointer, word2, ffloat(extent), ffloat(origin[0]), ffloat(origin[1]),
+                ffloat(origin[2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
+        for word in range(4):
+            lines.append("    data.Store(%du, b%d.%s);" % (BOUNDARY_RESULT_OFFSET + 16 * case + 4 * word, case, "xyzw"[word]))
+        expected.append(result)
+    lines.append("}")
+    return "\n".join(lines) + "\n", expected
+
+
+def run_boundary_dispatch(dxc, runner, adapter, directory):
+    source = directory / "bvh_boundary.hlsl"
+    cso = directory / "bvh_boundary.cso"
+    output = directory / "bvh_boundary.bin"
+    hlsl, expected = boundary_hlsl()
+    source.write_text(hlsl, encoding="ascii")
+    compiled = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
+                              capture_output=True, text=True)
+    if compiled.returncode or compiled.stderr:
+        raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
+    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", str(BOUNDARY_BUFFER_SIZE), str(output)],
+                            capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 77:
+        return 77, None, expected
+    if result.returncode or result.stderr:
+        raise AssertionError(result.stderr or "offscreen_check exited with %d" % result.returncode)
+    data = output.read_bytes()
+    assert len(data) == BOUNDARY_BUFFER_SIZE, (len(data), BOUNDARY_BUFFER_SIZE)
+    return 0, struct.unpack("<%dI" % (len(data) // 4), data), expected
+
+
 def run_dispatch(dxc, runner, adapter, directory, mutation=None):
     name = "bvh_dispatch_" + mutation if mutation else "bvh_dispatch"
     source = directory / (name + ".hlsl")
     cso = directory / (name + ".cso")
     output = directory / (name + ".bin")
     source.write_text(dispatch_hlsl(mutation), encoding="ascii")
-    compiled = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
+    compiled = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
                               capture_output=True, text=True)
     if compiled.returncode or compiled.stderr:
         raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
@@ -597,6 +682,15 @@ def check_dispatch(dxc, runner, adapter):
             changed = tuple(mutant[start:start + 4])
             check("dispatch %s control changes %s" % (mutation, witness), changed != cases[case]["expected"],
                   "got %s" % ["%08x" % w for w in changed])
+        status, boundary_words, boundary_expected = run_boundary_dispatch(dxc, runner, adapter, directory)
+        if status == 77:
+            print("dispatch boundary: skip (adapter unavailable)")
+            return 77
+        for case, wanted in enumerate(boundary_expected):
+            start = BOUNDARY_RESULT_OFFSET // 4 + 4 * case
+            got = tuple(boundary_words[start:start + 4])
+            check("decoded descriptor extent case %d" % case, got == wanted,
+                  "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in wanted]))
     if failures:
         print("FAILED: %s" % ", ".join(failures))
         return 1

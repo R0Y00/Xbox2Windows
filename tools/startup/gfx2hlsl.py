@@ -8111,9 +8111,10 @@ class Stage:
         if base == 0:
             raise Unsupported('%s absolute node base is not lowered' % name)
         if vals[2] is not None:
-            if vals[2] < 1 or vals[2] >= 0x04000000:
-                raise Unsupported('%s descriptor size %d does not cover the node' % (name, vals[2]))
-            if (node_offset >> 6) + (node_bytes >> 6) > vals[2]:
+            if vals[2] >= 0x04000000:
+                raise Unsupported('%s descriptor size %d is above 4 GiB' % (name, vals[2]))
+            # Size is a count minus one in 64-byte units, so size=0 is a one-unit span.
+            if (node_offset >> 6) + (node_bytes >> 6) - 1 > vals[2]:
                 raise Unsupported('%s node base %#x is outside descriptor size %d' % (name, node_offset, vals[2]))
         if base + node_offset + node_bytes > 1 << 48:
             raise Unsupported('%s node address wraps the 48-bit address space' % name)
@@ -11094,7 +11095,7 @@ BVH_HELPERS = (
     # slice does not bind, so it is refused here as a miss rather than read at address zero.
     'bool x2w_bvh_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
     '    return (word1 & 0x7fffff00u) == 0u &&',
-    '        word3 == 0x80000000u && word2 >= 1u && word2 < 0x04000000u &&',
+    '        word3 == 0x80000000u && word2 < 0x04000000u &&',
     '        (word0 != 0u || (word1 & 0x000000ffu) != 0u);',
     '}',
     # One FP32 box from a radv_bvh_box32_node (Mesa 25.1.0 bvh/bvh.h, MIT): children[4] at
@@ -11188,7 +11189,7 @@ BVH_HELPERS = (
     '    uint4 miss = uint4(X2W_BVH_MISS, X2W_BVH_MISS, X2W_BVH_MISS, X2W_BVH_MISS);',
     '    if ((node & 7u) != 4u || !x2w_bvh_descriptor_ok(word0, word1, word2, word3)) return miss;',
     '    uint offset = (node & 0xfffffff8u) << 3u;',
-    '    if ((offset >> 6u) + 1u > word2) return miss;',
+    '    if ((offset >> 6u) > word2) return miss;',
     '    inv_dir = clamp(inv_dir, -3.402823466e+38, 3.402823466e+38);',
     '    bool h0, h1, h2, h3;',
     '    float d0 = x2w_bvh_box16_slot(nodes, offset, 0u, extent, origin, inv_dir, h0);',
