@@ -33,7 +33,7 @@ The runtime records one texel of render target 0 after each translated draw of
 decodes `rgba=` for `R8G8B8A8_UNORM`, `R8G8B8A8_UNORM_SRGB`, `B8G8R8A8_UNORM` and
 `B8G8R8A8_UNORM_SRGB`. The copy budget is 48, so a history that reaches 48 samples
 may be missing later draws. See [Per-draw texel history](../experiments.md#per-draw-texel-history)
-and the [startup runtime options](../startup-runtime.md#environment-variables).
+and the [startup runtime options](../startup-runtime.md#switches).
 
 The `draw=` value is the runtime copy ordinal, not a title draw-call number. It is
 monotonic in one process and is used here only to order the retained samples.
@@ -110,3 +110,4 @@ The parser accepts only the version-1 header and the exact field order above.
 The BMP path accepts BI_RGB 24-bit or 32-bit images up to 16,384 pixels per side
 and 64 MiB. A 48-sample history is reported as truncated by design, even when the
 title happened to stop after exactly 48 copies.
+
