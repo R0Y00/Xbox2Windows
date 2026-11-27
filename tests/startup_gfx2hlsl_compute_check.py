@@ -1505,6 +1505,10 @@ def check_formatted_loads():
         assert hlsl.count(' = ((ud3 >> ') == width
     # Word 3 is overwritten in an otherwise intact native descriptor.
     refused('words were rewritten', lambda: translate('L-uint', code=prefix + bytes.fromhex('80038fbe') + LOAD_L + end))
+    # An instruction writes a derived descriptor word to a separate SGPR (s21), leaving operand s[12:15] intact.
+    # The indexed formatted load is refused because the descriptor is modified.
+    refused('indexed load through a modified descriptor',
+            lambda: translate('L-uint', code=prefix + bytes.fromhex('0dff1587ffff00c0') + LOAD_L + end))
     # At a branch target, there is no local descriptor load to prove.
     refused('local table load', lambda: translate('L-uint', code=prefix + bytes.fromhex('000082bf') + LOAD_L + end))
     local_load = bytes.fromhex('000082bf') + prefix + LOAD_L + end

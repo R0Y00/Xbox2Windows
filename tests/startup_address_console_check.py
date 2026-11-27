@@ -8,6 +8,15 @@
   <consumer> <backend> gate-ring     the same draws with X2W_TEST_ADDRESS_UPLOAD_RING=1: the 256 MiB ring
                                      refuses the uploads past its cap, the refused draws read the null view
                                      and the left half keeps payload 0
+  <consumer> <backend> gate-ring-reuse  after completion, a new ring upload draws payload 18 over the right half
+  <consumer> <backend> gate-ring-keep   list A uploads 32 payloads (512 MiB) from the ring, is submitted, completes
+                                     and is never Reset; list B then draws payload 32 over the right half. Without
+                                     X2W_D3D12_RING_RELEASE_AT_SUBMIT, A keeps its chunks: the ring refuses past 256 MiB
+                                     and the right half reads the null view
+  <consumer> <backend> gate-ring-keep-release  the same with X2W_D3D12_RING_RELEASE_AT_SUBMIT=1: A releases its
+                                     chunks at its fenced submit, so B draws payload 32; A submitted again afterwards
+                                     would read reused chunks, so it is refused before the execute: the target, read
+                                     back after that submit, still holds payload 32 on the right (not A's payload 31)
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
 equations of AMD addrlib's GFX10 pattern tables, written out below. Reference: addrlib as Mesa carries it
@@ -210,6 +219,7 @@ def check(directory, consumer, backend, case, extra=None, held=None, late=False)
 
 
 GATE_PAYLOADS = 18
+KEEP_PAYLOADS = 32  # tests/startup_stream_draw.cpp, X2W_TEST_CONSOLE_KEEP
 
 
 def gate_colour(payload):
@@ -217,7 +227,7 @@ def gate_colour(payload):
     return bytes(((17 * payload + 3) & 255, (255 - 9 * payload) & 255, payload ^ 0x5a, 255))
 
 
-def check_gate(directory, consumer, backend, ring):
+def check_gate(directory, consumer, backend, mode):
     """Uploads recorded while the queue cannot run must still hold their bytes when it does.
 
     The normal fixture records and discards a draw using payload 0 before the first submit retries that
@@ -237,6 +247,22 @@ def check_gate(directory, consumer, backend, ring):
             "  return t.Load(int3(uint(p.x) % 2048, uint(p.y) % 2048, 0));\n}\n")
     trap_log = directory / "trap.log"
     modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log)}
+    ring = mode != "gate"
+    reuse = mode == "gate-ring-reuse"
+    keep = mode in ("gate-ring-keep", "gate-ring-keep-release")
+    release = mode == "gate-ring-keep-release"
+    if keep:
+        modes["X2W_TEST_CONSOLE_KEEP"] = "1"
+    else:
+        os.environ.pop("X2W_TEST_CONSOLE_KEEP", None)
+    if release:
+        modes["X2W_D3D12_RING_RELEASE_AT_SUBMIT"] = "1"
+    else:
+        os.environ.pop("X2W_D3D12_RING_RELEASE_AT_SUBMIT", None)
+    if reuse:
+        modes["X2W_TEST_ADDRESS_UPLOAD_RING_REUSE"] = "1"
+    else:
+        os.environ.pop("X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", None)
     if ring:
         modes["X2W_TEST_ADDRESS_UPLOAD_RING"] = "1"
     else:
@@ -249,6 +275,10 @@ def check_gate(directory, consumer, backend, ring):
         raise AssertionError(f"gate: readback length {len(actual)}")
     first = gate_colour(0)
     last = bytes(4) if ring else gate_colour(GATE_PAYLOADS - 1)
+    if reuse:
+        last = gate_colour(GATE_PAYLOADS)
+    if release:
+        last = gate_colour(KEEP_PAYLOADS)
     wrong = {"left": 0, "right": 0}
     seen = set()
     for y in range(TARGET_H):
@@ -261,15 +291,31 @@ def check_gate(directory, consumer, backend, ring):
     log = trap_log.read_text(errors="replace")
     released = f"x2w-draw by-address uploads: {GATE_PAYLOADS} submits completed and released"
     half = TARGET_W * TARGET_H // 2
+    if keep:
+        if wrong["left"] or wrong["right"]:
+            ring_lines = "\n".join(line for line in log.splitlines() if "upload ring" in line)
+            raise AssertionError(f"{mode}: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected {first.hex()} left, "
+                                 f"{last.hex()} right\n{ring_lines}")
+        refused = "x2w-draw upload ring reservation refused: no unused capacity" in log
+        reported = "were reused; refused, it is not executed" in log
+        if release and not reported:
+            raise AssertionError(f"{mode}: list A submitted again after B reused its chunk was not refused")
+        if not release and (not refused or reported):
+            raise AssertionError(f"{mode}: expected the 256 MiB refusal and no resubmit refusal (refused={refused}, reported={reported})")
+        print(f"{backend} {mode}: {half} left pixels hold payload 0 and {half} right pixels hold {last.hex()} after A's "
+              "resubmit; "
+              + ("A's chunks were released at its fenced submit and its stale resubmit was refused, not executed" if release
+                 else "the never-Reset list kept its chunks and the ring refused past its cap"))
+        return 0
     if ring:
         if wrong["left"] or wrong["right"]:
-            raise AssertionError(f"gate-ring: {wrong} wrong pixels; expected payload 0 left and null view right")
+            raise AssertionError(f"{mode}: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected {first.hex()} left, {last.hex()} right")
         if "x2w-draw upload ring reservation refused: no unused capacity" not in log:
             raise AssertionError("gate-ring: no upload reservation refusal")
         if "x2w-draw by-address uploads:" in log:
             raise AssertionError("gate-ring: the ring control retained upload buffers")
         print(f"{backend} gate, uploads from the shared ring: exhaustion refused; "
-              f"{half} left pixels hold payload 0 and {half} right pixels read the null view")
+              f"{half} left pixels hold payload 0 and {half} right pixels hold {last.hex()}")
         return 0
     if wrong["left"] or wrong["right"]:
         raise AssertionError(f"gate: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected {first.hex()} left, {last.hex()} right")
@@ -281,13 +327,15 @@ def check_gate(directory, consumer, backend, ring):
     return 0
 
 
+GATES = ("gate", "gate-ring", "gate-ring-reuse", "gate-ring-keep", "gate-ring-keep-release")
+
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ("gate", "gate-ring")):
-        usage = "usage: startup_address_console_check.py <consumer> <backend> [gate | gate-ring]\n"
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in GATES):
+        usage = "usage: startup_address_console_check.py <consumer> <backend> [gate | gate-ring | gate-ring-reuse | gate-ring-keep | gate-ring-keep-release]\n"
         sys.exit(usage + "\n\n".join(__doc__.split("\n\n")[:2]))
     if len(sys.argv) == 4:
         with tempfile.TemporaryDirectory() as temporary:
-            sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3] == "gate-ring"))
+            sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3]))
     for case in CASES:
         with tempfile.TemporaryDirectory() as temporary:
             result = check(Path(temporary), *sys.argv[1:3], case)
