@@ -957,6 +957,15 @@ pipelines still need a published translation.
 Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
 ([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
 [route, controls and results](experiments/startup-compute-native-dispatch.md)).
+The #2958/#2993 fixture reads back a 3D float store fed by a scalar buffer SRV and a 2D texture SRV.
+The consumer creates the views with the adapter's descriptor increment and copies their tokens
+into a packed guest table when the increment exceeds 32 bytes. A zero-size W range must translate
+natively, be refused at Dispatch, and leave all 6,144 volume words untouched.
+Targeted in-process readbacks also check a mip-one 1D float store, a 2D-array float store into
+relative slice 1 (physical slice 2), and a packed D16 store into an RGBA16_FLOAT texture with
+round-to-nearest-even input conversion. Each case checks every output value, including sentinels
+outside the store region. On adapters without 32-lane waves the cases check the named refusal
+and untouched output before the test returns 77.
 
 ### Compute pipeline requests
 

@@ -19,9 +19,10 @@ that case's CPU expectation.
 4. Order: the first program runs again, now with a published translation in the cache. The native translation is
    still the one used, and all 320 words match.
 5. Table views: a scalar buffer read and a 2D image load feed a 3D image store. Replacing the load with a sample
-   adds a sampler and must leave the volume untouched.
+   adds a sampler and must leave the volume untouched. A zero-size UAV W range also leaves it untouched.
+6. Texture outputs: 1D float, 2D-array float, and 2D packed D16 stores match CPU references.
 
-A direct compute module declares wave size 32. On an adapter without 32-lane waves, steps 1 and 5 check that the
+A direct compute module declares wave size 32. On an adapter without 32-lane waves, steps 1, 5 and 6 check that the
 native translation is refused by that name with the output untouched. The sampler control and steps 2 and 3 run as
 written, step 4 uses the published translation, and the check exits 77. Exit 77 also when the adapter is unavailable.
 """
@@ -34,6 +35,8 @@ import tempfile
 
 import startup_gfx2hlsl_compute_check as C
 import startup_compute_dispatch_texture_check as T
+import startup_compute_image_store_check as A
+import startup_compute_image_store_d16_check as D
 from startup_compute_dispatch_check import dispatch, lines, prepare_case
 from startup_compute_translate_check import state_a
 from startup_stream_check import gfx2hlsl as G
@@ -43,6 +46,8 @@ LOADS_X4 = bytes.fromhex('050308f4' '000000fa' '050408f4' '200000fa')
 RECORD_LOADS = ['s_load_dwordx4 s[12:15], s[10:11], 0x0', 's_load_dwordx4 s[16:19], s[10:11], 0x20']
 NO_WAVES = 'not translated natively: the adapter has no 32-lane waves'
 SAMPLER_REFUSAL = 'not translated natively: a sampler, or more entry values, inputs or outputs than the dispatch path binds'
+TEXTURE_DISPATCH = 'Dispatch(2, 1, 1)'
+ZERO_W_REFUSAL = 'an output 3D texture W range is outside the mip'
 
 
 def mismatch(got, expected, result):
@@ -99,9 +104,12 @@ def table_views(directory, consumer, dxc_dir, adapter, no_waves):
         start = 2 * plane + y * 32 * 4  # view FirstWSlice 1, shader Z 1
         expected[start:start + 32] = (0x3f200000, initial[0], *T.STORE_VALUES[2:]) * 8
 
-    for sample in (False, True):
+    for mode, sample, zero_w in (
+            ('texture-volume-native-inputs', False, False),
+            ('texture-volume-native-inputs', True, False),
+            ('texture-volume-native-zero-w', False, True)):
         (directory / 'program').write_bytes(table_program(sample))
-        got, result = T.run(directory, consumer, env, 'texture-volume-native-inputs', '<%dI' % len(initial))
+        got, result = T.run(directory, consumer, env, mode, '<%dI' % len(initial))
         if sample or no_waves:
             reason = SAMPLER_REFUSAL if sample else NO_WAVES
             assert len(lines(result, reason)) == 1, result.stderr[-3000:]
@@ -109,13 +117,70 @@ def table_views(directory, consumer, dxc_dir, adapter, no_waves):
             assert got == initial, 'a refused Dispatch wrote the volume'
         else:
             assert len(lines(result, 'translated natively: 3 entry values, 2 inputs, 1 outputs')) == 1, result.stderr[-3000:]
+            if zero_w:
+                refusal = lines(result, f'{TEXTURE_DISPATCH} refused:')
+                assert len(refusal) == 1 and refusal[0].endswith(ZERO_W_REFUSAL), result.stderr[-3000:]
+                assert not lines(result, f'{TEXTURE_DISPATCH} translated'), result.stderr[-3000:]
+                assert got == initial, 'the zero WSize Dispatch changed the volume'
+                continue
             assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
             assert got == expected, 'native table views changed %d unexpected words\n%s' % (
                 sum(a != b for a, b in zip(got, expected)), result.stderr[-3000:])
             T.clean(result)
     assert all(p.name.startswith('req_') or p.name == 'native' for p in cache.iterdir())
     if not no_waves:
-        print('native table views: all volume words match the CPU reference, and a sampler is refused')
+        print('native table views: volume words match, and the sampler and zero WSize controls leave them untouched')
+
+
+def half4_program(f32_words):
+    moves = b''.join(struct.pack('<2I', 0x7e0002ff | reg << 17, bits)
+                     for reg, bits in enumerate(f32_words, 10))
+    # v_cvt_f16_f32 vN, vN, followed by v_pack_b32_f16 v[14:15] from pairs in v[10:13].
+    converts = b''.join(struct.pack('<I', 0x7e001500 | reg << 17 | reg) for reg in range(10, 14))
+    packs = b''.join(struct.pack('<2I', 0xd7110000 | dest, (256 + low) | (257 + low) << 9)
+                     for dest, low in ((14, 10), (15, 12)))
+    return A.ARRAY_PROLOGUE + bytes.fromhex('7fc08cbf') + moves + converts + packs + D.STORE + A.ARRAY_END
+
+
+def texture_outputs(directory, consumer, dxc_dir, adapter, no_waves):
+    cache, env = prepare_case(directory, adapter)
+    env['X2W_NATIVE_SHADERS'] = dxc_dir
+    # One UAV at guest record 2, with the same root layout as the volume store fixture.
+    Path(env['X2W_TEST_COMPUTE_ROOT']).write_bytes(
+        C.root_blob(3, table_range=True)[:-24] + struct.pack('<6I', 1, 1, 0, 0, 0, 2))
+    # Include ties on both sides of the even-half rule and values just above/below a midpoint.
+    f32_words = (0x3f801000, 0xbf803000, 0x3e801001, 0xc0000fff)
+    floats = struct.unpack('<4f', struct.pack('<4I', *f32_words))
+    half_values = struct.unpack('<4H', struct.pack('<4e', *floats))
+    cases = (
+        ('texture-line', T.store_program('line'), T.store_group('line'), 1, 1, 0, 'I', T.STORE_VALUES),
+        ('texture-array', A.array_program(1), A.fixture.GROUP, 8, 6, 2, 'I', A.ARRAY_VALUES),
+        ('texture-store', half4_program(f32_words), D.fixture.GROUP, 8, 1, 0, 'H', half_values),
+    )
+    for mode, program, group, height, layers, target_layer, unit, values in cases:
+        (directory / 'program').write_bytes(program)
+        (directory / 'state').write_bytes(state_a(group, T.STORE_RSRC2))
+        row = 32 * 4
+        plane = row * height
+        initial = ([0x5000 + i for i in range(plane)] if unit == 'H' else
+                   [0xbf000000 | (z << 12) | i for z in range(layers) for i in range(plane)])
+        expected = initial.copy()
+        for y in range(group[1]):
+            start = target_layer * plane + y * row
+            expected[start:start + 32] = values * 8  # 2 groups of 4 threads in X
+
+        got, result = T.run(directory, consumer, env, mode, f'<{len(initial)}{unit}')
+        if no_waves:
+            assert len(lines(result, NO_WAVES)) == 1, result.stderr[-3000:]
+            assert len(lines(result, f'{TEXTURE_DISPATCH} refused: no translation')) == 1, result.stderr[-3000:]
+            assert got == initial, f'{mode}: a Dispatch without 32-lane waves wrote the output'
+        else:
+            assert len(lines(result, 'translated natively: 3 entry values, 0 inputs, 1 outputs')) == 1, result.stderr[-3000:]
+            assert len(lines(result, f'{TEXTURE_DISPATCH} translated')) == 1, result.stderr[-3000:]
+            assert got == expected, (mode, sum(a != b for a, b in zip(got, expected)), result.stderr[-3000:])
+            T.clean(result)
+            print(f'native {mode}: all {len(got)} output values match the CPU reference')
+    assert all(p.name.startswith('req_') or p.name == 'native' for p in cache.iterdir())
 
 
 def main(consumer, dxc_dir, adapter):
@@ -175,6 +240,7 @@ def main(consumer, dxc_dir, adapter):
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
 
         table_views(directory / 'table-views', consumer, dxc_dir, adapter, no_waves)
+        texture_outputs(directory / 'texture-outputs', consumer, dxc_dir, adapter, no_waves)
         controls = ('the C++ compiler refuses case A with every word untouched, and a published translation then runs '
                     'it')
         if no_waves:
