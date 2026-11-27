@@ -563,8 +563,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
+               i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&

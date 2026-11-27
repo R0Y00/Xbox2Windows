@@ -1628,6 +1628,7 @@ struct DirectCompute {
                 const auto &inst = program.code[j];
                 const auto n = inst.name;
                 const bool reads_scc = n == "s_cselect_b32" || n == "s_cselect_b64" ||
+                    n == "s_cmov_b32" || n == "s_cmov_b64" || n == "s_cmovk_i32" ||
                     std::find(inst.src.begin(), inst.src.end(), 253u) != inst.src.end();
                 // These scalar mask operations set SCC from their entire
                 // result and do not consume the incoming SCC. An explicit
@@ -2048,6 +2049,34 @@ struct DirectCompute {
         }
         if (n == "s_movk_i32") {
             write(i.dst, to_string(Word(int16_t(i.a))));
+            return;
+        }
+        if (compute && (n == "s_cmov_b32" || n == "s_cmov_b64" || n == "s_cmovk_i32")) {
+            // RDNA 2 ISA SOP1/SOPK (#3070): D = SCC ? S0 : D; SCC is unchanged.
+            const bool pair = n == "s_cmov_b64";
+            if (pair ? ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
+                     : (i.dst > 106 && !(!wave64 && i.dst == 107)))
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0];
+            if (pair) {
+                if (!((s0 <= 104 && !(s0 & 1)) || (s0 >= 128 && s0 <= 208) || s0 == 255))
+                    refuse(i.pc, "invalid s_cmov_b64 source");
+            } else if (n == "s_cmov_b32") {
+                if (s0 > 106 && !(!wave64 && s0 == 107) && !constant32(i, s0))
+                    refuse(i.pc, "invalid s_cmov_b32 source");
+            }
+            auto cond = cmp("ne", read(128), "0");
+            auto old_lo = operand32(i, i.dst);
+            if (pair) {
+                auto old_hi = operand32(i, i.dst + 1);
+                auto new_lo = operand32(i, s0);
+                auto new_hi = pair_high(i, s0);
+                write(i.dst, select(cond, new_lo, old_lo));
+                write(i.dst + 1, select(cond, new_hi, old_hi));
+            } else {
+                auto next = n == "s_cmovk_i32" ? to_string(Word(int16_t(i.a))) : operand32(i, s0);
+                write(i.dst, select(cond, next, old_lo));
+            }
             return;
         }
         if (compute && (n == "v_readlane_b32" || n == "v_writelane_b32")) {
