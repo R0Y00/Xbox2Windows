@@ -6301,6 +6301,13 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fail_view_allocations(int site, 
 
 // Fixture probe (startup_view_alloc): the sizes of the three view containers, the id + 1 that the tracked slot of a
 // title descriptor handle names (0: none), and whether a resource is still in the retire class.
+// Fixture export (startup_view_token): view token writes made through the guard since the process started; both stay 0
+// without X2W_D3D12_VIEW_TOKEN_GUARDED=1.
+extern "C" __declspec(dllexport) void x2w_d3d12_view_token_writes(LONG* written, LONG* refused)
+{
+    if (written) *written = view_tokens_guarded_written;
+    if (refused) *refused = view_tokens_guarded_refused;
+}
 struct ViewStoreProbe {
     unsigned long long records, materialized, ids, records_capacity, materialized_capacity;
     unsigned shadow, view_refs, retire_when_idle;
