@@ -26,6 +26,8 @@ import sys
 import tempfile
 
 from native_compute_clear_check import write_request
+from native_dpp_mirror_check import vop2
+from native_scalar_lds_check import sop1, vmove
 
 
 def words(hexes):
@@ -53,19 +55,23 @@ LOADS = {
 EPILOGUE = words('70008cbf 001070e008140a80 041070e008150a80 081070e008160a80 0c1070e008170a80 '
                  '101070e008180a80 000081bf')
 REFUSALS = [
-    ('008030dc01007d14', 'global_load_dword with a scalar address pair'),           # v[1:2], off
+    ('008030dc01007d14', 'DWORD loads with a scalar address pair'),               # v[1:2], off
     ('008030dc01001414', 'global load base is not a root buffer address'),        # s[20:21], a table pointer
     ('028030dc01000414', 'global load at an unaligned immediate offset'),         # offset:2
-    ('008034dc01000414', 'global_load_dword with a scalar address pair'),         # global_load_dwordx2
-    ('008070dc01140400', 'global_load_dword with a scalar address pair'),         # global_store_dword
+    ('008034dc010004ff', 'global load destination register range'),             # x2 beginning at v255
+    ('00803cdc010004fe', 'global load destination register range'),             # x3 beginning at v254
+    ('008038dc010004fd', 'global load destination register range'),             # x4 beginning at v253
+    ('008070dc01140400', 'DWORD loads with a scalar address pair'),             # global_store_dword
     ('800385be 008030dc01000414', 'global load base is an advanced or mismatched root address'),  # s_mov_b32 s5, 0
     ('04900480 008030dc01000414', 'unbound numeric SGPR s4'),  # s_add_u32 s4, s4, 16 on the root address
-    ('00a030dc01000414', 'global_load_dword with a scalar address pair'),         # the lds bit
-    ('000030dc01007d14', 'global_load_dword with a scalar address pair'),         # flat_load_dword (segment 0)
-    ('004030dc01007d14', 'global_load_dword with a scalar address pair'),         # scratch_load_dword (segment 1)
-    ('0080c8dc01140400', 'global_load_dword with a scalar address pair'),         # global_atomic_add
+    ('00a030dc01000414', 'DWORD loads with a scalar address pair'),               # the lds bit
+    ('000030dc01007d14', 'DWORD loads with a scalar address pair'),               # flat_load_dword (segment 0)
+    ('004030dc01007d14', 'DWORD loads with a scalar address pair'),               # scratch_load_dword (segment 1)
+    ('0080c8dc01140400', 'DWORD loads with a scalar address pair'),               # global_atomic_add
 ]
 POLICY = '009033dc01000414'  # global_load_dword v20, v1, s[4:5] glc slc dlc: accepted
+INACTIVE = 0x13579bdf
+WIDE_OPS = {2: 13, 3: 15, 4: 14}
 
 
 def reference(drop_offset=False, drop_wrap_guard=False):
@@ -82,6 +88,48 @@ def reference(drop_offset=False, drop_wrap_guard=False):
             d_byte = 0xfffffff0 | 4 * (lane & 3)
             d = word((d_byte + 16) & 0xffffffff) if drop_wrap_guard else 0
             expected[base:base + 5] = [word(4 * lane), b, c, d, word(4 * lane)]
+    return expected
+
+
+def wide_program(width, case, *, reverse=False):
+    code = PROLOGUE.copy()
+    dst, coord, offset = 20, 1, 0
+    if case == 'alias':
+        dst, offset = 1, 16
+    elif case == 'tail':
+        code += [vop2(0x25, 1, 255, 1), 244]
+    elif case == 'sparse':
+        offset = -4
+        for j in range(width):
+            code += [vmove(dst + j, 255), INACTIVE]
+        code += [sop1(3, 126, 255), 0x55555555]
+    elif case == 'wrap':
+        coord, offset = 2, 16
+    elif case == 'extent':
+        offset = 2044
+    else:
+        raise ValueError(case)
+    code += [0xdc008000 | WIDE_OPS[width] << 18 | (offset & 0xfff), dst << 24 | 4 << 16 | coord]
+    code.append(0xbf8c0070)  # s_waitcnt vmcnt(0) lgkmcnt(0)
+    if case == 'sparse':
+        code.append(sop1(3, 126, 193))
+    for j in range(width):
+        source = dst + (width - 1 - j if reverse else j)
+        code += [0xe0701000 | (j * 4), 0x800a0008 | source << 8]
+    return code + [0xbf810000]
+
+
+def wide_reference(width, case):
+    expected = [0x69696969] * 2064
+    for lane in range(64):
+        local = lane % 32
+        if case == 'sparse' and local % 2:
+            values = [INACTIVE] * width
+        else:
+            start = {'alias': local + 4, 'tail': local + 61, 'sparse': local - 1, 'wrap': 1 << 30}[case]
+            values = [0x51aa0000 + start + j if start >= 0 and start + j < 64 else 0 for j in range(width)]
+        base = 8 + lane * 8
+        expected[base:base + width] = values
     return expected
 
 
@@ -102,7 +150,7 @@ def main(compiler, replay, sdk):
             assert run.returncode and message in run.stderr, (code, message, run.stdout, run.stderr)
         _, run = compile_words(PROLOGUE + words(POLICY) + EPILOGUE)
         assert run.returncode == 0, run.stderr
-        print('refused: off, a table pointer, offset:2, dwordx2, store, a replaced high half, an advanced pointer, '
+        print('refused: off, a table pointer, offset:2, VGPR overflows, store, a replaced high half, an advanced pointer, '
               'lds, flat and scratch segments, an atomic; glc slc dlc accepted')
 
         code = PROLOGUE + words(' '.join(LOADS.values())) + EPILOGUE
@@ -116,14 +164,17 @@ def main(compiler, replay, sdk):
         counts = [dump.count(t) for t in ('rawBufferLoad.i32(i32 139', 'icmp ule i32', 'icmp uge i32')]
         assert counts == [6, 2, 1], counts
         print('module: 6 raw buffer loads, 2 upper-bound and 1 lower-bound guards')
-        dest = work / 'readback.bin'
-        result = subprocess.run([replay, sdk, marker, work / 'cache', '0', dest, '--direct'],
-                                capture_output=True, text=True)
-        if result.returncode == 77:
-            print(result.stdout + result.stderr)
-            sys.exit(77)
-        assert result.returncode == 0, (result.stdout, result.stderr)
-        actual = list(struct.unpack('<2064I', dest.read_bytes()))
+        def replay_words(request):
+            dest = work / 'readback.bin'
+            result = subprocess.run([replay, sdk, request, work / 'cache', '0', dest, '--direct'],
+                                    capture_output=True, text=True)
+            if result.returncode == 77:
+                print(result.stdout + result.stderr)
+                sys.exit(77)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return list(struct.unpack('<2064I', dest.read_bytes()))
+
+        actual = replay_words(marker)
         expected = reference()
         diff = [(i, hex(a), hex(b)) for i, (a, b) in enumerate(zip(actual, expected)) if a != b]
         assert not diff, diff[:10]
@@ -132,6 +183,22 @@ def main(compiler, replay, sdk):
             assert mutant != expected and actual != mutant, label
         print('global_load_dword: 320 words of two groups matched (offsets 0, 16, -8, the 2^32 guard and an '
               'unaligned address); the offset-dropped and wrap-guard-dropped references differ')
+        for width in WIDE_OPS:
+            for case in ('alias', 'tail', 'sparse', 'wrap'):
+                marker, run = compile_words(wide_program(width, case))
+                assert run.returncode == 0, (width, case, run.stdout, run.stderr)
+                got, expected = replay_words(marker), wide_reference(width, case)
+                diff = [(i, hex(a), hex(b)) for i, (a, b) in enumerate(zip(got, expected, strict=True)) if a != b]
+                assert not diff, (width, case, diff[:10])
+            _, extent = compile_words(wide_program(width, 'extent'))
+            assert extent.returncode == 0 and f't0 root=0 bytes=0 min_size={2044 + width * 4}' in extent.stdout, (
+                width, extent.stdout, extent.stderr)
+            marker, run = compile_words(wide_program(width, 'alias', reverse=True))
+            assert run.returncode == 0, run.stderr
+            wrong = replay_words(marker)
+            changed = sum(a != b for a, b in zip(wrong, wide_reference(width, 'alias'), strict=True))
+            assert changed == 64 * (width - (width % 2)), (width, changed)
+            print(f'global_load_dwordx{width}: alias, tail, sparse EXEC and wrap match; reversing results changes {changed} words')
 
 
 if __name__ == '__main__':

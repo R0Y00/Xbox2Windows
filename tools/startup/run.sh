@@ -29,19 +29,19 @@ usage() {
     echo "       [--memory-gib 14] [--continue-asserts 0] [--input-script S] [--storage DIR]" >&2
     echo "       [--shader-cache out/startup/shader_cache] [--console 0|1] [--render] [--fake-user]" >&2
     echo "       [--gpu-mirror] [--host-cpu] [--translate] [--startup-below-40] [--trace-calls]" >&2
-    echo "       [--hide-title-window]" >&2
+    echo "       [--hide-title-window] [--capture-every S]" >&2
     exit 64
 }
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 here="$repo/tools/startup"
 exe="" data="" log="" seconds=120 build_dir=out/build/release memory_gib=14 continue_asserts=0
-input_script="" storage="" shader_cache=out/startup/shader_cache console=1
+input_script="" storage="" shader_cache=out/startup/shader_cache console=1 capture_every=0
 render="" fake_user="" gpu_mirror="" host_cpu="" translate="" below_40="" trace_calls="" hide_title=""
 while [ $# -gt 0 ]; do
     case $1 in
         --exe|--data|--log|--seconds|--build-dir|--memory-gib|--continue-asserts|--input-script|--storage|\
-        --shader-cache|--console)
+        --shader-cache|--console|--capture-every)
             [ $# -ge 2 ] || usage
             case $1 in
                 --exe) exe=$2 ;; --data) data=$2 ;; --log) log=$2 ;; --seconds) seconds=$2 ;;
@@ -50,6 +50,7 @@ while [ $# -gt 0 ]; do
                 --input-script) input_script=$2 ;;          # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
                 --storage) storage=$2 ;;                    # X2W_STORAGE_PATH: persistent local storage root
                 --shader-cache) shader_cache=$2 ;; --console) console=$2 ;;
+                --capture-every) capture_every=$2 ;;        # window_<sss>s.png every N seconds (0 = off)
             esac
             shift 2 ;;
         --render) render=1; shift ;;              # draw through translated pipelines
@@ -100,6 +101,9 @@ export X2W_AUDIO_PERMISSIVE=1 X2W_D3D12_DEVICE_NOOP=1 X2W_D3D12_LIST_NOOP=1
 export X2W_D3D12_PERMISSIVE=1 X2W_XMEM_PERMISSIVE=1 X2W_RUNTIME_PROXY=1
 # Under Wine, one section and view per page did not get past start-up (docs/wine.md).
 export X2W_XMEM_SHARED_VIEWS=${X2W_XMEM_SHARED_VIEWS:-1}
+# Mapping calls join the shared view that ends at their address: fewer views, and under Wine each map costs more
+# the more views there are (docs/wine.md).
+export X2W_XMEM_JOIN_CALLS=${X2W_XMEM_JOIN_CALLS:-1}
 export WINEDEBUG=${WINEDEBUG:--all} WINEFSYNC=${WINEFSYNC:-1}
 # Wine's built-in D3D12 is not enough (docs/wine.md); the prefix holds vkd3d-proton and DXVK.
 export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-d3d12,d3d12core,dxgi,d3d11=n}
@@ -195,9 +199,11 @@ trace_args=()
 [ -z "$trace_calls" ] || trace_args=(--trace-calls 1)
 console_args=()
 [ "$console" = 1 ] || console_args=(--console "$console")
+capture_args=()
+[ "$capture_every" = 0 ] || capture_args=(--capture-every "$capture_every")
 "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/debug_launch.py")" "$(win_path "$exe")" "$(win_path "$data")" \
     "$(win_path "$log")" --timeout "$seconds" --memory-gib "$memory_gib" --trace-files 1 \
-    --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" > "$log_host.out" 2>&1
+    --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" "${capture_args[@]}" > "$log_host.out" 2>&1
 debugger_exit=$?
 head -n 5 "$log_host.out"
 exit $debugger_exit
