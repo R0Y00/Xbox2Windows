@@ -111,6 +111,8 @@ bool expected_at(int ms, GamepadState& want)
         want.leftThumbstickY = 0.5f;
     } else if (ms >= 3000 && ms < 3500) {
         want.leftThumbstickX = 1.0f;
+    } else if (ms >= 3600 && ms < 3700) {
+        want.buttons = 0x8;  // B press, shorter than the 250 ms trace heartbeat and off its grid
     }
     return true;
 }
@@ -145,7 +147,7 @@ bool xinput_pad_connected()
 // completes 1.5 s after the child publishes a new picture at 1.0 s; the entries that follow are
 // shifted to 2.0, 2.5, 3.0 and 3.5 s.
 constexpr const char* script_text =
-    "mark=start@0,wait=0.5/2,4@+0.5+0.5,lx=1@+0.5+1,mark=turn@+0,ly=0.5@+0+0.5";
+    "mark=start@0,wait=0.5/2,4@+0.5+0.5,lx=1@+0.5+1,mark=turn@+0,ly=0.5@+0+0.5,8@+1.1+0.1";
 
 int run_child(const char* dll, bool trace)
 {
@@ -217,8 +219,12 @@ int run_child(const char* dll, bool trace)
         const char* const stick_line =
             "x2w-input-trace state buttons=0x00000000 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 "
             "script=2.500 present=11";
+        const char* const b_line =
+            "x2w-input-trace state buttons=0x00000008 lt=0.000 rt=0.000 lx=0.000 ly=0.000 rx=0.000 ry=0.000 "
+            "script=3.600 present=11";
         check(count(log, state_line) == 1, "trace: A press line with script time 2.000 and present 11");
         check(count(log, stick_line) == 1, "trace: left stick and Y axis line at script time 2.500");
+        check(count(log, b_line) == 1, "trace: off-grid B press line at script time 3.600");
         check(count(log, "x2w-input-trace wait event=begun item=2 at=0.000 elapsed=0.000 signal=1") == 1,
               "trace: wait begun line");
         check(count(log, "x2w-input-trace wait event=changed item=2 at=1.000 elapsed=1.000 signal=1") == 1,
@@ -229,7 +235,7 @@ int run_child(const char* dll, bool trace)
         check(count(log, "x2w-input-trace mark label=turn item=5 at=2.500 present=11") == 1, "trace: turn mark line");
         check(count(log, "x2w-input-trace wait event=timeout") == 0, "trace: no timeout line");
         const std::size_t states = count(log, "x2w-input-trace state ");
-        check(states >= 12 && states <= 20, "trace: bounded state lines (12..20 in four seconds)");
+        check(states >= 12 && states <= 21, "trace: bounded state lines (12..21 in four seconds)");
     } else {
         check(count(log, trace_prefix) == 0, "control: no x2w-input-trace line without the switch");
         check(count(log, "x2w-input script mark start at 0.000 s (item 1, present 10)") == 1,
