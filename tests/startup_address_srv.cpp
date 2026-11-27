@@ -485,6 +485,44 @@ int draw_formatted_view(void* guest, void* list)
     return 0;
 }
 
+// X2W_TEST_TABLE_ALIAS_WRITE=1: a raw buffer view the title creates over a placed buffer, at table entry 0. The
+// title writes the record, draws the left half, writes it again, draws the right half, and writes it a third time
+// after recording, before the list runs. A per-draw copy shows the first two values; a live alias shows the third
+// in both halves (tests/startup_table_alias_check.py).
+int draw_table_alias_writes(void* guest, void* list)
+{
+    // VirtualAlloc memory, so the placement can alias it (an existing heap cannot open image memory).
+    auto* const records = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!records) return 71;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1,
+        DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    void* placed = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(records), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed))))) return 47;
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                                         D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    view.Buffer.NumElements = 64;
+    view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    invoke(guest, 18, ptr(placed), ptr(&view), cpu);
+    const auto write = [&](std::uint32_t value) {
+        records[4] = value;
+        records[5] = value + 1;
+    };
+    const auto draw = [&](LONG left, LONG right) {
+        const D3D12_RECT strip{left, 0, right, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    write(40);
+    draw(0, 4);
+    write(80);
+    draw(4, 8);
+    write(120);  // after recording: only a binding that reads at execution sees it
+    return 0;
+}
+
 int draw_copied_vertex_buffer_srv(void* guest, void* list)
 {
     constexpr UINT full_bytes = 512;

@@ -2559,6 +2559,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
+        const std::size_t view_bytes = bytes;  // before the 16 MiB copy cap
         if (bytes > (16u << 20)) {
             bytes = 16u << 20;
             // Formatted loads past the copy would read zeros on the desktop; refuse the draw instead.
@@ -2581,6 +2582,25 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_facts.bound = bound;
             count_null_binding(x2w_local::classify_null_binding(buffer_facts));
         };
+        // X2W_D3D12_TABLE_ALIAS=1: a table buffer whose whole range lies in a placed buffer that aliases title memory
+        // binds that alias, as vertex streams do, instead of a frame copy. The GPU then reads the bytes at execution,
+        // not as they were when the draw was recorded, and the range is not cut at 16 MiB.
+        static const bool table_alias = x2w_local::env_on("X2W_D3D12_TABLE_ALIAS");
+        if (table_alias && srv.source == 0 && !formatted.entry && address && view_bytes && view_bytes <= (512u << 20)) {
+            const auto table_placed = placed_buffer_range(self->own().list_device, address, view_bytes);
+            if (!table_placed.reject && table_placed.alias && table_placed.owner &&
+                InterlockedCompareExchange(&table_placed.owner->own().refs, 0, 0)) {
+                const u64 view_offset = address - reinterpret_cast<u64>(table_placed.owner->own().title_memory);
+                if (view_offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 &&
+                    retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(table_placed.alias))) {
+                    require_state(self, table_placed.alias,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    buffer_view(dest, table_placed.alias, view_offset, view_bytes);
+                    count_buffer(true);
+                    continue;
+                }
+            }
+        }
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
             buffer_view(dest, nullptr, 0, 0);
             count_buffer(false);
