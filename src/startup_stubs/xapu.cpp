@@ -259,7 +259,10 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
     if (!packet && !packet_bytes) {  // no packet: complete with 0 bytes, as without libopus
         return hr_ok;
     }
-    if (slot >= max_slots) return hr_invalid_arg;
+    if (slot >= max_slots) {
+        refusal = DecodeRefusal::invalid_argument;
+        return hr_invalid_arg;
+    }
     SlotDecoder& d = conn.decoders[slot];
     const int rate = conn.opus_streams ? 48000 : rate_f == 8000.0f ? 8000 : rate_f == 12000.0f ? 12000 : rate_f == 16000.0f ? 16000
                    : rate_f == 24000.0f ? 24000 : rate_f == 48000.0f ? 48000 : 0;
@@ -498,6 +501,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
             if (!x2w_local::readable(command, entry.type == 1 ? 28 : 24)) {
                 hr = hr_pointer;
             } else if (entry.slot >= max_slots) {
+                refusal = DecodeRefusal::invalid_argument;
                 hr = hr_invalid_arg;
             } else {
                 entry.stream_command = true;
@@ -505,9 +509,15 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
                 if (entry.type == 1) {
                     std::uint32_t channels = 0;
                     std::memcpy(&channels, command + 24, 4);
-                    if (channels != 1 && channels != 2) hr = hr_invalid_arg;
-                    else if (conn->decoders[entry.slot].channels) hr = hr_invalid_arg;
-                    else conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    if (channels != 1 && channels != 2) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else if (conn->decoders[entry.slot].channels) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else {
+                        conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    }
                 }
             }
         }
