@@ -71,7 +71,7 @@ python -B tests/startup_gfx2hlsl_bvh_check.py dispatch <dxc> <offscreen_check> w
 ```
 
 The dispatch mode compiles both helpers with a `RWByteAddressBuffer` in place of the bound
-`ByteAddressBuffer`, writes four FP32 nodes, three binary16 nodes and twenty-one rays, and compares the
+`ByteAddressBuffer`, writes four FP32 nodes, four binary16 nodes and twenty-one rays, and compares the
 four result DWORDs for every case (1232-byte readback). All eight sorted FP32 cases, three unsorted FP32
 cases, eight sorted binary16 cases (including the rounded bound and both encoded bases) and two unsorted
 binary16 cases pass on a Microsoft Basic Render Driver (`1414:008c`, driver `10.0.26100.10068`) and on an
