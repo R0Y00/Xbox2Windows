@@ -7885,7 +7885,8 @@ class Stage:
                                   'lowered in this slice' % (name, tok))
             raise Unsupported('%s descriptor %s is not four constant SGPRs' % (name, tok))
         words = ['0x%08xu' % (value & 0xffffffff) for value in values]
-        base = ((values[1] & 0xff) << 32) | values[0]
+        # The 40-bit base represents address bits 47:8, not a byte address.
+        base = (((values[1] & 0xff) << 32) | (values[0] & 0xffffffff)) << 8
         return (('bvhbase', base, values[2]), None), words, values
 
     def op_image_bvh_intersect_ray(self, ops, mods):
@@ -7897,9 +7898,10 @@ class Stage:
         with a constant node base, a constant inline T# and a node whose kind bits are 5.
         The descriptor base binds a ByteAddressBuffer at the 256-byte-aligned allocation; the node
         pointer is an offset in 8-byte units from that base. The emitted helper performs the four
-        slab tests, clips against extent, compacts misses to 0xffffffff, and sorts by entry distance
-        only when the descriptor's box-sorting enable bit is set. Triangle nodes, 16-bit box nodes,
-        the 64-bit form, A16, non-sequential addresses and every other node kind are refused by name.
+        slab tests, clips against extent, replaces misses with 0xffffffff in their original slots,
+        and sorts by entry distance only when the descriptor's box-sorting enable bit is set.
+        Triangle nodes, 16-bit box nodes, the 64-bit form, A16, non-sequential addresses and every
+        other node kind are refused by name.
         """
         name = 'image_bvh_intersect_ray'
         if self.kind != 'cs':
@@ -7934,8 +7936,6 @@ class Stage:
         if node_offset > 0xffffff80 or node_offset & 0x7f:
             raise Unsupported('%s node base %#x is not an aligned 128-byte node' % (name, node_offset))
         key, words, vals = self.bvh_descriptor(ops[2])
-        if vals[0] is not None and vals[0] & 0xff:
-            raise Unsupported('%s descriptor base is not 256-byte aligned' % name)
         if vals[1] is not None:
             if vals[1] & 0x7f800000:
                 raise Unsupported('%s box growing amount %d is not lowered' % (name, (vals[1] >> 23) & 0xff))
@@ -7946,25 +7946,24 @@ class Stage:
                 raise Unsupported('%s descriptor type %d is not 8' % (name, (vals[3] >> 28) & 0xf))
             if vals[3] & 0x0fffffff:
                 raise Unsupported('%s descriptor size above 4 GiB or reserved word 3 %#x' % (name, vals[3]))
-        if vals[0] is not None and vals[1] is not None and ((vals[1] & 0xff) << 32 | vals[0]) == 0:
+        base = key[0][1]
+        if base == 0:
             raise Unsupported('%s absolute node base is not lowered' % name)
         if vals[2] is not None:
             if vals[2] < 1 or vals[2] >= 0x04000000:
                 raise Unsupported('%s descriptor size %d does not cover a 128-byte node' % (name, vals[2]))
             if (node_offset >> 6) + 1 > vals[2]:
                 raise Unsupported('%s node base %#x is outside descriptor size %d' % (name, node_offset, vals[2]))
+        if base + node_offset + 128 > 1 << 48:
+            raise Unsupported('%s node address wraps the 48-bit address space' % name)
         extent = self.f(cs[1])
         origin = [self.f(cs[2 + i]) for i in range(3)]
         [self.f(cs[5 + i]) for i in range(3)]  # the instruction consumes ray_dir; the helper uses inv_dir
         inv_dir = [self.f(cs[8 + i]) for i in range(3)]
-        if vals[1] is not None:
-            sort = '0x80000000u' if vals[1] & 0x80000000 else '0x00000000u'
-        else:
-            sort = '(%s & 0x80000000u)' % words[1]
         res = self.pipe.resource(key, 'bvh')
         self.pipe.uses_bvh = True
         call = 'x2w_bvh_intersect_box32(%s, 0x%08xu, %s, %s, %s, %s, %s, float3(%s, %s, %s), float3(%s, %s, %s))' % (
-            res, node, words[0], sort, words[2], words[3], extent,
+            res, node, words[0], words[1], words[2], words[3], extent,
             origin[0], origin[1], origin[2], inv_dir[0], inv_dir[1], inv_dir[2])
         self.emit('uint4 bt%x = %s;' % (self.pc or 0, call))
         for i in range(4):
@@ -10797,13 +10796,14 @@ VERIFIED_SINT_RTVS = frozenset((4, 14, 18, 32, 38, 43, 52, 59, 64))
 
 BVH_HELPERS = (
     'static const uint X2W_BVH_MISS = 0xffffffffu;',
-    # The 128-bit BVH T# (RDNA 2 ISA Table 49): base 39:0, box growing 62:55, sort enable 63,
+    # The 128-bit BVH T# (RDNA 2 ISA Table 49): base in 256-byte units at 39:0,
+    # box growing 62:55, sort enable 63,
     # size 105:64 and type 8 at 127:124. This slice binds a ByteAddressBuffer at the base and
     # keeps the descriptor in a 32-bit address window, so the size-high ten bits and every
     # reserved field must be zero. A zero base selects the absolute pointer form, which this
     # slice does not bind, so it is refused here as a miss rather than read at address zero.
     'bool x2w_bvh_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
-    '    return (word0 & 0x000000ffu) == 0u && (word1 & 0x7fffff00u) == 0u &&',
+    '    return (word1 & 0x7fffff00u) == 0u &&',
     '        word3 == 0x80000000u && word2 >= 1u && word2 < 0x04000000u &&',
     '        (word0 != 0u || (word1 & 0x000000ffu) != 0u);',
     '}',
@@ -10825,10 +10825,10 @@ BVH_HELPERS = (
     # A NaN in min.x marks an inactive box (Vulkan inactive primitive rule; Mesa tests NaN != NaN).
     '    bool active = (asuint(lo.x) & 0x7fffffffu) <= 0x7f800000u;',
     '    hit = active && tmax >= max(0.0, tmin) && tmin < extent;',
-    '    return hit ? tmin : 3.402823466e+38;',
+    '    return hit ? tmin : asfloat(0x7f800000u);',
     '}',
-    # The five compare-exchange stages of Mesa radv_nir_rt_common.c: equal keys do not swap,
-    # so misses (key +inf) sink to the end and unsorted hits keep their child order.
+    # The five compare-exchange stages of Mesa radv_nir_rt_common.c: a strict comparison
+    # sorts misses (key +inf) to the end without swapping equal keys within each pair.
     'void x2w_bvh_sort_pair(inout uint ia, inout uint ib, inout float ka, inout float kb) {',
     '    if (kb < ka) { uint ti = ia; ia = ib; ib = ti; float tk = ka; ka = kb; kb = tk; }',
     '}',
@@ -10861,22 +10861,12 @@ BVH_HELPERS = (
     '    c1 = h1 ? c1 : X2W_BVH_MISS;',
     '    c2 = h2 ? c2 : X2W_BVH_MISS;',
     '    c3 = h3 ? c3 : X2W_BVH_MISS;',
-    # Sorting disabled keeps the children in their original order. Do not reuse the sort network:
-    # its nonadjacent compare-exchange stages move a later hit into an earlier position while
-    # compacting the miss between them, which reorders equal keys.
-    '    if (!sort_boxes) {',
-    '        uint4 ordered = miss;',
-    '        uint n = 0u;',
-    '        if (h0) ordered[n++] = c0;',
-    '        if (h1) ordered[n++] = c1;',
-    '        if (h2) ordered[n++] = c2;',
-    '        if (h3) ordered[n++] = c3;',
-    '        return ordered;',
-    '    }',
-    '    float k0 = h0 ? d0 : 3.402823466e+38;',
-    '    float k1 = h1 ? d1 : 3.402823466e+38;',
-    '    float k2 = h2 ? d2 : 3.402823466e+38;',
-    '    float k3 = h3 ? d3 : 3.402823466e+38;',
+    # With sorting disabled, each result remains in its original child slot.
+    '    if (!sort_boxes) return uint4(c0, c1, c2, c3);',
+    '    float k0 = h0 ? d0 : asfloat(0x7f800000u);',
+    '    float k1 = h1 ? d1 : asfloat(0x7f800000u);',
+    '    float k2 = h2 ? d2 : asfloat(0x7f800000u);',
+    '    float k3 = h3 ? d3 : asfloat(0x7f800000u);',
     '    x2w_bvh_sort_pair(c0, c1, k0, k1);',
     '    x2w_bvh_sort_pair(c2, c3, k2, k3);',
     '    x2w_bvh_sort_pair(c0, c2, k0, k2);',
