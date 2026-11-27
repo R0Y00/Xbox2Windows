@@ -326,6 +326,13 @@ to a real present. The contract under the switch:
 
   Neither line is the composited window picture.
 
+The diagnostic readback publishes pixels only after its queue fence reaches
+the submitted value without reporting device removal. A timeout or failed
+event registration retains the submitted surface, queue and readback storage
+until completion; intervening samples are skipped. A failed signal or removed
+device disables further diagnostic readback for the module lifetime.
+`startup_present_readback` exercises the completion policy without a GPU.
+
 The first presents and every 300th log each plane:
 
 ```text

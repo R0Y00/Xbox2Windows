@@ -21,6 +21,7 @@
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/present_readback_state.h"
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
@@ -1923,12 +1924,45 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
         static LONG raw_failures;
         if (first_calls(raw_failures, 4)) log("x2w-render raw plane %d (not composited): %s", raw_plane, failure);
     };
+    static std::mutex readback_mutex;
+    const std::lock_guard lock(readback_mutex);
     static ID3D12CommandAllocator* allocator;
     static ID3D12GraphicsCommandList* list;
     static ID3D12Fence* fence;
     static ID3D12Resource* readback;
     static UINT64 readback_bytes, fence_value;
+    static ID3D12Resource* submitted_surface;
+    static ID3D12CommandQueue* submitted_queue;
+    static x2w_startup::PresentReadbackState completion;
     static HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const auto release_submitted = [&] {
+        submitted_surface->Release();
+        submitted_queue->Release();
+        submitted_surface = nullptr;
+        submitted_queue = nullptr;
+    };
+    const auto discard_recording = [&] {
+        if (list) { list->Release(); list = nullptr; }
+        if (allocator) { allocator->Release(); allocator = nullptr; }
+        if (fence) { fence->Release(); fence = nullptr; }
+        fence_value = 0;
+    };
+    if (completion.unusable()) {
+        std::snprintf(failure, sizeof(failure), "readback unavailable after fence failure");
+        report_failure();
+        return;
+    }
+    if (completion.pending()) {
+        const auto state = completion.observe(fence->GetCompletedValue());
+        if (state != x2w_startup::FenceCompletion::completed) {
+            std::snprintf(failure, sizeof(failure), "%s",
+                          state == x2w_startup::FenceCompletion::removed ?
+                          "readback fence reported device removal" : "previous readback still in flight");
+            report_failure();
+            return;
+        }
+        release_submitted();
+    }
     ID3D12Device* device = device_of(the_device);
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -1969,6 +2003,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     if (SUCCEEDED(hr)) hr = allocator->Reset();
     if (SUCCEEDED(hr)) hr = list->Reset(allocator, nullptr);
     if (FAILED(hr)) {
+        discard_recording();
         std::snprintf(failure, sizeof(failure), "readback setup failed 0x%08lx", static_cast<unsigned long>(hr));
         report_failure();
         return;
@@ -1982,19 +2017,61 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
     to.PlacedFootprint = footprint;
     list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     transition(list, surface, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    list->Close();
+    hr = list->Close();
+    if (FAILED(hr)) {
+        discard_recording();
+        std::snprintf(failure, sizeof(failure), "readback close failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
+    if (fence_value == UINT64_MAX - 1 || !event || !ResetEvent(event)) {
+        std::snprintf(failure, sizeof(failure), "readback fence or event unavailable");
+        report_failure();
+        return;
+    }
+    // ExecuteCommandLists does not retain the resources referenced by recorded commands.
+    surface->AddRef();
+    queue->AddRef();
+    submitted_surface = surface;
+    submitted_queue = queue;
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence, ++fence_value);
-    fence->SetEventOnCompletion(fence_value, event);
+    hr = queue->Signal(fence, ++fence_value);
+    if (FAILED(hr)) {
+        completion.signal_failed();
+        std::snprintf(failure, sizeof(failure), "readback fence signal failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
+    completion.submitted(fence_value);
+    hr = fence->SetEventOnCompletion(fence_value, event);
+    if (FAILED(hr)) {
+        std::snprintf(failure, sizeof(failure), "readback completion event failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
     if (WaitForSingleObject(event, 3000) != WAIT_OBJECT_0) {
         std::snprintf(failure, sizeof(failure), "readback timed out");
         report_failure();
         return;
     }
+    const auto completed = completion.observe(fence->GetCompletedValue());
+    if (completed != x2w_startup::FenceCompletion::completed) {
+        std::snprintf(failure, sizeof(failure), "%s",
+                      completed == x2w_startup::FenceCompletion::removed ?
+                      "readback fence reported device removal" : "readback fence incomplete after wait");
+        report_failure();
+        return;
+    }
+    release_submitted();
     void* mapped = nullptr;
     const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
-    if (FAILED(readback->Map(0, &range, &mapped))) return;
+    hr = readback->Map(0, &range, &mapped);
+    if (FAILED(hr) || !mapped) {
+        std::snprintf(failure, sizeof(failure), "readback map failed 0x%08lx", static_cast<unsigned long>(hr));
+        report_failure();
+        return;
+    }
     if (!raw) {
         AcquireSRWLockExclusive(&shown_lock);
         shown_pixels.resize(shown_width * shown_height);
