@@ -3339,7 +3339,7 @@ bool root_srv_at_draw()
     static const bool on = GetEnvironmentVariableW(L"X2W_D3D12_ROOT_SRV_AT_DRAW", nullptr, 0) != 0;
     return on;
 }
-LONG root_srv_copies_deferred, root_srv_copies_at_draw;
+LONG root_srv_copies_deferred, root_srv_copies_at_draw, root_srv_copies_made;
 void bind_root_srv_copy(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pass, UINT parameter, u64 address);
 void bind_pending_root_srvs(Wrapper* self, UINT skip);
 
@@ -4187,8 +4187,18 @@ void bind_root_srv_copy(Wrapper* self, ID3D12GraphicsCommandList* list, Pass& pa
         log("x2w-render root SRV %u at title 0x%llx: %zu bytes -> desktop 0x%llx [%s]", parameter, address, bytes, desktop, head);
     }
     if (!desktop) return;
+    InterlockedIncrement(&root_srv_copies_made);
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
+}
+
+// Fixture export (startup_root_srv_draw): slot 44 root SRV copies since the process started. `deferred` and `at_draw`
+// count only with X2W_D3D12_ROOT_SRV_AT_DRAW=1; `copied` counts every copy into the upload ring, either mode.
+extern "C" __declspec(dllexport) void x2w_d3d12_root_srv_copies(LONG* deferred, LONG* at_draw, LONG* copied)
+{
+    if (deferred) *deferred = root_srv_copies_deferred;
+    if (at_draw) *at_draw = root_srv_copies_at_draw;
+    if (copied) *copied = root_srv_copies_made;
 }
 
 // X2W_D3D12_ROOT_SRV_AT_DRAW=1: the bind_root_srv_copy of slot 44 waits for a draw that reads the desktop root SRV,

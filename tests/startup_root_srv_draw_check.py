@@ -1,18 +1,20 @@
 """A graphics root SRV (list slot 44) at a title address without an upload mapping, read by a translated draw.
 
 tests/startup_root_srv_draw.cpp (X2W_TEST_ROOT_SRV_DRAW=write-after): slot 44 sees the buffer holding red, the title
-writes green, then draws. Run with X2W_D3D12_ROOT_SRV_AT_DRAW unset and set:
+writes green, then draws, and the stand-in's copy counts are printed. Run with X2W_D3D12_ROOT_SRV_AT_DRAW unset and set:
   - both: the translated draw reads the SRV from its title address at the draw and draws green;
-  - unset: slot 44 also copies a window for the desktop binding (logged "x2w-render root SRV 0 at title");
-  - set: no draw reads that binding, so no copy is made and nothing is logged.
+  - unset: slot 44 also copies a window into the upload ring for the desktop binding (copied 1);
+  - set: no draw reads that binding, so the copy is deferred and never made (deferred 1, made at a draw 0, copied 0).
 The left half of the 8x4 target is drawn, the right half keeps the clear colour.
 """
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import tempfile
 
-from startup_address_srv_check import draw_texture
+from startup_address_srv_check import prepare_draw_cache
 
 HLSL = (
     "ByteAddressBuffer colour : register(t0);\n"
@@ -23,34 +25,45 @@ HLSL = (
 CLEAR = bytes((0, 0, 255, 255))
 GREEN = bytes((0, 255, 0, 255))
 SWITCH = "X2W_D3D12_ROOT_SRV_AT_DRAW"
-COPY_LINE = "x2w-render root SRV 0 at title"
+COUNTS = re.compile(r"root SRV copies: deferred (-?\d+), made at a draw (-?\d+), copied (-?\d+)")
 
 
 def run(directory, consumer, backend, at_draw):
     folder = directory / f"write-after-{int(at_draw)}"
     folder.mkdir()
-    log = folder / "trap.log"
     os.environ.pop(SWITCH, None)  # an inherited setting must not decide the unset case
-    modes = {"X2W_TEST_ROOT_SRV_DRAW": "write-after", "X2W_TRAP_LOG": str(log)}
+    modes = {"X2W_TEST_ROOT_SRV_DRAW": "write-after", "X2W_TRAP_LOG": str(folder / "trap.log")}
     if at_draw:
         modes[SWITCH] = "1"
-    pixels = draw_texture(folder, consumer, backend, HLSL, modes, binding="srv 0 buf root 0")
-    copies = [line for line in log.read_text(errors="replace").splitlines() if COPY_LINE in line] if log.exists() else []
-    return pixels, copies
+    env, args, output = prepare_draw_cache(folder, consumer, HLSL, modes, "srv 0 buf root 0")
+    result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 77:
+        return None, None
+    if result.returncode:
+        raise RuntimeError(f"consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
+    found = COUNTS.search(result.stdout)
+    if not found:
+        raise AssertionError(f"{SWITCH}={int(at_draw)}: no copy counts printed")
+    return output.read_bytes(), tuple(int(value) for value in found.groups())
 
 
 def check(directory, consumer, backend):
-    expected = (GREEN * 4 + CLEAR * 4) * 4
+    expected_pixels = (GREEN * 4 + CLEAR * 4) * 4
+    # (deferred, made at a draw, copied)
+    expected_counts = {False: (0, 0, 1), True: (1, 0, 0)}
     for at_draw in (False, True):
-        pixels, copies = run(directory, consumer, backend, at_draw)
+        pixels, counts = run(directory, consumer, backend, at_draw)
         if pixels is None:
             return 77
         label = f"{SWITCH}={int(at_draw)}"
-        if pixels != expected:
-            raise AssertionError(f"{label}: actual {pixels.hex()} expected {expected.hex()}")
-        if bool(copies) == at_draw:
-            raise AssertionError(f"{label}: {len(copies)} slot 44 copy lines, expected {'none' if at_draw else 'one'}")
-        print(f"{backend} {label}: 32 pixels exact (green, read at the draw); slot 44 copy lines {len(copies)}")
+        if pixels != expected_pixels:
+            raise AssertionError(f"{label}: actual {pixels.hex()} expected {expected_pixels.hex()}")
+        if counts != expected_counts[at_draw]:
+            raise AssertionError(f"{label}: copies (deferred, made at a draw, copied) {counts}, "
+                                 f"expected {expected_counts[at_draw]}")
+        print(f"{backend} {label}: 32 pixels exact (green, read at the draw); "
+              f"deferred {counts[0]}, made at a draw {counts[1]}, copied {counts[2]}")
     return 0
 
 

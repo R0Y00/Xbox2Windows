@@ -30,12 +30,14 @@ ctest --preset release --no-tests=error -j 1 -R '^startup_root_srv_draw_(warp|ha
 
 `startup_root_srv_draw_*` (`X2W_TEST_ROOT_SRV_DRAW=write-after`, `tests/startup_root_srv_draw.cpp`): the stream
 root's parameter 0 is a root SRV. Slot 44 binds a `VirtualAlloc` buffer holding red, the title writes green, then a
-translated draw reads the SRV through its root pointer. Both modes draw green over the left half. With the switch
-unset slot 44 also logs its copy (`x2w-render root SRV 0 at title`); with it set nothing is copied. Mutant: ignoring
-the switch fails `X2W_D3D12_ROOT_SRV_AT_DRAW=1: 1 slot 44 copy lines, expected none`.
+translated draw reads the SRV through its root pointer. Both modes draw green over the left half. After the draw is
+recorded the fixture reads the stand-in's counts (`x2w_d3d12_root_srv_copies`): unset, `deferred 0, made at a draw 0,
+copied 1`; set, `deferred 1, made at a draw 0, copied 0`. Mutant: ignoring the switch fails
+`X2W_D3D12_ROOT_SRV_AT_DRAW=1: copies (deferred, made at a draw, copied) (0, 0, 1), expected (1, 0, 0)`.
 
 Not covered by a pixel check: a real-pipeline draw that reads the binding, because none can be built (see above).
-The clearing of pending bits follows `srv_bound` by construction.
+The clearing of pending bits follows `srv_bound` by construction, and `list_close` resets the whole pass, so a
+pending address never reaches the next recording.
 
 ## Startup run of the main executable
 
