@@ -9422,6 +9422,37 @@ class Stage:
         src1 = 'asint(%s)' % self.u(src1_tok)
         self.set_vf(dst[1], 'ldexp32(%s, %s)' % (src0, src1), mods)
 
+    def dot8_int(self, name, signed, ops, mods):
+        """VOP3P 8-nibble integer dot product with 32-bit accumulate and optional saturating clamp."""
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        if any(m != 'clamp' for m in mods):
+            raise Unsupported('%s with unsupported modifiers %s' % (name, mods))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        args = []
+        for tok in ops[1:4]:
+            if (tok.startswith('|') or tok.endswith('|') or tok.startswith(('abs(', 'neg('))
+                    or (tok.startswith('-') and not re.fullmatch(r'-\d+', tok))):
+                raise Unsupported('%s source modifier %s' % (name, tok))
+            sr = reg_range(tok)
+            if sr and (sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105)):
+                raise Unsupported('%s source %s' % (name, tok))
+            args.append(self.u(tok))
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None and isinstance(getattr(pipe, 'uses_dot8', None), set):
+            pipe.uses_dot8.add(name)
+        helper = 'dot8_i32_i4' if signed else 'dot8_u32_u4'
+        sat = 'true' if 'clamp' in mods else 'false'
+        self.set_v(dst[1], '%s(%s, %s, %s, %s)' % (helper, args[0], args[1], args[2], sat))
+
+    def op_v_dot8_i32_i4(self, ops, mods):
+        return self.dot8_int('v_dot8_i32_i4', True, ops, mods)
+
+    def op_v_dot8_u32_u4(self, ops, mods):
+        return self.dot8_int('v_dot8_u32_u4', False, ops, mods)
+
     def i64_words(self, tok, signed=False, literal=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
         32-bit hex literal when `literal` is set (zero-extended, sign-extended when the operation is signed)."""
@@ -10823,6 +10854,7 @@ class Pipeline:
     uses_gather_2d_lod = False
     uses_store_d16_x = False
     uses_sad = ()
+    uses_dot8 = ()
     uses_lerp_u8 = False
     uses_perm_b32 = False
     uses_store_format_xyzw = False
@@ -10864,6 +10896,7 @@ class Pipeline:
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
         self.uses_sad = set()
+        self.uses_dot8 = set()
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.uses_store_format_xyzw = False
@@ -11324,6 +11357,28 @@ class Pipeline:
         if 'v_msad_u8' in self.uses_sad:
             out.append(
                 'uint msad_u8(uint a, uint b, uint c) { return sad4_u8(a, b, true) + c; }')
+        if 'v_dot8_u32_u4' in self.uses_dot8:
+            # RDNA 2 ISA V_DOT8_U32_U4: sum of 8 unsigned nibble products + S2, optional uint32 clamp.
+            out.append(
+                'uint dot8_u32_u4(uint a, uint b, uint c, bool sat) {'
+                ' uint s = 0u;'
+                ' [unroll] for (uint k = 0u; k < 8u; ++k)'
+                ' s += ((a >> (k * 4u)) & 0xfu) * ((b >> (k * 4u)) & 0xfu);'
+                ' uint r = c + s;'
+                ' return (sat && r < c) ? 0xffffffffu : r; }')
+        if 'v_dot8_i32_i4' in self.uses_dot8:
+            # RDNA 2 ISA V_DOT8_I32_I4: sum of 8 signed nibble products + int(S2), optional int32 clamp.
+            out.append(
+                'uint dot8_i32_i4(uint a, uint b, uint c, bool sat) {'
+                ' int s = 0;'
+                ' [unroll] for (uint k = 0u; k < 8u; ++k) {'
+                ' int x = asint(((a >> (k * 4u)) & 0xfu) << 28u) >> 28;'
+                ' int y = asint(((b >> (k * 4u)) & 0xfu) << 28u) >> 28;'
+                ' s += x * y; }'
+                ' uint r = c + asuint(s);'
+                ' if (sat && asint(c) > 0 && s > 0 && asint(r) < 0) return 0x7fffffffu;'
+                ' if (sat && asint(c) < 0 && s < 0 && asint(r) >= 0) return 0x80000000u;'
+                ' return r; }')
         if self.uses_store_format_xyzw:
             legacy = ['        %sif (field == %du) fmt = %du;' % ('' if i == 0 else 'else ', field, code)
                       for i, (field, code) in enumerate(sorted(STORE_FORMAT_XYZW_LEGACY_FORMATS.items()))]
@@ -11528,6 +11583,7 @@ class ComputePipeline(Pipeline):
         self.uses_store_d16_x = False
         self.uses_bvh = False
         self.uses_sad = set()
+        self.uses_dot8 = set()
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
