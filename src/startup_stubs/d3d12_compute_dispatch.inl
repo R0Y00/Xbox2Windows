@@ -352,12 +352,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         ID3D12Resource* resource;
         u64 offset, bytes;
         bool transition, texture, described;
-        unsigned char desc[40];  // a texture view's description, as the title gave it with a desktop format
+        union {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+        } desc;  // a texture view's description, as the title gave it with a desktop format
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
     } views[40]{};
-    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
+    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) >= ViewRecord::srv_desc_bytes);
+    static_assert(sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) >= ViewRecord::uav_desc_bytes);
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
     ComputeTranslation* const tr = &compute_translations()[key];
@@ -460,8 +464,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
             if (!output) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-                const bool described = record.desc_bytes >= sizeof(desc);
-                if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+                const bool described = record.desc_bytes >= ViewRecord::srv_desc_bytes;
+                if (described) std::memcpy(&desc, record.desc, ViewRecord::srv_desc_bytes);
                 if (desc.Format) desc.Format = desktop_format(desc.Format);
                 words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
@@ -473,13 +477,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
                 views[i] = {texture, 0, 0, true, true, described};
-                std::memcpy(views[i].desc, &desc, sizeof(desc));
+                views[i].desc.srv = desc;
                 views[i].wrapper = wrapper;
                 continue;
             }
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-            const bool described = record.desc_bytes >= sizeof(desc);
-            if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+            const bool described = record.desc_bytes >= ViewRecord::uav_desc_bytes;
+            if (described) std::memcpy(&desc, record.desc, ViewRecord::uav_desc_bytes);
             if (desc.Format) desc.Format = desktop_format(desc.Format);
             const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
             words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
@@ -527,7 +531,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
-            std::memcpy(views[i].desc, &desc, sizeof(desc));
+            views[i].desc.uav = desc;
             views[i].wrapper = wrapper;
             continue;
         }
@@ -619,7 +623,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
-                view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
+                view.described ? &view.desc.srv : nullptr, dest);
             continue;
         }
         if (i < inputs) {
@@ -630,7 +634,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (view.texture) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
-                view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
+                view.described ? &view.desc.uav : nullptr, dest);
             continue;
         }
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
