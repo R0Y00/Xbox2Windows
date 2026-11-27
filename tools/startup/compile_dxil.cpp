@@ -11,6 +11,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <future>
 #include <map>
 #include <set>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 using Clock = std::chrono::steady_clock;
 static double elapsed_ms(Clock::time_point since) {
@@ -525,7 +527,288 @@ static int run_refusals(int argc, wchar_t** argv) {
     }
 }
 
+static bool is_lower_hex16(std::wstring_view text) {
+    if (text.size() != 16)
+        return false;
+    for (wchar_t c : text)
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f')))
+            return false;
+    return true;
+}
+
+static int parse_interval_ms(std::wstring_view number) {
+    if (number.empty() || number.size() > 5 || number.find_first_not_of(L"0123456789") != number.npos)
+        throw std::runtime_error("--interval must be between 10 and 60000 ms");
+    const int ms = std::stoi(std::wstring(number));
+    if (ms < 10 || ms > 60000)
+        throw std::runtime_error("--interval must be between 10 and 60000 ms");
+    return ms;
+}
+
+static bool has_complete_dxbc(const fs::path& path) {
+    std::error_code ec;
+    const auto actual = fs::file_size(path, ec);
+    if (ec || actual < 32 || actual > (256ull << 20))
+        return false;
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    unsigned char header[32]{};
+    if (!file.read(reinterpret_cast<char*>(header), sizeof(header)))
+        return false;
+    if (std::memcmp(header, "DXBC", 4) != 0)
+        return false;
+    uint32_t total = 0, parts = 0;
+    std::memcpy(&total, header + 24, sizeof(total));
+    std::memcpy(&parts, header + 28, sizeof(parts));
+    return total == actual && parts > 0 && parts <= (total - 32) / 4;
+}
+
+struct WatchRequest {
+    std::wstring key;
+    fs::path marker;
+    bool compute = false;
+};
+
+static bool is_watch_request_pending(const fs::path& request_dir, const WatchRequest& req, bool skip_failed) {
+    std::error_code ec;
+    const auto marker_mtime = fs::last_write_time(req.marker, ec);
+    if (ec)
+        return false;
+    const fs::path stem = request_dir / req.key;
+    const fs::path manifest_path = fs::path(stem) += L".txt";
+    const fs::path fail_path = fs::path(stem) += L".fail";
+    const fs::path psdep_path = fs::path(stem) += L".psdep";
+
+    std::optional<fs::file_time_type> psin_mtime;
+    bool lost = false;
+    if (!req.compute) {
+        const fs::path psin_path = fs::path(req.marker).replace_extension(L".psin");
+        if (fs::is_regular_file(psin_path, ec)) {
+            const auto t = fs::last_write_time(psin_path, ec);
+            if (!ec)
+                psin_mtime = t;
+        }
+        lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
+    }
+
+    const bool has_manifest = fs::is_regular_file(manifest_path, ec);
+    if (has_manifest && !lost) {
+        const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
+        if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
+            if (req.compute) {
+                if (has_complete_dxbc(fs::path(stem) += L".cs.cso"))
+                    return false;
+            } else {
+                if (has_complete_dxbc(fs::path(stem) += L".vs.cso") &&
+                    has_complete_dxbc(fs::path(stem) += L".ps.cso"))
+                    return false;
+            }
+        }
+    }
+
+    const bool recheck = lost && has_manifest;
+    if (skip_failed && !recheck && fs::is_regular_file(fail_path, ec)) {
+        const auto fail_mtime = fs::last_write_time(fail_path, ec);
+        const auto latest_input =
+            (psin_mtime.has_value() && *psin_mtime > marker_mtime) ? *psin_mtime : marker_mtime;
+        if (!ec && fail_mtime >= latest_input)
+            return false;
+    }
+    return true;
+}
+
+static std::vector<WatchRequest> collect_watch_requests(const fs::path& request_dir, bool skip_failed) {
+    std::vector<WatchRequest> found;
+    for (const auto& file : fs::directory_iterator(request_dir)) {
+        std::error_code ec;
+        if (!file.is_regular_file(ec))
+            continue;
+        const auto path = file.path();
+        const auto ext = path.extension().wstring();
+        const bool is_compute = ext == L".c67";
+        if (!is_compute && ext != L".a")
+            continue;
+        const auto stem = path.stem().wstring();
+        if (stem.size() != 20 || stem.rfind(L"req_", 0) != 0)
+            continue;
+        const auto key = stem.substr(4);
+        if (!is_lower_hex16(key))
+            continue;
+        found.push_back({key, fs::weakly_canonical(path), is_compute});
+    }
+    std::sort(found.begin(), found.end(), [](const WatchRequest& a, const WatchRequest& b) {
+        return PathLess{}(a.marker, b.marker);
+    });
+    std::vector<WatchRequest> pending;
+    for (auto& req : found) {
+        if (is_watch_request_pending(request_dir, req, skip_failed))
+            pending.push_back(std::move(req));
+    }
+    return pending;
+}
+
+static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const fs::path& cache_dir,
+                                      const fs::path& request_dir, const WatchRequest& req) {
+    const fs::path stem = request_dir / req.key;
+    const fs::path manifest_path = fs::path(stem) += L".txt";
+    const fs::path fail_path = fs::path(stem) += L".fail";
+    std::error_code ignored;
+    fs::remove(manifest_path, ignored);
+    std::ostringstream sink;
+    if (req.compute) {
+        bool hit = false;
+        auto program = x2w::prepare_direct_compute(req.marker, 0, false, cache_dir, hit, x2w::HeapViewContract::none);
+        auto manifest = x2w::format_compute_runtime_manifest(program);
+        if (!manifest)
+            throw std::runtime_error("unsupported startup runtime manifest bindings");
+        auto cs_dxil = compile_to_dxil(compiler, program.dxil_ir, L"cs_6_6", cache_dir, true, sink);
+        publish_atomic(fs::path(stem) += L".cs.cso", cs_dxil.data(), cs_dxil.size());
+        publish_atomic(manifest_path, manifest->data(), manifest->size());
+        fs::remove(fail_path, ignored);
+        return "compiled compute";
+    }
+    auto input = x2w::read_graphics_request(req.marker);
+    bool hit = false;
+    auto pair = x2w::prepare_direct_graphics(input.a, input.b, cache_dir, hit, input.root, input.input_layout,
+                                             input.pixel_entry);
+    auto manifest = x2w::format_graphics_runtime_manifest(pair);
+    if (!manifest)
+        throw std::runtime_error("unsupported startup runtime manifest bindings");
+    auto vs_dxil = compile_to_dxil(compiler, pair.vertex.dxil_ir, L"vs_6_6", cache_dir, true, sink);
+    auto ps_dxil = compile_to_dxil(compiler, pair.pixel.dxil_ir, L"ps_6_6", cache_dir, true, sink);
+    publish_atomic(fs::path(stem) += L".vs.cso", vs_dxil.data(), vs_dxil.size());
+    publish_atomic(fs::path(stem) += L".ps.cso", ps_dxil.data(), ps_dxil.size());
+    const fs::path psdep_path = fs::path(stem) += L".psdep";
+    if (!input.pixel_input_description.empty())
+        publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+    else
+        fs::remove(psdep_path, ignored);
+    publish_atomic(manifest_path, manifest->data(), manifest->size());
+    fs::remove(fail_path, ignored);
+    return "compiled graphics";
+}
+
+static int run_watch(int argc, wchar_t** argv) {
+    fs::path sdk_dir, cache_dir, request_dir;
+    int positional = 0;
+    int jobs = 1;
+    int interval_ms = 2000;
+    bool once = false;
+    auto usage = []() {
+        std::cerr << "usage: compile_dxil --watch SDK_DIRECTORY CACHE_DIRECTORY REQUEST_DIRECTORY "
+                     "[--jobs N] [--interval MS] [--once]\n";
+        return 2;
+    };
+    try {
+        for (int i = 2; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+            if (arg == L"--once") {
+                once = true;
+            } else if (arg == L"--jobs") {
+                if (i + 1 >= argc)
+                    throw std::runtime_error("missing value for --jobs");
+                jobs = parse_jobs_count(argv[++i]);
+            } else if (arg == L"--interval") {
+                if (i + 1 >= argc)
+                    throw std::runtime_error("missing value for --interval");
+                interval_ms = parse_interval_ms(argv[++i]);
+            } else if (!arg.empty() && arg.front() == L'-') {
+                return usage();
+            } else {
+                if (positional == 0) sdk_dir = fs::path(arg);
+                else if (positional == 1) cache_dir = fs::path(arg);
+                else if (positional == 2) request_dir = fs::path(arg);
+                else return usage();
+                ++positional;
+            }
+        }
+        if (positional != 3)
+            return usage();
+        if (!fs::exists(sdk_dir) || !fs::is_directory(sdk_dir)) {
+            std::cerr << "SDK path must be an existing directory\n";
+            return 1;
+        }
+        if (!fs::exists(request_dir) || !fs::is_directory(request_dir)) {
+            std::cerr << "request path must be an existing directory\n";
+            return 1;
+        }
+        request_dir = fs::weakly_canonical(request_dir);
+        fs::create_directories(cache_dir);
+        cache_dir = fs::weakly_canonical(cache_dir);
+
+        x2w::ShaderDxilCompiler coordinator(sdk_dir);
+        bool skip_failed = false;
+        while (true) {
+            std::vector<WatchRequest> pending;
+            try {
+                pending = collect_watch_requests(request_dir, skip_failed);
+            } catch (const fs::filesystem_error& error) {
+                if (once)
+                    throw;
+                std::cerr << "watch scan error, retrying: " << error.what() << '\n';
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+                continue;
+            }
+            if (!pending.empty()) {
+                std::vector<std::string> outcomes(pending.size());
+                auto process_item = [&](x2w::ShaderDxilCompiler& compiler, size_t idx) {
+                    const auto& req = pending[idx];
+                    try {
+                        outcomes[idx] = compile_watch_item(compiler, cache_dir, request_dir, req);
+                    } catch (const std::exception& error) {
+                        const std::string line = format_fail_line(error.what());
+                        try {
+                            publish_atomic((request_dir / req.key) += L".fail", line.data(), line.size());
+                        } catch (...) {
+                        }
+                        std::string summary = line;
+                        if (!summary.empty() && summary.back() == '\n')
+                            summary.pop_back();
+                        outcomes[idx] = "refused: " + summary;
+                    }
+                };
+                const int worker_count = (std::min)(jobs, static_cast<int>(pending.size()));
+                if (worker_count <= 1) {
+                    for (size_t idx = 0; idx < pending.size(); ++idx)
+                        process_item(coordinator, idx);
+                } else {
+                    std::atomic<size_t> next{};
+                    std::vector<std::future<void>> workers;
+                    workers.reserve(worker_count);
+                    for (int w = 0; w < worker_count; ++w) {
+                        workers.emplace_back(std::async(std::launch::async, [&]() {
+                            auto compiler = coordinator.new_worker();
+                            for (size_t idx = next++; idx < pending.size(); idx = next++)
+                                process_item(compiler, idx);
+                        }));
+                    }
+                    for (auto& w : workers)
+                        w.get();
+                }
+                for (size_t idx = 0; idx < pending.size(); ++idx) {
+                    std::string key_ascii;
+                    key_ascii.reserve(pending[idx].key.size());
+                    for (wchar_t ch : pending[idx].key)
+                        key_ascii.push_back(static_cast<char>(ch));
+                    std::cout << key_ascii << ": " << outcomes[idx] << '\n';
+                }
+                std::cout.flush();
+            }
+            if (once)
+                return 0;
+            skip_failed = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        }
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && std::wstring_view(argv[1]) == L"--watch")
+        return run_watch(argc, argv);
     if (argc >= 2 && std::wstring_view(argv[1]) == L"--refusals")
         return run_refusals(argc, argv);
     if (argc == 4 && std::wstring_view(argv[1]) == L"--index-graphics-interfaces") {
@@ -554,6 +837,7 @@ int wmain(int argc, wchar_t** argv) {
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
                      "Use --refusals REQUEST_DIRECTORY [--jobs N] [--json] for a read-only refusal summary.\n"
+                     "Use --watch SDK_DIRECTORY CACHE_DIRECTORY REQUEST_DIRECTORY [--jobs N] [--interval MS] [--once] to translate pending requests.\n"
                      "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n";
         return 2;
     }
