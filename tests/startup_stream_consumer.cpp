@@ -207,7 +207,11 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
-// root; dispatch-same-buffer names the output buffer as the input too.
+// root; dispatch-same-buffer names the output buffer as the input too. dispatch-output-token writes, where the output
+// descriptor was, the token of a raw unordered access view of the output buffer (device slot 19);
+// dispatch-output-token-typed makes that view R32_UINT. dispatch-output-token-structured (stride 8) and
+// dispatch-output-token-typed8 (R16G16B16A16_FLOAT) describe the same 1280 bytes as 160 8-byte elements, so an
+// element size taken as 4 binds only the first half of the output.
 // Input descriptors the dispatch refuses, one reason each: dispatch-input-empty has zero records (a nonzero base,
 // word 3 zero), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
@@ -415,6 +419,21 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else if (mode == "dispatch-root-srv-reset") {
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind();
+    }
+    if (mode.rfind("dispatch-output-token", 0) == 0) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
+        view.Buffer = {0, words, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        if (mode == "dispatch-output-token-typed") {
+            view.Format = DXGI_FORMAT_R32_UINT;
+            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+        } else if (mode == "dispatch-output-token-structured") {
+            view.Format = DXGI_FORMAT_UNKNOWN;
+            view.Buffer = {0, words / 2, 8, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+        } else if (mode == "dispatch-output-token-typed8") {
+            view.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            view.Buffer = {0, words / 2, 0, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+        }
+        invoke(device, 19, word(placed[1]), 0, word(&view), cpu + sizeof(descriptors[0]));
     }
     if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
     invoke(list, 40, 0, 2, word(graphics), 0);

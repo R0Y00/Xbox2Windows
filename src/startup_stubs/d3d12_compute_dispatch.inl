@@ -2,7 +2,8 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
-// outputs) named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
+// outputs) named by hardware buffer descriptors or 64-bit root SRV addresses or, for outputs, by the token of a raw,
+// structured or typed buffer view the title created (device slot 19), and textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
@@ -533,12 +534,57 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
+        if (words[0] == view_token_magic) {
+            // An output named by the token of a raw, structured or typed buffer UAV the title created (device slot 19) is
+            // bound in that view's desktop resource over the view's own range, as an input token is (slot 18).
+            ViewRecord record{};
+            bool known = false;
+            AcquireSRWLockShared(&note_lock);
+            if (words[1] < view_records().size()) {
+                record = view_records()[words[1]];
+                known = true;
+            }
+            ReleaseSRWLockShared(&note_lock);
+            const Wrapper* const owner = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+            auto* const buffer = owner && owner->own().kind == resource_kind ? static_cast<ID3D12Resource*>(owner->own().real) : nullptr;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+            if (known && record.desc_bytes >= sizeof(desc)) std::memcpy(&desc, record.desc, sizeof(desc));
+            if (desc.Format) desc.Format = desktop_format(desc.Format);
+            const bool raw = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW && desc.Format == DXGI_FORMAT_R32_TYPELESS &&
+                !desc.Buffer.StructureByteStride;
+            const bool structured = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && desc.Format == DXGI_FORMAT_UNKNOWN &&
+                desc.Buffer.StructureByteStride;
+            const bool typed = desc.Buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE && !desc.Buffer.StructureByteStride;
+            const UINT element = raw ? 4 : structured ? desc.Buffer.StructureByteStride :
+                typed ? x2w_startup::typed_buffer_format_bytes(desc.Format) : 0;
+            const D3D12_RESOURCE_DESC resource = buffer ? buffer->GetDesc() : D3D12_RESOURCE_DESC{};
+            const u64 offset = element && desc.Buffer.FirstElement <= UINT64_MAX / element ? desc.Buffer.FirstElement * element : ~u64{};
+            const u64 bytes = u64{desc.Buffer.NumElements} * element;
+            if (!known || record.slot != 19 || !buffer || record.desc_bytes < sizeof(desc) ||
+                desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                reason = "an output view token is not a buffer UAV of a desktop resource";
+            else if (!element) reason = "an output buffer view has no element size";
+            else if (!bytes || bytes % 4 || bytes > (16u << 20) || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
+                     offset > resource.Width || bytes > resource.Width - offset)
+                reason = "an output buffer view range is empty, unaligned or outside its resource";
+            // The entry values an output descriptor supplies are words of a hardware descriptor, which a token has not.
+            for (const ComputeTranslation::Slot& ud : tr->uds)
+                if (!reason && ud.source >= ComputeTranslation::output_word3 && ud.a >= 0 &&
+                    inputs + static_cast<std::size_t>(ud.a) == i)
+                    reason = "an entry value reads the descriptor of an output named by a view token";
+            for (std::size_t input = 0; input < inputs && !reason; ++input)
+                if (views[input].resource == buffer) reason = "an output buffer is also an input";
+            views[i] = {buffer, offset, bytes, true};
+            std::memcpy(views[i].words, words, sizeof(views[i].words));
+            continue;
+        }
         // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        // to the title. shortcut: copied placements are refused, add them with their first user.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const auto placed = words[0] == view_token_magic || !bytes || bytes % 4 || bytes > (16u << 20)
+        const auto placed = !bytes || bytes % 4 || bytes > (16u << 20)
             ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;

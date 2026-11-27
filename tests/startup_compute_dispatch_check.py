@@ -22,6 +22,10 @@ memory; the output words are read from that memory after the queue's fence. The 
 7. slot 35 selects the correct table at descriptor index 2 instead of the swapped pair at the heap start;
    setting the same heap again preserves the table, but changing the compute root or view heap after binding
    must refuse at the table lookup, not an earlier check.
+8. the output named by the token of a buffer view of the output buffer, all 320 words matching and nothing refused:
+   dispatch-output-token (raw), dispatch-output-token-typed (R32_UINT), and dispatch-output-token-structured
+   (stride 8) and dispatch-output-token-typed8 (R16G16B16A16_FLOAT), whose 8-byte elements catch an element size
+   taken as 4.
 Exit 77 only if the initial probe cannot use the adapter or required heaps.
 """
 import os
@@ -156,6 +160,13 @@ def main(consumer, dxc, adapter):
                 print(f'{mode}: exact table refusal, all {C.WORDS} sentinel words unchanged')
             errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
             assert not errors, errors[0]
+        for mode in ('dispatch-output-token', 'dispatch-output-token-typed', 'dispatch-output-token-structured',
+                     'dispatch-output-token-typed8'):
+            got, result = dispatch(directory, consumer, env, mode)
+            wrong = sum(a != b for a, b in zip(got, expected))
+            assert not wrong, f'{mode}: {wrong} words differ from the CPU reference\n{result.stderr[-3000:]}'
+            assert not lines(result, 'refused: '), result.stderr[-3000:]
+            print(f'{mode}: all {C.WORDS} words match the CPU reference')
         print(f'startup_compute_dispatch: PASS on {adapter}')
 
 
