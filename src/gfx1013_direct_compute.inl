@@ -1083,6 +1083,56 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, bits));
             return true;
         }
+        if (n == "v_floor_f16" || n == "v_ceil_f16" || n == "v_trunc_f16" || n == "v_rndne_f16") {
+            if (i.subword || i.dpp_control || permuted || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            auto bits = ir.binary("and", operand32(i, i.src[0]), "65535");
+            if (i.abs & 1) bits = ir.binary("and", bits, "32767");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
+            auto sign = ir.binary("and", bits, "32768");
+            auto mag = ir.binary("and", bits, "32767");
+            auto exp = ir.binary("and", ir.binary("lshr", bits, "10"), "31");
+            auto nz = cmp("ne", mag, "0");
+            auto neg = cmp("ne", sign, "0");
+            auto pos = cmp("eq", sign, "0");
+            string sub_one = sign;
+            if (n == "v_floor_f16")
+                sub_one = select(ir.value("and i1 " + nz + ", " + neg), "48128", sign);
+            else if (n == "v_ceil_f16")
+                sub_one = select(ir.value("and i1 " + nz + ", " + pos), "15360", sign);
+            else if (n == "v_rndne_f16")
+                sub_one = select(cmp("ugt", mag, "14336"), ir.binary("or", sign, "15360"), sign);
+            auto frac_bits = select(cmp("ult", exp, "15"), "1",
+                                    select(cmp("ugt", exp, "24"), "1", ir.binary("sub", "25", exp)));
+            auto unit = ir.binary("shl", "1", frac_bits);
+            auto mask = ir.binary("sub", unit, "1");
+            auto half = ir.binary("lshr", unit, "1");
+            auto frac = ir.binary("and", bits, mask);
+            auto base = ir.binary("and", bits, ir.binary("xor", mask, "65535"));
+            string mid = base;
+            if (n != "v_trunc_f16") {
+                string inc;
+                if (n == "v_floor_f16")
+                    inc = ir.value("and i1 " + neg + ", " + cmp("ne", frac, "0"));
+                else if (n == "v_ceil_f16")
+                    inc = ir.value("and i1 " + pos + ", " + cmp("ne", frac, "0"));
+                else
+                    inc = ir.value("or i1 " + cmp("ugt", frac, half) + ", " +
+                                   ir.value("and i1 " + cmp("eq", frac, half) + ", " +
+                                            cmp("ne", ir.binary("and", base, unit), "0")));
+                mid = select(inc, ir.binary("add", base, unit), base);
+            }
+            auto result = select(cmp("uge", exp, "25"), bits, select(cmp("ult", exp, "15"), sub_one, mid));
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         if (n == "v_pack_b32_f16") {
             // VOP3 only: D[15:0] = S0.f16, D[31:16] = S1.f16. Every step is an
             // integer bit operation so signed zeros and NaN payloads survive.
