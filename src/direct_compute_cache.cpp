@@ -471,7 +471,7 @@ static std::vector<NativeVertexElement> vertex_layout(std::string_view text, con
 
 DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view b, const fs::path &cache,
                                            bool &cache_hit, std::string_view root, std::string_view input_layout,
-                                           std::string_view pixel_entry) {
+                                           std::string_view pixel_entry, bool write_cache) {
     // A fixed PSO can expose a shorter serialized desktop root than the
     // guest's hardware descriptor table. An explicitly supplied companion
     // describes the guest ABI. Never use its executable code in the pair.
@@ -479,7 +479,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     const std::array<std::string_view, 2> raw{a, b};
     const std::array<Bytes, 2> digests{shader_digest(a), shader_digest(b)};
     Bytes identity = Bytes(X2W_NATIVE_SHADER_REVISION) + "/linked/vs_ps_6_6/";
-    if (a.substr(0,4) != "DXBC" && b.substr(0,4) != "DXBC") {
+    if (!cache.empty() && a.substr(0,4) != "DXBC" && b.substr(0,4) != "DXBC") {
         for (size_t i = 0; i < raw.size(); ++i) {
             auto file = cache / "interfaces" / (digests[i] + ".cdxil");
             if (std::filesystem::exists(file)) companions[i] = read_shader_container_bytes(file);
@@ -505,7 +505,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     const auto key = shader_digest(identity + shader_digest(root) + shader_digest(input_layout) + shader_digest(pixel_entry));
     const auto path = cache / (key + ".pairir");
     Bytes payload;
-    cache_hit = lookup(path, key, payload);
+    cache_hit = write_cache && !cache.empty() && lookup(path, key, payload);
     auto effective_layout = [&](const NativeComputeShader &vs) {
         if (!input_layout.empty() || (pixel_entry.empty() && !reflected) || !vs.vertex_fetch) return std::string(input_layout);
         unsigned count = 0;
@@ -680,12 +680,14 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             }
         }
     }
-    auto vertex = encode(pair.vertex);
-    payload.clear();
-    word(payload, static_cast<uint32_t>(vertex.size()));
-    payload += vertex;
-    payload += encode(pair.pixel);
-    publish(path, key, payload);
+    if (write_cache && !cache.empty()) {
+        auto vertex = encode(pair.vertex);
+        payload.clear();
+        word(payload, static_cast<uint32_t>(vertex.size()));
+        payload += vertex;
+        payload += encode(pair.pixel);
+        publish(path, key, payload);
+    }
     return pair;
 }
 

@@ -8,8 +8,11 @@
 #include "startup_stubs/native_global_srv.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <future>
+#include <map>
 #include <set>
 #include <sstream>
 #include <fstream>
@@ -199,7 +202,332 @@ struct PathLess {
     }
 };
 
+static std::string collapse_ascii_line(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool space = true;
+    for (unsigned char c : text) {
+        if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+            if (!space) {
+                out.push_back(' ');
+                space = true;
+            }
+        } else {
+            out.push_back(static_cast<char>(c));
+            space = false;
+        }
+    }
+    if (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    return out;
+}
+
+static std::string format_fail_line(std::string_view message) {
+    std::string out = collapse_ascii_line(message);
+    if (out.empty())
+        out = "unknown refusal";
+    out.push_back('\n');
+    return out;
+}
+
+static bool is_ident_char(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
+
+static std::string normalize_refusal_reason(std::string_view raw) {
+    std::string s = collapse_ascii_line(raw);
+    if (s.rfind("native compute +0x", 0) == 0) {
+        const size_t colon = s.find(": ");
+        if (colon != std::string::npos)
+            s.erase(0, colon + 2);
+    }
+    auto replace_all_with = [](std::string& str, auto&& matcher) {
+        std::string out;
+        out.reserve(str.size());
+        size_t i = 0;
+        while (i < str.size()) {
+            size_t end = 0;
+            std::string rep;
+            if (matcher(str, i, end, rep)) {
+                out += rep;
+                i = end;
+            } else {
+                out.push_back(str[i++]);
+            }
+        }
+        str.swap(out);
+    };
+    replace_all_with(s, [](const std::string& str, size_t i, size_t& end, std::string& rep) {
+        if (i + 2 >= str.size() || str[i] != '0' || (str[i + 1] != 'x' && str[i + 1] != 'X'))
+            return false;
+        if (i > 0 && is_ident_char(static_cast<unsigned char>(str[i - 1])))
+            return false;
+        size_t j = i + 2;
+        while (j < str.size() && std::isxdigit(static_cast<unsigned char>(str[j])))
+            ++j;
+        if (j == i + 2)
+            return false;
+        if (j < str.size() && (str[j] == 'u' || str[j] == 'U') &&
+            (j + 1 == str.size() || !is_ident_char(static_cast<unsigned char>(str[j + 1]))))
+            ++j;
+        end = j;
+        rep = "0xN";
+        return true;
+    });
+    for (const std::string_view prefix : {" at byte ", " VGPR "}) {
+        replace_all_with(s, [&](const std::string& str, size_t i, size_t& end, std::string& rep) {
+            if (str.compare(i, prefix.size(), prefix) != 0)
+                return false;
+            size_t j = i + prefix.size();
+            if (j >= str.size() || !std::isdigit(static_cast<unsigned char>(str[j])))
+                return false;
+            while (j < str.size() && std::isdigit(static_cast<unsigned char>(str[j])))
+                ++j;
+            if (j < str.size() && is_ident_char(static_cast<unsigned char>(str[j])))
+                return false;
+            end = j;
+            rep = std::string(prefix) + "N";
+            return true;
+        });
+    }
+    replace_all_with(s, [](const std::string& str, size_t i, size_t& end, std::string& rep) {
+        if (str[i] != 's' && str[i] != 'v')
+            return false;
+        if (i > 0 && is_ident_char(static_cast<unsigned char>(str[i - 1])))
+            return false;
+        size_t j = i + 1;
+        if (j < str.size() && str[j] == '[') {
+            ++j;
+            const size_t a = j;
+            while (j < str.size() && std::isdigit(static_cast<unsigned char>(str[j])))
+                ++j;
+            if (j == a || j >= str.size() || str[j] != ':')
+                return false;
+            const size_t b = ++j;
+            while (j < str.size() && std::isdigit(static_cast<unsigned char>(str[j])))
+                ++j;
+            if (j == b || j >= str.size() || str[j] != ']')
+                return false;
+            ++j;
+            if (j < str.size() && is_ident_char(static_cast<unsigned char>(str[j])))
+                return false;
+            end = j;
+            rep = std::string(1, str[i]) + "[N:N]";
+            return true;
+        }
+        const size_t a = j;
+        while (j < str.size() && std::isdigit(static_cast<unsigned char>(str[j])))
+            ++j;
+        if (j == a || (j < str.size() && is_ident_char(static_cast<unsigned char>(str[j]))))
+            return false;
+        end = j;
+        rep = std::string(1, str[i]) + "N";
+        return true;
+    });
+    if (s.empty())
+        s = "unknown refusal";
+    return s;
+}
+
+static int parse_jobs_count(std::wstring_view number) {
+    if (number.empty() || number.size() > 2 || number.find_first_not_of(L"0123456789") != number.npos)
+        throw std::runtime_error("--jobs must be between 1 and 64");
+    const int jobs = std::stoi(std::wstring(number));
+    if (jobs < 1 || jobs > 64)
+        throw std::runtime_error("--jobs must be between 1 and 64");
+    return jobs;
+}
+
+static std::string json_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 2);
+    out.push_back('"');
+    for (unsigned char c : text) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+static int run_refusals(int argc, wchar_t** argv) {
+    fs::path request_dir;
+    bool has_dir = false;
+    bool json = false;
+    int jobs = 1;
+    try {
+        for (int i = 2; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+            if (arg == L"--json") {
+                json = true;
+            } else if (arg == L"--jobs") {
+                if (i + 1 >= argc)
+                    throw std::runtime_error("missing value for --jobs");
+                jobs = parse_jobs_count(argv[++i]);
+            } else if (!arg.empty() && arg.front() == L'-') {
+                std::cerr << "usage: compile_dxil --refusals REQUEST_DIRECTORY [--jobs N] [--json]\n";
+                return 2;
+            } else if (has_dir) {
+                std::cerr << "usage: compile_dxil --refusals REQUEST_DIRECTORY [--jobs N] [--json]\n";
+                return 2;
+            } else {
+                request_dir = fs::path(arg);
+                has_dir = true;
+            }
+        }
+        if (!has_dir) {
+            std::cerr << "usage: compile_dxil --refusals REQUEST_DIRECTORY [--jobs N] [--json]\n";
+            return 2;
+        }
+        if (!fs::exists(request_dir) || !fs::is_directory(request_dir)) {
+            std::cerr << "request path must be an existing directory\n";
+            return 1;
+        }
+        std::vector<fs::path> graphics_inputs, compute_inputs;
+        for (const auto& file : fs::directory_iterator(request_dir)) {
+            if (!file.is_regular_file())
+                continue;
+            const auto path = file.path();
+            if (path.stem().wstring().rfind(L"req_", 0) != 0)
+                continue;
+            if (path.extension() == L".a")
+                graphics_inputs.push_back(fs::weakly_canonical(path));
+            else if (path.extension() == L".c67")
+                compute_inputs.push_back(fs::weakly_canonical(path));
+        }
+        std::sort(graphics_inputs.begin(), graphics_inputs.end(), PathLess{});
+        std::sort(compute_inputs.begin(), compute_inputs.end(), PathLess{});
+
+        struct Task {
+            bool compute;
+            size_t index;
+        };
+        std::vector<Task> tasks;
+        tasks.reserve(graphics_inputs.size() + compute_inputs.size());
+        for (size_t i = 0; i < graphics_inputs.size(); ++i)
+            tasks.push_back({false, i});
+        for (size_t i = 0; i < compute_inputs.size(); ++i)
+            tasks.push_back({true, i});
+
+        std::vector<std::string> results(tasks.size());
+        if (!tasks.empty()) {
+            const int workers_count = (std::min)(jobs, static_cast<int>(tasks.size()));
+            std::atomic<size_t> next{};
+            auto run_worker = [&]() {
+                for (size_t t = next++; t < tasks.size(); t = next++) {
+                    const auto& task = tasks[t];
+                    try {
+                        if (task.compute) {
+                            auto req = x2w::read_compute_request(compute_inputs[task.index]);
+                            (void)x2w::translate_compute(req, 0, true);
+                        } else {
+                            auto input = x2w::read_graphics_request(graphics_inputs[task.index]);
+                            bool hit = false;
+                            (void)x2w::prepare_direct_graphics(input.a, input.b, request_dir, hit,
+                                                               input.root, input.input_layout, input.pixel_entry, false);
+                        }
+                    } catch (const fs::filesystem_error&) {
+                        results[t] = "unreadable shader request";
+                    } catch (const std::exception& error) {
+                        results[t] = normalize_refusal_reason(error.what());
+                    }
+                }
+            };
+            if (workers_count == 1) {
+                run_worker();
+            } else {
+                std::vector<std::future<void>> workers;
+                workers.reserve(workers_count);
+                for (int w = 0; w < workers_count; ++w)
+                    workers.emplace_back(std::async(std::launch::async, run_worker));
+                for (auto& w : workers)
+                    w.get();
+            }
+        }
+
+        struct Section {
+            unsigned examined = 0, no_refusal = 0, refused = 0;
+            std::map<std::string, unsigned> counts;
+            std::vector<std::pair<std::string, unsigned>> sorted_reasons() const {
+                std::vector<std::pair<std::string, unsigned>> rows(counts.begin(), counts.end());
+                std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+                    if (a.second != b.second)
+                        return a.second > b.second;
+                    return a.first < b.first;
+                });
+                return rows;
+            }
+        } graphics_sec, compute_sec;
+
+        for (size_t t = 0; t < tasks.size(); ++t) {
+            Section& sec = tasks[t].compute ? compute_sec : graphics_sec;
+            ++sec.examined;
+            if (results[t].empty()) {
+                ++sec.no_refusal;
+            } else {
+                ++sec.refused;
+                ++sec.counts[results[t]];
+            }
+        }
+
+        if (json) {
+            auto write_json_sec = [](std::ostream& os, const Section& sec) {
+                os << "{\"examined\":" << sec.examined
+                   << ",\"no_refusal\":" << sec.no_refusal
+                   << ",\"refused\":" << sec.refused
+                   << ",\"reasons\":[";
+                const auto rows = sec.sorted_reasons();
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    if (i) os << ',';
+                    os << "{\"reason\":" << json_escape(rows[i].first) << ",\"count\":" << rows[i].second << '}';
+                }
+                os << "]}";
+            };
+            std::cout << "{\"graphics\":";
+            write_json_sec(std::cout, graphics_sec);
+            std::cout << ",\"compute\":";
+            write_json_sec(std::cout, compute_sec);
+            std::cout << "}\n";
+        } else {
+            auto write_text_sec = [](std::ostream& os, const char* title, const char* count_label, const Section& sec) {
+                os << title << '\n'
+                   << count_label << ": " << sec.examined << '\n'
+                   << "No refusal recorded (not compiled): " << sec.no_refusal << '\n'
+                   << "Refused: " << sec.refused << '\n'
+                   << "Count\tReason\n";
+                for (const auto& [reason, count] : sec.sorted_reasons())
+                    os << count << '\t' << reason << '\n';
+            };
+            write_text_sec(std::cout, "Graphics requests", "Requests examined", graphics_sec);
+            write_text_sec(std::cout, "Compute requests (device slot 67)", "Compute requests examined", compute_sec);
+        }
+        return 0;
+    } catch (const fs::filesystem_error&) {
+        std::cerr << "unreadable shader request directory\n";
+        return 1;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && std::wstring_view(argv[1]) == L"--refusals")
+        return run_refusals(argc, argv);
     if (argc == 4 && std::wstring_view(argv[1]) == L"--index-graphics-interfaces") {
         try {
             const auto stages = x2w::index_graphics_interfaces(argv[2],argv[3]);
@@ -225,6 +553,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
+                     "Use --refusals REQUEST_DIRECTORY [--jobs N] [--json] for a read-only refusal summary.\n"
                      "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n";
         return 2;
     }
@@ -282,14 +611,8 @@ int wmain(int argc, wchar_t** argv) {
             return argv[profile_index];
         };
         int jobs=1;
-        if (parallel) {
-            std::wstring number=argv[4];
-            if (number.empty() || number.size()>2 || number.find_first_not_of(L"0123456789")!=number.npos)
-                throw std::runtime_error("--jobs must be between 1 and 64");
-            jobs=std::stoi(number);
-            if (jobs<1 || jobs>64) throw std::runtime_error("--jobs must be between 1 and 64");
-            jobs=(std::min)(jobs,count);
-        }
+        if (parallel)
+            jobs = (std::min)(parse_jobs_count(argv[4]), count);
         auto start=Clock::now();
         std::set<fs::path,PathLess> occupied(inputs.begin(),inputs.end());
         if(compute_request) {
@@ -312,6 +635,7 @@ int wmain(int argc, wchar_t** argv) {
             reserve_output(outputs[i]);
             if(directory) {
                 reserve_output(fs::path(stems[i]) += L".txt");
+                reserve_output(fs::path(stems[i]) += L".fail");
                 if(graphics_batch) {
                     reserve_output(fs::path(stems[i]) += L".ps.cso");
                     reserve_output(fs::path(stems[i]) += L".psdep");
@@ -330,6 +654,7 @@ int wmain(int argc, wchar_t** argv) {
                 fs::remove(manifest_path, ignored);
                 auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true);
                 if (manifest) publish_atomic(manifest_path, manifest->data(), manifest->size());
+                fs::remove(fs::path(stems[i]) += L".fail", ignored);
                 return;
             }
             const fs::path manifest_path = fs::path(stems[i]) += L".txt";
@@ -357,6 +682,7 @@ int wmain(int argc, wchar_t** argv) {
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
+            fs::remove(fs::path(stems[i]) += L".fail", ignored);
         };
         if(jobs==1 && !directory) {
             x2w::ShaderDxilCompiler compiler(argv[1]);
@@ -379,7 +705,16 @@ int wmain(int argc, wchar_t** argv) {
                     std::ostringstream report;
                     if(init_ms>=0) { report << "worker_init_ms=" << init_ms << '\n'; init_ms=-1; }
                     try { compile_job(compiler, i, report); }
-                    catch(const std::exception& error) { errors[i]=error.what(); }
+                    catch(const std::exception& error) {
+                        errors[i]=error.what();
+                        if (directory) {
+                            try {
+                                const auto line = format_fail_line(errors[i]);
+                                publish_atomic(fs::path(stems[i]) += L".fail", line.data(), line.size());
+                            } catch (...) {
+                            }
+                        }
+                    }
                     reports[i]=report.str();
                 }
             }));
