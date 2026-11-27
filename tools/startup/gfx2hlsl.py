@@ -2999,7 +2999,7 @@ class Stage:
         The shared run can read neither incoming EXEC nor scalar values that differ between the wave and model.
         """
         x, y, z = self.pipe.group
-        if (x * y * z > 32 or branch <= guard + 1 or into.get(join) != [guard]
+        if (x * y * z > 32 or into.get(join) != [guard]
                 or any(k in into for k in range(guard + 1, target) if k != join)):
             return False
         name, ops, mods = parse(self.ins[branch - 1][3])

@@ -1198,6 +1198,8 @@ def check_execz_exit_run():
     # This group has only breaking lanes, so the hardware wave also takes the exit.
     assert trace(range(3)) == singletons(range(3)) == [9, 9, 9]
     translate('O', code=EXIT_RUN_WORDS, group=(3, 1, 1)).hlsl_cs()
+    # Pin the accepted upper edge of the single-wave32 scope bound (`x * y * z <= 32`).
+    translate('O', code=EXIT_RUN_WORDS, group=(32, 1, 1)).hlsl_cs()
     assert trace(lanes, remask=False)[0] == KEY
     assert singletons(lanes, remask=False)[0] == 9
     assert trace(lanes, scalar_on_stay=True)[0] == 1
@@ -1218,6 +1220,7 @@ def check_execz_exit_run():
     for big in ((33, 1, 1), (64, 1, 1)):
         refused(reason, lambda group=big: translate('O', code=EXIT_RUN_WORDS, group=group).hlsl_cs())
     for at, new in ((28, '800395be'),   # s_mov_b32 s21, 0: restore mask was never saved from EXEC
+                    (36, '800380be'),   # s_mov_b32 s0, 0: ANDN2 source mask was never saved from EXEC
                     (52, '007e168a'),   # s_andn2_b32 s22, s0, exec_lo: destination differs from source
                     (60, '1503febe'),   # remask from s21: breaking lanes are active in the wave's v_xor
                     (84, '00008abf'),   # s_barrier 0x0 in place of the run's s_waitcnt
