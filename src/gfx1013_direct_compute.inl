@@ -131,7 +131,9 @@ struct DirectCompute {
     string operand32(const Inst &i, unsigned n, unsigned sgpr_limit = 106) {
         if (graphics_input && n == 106)
             refuse(i.pc, "graphics instruction consumes a full wave mask");
-        if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || (n >= 256 && n < 512)) {
+        // M0 holds ordinary numeric ALU bits here, not an implicit memory/indexing operand.
+        const bool numeric_m0 = !graphics_input && n == 124 && i.enc != Encoding::Mubuf && i.enc != Encoding::Smem;
+        if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || numeric_m0 || (n >= 256 && n < 512)) {
             analysis.require_numeric(i, n, sgpr_limit);
             return read(n);
         }
@@ -2288,7 +2290,8 @@ struct DirectCompute {
         };
         if (n == "s_mov_b32" || n == "s_mov_b64") {
             const bool exec_hi = i.dst == 127 && (wave64 || (compute && n == "s_mov_b32"));
-            if (i.dst > 106 && i.dst != 126 && !(compute && i.dst == 107) && !exec_hi)
+            if (i.dst > 106 && i.dst != 126 && !(compute && i.dst == 107) && !exec_hi &&
+                !(compute && i.dst == 124 && n == "s_mov_b32"))
                 refuse(i.pc, "direct scalar move destination");
             if (i.src[0] <= 105 && !state[i.src[0]].numeric()) {
                 if (i.dst > 105)
