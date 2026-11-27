@@ -39,6 +39,9 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
+#include "startup_stubs/d3d12_replay_slots.h"
+#include "startup_stubs/replay_pages.h"
+#include "startup_stubs/png_write.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
 #include "startup_stubs/upload_reservation.h"
@@ -2307,6 +2310,11 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, int
 // Stream and descriptor graphics pipelines share the VS/PS translation cache (d3d12_draw.inl).
 std::size_t readable_window(u64 address, std::size_t wanted);
 #include "startup_stubs/d3d12_capture.inl"
+u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc);  // d3d12_memory_srv.inl
+std::size_t desktop_stream_size(UINT type);
+extern LONG translated_draws;  // d3d12_draw.inl: the recorder's "d" window counts them per frame
+#include "startup_stubs/d3d12_record.inl"
+#include "startup_stubs/d3d12_present_pictures.inl"
 
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
@@ -4967,6 +4975,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
                                      tail ? tail->GetCPUDescriptorHandleForHeapStart().ptr : 0});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
+    if (supplied_memory) replay_record::remember_heap_pages(supplied_memory, bytes);
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;
     note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
               title_memory, desktop,
@@ -5564,6 +5573,15 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
     return S_OK;
 }
 
+// A buffer placed on an existing title heap: the flags desktop accepts there.
+D3D12_RESOURCE_DESC existing_heap_buffer_desc(const D3D12_RESOURCE_DESC& desc)
+{
+    D3D12_RESOURCE_DESC copy = desc;
+    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    return copy;
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -5702,12 +5720,15 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
         (cap_existing_heap && !x2w_startup::unplaced_existing_heap_allowed(x2w_startup::allocation_bytes(base))))
         hr = E_INVALIDARG;
+    u64 heap_id = 0;  // 1-based index in existing_heaps, for the replay recorder's HPLC chunk
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
-        for (const auto& [known, h] : existing_heaps) {
+        for (std::size_t i = 0; i < existing_heaps.size(); ++i) {
+            const auto& [known, h] = existing_heaps[i];
             if (known == base) {
                 heap = h.real;
                 backing_budget = h.budget;
+                heap_id = i + 1;
             }
         }
         if (!heap) {
@@ -5721,12 +5742,11 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
             if (SUCCEEDED(hr)) {
                 backing_budget = x2w_budget::backing_heap(heap, 0);
                 existing_heaps.emplace_back(base, ExistingHeap{heap, backing_budget});
+                heap_id = existing_heaps.size();
             }
         }
     }
-    D3D12_RESOURCE_DESC copy = *desc;
-    copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>((sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
-                                                   D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
         hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
@@ -5746,6 +5766,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx%s", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull, linear_note);
     if (FAILED(hr)) return hr;
+    if (aliased && replay_record::active_placement) {
+        const auto bytes = heap->GetDesc().SizeInBytes;
+        *replay_record::active_placement = {heap_id, reinterpret_cast<u64>(base), bytes, offset};
+    }
     if (linear.path == x2w_startup::LinearBuffers::kept_default_path) linear_buffers().kept_default(resource, linear);
     return publish_placed_buffer(self, address, desc, initial_state, resource, aliased, backing_budget, out);
 }
@@ -7326,6 +7350,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
+        replay_record::present();
+        present_pictures::present(self, surface, frame);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
@@ -7672,6 +7698,7 @@ void build_tables()
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
+    replay_record::install();  // last: it wraps the slots installed above
 }
 
 SRWLOCK written_lock = SRWLOCK_INIT;
@@ -7689,6 +7716,45 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 
+// The offline player owns these heap references and keys them by recorded creation ID.
+extern "C" __declspec(dllexport) HRESULT x2w_d3d12_replay_place(
+    void* device, void* base, UINT64 offset, const D3D12_RESOURCE_DESC* desc, UINT state,
+    ID3D12Heap** heap, void** out)
+{
+    auto* self = static_cast<Wrapper*>(device);
+    if (!desc || !out || !heap || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return E_INVALIDARG;
+    *out = nullptr;
+    x2w_budget::Ticket* backing_budget = nullptr;
+    if (!*heap) {
+        Microsoft::WRL::ComPtr<ID3D12Device3> device3;
+        HRESULT hr = device_of(self)->QueryInterface(IID_PPV_ARGS(&device3));
+        if (FAILED(hr)) return hr;
+        Microsoft::WRL::ComPtr<ID3D12Heap> opened;
+        hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&opened));
+        if (FAILED(hr)) return hr;
+        // Keep the page-alias resolver and resource budgeting on the ordinary slot 133 heap registry.
+        std::lock_guard lock(placed_mutex);
+        backing_budget = x2w_budget::backing_heap(opened.Get(), 0);
+        existing_heaps.emplace_back(base, ExistingHeap{opened.Get(), backing_budget});
+        opened->AddRef();  // registry lifetime, independent of the player's cache
+        *heap = opened.Detach();
+    } else {
+        std::lock_guard lock(placed_mutex);
+        const auto known = std::find_if(existing_heaps.begin(), existing_heaps.end(),
+            [&](const auto& entry) { return entry.second.real == *heap; });
+        if (known != existing_heaps.end()) backing_budget = known->second.budget;
+    }
+    const auto initial_state = state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_DESC copy = existing_heap_buffer_desc(*desc);
+    const HRESULT hr = device_of(self)->CreatePlacedResource(*heap, offset, &copy, initial_state, nullptr,
+                                                             IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return hr;
+    return publish_placed_buffer(self, static_cast<char*>(base) + offset, desc, initial_state, resource, true,
+                                 backing_budget, out);
+}
+
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
     static const bool ready = (build_tables(), true);
@@ -7701,6 +7767,7 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     }
     the_device = candidate;
     removal_device = device;
+    x2w_d3d12_replay_record_object(device_kind, candidate);
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
