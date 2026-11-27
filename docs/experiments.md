@@ -2,6 +2,19 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## First native graphics draw through the stand-in
+
+Set `X2W_NATIVE_SHADERS` to the desktop DXC directory and `X2W_SHADER_CACHE` to a writable cache.
+The stand-in reads the published graphics request, links the pair, and uses the compiler's persistent
+frontend and bytecode caches. The runtime consumes the same supported binding manifest as the offline
+compiler. The source-built triangle fixture uses one RGBA8 target and checks all 32 pixels in each
+of two processes. A third process supplies an unsupported pixel stage and checks the untouched clear.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer d3d12_xs_shim
+ctest --preset dev --no-tests=error -V -R '^startup_native_graphics_draw_(hardware|warp)$'
+```
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
