@@ -5,7 +5,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
+
+#include "startup_builder_gate_cs.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -26,13 +29,18 @@ Method slot(IUnknown* object, unsigned index)
 }
 
 using CreateBuilder = HRESULT(WINAPI*)(IUnknown*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+
+struct VirtualFreeDeleter {
+    void operator()(void* p) const noexcept { VirtualFree(p, 0, MEM_RELEASE); }
+};
 }  // namespace
 
 int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const bool builder = std::strcmp(argv[2], "builder") == 0;
-    if (!builder && std::strcmp(argv[2], "nonbuilder") != 0) return 2;
+    const bool completed = std::strcmp(argv[2], "completed") == 0;
+    if (!builder && !completed && std::strcmp(argv[2], "nonbuilder") != 0) return 2;
 
     SetEnvironmentVariableA("X2W_COMPUTE_BUILDER_GATE", "1");
     SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");
@@ -54,10 +62,22 @@ int main(int argc, char** argv)
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.CS = {console_code, sizeof(console_code)};
 
+    ComPtr<ID3D12RootSignature> root;
+    if (completed) {
+        D3D12_ROOT_SIGNATURE_DESC root_desc{};
+        ComPtr<ID3DBlob> root_blob;
+        check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, nullptr),
+              "serialize empty root");
+        check(guest->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+                                         IID_PPV_ARGS(&root)), "empty root");
+        desc.pRootSignature = root.Get();
+        desc.CS = {builder_gate_cs, sizeof(builder_gate_cs)};
+    }
+
     using Slot62 = HRESULT(WINAPI*)(IUnknown*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, UINT,
                                     const void*, REFIID, void**);
     ComPtr<ID3D12PipelineState> pipeline;
-    if (builder) {
+    if (builder || completed) {
         const std::wstring path(argv[1], argv[1] + std::strlen(argv[1]));
         HMODULE module = LoadLibraryW(path.c_str());
         if (!module) return 3;
@@ -83,8 +103,31 @@ int main(int argc, char** argv)
 
     using SetPipeline = void(WINAPI*)(IUnknown*, IUnknown*);
     using Dispatch = void(WINAPI*)(IUnknown*, UINT, UINT, UINT);
+    using Root = void(WINAPI*)(IUnknown*, IUnknown*);
+    if (completed) slot<Root>(list.Get(), 33)(list.Get(), root.Get());
     slot<SetPipeline>(list.Get(), 25)(list.Get(), pipeline.Get());
     slot<Dispatch>(list.Get(), 14)(list.Get(), 1, 1, 1);
+
+    ComPtr<ID3D12Resource> argument_buffer;
+    std::unique_ptr<void, VirtualFreeDeleter> backing(
+        VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (completed) {
+        if (!backing) return 5;
+        auto* address = static_cast<char*>(backing.get()) + 4;
+        const D3D12_DISPATCH_ARGUMENTS arguments{1, 1, 1};
+        std::memcpy(address, &arguments, sizeof(arguments));
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 4096;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        using Place = HRESULT(WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID,
+                                        void**);
+        check(slot<Place>(guest.Get(), 133)(guest.Get(), address, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            IID_PPV_ARGS(&argument_buffer)),
+              "argument placed buffer");
+    }
 
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
@@ -99,7 +142,7 @@ int main(int argc, char** argv)
           "signature");
 
     using Execute = void(WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
-    slot<Execute>(list.Get(), 61)(list.Get(), signature.Get(), 1, nullptr, 0, nullptr, 0);
+    slot<Execute>(list.Get(), 61)(list.Get(), signature.Get(), 1, argument_buffer.Get(), 0, nullptr, 0);
     std::printf("%s done\n", argv[2]);
     return 0;
 }

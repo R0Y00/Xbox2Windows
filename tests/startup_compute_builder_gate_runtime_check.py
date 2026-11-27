@@ -22,7 +22,12 @@ def main(executable, module):
 
     nonbuilder = run(executable, module, "nonbuilder")
     assert "compute builder gate" not in nonbuilder, nonbuilder
-    print("builder gate: direct and indirect Dispatch refused; non-builder path untouched")
+
+    completed = run(executable, module, "completed")
+    assert "all have a desktop PSO" in completed, completed
+    assert "requires a desktop compute pipeline and root" not in completed, completed
+    assert "ExecuteIndirect refused" not in completed, completed
+    print("builder gate: incomplete set refused; completed set dispatch reaches the list; non-builder untouched")
 
 
 if __name__ == "__main__":

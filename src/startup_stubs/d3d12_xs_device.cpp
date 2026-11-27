@@ -3068,6 +3068,17 @@ bool compute_builder_dispatch_allowed(Wrapper* list, const char* stage)
         decision = gate->decide(true);
     }
     if (decision == x2w_startup::BuilderGateDecision::allow) {
+        // The title bound a placeholder wrapper earlier; the gate has just published its real
+        // desktop PSO. Refresh the recording's cached compute state and bind the PSO so the
+        // caller's Dispatch decision sees the completed pipeline instead of the placeholder.
+        if (auto* host = recording(list); host && pass.pipeline && pass.pipeline->own().real) {
+            pass.pipeline_real = true;
+            pass.compute_pipeline = true;
+            pass.compute_pipeline_root = pass.pipeline->own().pipeline_root;
+            host->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+            if (pass.compute_root && pass.compute_pipeline_root == pass.compute_root)
+                host->SetComputeRootSignature(pass.compute_root);
+        }
         static LONG logged;
         if (first_calls(logged, 1))
             log("x2w-render compute builder gate: %u tracked pipelines, all have a desktop PSO; %s allowed",

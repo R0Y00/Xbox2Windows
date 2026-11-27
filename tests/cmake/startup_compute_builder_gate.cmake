@@ -15,6 +15,13 @@ target_link_libraries(startup_builder_module PRIVATE d3d12)
 add_executable(startup_compute_builder_gate_runtime tests/startup_compute_builder_gate_runtime.cpp)
 target_compile_features(startup_compute_builder_gate_runtime PRIVATE cxx_std_17)
 target_link_libraries(startup_compute_builder_gate_runtime PRIVATE d3d12_xs_shim d3d12 dxgi)
+set(startup_builder_gate_header "${CMAKE_CURRENT_BINARY_DIR}/startup_builder_gate_cs.h")
+add_custom_command(OUTPUT "${startup_builder_gate_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn builder_gate_cs
+        -Fh "${startup_builder_gate_header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_builder_gate.hlsl"
+    DEPENDS tests/startup_builder_gate.hlsl VERBATIM)
+target_sources(startup_compute_builder_gate_runtime PRIVATE "${startup_builder_gate_header}")
+target_include_directories(startup_compute_builder_gate_runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_compute_builder_gate_runtime
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_builder_gate_runtime_check.py"
