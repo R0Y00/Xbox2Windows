@@ -9,6 +9,8 @@ is nonzero. Both take aligned SGPR pairs or constants, with sign extension
 for inline negatives and zero extension for other integers. They can
 write VCC as a pair. EXEC destinations are refused.
 
+Direct compute also accepts `s_bitreplicate_b64_b32 exec, imm`, writing both EXEC words and preserving SCC. Wave32 lane activity uses only `exec_lo`.
+
 ## Verification
 
 `native_salu64_controls` checks that compiling `s_cselect_b64 exec, -1, 0`

@@ -3,8 +3,8 @@
 The instruction is RDNA 2 MIMG opcode 230. This check covers the translator path and the
 box model only: a constant inline BVH T#[12:15], an 11-dword packed address, a constant
 node base whose low three bits are 4 (binary16) or 5 (FP32), and the four child results.
-Triangle nodes, the 64-bit form, A16, NSA and every dynamic descriptor or node base are
-refused by name before any HLSL is emitted. The independent CPU box reference is
+The triangle kinds have a dedicated check. The 64-bit form, A16, NSA and every dynamic
+descriptor or node base are refused by name before any HLSL is emitted. The independent CPU box reference is
 tests/gfx1030_bvh_box/bvh_model.py; the Windows dispatch exercises both emitted helpers.
 """
 import math
@@ -198,10 +198,22 @@ def dispatch_cases():
         cases.append(dict(name=name, helper="x2w_bvh_intersect_box16", pointer=(offset >> 3) | 4,
                           word0=0x1000, word1=0, word2=0x40,
                           extent=extent, origin=origin, direction=direction, expected=expected))
+    # A T# can cover both box and triangle nodes; box kinds ignore the triangle return mode
+    # bit. These cases fail if either the translator or the emitted box helper rejects it.
+    name, offset, extent, origin, direction, expected = RAYS[0]
+    cases.append(dict(name="box32_return_mode_ignored", helper="x2w_bvh_intersect_box32",
+                      pointer=(offset >> 3) | 5, word0=0x1000, word1=SORT_ENABLE, word2=0x0b,
+                      word3=RESOURCE_TYPE | 0x01000000, extent=extent, origin=origin,
+                      direction=direction, expected=expected))
+    name, offset, extent, origin, direction, expected = HALF_RAYS[0]
+    cases.append(dict(name="box16_return_mode_ignored", helper="x2w_bvh_intersect_box16",
+                      pointer=(offset >> 3) | 4, word0=0x1000, word1=SORT_ENABLE, word2=0x40,
+                      word3=RESOURCE_TYPE | 0x01000000, extent=extent, origin=origin,
+                      direction=direction, expected=expected))
     return cases
 
 
-BUFFER_SIZE = RESULT_OFFSET + 16 * (len(RAYS) + len(UNSORTED_RAYS) + len(HALF_RAYS) + len(HALF_UNSORTED_RAYS))
+BUFFER_SIZE = RESULT_OFFSET + 16 * len(dispatch_cases())
 
 
 def translate_program(*, node=0x05, sort_boxes=True, word0=0x1000, word1=None, word2=0x0b,
@@ -348,6 +360,16 @@ def controls():
         check("sort-disabled box16 call uses a zero sort word",
               "0x00001000u, 0x00000000u, 0x0000000bu, 0x80000000u" in call, call)
 
+    # One T# can cover both node types, so a box node ignores the triangle return mode bit.
+    for node, helper in ((0x05, "x2w_bvh_intersect_box32"), (0x04, "x2w_bvh_intersect_box16")):
+        pipe, hlsl, refusals = translate_program(node=node, word3=RESOURCE_TYPE | 0x01000000)
+        check("box kind %d with triangle return mode bit translates" % (node & 7),
+              pipe is not None and not refusals, str(refusals))
+        if pipe is not None:
+            call = next((line for line in hlsl.splitlines() if helper + "(r0" in line), "")
+            check("box kind %d call preserves the ignored return mode bit" % (node & 7),
+                  "0x00001000u, 0x80000000u, 0x0000000bu, 0x81000000u" in call, call)
+
     # Independently decode the 40-bit unit field; test the same raw DWORDs in
     # the emitted call and the decoded byte-address binding in the manifest.
     for units, high, base in ((0x1000, 0, 0x100000), (0x1008, 0, 0x100800),
@@ -424,7 +446,6 @@ def controls():
 
     # Every refusal must happen before a helper call or a result VGPR is emitted.
     cases = [
-        ("triangle node", dict(node=0x00), "triangle node (kind 0)"),
         ("unknown node kind", dict(node=0x06), "node kind 6"),
         ("unaligned node", dict(node=0x0d), "not an aligned 128-byte node"),
         ("non-constant node", dict(constant_node=False), "non-constant node base"),
@@ -439,7 +460,7 @@ def controls():
         ("node outside size", dict(node=0x25, word2=3), "outside descriptor size"),
         ("box16 node outside size", dict(node=0x54, word2=9), "outside descriptor size"),
         ("absolute base", dict(word0=0, word1=0), "absolute node base"),
-        ("size high bits", dict(word3=RESOURCE_TYPE | 0x100), "size above 4 GiB"),
+        ("size high bits", dict(word3=RESOURCE_TYPE | 0x100), "does not match node kind 5"),
     ]
     for label, kwargs, reason in cases:
         if label == "NSA address":
@@ -487,7 +508,7 @@ def compile_check(hlsl):
     with tempfile.TemporaryDirectory(dir=ROOT / "out" if (ROOT / "out").is_dir() else None) as temporary:
         source = Path(temporary) / "bvh_box.hlsl"
         source.write_text(hlsl, encoding="ascii")
-        result = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(source.with_suffix(".cso")), str(source)],
+        result = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(source.with_suffix(".cso")), str(source)],
                                 capture_output=True, text=True)
     if result.returncode or result.stderr:
         check("dxc compiles the translated helper", False, result.stderr or "exit %d" % result.returncode)
@@ -550,9 +571,10 @@ def dispatch_hlsl(mutation=None):
     for case, item in enumerate(dispatch_cases()):
         inv = tuple(1.0 / c for c in item["direction"])
         lines.append(
-            "    uint4 r%d = %s(data, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, 0x80000000u, "
+            "    uint4 r%d = %s(data, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu, "
             "%s, float3(%s, %s, %s), float3(%s, %s, %s));" % (
                 case, item["helper"], item["pointer"], item["word0"], item["word1"], item["word2"],
+                item.get("word3", 0x80000000),
                 ffloat(item["extent"]), ffloat(item["origin"][0]), ffloat(item["origin"][1]),
                 ffloat(item["origin"][2]), ffloat(inv[0]), ffloat(inv[1]), ffloat(inv[2])))
         for word in range(4):
