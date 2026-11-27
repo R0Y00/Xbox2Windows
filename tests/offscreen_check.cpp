@@ -1364,9 +1364,9 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] prints one RGBA32F pixel.
-// The optional selector is forwarded as the existing second root constant.
-// --startup-image-2d-array-view takes the identical args; argv[2] selects the two-slice 2D-array renderer.
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] [8] prints one RGBA32F pixel.
+// The optional selector is forwarded as the second root constant. The final 8 requests an 8x8 mip base.
+// --startup-image-2d-array-view uses the two-slice renderer with the default 4x4 base.
 OperationResult run_startup_image_2d_view(const OperationContext& ctx)
 {
     const std::string_view window = ctx.argv[6];
@@ -1375,15 +1375,21 @@ OperationResult run_startup_image_2d_view(const OperationContext& ctx)
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
     const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array-view") == 0;
     float selector = 0.0f;
-    if (ctx.argc == 8) {
+    if (ctx.argc >= 8) {
         if (std::strcmp(ctx.argv[7], "1") == 0)
             selector = 1.0f;
         else if (std::strcmp(ctx.argv[7], "0") != 0)
             return {OutcomeKind::fail, "view selector must be 0 or 1"};
     }
+    UINT mip_base = 4;
+    if (ctx.argc == 9) {
+        if (std::strcmp(ctx.argv[8], "8") != 0)
+            return {OutcomeKind::fail, "2D mip base must be 8"};
+        mip_base = 8;
+    }
     float color[4]{};
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], selector, color, ctx.argv[5], array, 3, false, !array,
-                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+                           UINT(window[0] - '0'), UINT(window[2] - '0'), mip_base);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
@@ -1738,7 +1744,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-view", 7, 9, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-2d-array-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 8, nullptr, kNoGate, run_startup_image_store},
