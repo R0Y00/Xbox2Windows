@@ -16,7 +16,7 @@ mip 3 at 0, mip 2 at 256, mip 1 at 768 and mip 0 at 1536.
 The change:
 
 - `gfx10_layout.h`: `supports` takes a 1D texture in the linear mode with a height of one and an
-  element of one texel. Block-compressed formats and the tiled modes stay refused for 1D.
+  element of one texel. Block-compressed formats, 1D arrays and the tiled modes stay refused for 1D.
 - `address_texture.h`: a 1D array is refused, since the draw uploads a 1D texture only when it is not
   an array (`d3d12_draw.inl`). `address_view_fits` takes a `TEXTURE1D` view of a 1D texture that fits
   the mip range with no LOD clamp.
@@ -30,7 +30,7 @@ Windows 11 Pro 10.0.26200, NVIDIA GeForce RTX 5090 (driver 32.0.16.1088) and Mic
 
 | Test | Result |
 | --- | --- |
-| `startup_gfx10_layout` | PASS: 15 round trips (2 new 1D linear shapes: RGBA8 sRGB 300 with 9 mips, R8 4096 with 13 mips), 14 refusals (new: 1D in `0x105`, 1D two rows high, 1D BC1), 22 address descriptions (new: a 1D texture is accepted, a 1D array and a desktop-layout 1D texture are refused), 33 views (new: the whole 1D chain, its last mip, past the chain, an LOD clamp, a 1D view of a 2D texture and a 2D view of a 1D texture) |
+| `startup_gfx10_layout` | PASS: 15 round trips (2 new 1D linear shapes: RGBA8 sRGB 300 with 9 mips, R8 4096 with 13 mips), 15 refusals (new: 1D in `0x105`, 1D two rows high, 1D BC1, a 1D array), 22 address descriptions (new: a 1D texture is accepted, a 1D array and a desktop-layout 1D texture are refused), 33 views (new: the whole 1D chain, its last mip, past the chain, an LOD clamp, a 1D view of a 2D texture and a 2D view of a 1D texture) |
 | `startup_gfx10_layout_linear_addrlib` | PASS: 349,547 sizes and element addresses match addrlib, now with three 1D textures (`ADDR_RSRC_TEX_1D`: RGBA8 sRGB 300 with 9 mips, R8 4096 with 13 mips, RGBA16F 1000 with 10 mips) |
 | `startup_address_console_{warp,hardware}` | PASS: 3 new 1D draws through a `Texture1D` view are exact on all 65,536 pixels: RGBA8 300 with one mip, and its 4-mip chain viewed at mip 0 and at mip 2 |
 | `startup_address_console_linear_unpadded_{warp,hardware}` | PASS (control): the 4-mip 1D chain with its mips packed without padding (mip 2 at 152 instead of 256) is published and all 65,536 pixels of the mip-2 draw differ; the 2D case is unchanged (63,488 differ) |

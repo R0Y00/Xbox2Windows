@@ -72,14 +72,15 @@ inline UINT block_log2(UINT mode)
 }
 
 // A two-dimensional, single-sample texture whose memory this header can address, or a one-dimensional
-// one in the linear mode. addrlib refuses a 1D surface taller than one row (HwlComputeSurfaceInfoLinear).
+// one in the linear mode. addrlib refuses a 1D surface taller than one row (HwlComputeSurfaceInfoLinear). A 1D
+// array is refused here as well as in address_view_fits: the draw uploads a 1D texture only when it is not an array.
 inline bool supports(const D3D12_RESOURCE_DESC& d)
 {
     const UINT mode = swizzle_mode(d), log2 = block_log2(mode);
     const Element element = element_of(d.Format);
     if ((!log2 && mode != linear_mode) || !element.bytes) return false;
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
-        if (mode != linear_mode || d.Height != 1 || element.texels != 1) return false;
+        if (mode != linear_mode || d.Height != 1 || d.DepthOrArraySize != 1 || element.texels != 1) return false;
     } else if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         return false;
     }

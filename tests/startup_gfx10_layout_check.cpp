@@ -239,6 +239,7 @@ void check_refusals()
     refused("1D in a 4 KiB swizzle mode", texture_1d(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x105));
     d = texture_1d(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100); d.Height = 2; refused("1D two rows high", d);
     refused("1D block-compressed", texture_1d(256, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x100));
+    refused("1D array", texture_1d(256, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, 0x100));
 }
 
 // The linear mode by hand: a 100x10 R16G16B16A16 texture with three mips. Each mip's pitch is its
@@ -525,6 +526,6 @@ int main(int argc, char** argv)
         std::printf("startup_gfx10_layout: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 15 round trips, 1 linear chain, 14 refusals, 22 address descriptions, 33 views)\n");
+    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 15 round trips, 1 linear chain, 15 refusals, 22 address descriptions, 33 views)\n");
     return 0;
 }
