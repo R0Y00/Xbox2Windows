@@ -1,18 +1,9 @@
 // Lower the shared decoded CFG to DXIL operations. A scalar register holds one
 // 32-bit word per wave. Ordinary vector writes retain their old value on inactive lanes.
 struct DirectCompute {
-    static constexpr Word inline_float_words[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
-                                               0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
-    // The same nine constants as binary16, which an f16 operand reads instead of the f32 pattern.
+    // The nine inline float constants as binary16, which an f16 operand reads instead of the f32 pattern.
     static constexpr Word inline_half_words[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
                                               0xc000, 0x4400, 0xc400, 0x3118};
-    static std::optional<Word> constant32(const Inst &i, unsigned r) {
-        if (r >= 128 && r <= 192) return r - 128;
-        if (r >= 193 && r <= 208) return Word(192) - r;
-        if (r >= 240 && r <= 248) return inline_float_words[r - 240];
-        if (r == 255) return i.literal;
-        return {};
-    }
     static void validate_lane_shape(const Inst &i, unsigned threads, unsigned width) {
         const auto constant = constant32(i, i.src[1]);
         const auto remaining = threads % width;
@@ -54,6 +45,8 @@ struct DirectCompute {
     std::map<unsigned, string> graphics_registers;
     string graphics_predicate;
     unsigned graphics_pc = 0;
+    const State *compute_state = nullptr;
+    unsigned compute_pc = 0;
     bool perspective_center_pair = false;
     bool exact_pixel_entry = false;
     std::function<bool(unsigned)> helper_result_unobserved;
@@ -81,7 +74,7 @@ struct DirectCompute {
             ir.setup << "  " << name << " = alloca i32, align 4\n";
         return name;
     }
-    string read(unsigned r) {
+    string read_storage(unsigned r) {
         if (graphics_input) {
             auto guarded = guarded_ij.find(r);
             if (guarded != guarded_ij.end())
@@ -98,7 +91,17 @@ struct DirectCompute {
         }
         return ir.value("load i32, i32* " + address(r) + ", align 4");
     }
+    string read(unsigned r) {
+        if (compute_state && compute_state->has_spill(r))
+            refuse(compute_pc, "symbolic VGPR lane read of " + reg(r));
+        return read_storage(r);
+    }
+    bool lane_write = false;  // v_writelane_b32 updates one lane of a VGPR that may hold symbolic lanes
     void write(unsigned r, const string &value) {
+        // A VGPR write the analysis did not model as clearing its symbolic lanes
+        // would let a later v_readlane_b32 return a stale identity.
+        if (compute_state && !lane_write && compute_state->has_spill(r))
+            refuse(compute_pc, "write to a VGPR holding symbolic lanes: " + reg(r));
         if (graphics_input) {
             guarded_ij.erase(r);
             graphics_registers[r] = value;
@@ -139,7 +142,7 @@ struct DirectCompute {
             auto result = ir.value("select i1 " + graphics_predicate + ", float " + sampled_float + ", float " + previous);
             write(r, ir.value("bitcast float " + result + " to i32"));
         } else
-            write(r, select(graphics_input ? graphics_predicate : active(), value, read(r)));
+            write(r, select(graphics_input ? graphics_predicate : active(), value, read_storage(r)));
     }
     string operand32(const Inst &i, unsigned n) {
         if (graphics_input && n == 106)
@@ -2098,6 +2101,59 @@ struct DirectCompute {
         auto overflow = ir.binary("and", ir.binary("xor", a, sum), ir.binary("xor", b, sum));
         return select(cmp("slt", overflow, "0"), select(cmp("slt", a, "0"), "2147483648", "2147483647"), sum);
     }
+    bool packed_minmax(const Inst &i, const State &state) {
+        if (i.enc != Encoding::Mix)
+            return false;
+        const auto n = i.name;
+        const bool floating = n == "v_pk_min_f16" || n == "v_pk_max_f16";
+        const bool signed_int = n == "v_pk_min_i16" || n == "v_pk_max_i16";
+        if (!floating && !signed_int && n != "v_pk_min_u16" && n != "v_pk_max_u16")
+            return false;
+        // VOP3P NEG_HI/LO occupy the usual ABS/NEG fields. The third
+        // OP_SEL_HI bit is unused here, like the packed add and shift forms.
+        if (i.clamp || i.abs || i.neg || i.src[2] || (i.a & 0x2000))
+            refuse(i.pc, "unsupported packed 16-bit min/max encoding");
+        if (floating && (!half_mode_known || (mode_bits & 0xc0u) != 0xc0u))
+            refuse(i.pc, "unsupported packed binary16 min/max denormal mode");
+        auto source = [&](unsigned src) {
+            if (src <= 105) {
+                if (state[src].type == Symbol::Type::masked || state[src].type == Symbol::Type::uniform_mask)
+                    refuse(i.pc, "packed 16-bit min/max uses a lane mask");
+            } else if (src < 256 && src != 128 && src != 255) {
+                refuse(i.pc, "unsupported packed 16-bit min/max source");
+            }
+            return operand32(i, src);
+        };
+        const auto a = source(i.src[0]), b = source(i.src[1]);
+        const bool maximum = n.substr(5, 3) == "max";
+        auto half = [&](const string &word, bool high) {
+            return high ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+        };
+        auto order_key = [&](const string &bits) -> string {
+            if (floating) {
+                // Binary16 encodings are monotone within each sign. Reverse
+                // the negative half of that order and keep -0 below +0.
+                auto negative = cmp("uge", bits, "32768");
+                return ir.binary("xor", bits, select(negative, "65535", "32768"));
+            }
+            return signed_int ? ir.binary("xor", bits, "32768") : bits;
+        };
+        auto lane = [&](unsigned selectors) {
+            auto x = half(a, selectors & 1), y = half(b, selectors & 2);
+            auto result = select(cmp(maximum ? "ugt" : "ult", order_key(x), order_key(y)), x, y);
+            if (floating) {
+                // Follow the existing startup contract. One NaN selects
+                // the numeric side. Two NaNs use the canonical quiet NaN.
+                auto x_nan = cmp("ugt", ir.binary("and", x, "32767"), "31744");
+                auto y_nan = cmp("ugt", ir.binary("and", y, "32767"), "31744");
+                result = select(x_nan, select(y_nan, "32256", y), select(y_nan, x, result));
+            }
+            return result;
+        };
+        auto low = lane((i.a >> 11) & 3), high = lane((i.b >> 27) & 3);
+        vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+        return true;
+    }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
         if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
@@ -2304,7 +2360,7 @@ struct DirectCompute {
             if (graphics_input) write(i.dst, {});
             return;
         }
-        if (float_alu(i, permuted))
+        if (packed_minmax(i, state) || float_alu(i, permuted))
             return;
         if (i.enc == Encoding::Vopc && !i.clamp && !i.scale &&
             (n.find("class") == n.npos || n.find("_f16") != n.npos || n.find("_f32") != n.npos)) {
@@ -2507,19 +2563,37 @@ struct DirectCompute {
                 refuse(i.pc, "lane read/write register operand");
             const unsigned width = wave64 ? 64 : 32;
             const unsigned selector = i.src[1];
+            const auto guest = guest_spill_lane(i, wave64);
+            const unsigned vector = reading ? i.src[0] : i.dst;
+            if (guest && reading) {
+                const auto slot = state.lane_spills.find({vector, *guest});
+                if (slot != state.lane_spills.end()) {
+                    if (!slot->second)
+                        refuse(i.pc, "symbolic VGPR lane read has conflicting incoming values");
+                    if (i.dst > 105)
+                        refuse(i.pc, "symbolic VGPR lane read needs an ordinary SGPR destination");
+                    return; // Transfer associated the destination SGPR with this identity.
+                }
+            }
+            if (!reading && i.src[0] <= 105 && identity_spill(state[i.src[0]])) {
+                if (!guest)
+                    refuse(i.pc, "symbolic VGPR lane write needs a constant lane");
+                return;
+            }
             string selected;
             if (selector <= 105 || (!wave64 && selector == 107)) {
+                if (state.has_spill(vector))
+                    refuse(i.pc, "symbolic VGPR lane read or write needs a constant lane");
                 selected = ir.binary("and", val(1), to_string(width - 1));
             } else {
-                const auto constant = constant32(i, selector);
-                if (!constant)
+                if (!guest)
                     refuse(i.pc, "lane read/write needs a constant or SGPR lane");
-                selected = to_string(*constant & (width - 1));
+                selected = to_string(*guest);
             }
             if (reading) {
                 const auto physical = wave64 ? ir.binary("and", selected, "31") : selected;
                 auto value = ir.invoke("i32", "waveReadLaneAt.i32", 117,
-                                       {{"i32", val(0)}, {"i32", physical}}, "nounwind");
+                                       {{"i32", read_storage(vector)}, {"i32", physical}}, "nounwind");
                 if (wave64) {
                     const auto halves = exchange_halves(value);
                     value = select(cmp("uge", selected, "32"), halves[1], halves[0]);
@@ -2528,7 +2602,9 @@ struct DirectCompute {
             } else {
                 const auto guest_lane = wave64 ? ir.binary("or", lane, select(upper_half, "32", "0")) : lane;
                 // The lane selector is the sole write predicate, independent of guest EXEC.
-                write(i.dst, select(cmp("eq", guest_lane, selected), val(0), read(i.dst)));
+                lane_write = true;
+                write(i.dst, select(cmp("eq", guest_lane, selected), val(0), read_storage(i.dst)));
+                lane_write = false;
             }
             return;
         }
@@ -3538,8 +3614,13 @@ struct DirectCompute {
             if (!p.reached[k])
                 continue;
             const auto &op = p.code[k];
-            if (binary16_alu(op.name) || op.name == "v_cvt_f16_u16" || op.name == "v_cvt_f16_i16" ||
-                op.name == "v_cvt_u16_f16" || op.name == "v_cvt_i16_f16")
+        if (binary16_alu(op.name) ||
+            op.name == "v_pk_min_f16" ||
+            op.name == "v_pk_max_f16" ||
+            op.name == "v_cvt_f16_u16" ||
+            op.name == "v_cvt_f16_i16" ||
+            op.name == "v_cvt_u16_f16" ||
+            op.name == "v_cvt_i16_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
@@ -3568,6 +3649,8 @@ struct DirectCompute {
         ir.body << "  br label %pc" << entry << "\n";
         for (size_t k = 0; k < p.code.size(); ++k) {
             const auto &i = p.code[k];
+            compute_pc = i.pc;
+            compute_state = &p.before[k];
             if (labels.count(i.pc)) {
                 if (k && p.code[k - 1].name != "s_endpgm" && !p.code[k - 1].branch() &&
                     !(virtual_waves && p.code[k-1].name=="s_barrier"))

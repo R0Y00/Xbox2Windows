@@ -5,8 +5,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <dxgi1_4.h>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -62,27 +64,44 @@ void report_adapter(ID3D12Device* device) {
 int wmain(int argc, wchar_t **argv) {
     if (argc != 6 && argc != 7) return 2;
     try {
+        const auto mode = argc == 7 ? std::wstring_view(argv[6]) : std::wstring_view{};
+        const bool warp = mode == L"--direct-warp";
+        ComPtr<IDXGIAdapter> adapter;
+        if (warp) {
+            ComPtr<IDXGIFactory4> factory;
+            check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
+            const auto warp_hr = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+            if (warp_hr == DXGI_ERROR_NOT_FOUND || warp_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+            check(warp_hr, "WARP adapter");
+        }
         ComPtr<ID3D12Device> device;
-        if (GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", nullptr, 0)) {
-            bool unmatched = false;
-            device = create_device(false, unmatched, [](IUnknown* adapter, REFIID iid, void** result) {
-                return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, result);
-            }, stderr);
-            if (!device) {
-                if (!unmatched)
-                    std::fputs("Unable to enumerate D3D12 hardware adapters\n", stderr);
-                return 2;
-            }
-        } else {
-            const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
+        if (warp) {
+            // --direct-warp: the WARP adapter chosen above.
+            const auto device_hr = D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
             if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
             check(device_hr, "device");
+        } else {
+            if (GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", nullptr, 0)) {
+                bool unmatched = false;
+                device = create_device(false, unmatched, [](IUnknown* adapter, REFIID iid, void** result) {
+                    return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, result);
+                }, stderr);
+                if (!device) {
+                    if (!unmatched)
+                        std::fputs("Unable to enumerate D3D12 hardware adapters\n", stderr);
+                    return 2;
+                }
+            } else {
+                const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
+                if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+                check(device_hr, "device");
+            }
+            report_adapter(device.Get());
         }
-        report_adapter(device.Get());
         ShaderDxilCompiler compiler(argv[1]);
         fs::path marker=argv[2], dest=argv[5];
-        const bool null_array = argc == 7 && std::wstring_view(argv[6]) == L"--direct-null-srv";
-        const bool direct = null_array || (argc == 7 && std::wstring_view(argv[6]) == L"--direct");
+        const bool null_array = mode == L"--direct-null-srv";
+        const bool direct = null_array || warp || mode == L"--direct";
         if (direct) {
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
             D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};

@@ -203,15 +203,21 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
             const unsigned soffset = i.b >> 24;
-            if (direct && (!graphics || !(a & 0x2000u))) {
+            if (direct && !graphics) {
+                if ((a & 0x0203e000u) || (i.b & 0x00e00000u))
+                    refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
+                // The MUBUF encoding has no trailing literal word.
+                if (soffset > 105 && !(soffset >= 128 && soffset <= 208))
+                    refuse(pc, "raw buffer load scalar offset needs an SGPR or inline integer");
+            } else if (direct && graphics && !(a & 0x2000u)) {
                 // Linear MUBUF uses an optional OFFEN VGPR, scalar byte offset and OFFSET12.
                 if ((a & 0x02032000u) || (i.b & 0x00a00000u) || (soffset > 105 && soffset != 128))
-                    refuse(pc, graphics ? "raw graphics load requires linear addressing without LDS or TFE"
-                                        : "raw compute load requires linear addressing without LDS or TFE");
+                    refuse(pc, "raw graphics load requires linear addressing without LDS or TFE");
             } else if (!(direct && graphics && (a & 0x0203f000u) == 0x2000u &&
                         (i.b & 0xffe00000u) == 0x80000000u) &&
-                       ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u))
+                       ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u)) {
                 refuse(pc, "raw buffer load needs offen with zero scalar offset and no modifiers");
+            }
             i.name = "buffer_load_dword";
         } else {
             if (i.op > 3)
@@ -448,7 +454,82 @@ struct Symbol {
     bool operator==(const Symbol &r) const { return type == r.type && value == r.value && offset == r.offset &&
         index_mask == r.index_mask && definition == r.definition; }
 };
-using State = std::array<Symbol, 128>;
+struct State {
+    std::array<Symbol, 128> scalar{};
+    // Encoded VGPR and guest lane. A join can lose the identity while
+    // retaining the fact that some path omitted the runtime lane write.
+    std::map<std::pair<unsigned, unsigned>, std::optional<Symbol>> lane_spills;
+    Symbol &operator[](unsigned n) { return scalar[n]; }
+    const Symbol &operator[](unsigned n) const { return scalar[n]; }
+    const Symbol &at(unsigned n) const { return scalar.at(n); }
+    size_t size() const { return scalar.size(); }
+    auto begin() { return scalar.begin(); }
+    auto end() { return scalar.end(); }
+    auto begin() const { return scalar.begin(); }
+    auto end() const { return scalar.end(); }
+    bool has_spill(unsigned reg) const {
+        const auto it = lane_spills.lower_bound({reg, 0});
+        return it != lane_spills.end() && it->first.first == reg;
+    }
+    void clear_spills(unsigned reg, unsigned count = 1) {
+        lane_spills.erase(lane_spills.lower_bound({reg, 0}), lane_spills.lower_bound({reg + count, 0}));
+    }
+};
+static std::optional<Word> constant32(const Inst &i, unsigned r) {
+    static constexpr Word floats[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
+                                   0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+    if (r >= 128 && r <= 192) return r - 128;
+    if (r >= 193 && r <= 208) return Word(192) - r;
+    if (r >= 240 && r <= 248) return floats[r - 240];
+    if (r == 255) return i.literal;
+    return {};
+}
+static std::optional<unsigned> guest_spill_lane(const Inst &i, bool wave64) {
+    if (auto selector = constant32(i, i.src[1]))
+        return *selector & (wave64 ? 63 : 31);
+    return {};
+}
+static bool identity_spill(const Symbol &s) {
+    // Indexed descriptors and their derived fields still use an SGPR's
+    // runtime index. Erasing a lane operation would lose that payload.
+    // An unbound value stays unbound after a refill, so it is refused at its use.
+    return !s.numeric() &&
+           s.type != Symbol::Type::indexed_descriptor && !s.definition;
+}
+static void clear_vector_spills(const Inst &i, State &s) {
+    if (s.lane_spills.empty()) return;
+    switch (i.enc) {
+    case Encoding::Vop1: case Encoding::Vop2: case Encoding::Vop3: case Encoding::Mix:
+        if (i.dst >= 256 && i.name != "v_nop") {
+            const bool pair = i.name == "v_mad_u64_u32" || i.name == "v_mad_i64_i32" || i.name == "v_lshlrev_b64" ||
+                              i.name == "v_lshrrev_b64" || i.name == "v_ashrrev_i64";
+            s.clear_spills(i.dst, pair ? 2 : 1);
+            if (i.name == "v_swap_b32") s.clear_spills(i.src[0]);
+        }
+        break;
+    case Encoding::Mubuf:
+        if (i.name == "buffer_load_dword") {
+            constexpr unsigned widths[]{1, 2, 4, 3};
+            s.clear_spills(256 + i.dst, widths[i.op & 3]);
+        } else if (i.name == "buffer_load_format" || i.name.substr(0, 8) == "tbuffer_")
+            s.clear_spills(256 + i.dst, (i.op & 3) + 1);
+        else if (i.name == "global_load_dword" ||
+                 (i.name.substr(0, 14) == "buffer_atomic_" && (i.a & 0x4000)))
+            s.clear_spills(256 + i.dst);
+        break;
+    case Encoding::Image:
+        if (i.op != 8) {
+            unsigned count = 0;
+            for (unsigned mask = (i.a >> 8) & 15; mask; mask >>= 1)
+                count += mask & 1;
+            if (i.op == 68) count = 4;
+            if (i.b >> 31) count = (count + 1) / 2;
+            s.clear_spills(256 + i.dst, count);
+        }
+        break;
+    default: break;
+    }
+}
 // FSSM root descriptors carry a guest address in two SGPRs. Preserve the
 // identity of each half through scalar moves and CFG joins (Victory resource.rs).
 void bind_root_address(State &state, const ShaderRootInput &input, unsigned limit) {
@@ -509,12 +590,32 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
         return field(a,T::byte_oob);
     return {};
 }
-State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window = false) {
+State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
         s[n] = v;
     };
+    if (direct && !graphics) {
+        if (i.name == "v_writelane_b32") {
+            if (auto lane = guest_spill_lane(i, wave64)) {
+                const auto key = std::make_pair(i.dst, *lane);
+                const auto value = source(i, i.src[0], s);
+                if (i.src[0] <= 105 && identity_spill(value))
+                    s.lane_spills[key] = value;
+                else
+                    s.lane_spills.erase(key);
+            }
+            return s;
+        }
+        if (i.name == "v_readlane_b32") {
+            const auto lane = guest_spill_lane(i, wave64);
+            const auto slot = lane ? s.lane_spills.find({i.src[0], *lane}) : s.lane_spills.end();
+            set(i.dst, slot != s.lane_spills.end() && slot->second ? *slot->second : Symbol{});
+            return s;
+        }
+        clear_vector_spills(i, s);
+    }
     auto mask = carry_destination(i);
     const bool compared = graphics && i.enc == Encoding::Vopc && i.dst < 106 && i.name.substr(0,6) == "v_cmp_";
     if (mask || compared) {
@@ -738,14 +839,14 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
         auto k = work.front();
         work.pop_front();
         auto &i = p.code[k];
-        auto after = transfer(i, p.before[k], wave64, graphics, heap_window);
+        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph);
         auto merge = [&](size_t t) {
             bool changed = !p.reached[t];
             auto &in = p.before[t];
             if (changed) {
                 in = after;
                 p.reached[t] = true;
-            } else
+            } else {
                 for (unsigned n = 0; n < in.size(); ++n)
                     if (!(in[n] == after[n])) {
                         Symbol merged{};
@@ -756,6 +857,16 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
                             changed = true;
                         }
                     }
+                for (auto &[key, value] : in.lane_spills) {
+                    const auto other = after.lane_spills.find(key);
+                    if (value && (other == after.lane_spills.end() || !(other->second == value))) {
+                        value.reset();
+                        changed = true;
+                    }
+                }
+                for (const auto &slot : after.lane_spills)
+                    changed |= in.lane_spills.emplace(slot.first, std::nullopt).second;
+            }
             if (changed)
                 work.push_back(t);
         };
@@ -774,16 +885,10 @@ string reg(unsigned n) { return n >= 256 ? "v" + to_string(n - 256) : "s" + to_s
 string operand(const Inst &i, unsigned n) {
     if ((n <= 105) || n == 106 || n == 126 || n >= 256)
         return reg(n);
-    if (n >= 128 && n <= 208)
-        return hexword(n <= 192 ? n - 128 : 192u - n);
     if (n == 253)
         return "uint(scc)";
-    if (n == 255)
-        return hexword(i.literal);
-    constexpr Word f[] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
-                          0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
-    if (n >= 240 && n <= 248)
-        return hexword(f[n - 240]);
+    if (auto constant = constant32(i, n))
+        return hexword(*constant);
     refuse(i.pc, "unsupported operand " + to_string(n));
 }
 enum class AluType { Bits, Float, ToFloat };

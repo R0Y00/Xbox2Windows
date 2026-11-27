@@ -37,6 +37,8 @@ BOUND_CTRL to unusable sources. [Experiment and reproduction commands](experimen
 Lane reads may refill `vcc_lo` and, in wave32, `vcc_hi` as ordinary scalar data.
 [Experiment and reproduction commands](experiments/native-lane-access-compute.md)
 
+[Descriptor lane spill experiment](experiments/native-lane-spill-descriptor.md)
+
 ## 64-bit scalar operations in direct compute
 
 `s_bfm_b64`, `s_cselect_b64` and `s_not_b64` lower to two scalar words.
