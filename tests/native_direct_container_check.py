@@ -397,6 +397,14 @@ def main():
         check("compare-select-subword", cs, compute(words(*cmp_sdwa, *choose_byte, end)))
         check("cmpx-explicit-destination", cs, compute(words(cmp_sdwa[0] | (0x10 << 17),
               cmp_sdwa[1] | 0x8000, end)), "invalid SDWA compare destination")
+        for name, opcode, ext, error in (
+            ("class", 0x7d100af9, 0x0396eb80, "invalid SDWA class modifiers or mask destination"),
+            ("ne", 0x7d0a0cf9, 0x0086eb6b, "invalid SDWA compare destination"),
+        ):
+            check(f"sdwa-{name}-vcc-hi-wave64", cs, compute(words(opcode, ext, end), 64, wave32=False), error)
+            check(f"sdwa-{name}-sdst-108", cs, compute(words(opcode, (ext & ~0x7f00) | (108 << 8), end)), error)
+        check("sdwa-cmpx-vcc-hi", cs, compute(words(0x7d2a0cf9, 0x0086eb6b, end)),
+              "invalid SDWA compare destination")
         check("atomic-x2", cs, atomic_program((0xe1445000, 0x80020000)),
               "unsupported buffer atomic width")
         check("bad-container", cs, compute(ds)[:-1], "invalid DXBC length")

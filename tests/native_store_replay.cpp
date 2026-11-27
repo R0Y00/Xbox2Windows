@@ -1,6 +1,7 @@
 #include "desktop_gpu.h"
 #include "native_buffer_store_view.h"
 #include "native_compute_pipeline.h"
+#include "xmem_test_device.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -34,6 +35,26 @@ DXGI_FORMAT typed_format(unsigned bytes, bool half, bool reference) {
     if (half) return bytes == 2 ? DXGI_FORMAT_R16_FLOAT : bytes == 4 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     return (reference ? floats : uints)[bytes/4-1];
 }
+void report_adapter(ID3D12Device* device) {
+    const LUID luid = device->GetAdapterLuid();
+    std::fprintf(stderr, "adapter_luid=%08lx:%08lx\n", static_cast<unsigned long>(luid.HighPart), luid.LowPart);
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
+        FAILED(adapter->GetDesc1(&desc))) {
+        std::fputs("adapter=unavailable via DXGI\n", stderr);
+        return;
+    }
+    std::fprintf(stderr, "adapter=%ls vendor=%04x device=%04x\n", desc.Description, desc.VendorId, desc.DeviceId);
+    LARGE_INTEGER driver{};
+    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver)))
+        std::fprintf(stderr, "driver=%u.%u.%u.%u\n", HIWORD(driver.HighPart), LOWORD(driver.HighPart),
+                     HIWORD(driver.LowPart), LOWORD(driver.LowPart));
+    else
+        std::fputs("driver=unavailable via DXGI\n", stderr);
+}
 }
 
 // A reference directory supplies independently compiled DXIL and its user-data layout.
@@ -42,9 +63,22 @@ int wmain(int argc, wchar_t **argv) {
     if (argc != 6 && argc != 7) return 2;
     try {
         ComPtr<ID3D12Device> device;
-        const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
-        if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
-        check(device_hr, "device");
+        if (GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", nullptr, 0)) {
+            bool unmatched = false;
+            device = create_device(false, unmatched, [](IUnknown* adapter, REFIID iid, void** result) {
+                return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, result);
+            }, stderr);
+            if (!device) {
+                if (!unmatched)
+                    std::fputs("Unable to enumerate D3D12 hardware adapters\n", stderr);
+                return 2;
+            }
+        } else {
+            const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
+            if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+            check(device_hr, "device");
+        }
+        report_adapter(device.Get());
         ShaderDxilCompiler compiler(argv[1]);
         fs::path marker=argv[2], dest=argv[5];
         const bool null_array = argc == 7 && std::wstring_view(argv[6]) == L"--direct-null-srv";
