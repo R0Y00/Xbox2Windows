@@ -4,8 +4,12 @@
   (no arguments)                       pure-Python controls, extraction and negative controls
                                        (the extraction runs when an LLVM 15 library is found, and
                                        is skipped with a line otherwise)
-  binary <llvm-mc> [llvm-objcopy] [libLLVM]
-                                       reassemble the fixture sources and compare with the words below
+  binary <llvm-mc> [libLLVM]
+                                       reassemble the fixture sources and compare with the words below;
+                                       with a library the extraction runs against it as well
+  controls <libLLVM>                 the same full run with the extraction driven through the
+                                       given LLVM 15 library (LLVM-21 is accepted for a local run;
+                                       a recorded CI run should use an LLVM 15 build)
 
 The fixture builds one gfx1013 pixel program in three variants, all with the same per-pixel arithmetic
 and the same two exports: a uniform root-constant compare selects an early path or a normal path, and
@@ -23,7 +27,8 @@ the emitted dispatcher must reproduce the independent per-lane arithmetic oracle
 values, and the bounded FSSM v0x101 extraction of pixel_aot must return the original code exactly.
 The negative matrix refuses a register-derived displacement, a missing ADDC, a wrong sign extension,
 a signed ADD, a competing entry into the chain, pair clobbering, an address escape, an SCC escape, a
-stale scratch pair, an effectful continuation (export, store, barrier, EXEC write), a target off an
+stale scratch pair, an effectful continuation (export, store, barrier, EXEC write), a continuation
+ending at the first rather than the final s_endpgm, a target off an
 instruction boundary and a target outside the program, each with a named diagnostic.
 """
 import re
@@ -49,7 +54,7 @@ from startup_gfx2hlsl_bit_alu_check import Expr  # noqa: E402
 def resolve_libllvm():
     """The LLVM 15 shared library for the extraction check, or None when this host has none.
 
-    The binary and decode modes take the library as an argument; the plain mode searches the common
+    The binary mode takes the library as an optional argument; the plain mode searches the common
     install paths, following the discovery order tests/rdna2_tools_check.py uses.
     """
     candidates = ['/usr/lib64/llvm15/lib/libLLVM-15.so', 'libLLVM-15.so.1', 'libLLVM-15.so',
@@ -304,14 +309,15 @@ def envelope(code: bytes, name: bytes = b'fixture') -> bytes:
     return shader_record(blob, name)
 
 
-def extract(directory: Path, code: bytes, library: str = LIBRARY) -> bytes:
+def extract(directory: Path, code: bytes, library: str | None = LIBRARY) -> bytes:
     archive = directory / 'far-early-out.rpf'
     archive.write_bytes(envelope(code))
     return pixel_aot.native_program(archive, 'fixture', llvm=library)[1]
 
 
 # ---- checks ---------------------------------------------------------------------------------------
-def check_variant(name, rows, code, offsets, continuation, directory, *, displacement=None):
+def check_variant(name, rows, code, offsets, continuation, directory, *, displacement=None,
+                  library=LIBRARY):
     stage = G.Stage(Pipe(), 'ps', code)
     body = stage.body()
     # The emitted CFG: the entry branches on the root constant; the transfer is a jump block.
@@ -326,8 +332,8 @@ def check_variant(name, rows, code, offsets, continuation, directory, *, displac
             assert got == oracle(ud0, x, y), (name, ud0, x, y, got)
     # The bounded FSSM v0x101 extraction returns the original code exactly; without an LLVM 15
     # library on this host it is skipped, and the binary mode of a machine that has one covers it.
-    extracted = 'extraction skipped (no LLVM 15 library found)' if LIBRARY is None else (
-        'extracted exactly' if extract(directory, code) == code else 'MISMATCH')
+    extracted = 'extraction skipped (no LLVM 15 library found)' if library is None else (
+        'extracted exactly' if extract(directory, code, library) == code else 'MISMATCH')
     assert extracted in ('extracted exactly', 'extraction skipped (no LLVM 15 library found)'), \
         (name, extracted)
     if displacement is not None:
@@ -344,7 +350,7 @@ def negative(name, code, expected, extractor):
         assert expected in str(reason), (name, str(reason))
     else:
         raise AssertionError('%s: the startup translator accepted a refused program' % name)
-    if LIBRARY is None:
+    if extractor is None:
         print('%s: refused by the translator (%s); extraction skipped (no LLVM 15 library found)'
               % (name, expected))
         return
@@ -367,7 +373,7 @@ def drop_row(rows, index):
     return rows[:index] + rows[index + 1:]
 
 
-def check_negatives(directory, rows, code, far_rows, far_code):
+def check_negatives(directory, rows, code, far_rows, far_code, library=LIBRARY):
     ins = decode_all(code)
     index_of = {off: i for i, (off, _n, _name, _asm) in enumerate(ins)}
     asm_of = {i: asm for i, (_off, _n, _name, asm) in enumerate(ins)}
@@ -380,8 +386,10 @@ def check_negatives(directory, rows, code, far_rows, far_code):
     displacement = int(asm_of[add].split(', ')[-1], 0)
 
     def stage_and_extract(built):
+        if library is None:
+            return None
         def run(_code):
-            return extract(directory, built)
+            return extract(directory, built, library)
         return run
 
     # A register-derived displacement: the ADD reads s8, so the target is not a constant.
@@ -449,6 +457,16 @@ def check_negatives(directory, rows, code, far_rows, far_code):
         negative('effectful continuation (%s)' % label, words_of(rows_effect),
                  'far early-out: the continuation instruction', stage_and_extract(words_of(rows_effect)))
 
+    # A continuation ending at the first rather than the final s_endpgm: one s_nop is inserted
+    # before the first exit and the ADD re-aimed four bytes earlier onto it, so the transfer is
+    # proven and its continuation is pure, but it terminates before the program's final exit.
+    first_end = next(i for i, row in enumerate(rows) if row == END)
+    rows_first = rows[:first_end] + [NOP] + rows[first_end:]
+    rows_first = replace_row(rows_first, add, add_u32(displacement - 4))
+    negative('continuation ends before the final exit', words_of(rows_first),
+             "far early-out: the continuation ends at",
+             stage_and_extract(words_of(rows_first)))
+
     # A target off an instruction boundary: one byte past the continuation start is unaligned.
     rows_boundary = replace_row(rows, add, add_u32(displacement + 1))
     negative('target off an instruction boundary', words_of(rows_boundary),
@@ -469,17 +487,28 @@ def check_negatives(directory, rows, code, far_rows, far_code):
 def main():
     args = sys.argv[1:]
     if args and args[0] == 'binary':
-        if len(args) != 2:
+        if len(args) not in (2, 3):
             raise SystemExit(__doc__)
-        return check_binary(args[1])
+        return check_binary(args[1], args[2] if len(args) == 3 else None)
+    library = None
+    if args and args[0] == 'controls':
+        # The explicit selection drives the extraction half of every control below; it is not
+        # captured globally, so check_binary and the no-argument auto-discovery keep their own.
+        if len(args) != 2 or not Path(args[1]).is_file():
+            raise SystemExit(__doc__)
+        library = args[1]
+    elif args:
+        raise SystemExit(__doc__)
 
     short_rows, short_code, short_offsets = variant(BRANCH)
     calc_rows, calc_code, calc_offsets = variant(CHAIN)
     far_rows, far_code, far_offsets = variant(CHAIN, FAR_NOP_DWORDS)
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        check_variant('short s_branch', short_rows, short_code, short_offsets, len(short_rows) - 2, directory)
-        check_variant('short calculated', calc_rows, calc_code, calc_offsets, len(calc_rows) - 2, directory)
+        check_variant('short s_branch', short_rows, short_code, short_offsets, len(short_rows) - 2, directory,
+                      library=library)
+        check_variant('short calculated', calc_rows, calc_code, calc_offsets, len(calc_rows) - 2, directory,
+                      library=library)
         # The far variant: the displacement measured from the actual assembled offsets must exceed
         # the positive SOPP s_branch range, and its NOP run must be reachable in the normal path.
         continuation = len(far_rows) - 2
@@ -489,9 +518,9 @@ def main():
         nops = sum(1 for _off, _n, name, _asm in ins if name == 's_nop')
         assert nops >= FAR_NOP_DWORDS, (nops, FAR_NOP_DWORDS)
         check_variant('far calculated', far_rows, far_code, far_offsets, continuation, directory,
-                      displacement=displacement)
+                      displacement=displacement, library=library)
         print('far displacement %#x exceeds the SOPP positive range %d' % (displacement, SOPP_LIMIT))
-        check_negatives(directory, calc_rows, calc_code, far_rows, far_code)
+        check_negatives(directory, calc_rows, calc_code, far_rows, far_code, library=library)
     print('Far early-out: three variants, dispatcher oracle and refusal controls passed')
 
 
@@ -506,13 +535,19 @@ def assemble(llvm_mc, source):
     return bytes(words)
 
 
-def check_binary(llvm_mc):
+def check_binary(llvm_mc, library=None):
     for name, (rows, code, _offsets) in (('short s_branch', variant(BRANCH)),
                                          ('short calculated', variant(CHAIN)),
                                          ('far calculated', variant(CHAIN, FAR_NOP_DWORDS))):
         built = assemble(llvm_mc, source_of(rows))
         assert built == code, (name, built[:80].hex(), code[:80].hex(), len(built), len(code))
-    print('fixture words match llvm-mc')
+        if library is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                assert extract(Path(tmp), code, library) == code, name
+    if library is not None:
+        print('fixture words match llvm-mc, and the extraction of each variant through %s is exact' % library)
+    else:
+        print('fixture words match llvm-mc')
     return 0
 
 
