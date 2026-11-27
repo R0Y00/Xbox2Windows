@@ -139,8 +139,17 @@ static bool pure_checks()
     if (check(array, resource) != srv::Refusal::none || array.Texture2DArray.ArraySize != 2 ||
         !unchanged(array, resource)) return false;
     array.Texture2DArray.FirstArraySlice = 4;
+    // D3D12 (WARP, debug layer on) accepts a plain 1D/2D view of an array resource (slice 0) and a cube view on 7 or 12 slices.
     if (check(array, resource) != srv::Refusal::array_range ||
-        check(valid, resource) != srv::Refusal::dimension) return false;
+        check(valid, resource) != srv::Refusal::none) return false;
+    auto cube = view_desc(0, 1);
+    cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    cube.TextureCube = {0, 1, 0.0f};
+    resource.DepthOrArraySize = 12;
+    if (check(cube, resource) != srv::Refusal::none) return false;
+    resource.DepthOrArraySize = 5;
+    if (check(cube, resource) != srv::Refusal::dimension) return false;
+    resource.DepthOrArraySize = 4;
 
     resource.DepthOrArraySize = 18;
     auto cubes = view_desc(0, 1);
@@ -445,7 +454,7 @@ static int warp_check()
                                                 nullptr, IID_PPV_ARGS(&resource)))) return 1;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = 3;
+    heap_desc.NumDescriptors = 8;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&descriptors)))) return 1;
 
@@ -476,6 +485,24 @@ static int warp_check()
         FAILED(device->GetDeviceRemovedReason())) {
         std::puts("FAIL: WARP rejected the repaired D24S8 stencil SRV");
         return 1;
+    }
+    for (const UINT slices : {4u, 12u}) {
+        auto array_desc = texture_desc();
+        array_desc.DepthOrArraySize = static_cast<UINT16>(slices);
+        array_desc.MipLevels = 1;
+        ComPtr<ID3D12Resource> layered;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &array_desc, D3D12_RESOURCE_STATE_COMMON,
+                                                    nullptr, IID_PPV_ARGS(&layered)))) return 1;
+        auto plain = view_desc(0, 1);
+        auto cube = view_desc(0, 1);
+        cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        cube.TextureCube = {0, 1, 0.0f};
+        dest.ptr += device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+        if (!x2w_startup::x2w_create_srv(device.Get(), layered.Get(), &plain, dest, "fixture-plain-on-array") ||
+            (slices == 12 && !x2w_startup::x2w_create_srv(device.Get(), layered.Get(), &cube, dest, "fixture-cube-on-12"))) {
+            std::puts("FAIL: a plain or cube view of an array resource was refused");
+            return 1;
+        }
     }
     if (messages && messages->GetNumStoredMessages() != 0) {
         std::puts("FAIL: debug layer reported messages while creating SRVs");

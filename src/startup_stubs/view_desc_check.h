@@ -181,7 +181,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
     };
     switch (view.ViewDimension) {
     case D3D12_SRV_DIMENSION_TEXTURE1D:
-        fits = tex1d && single_sample && slices == 1;
+        fits = tex1d && single_sample;  // a plain view of an array resource reads slice 0 (accepted by D3D12)
         mips(view.Texture1D);
         break;
     case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
@@ -191,7 +191,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         array_count = &view.Texture1DArray.ArraySize;
         break;
     case D3D12_SRV_DIMENSION_TEXTURE2D:
-        fits = tex2d && single_sample && slices == 1;
+        fits = tex2d && single_sample;
         mips(view.Texture2D);
         plane_slice = &view.Texture2D.PlaneSlice;
         break;
@@ -203,7 +203,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         plane_slice = &view.Texture2DArray.PlaneSlice;
         break;
     case D3D12_SRV_DIMENSION_TEXTURE2DMS:
-        fits = tex2d && multi_sample && slices == 1;
+        fits = tex2d && multi_sample;
         break;
     case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
         fits = tex2d && multi_sample;
@@ -215,7 +215,7 @@ Refusal check(D3D12_SHADER_RESOURCE_VIEW_DESC& view, const D3D12_RESOURCE_DESC& 
         mips(view.Texture3D);
         break;
     case D3D12_SRV_DIMENSION_TEXTURECUBE:
-        fits = tex2d && single_sample && slices == 6 && resource.Width == resource.Height;
+        fits = tex2d && single_sample && slices >= 6 && resource.Width == resource.Height;
         mips(view.TextureCube);
         break;
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
