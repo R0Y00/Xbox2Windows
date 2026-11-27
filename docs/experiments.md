@@ -2,6 +2,96 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## Plain binary16 arithmetic in direct compute
+
+VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
+to binary16. [Plain-form experiment](experiments/f16-alu-direct.md)
+
+## SDWA binary16 arithmetic in direct compute
+
+The same four operations accept VGPR half selection, input abs and neg, and half-word destination placement
+with pad or preserve. The readback fixture checks both halves and untouched buffer guards.
+[SDWA experiment](experiments/native-sdwa-f16.md)
+
+## Guest logical 64-bit shift sources in direct compute
+
+Logical 64-bit shifts accept sign-extended inline integers, zero-extended
+32-bit literals and numeric even SGPR pairs. The compute fixture checks
+both directions, boundary shift amounts and the inline-float refusal.
+[Experiment and reproduction commands](experiments/native-shift64-sources.md)
+
+## Guest quad permutations in direct compute
+
+DPP16 quad permutations reuse the row mirror's EXEC and operand handling.
+The compute fixture checks arithmetic, lane selection and disabled sources.
+[Experiment and reproduction commands](experiments/native-dpp-quad-compute.md)
+
+## Guest lane reads and writes in direct compute
+
+`v_readlane_b32` and `v_writelane_b32` lower with a constant or SGPR lane; lane writes ignore EXEC.
+Lane reads may refill `vcc_lo` and, in wave32, `vcc_hi` as ordinary scalar data.
+[Experiment and reproduction commands](experiments/native-lane-access-compute.md)
+
+## 64-bit scalar operations in direct compute
+
+`s_bfm_b64`, `s_cselect_b64` and `s_not_b64` lower to two scalar words.
+The compute fixture reads both result words and SCC from two workgroups.
+[Experiment and reproduction commands](experiments/native-salu64-ops.md)
+
+## Byte-window stores in direct compute
+
+Raw buffer stores accept a descriptor with a cleared stride, a byte count
+derived from that descriptor's clamped stride, and the raw OOB selector.
+The compute fixture reads back all four store widths across two workgroups.
+[Experiment and reproduction commands](experiments/native-bytewin-store.md)
+
+## Guest row mirrors and masked branches in the direct DXIL frontend
+
+The hardware fixture gives each guest lane a distinct value. DPP16 control
+`0x141` reverses each group of eight and `0x140` reverses each group of
+sixteen. The reference implementation at Victory revision `9376fd6` computes
+these indices in `victory-shader/src/emit/lower.rs::dpp`. Its `cross_lane`
+check restricts pixel shaders to quad-local operations. The older Python
+`pixel_aot.parse_dpp` also checks whether both halves use the same quad
+permutation. The compute shader exchanges the first operand before applying the
+local second operand. A sparse EXEC mask distinguishes fetching an inactive
+source, supplying zero and retaining the destination. The test checks both
+workgroups and the surrounding buffer guards.
+
+The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
+lane writes and reads back lanes in each half of a guest wave64. The compiler
+can track those words independently of the desktop rasterizer's choice of
+quads. A second fixture uses repeated min/max, alternate-row selection and
+a scalar lane broadcast. An ordinary WQM pixel input whose source lies in
+another quad still requires a guest pixel-wave layout. For structured vertex
+EXEC branches the container fixture checks control-flow joins, saved-mask
+clobbers and scalar values escaping a masked arm.
+
+```powershell
+cmake --build --preset dev --target compile_dxil native_store_replay offscreen_check
+ctest --preset dev --no-tests=error -R '^(native_dpp_mirror_hardware|native_direct_container)$'
+```
+
+### Pixel coverage and whole-wave mask branches
+
+For a mask held in scalar registers, `s_wqm_b32` and `s_wqm_b64` expand
+each occupied four-bit group to four ones. A scalar region that saves the
+expanded EXEC or branches on zero tests the complete guest width. The fixture
+includes a wave64 with only bit 32 set and a wave32 with the same two input
+words. They take opposite branches.
+
+A separate pixel fixture interpolates a value, removes covered lanes where it
+is negative, runs a quad permutation under WQM and restores exact coverage
+before exporting. A survivor can read a neighbor whose coverage was removed.
+Successive filters intersect the surviving coverage. This lowering checks that
+an empty quad cannot contribute to another quad or leave an observable store.
+A cross-quad permutation in the same live arm is a rejection control.
+
+```powershell
+cmake --build --preset dev --target compile_dxil offscreen_check
+ctest --preset dev --no-tests=error -V -R '^native_graphics_wqm_hardware$'
+```
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
@@ -1881,6 +1971,8 @@ Run `ctest --preset dev --no-tests=error -R '^cpu_aot_xchg$' -V`.
 `cpu_hint_nop` pins the exact byte patterns. Seven accepted encodings (`0f1900`, `0f1908`, `0f19c0`, `0f1d00`, `0f1e00`, `f30f1e00`, `0f1f4000`, covering memory, displaced, register and prefixed ModRM forms) plus the 16-bit and 64-bit operand-size forms (`660f1900`, `660f1e00`, `480f1900`, `480f1e00`) must each lower to a body identical to an already-accepted `0F 1F NOP`, with block labels normalised because they are numbered by instruction count rather than by effect. Ten neighbours must still raise: `0f0dc0` (Group P), `0f18f0` and `0f18f8` (PREFETCHIT1/0), `0f1a00`, `0f1b00`, `0f1c08`, `f30f1efa` (ENDBR64), `f30f1efb` (ENDBR32), `0f1c00` (CLDEMOTE) and `f30f1ec8` (RDSSPD), so a widened accepted set is a visible change rather than a silent one. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop$' -V`.
 
 `cpu_hint_nop_fixture` compares native execution against the lowered body for the same bytes. One generator (`tests/cpu/hint_nop_fixture.py`) assembles the exact byte sequences and lowers the same instructions, so the two arms cannot drift apart. A prologue sets RAX from the input and the arithmetic flags from an `ADD`; each case then executes the encoding under test and stores the flags in AH with `LAHF`, so a changed register or flag shows up as a different return value. The memory forms are handed a pointer to a `PAGE_NOACCESS` page as the base register, and both the native and the lifted call run under the same exception guard, so a lowering that evaluated the operand is reported as a mismatch rather than crashing the fixture. Two controls make that meaningful: a real load from the same page must fault, and a real `mov eax, imm` with the same inputs must return a different value. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop_fixture$' -V`.
+
+**Non-temporal stores.** The shared lowering accepts the legacy SSE stores `MOVNTPS` (`0F 2B /r`), `MOVNTPD` (`66 0F 2B /r`) and `MOVNTDQ` (`66 0F E7 /r`) from XMM0 to XMM2, the registers it models for `MOVAPS`, and `MOVNTI` (`0F C3 /r`) from a 32- or 64-bit register. Each lowers to the streaming-store intrinsic of its width (`_mm_stream_si128`, `_mm_stream_si32`, `_mm_stream_si64`), so the non-temporal hint and the weak ordering stay the guest's: only the guest's own `SFENCE`, `MFENCE` or a locked instruction orders them. No flag changes. The XMM forms test the target against 15 first and raise the aligned-operand fault, as `MOVAPS` does, before anything is written; `MOVNTI` has no alignment requirement. The MMX `MOVNTQ`, the SSE4a scalar `MOVNTSS` and `MOVNTSD`, the VEX `VMOVNTPS`, `VMOVNTPD` and `VMOVNTDQ`, the `MOVNTDQA` load and XMM3 and above stay refused. `cpu_nt_store` (`tests/cpu/nt_store_check.py`) pins eight accepted encodings to their intrinsic and alignment test and eight neighbours to a refusal. `cpu_nt_store_fixture` (`tests/cpu/nt_store_fixture.py`) generates the native bytes and the lowered C++ from one list and runs both into separate sentinel-filled buffers: stores at aligned and displaced targets and `MOVNTI` at odd addresses must match native and an independent reference byte for byte; misaligned XMM targets must raise the access violation at address -1 natively and translated with nothing written; and a `PAGE_NOACCESS` target must raise the same write fault at the same address. Three controls must break a rule: `noalign` removes the alignment test and stores with `memcpy` (the streaming intrinsic is itself `MOVNTDQ` and would fault anyway), so it must store where native faults; `nostore` replaces the native store with a NOP and must miss the reference; and a native `MOVUPS` to the misaligned target must not fault, so the fault comes from the alignment rule. Run `ctest --preset dev --no-tests=error -R '^cpu_nt_store(_fixture)?$' -V`; the `release` preset runs the same checks.
 
 A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + index × scale + displacement at 32 bits and zero-extends the result, ignoring the upper halves of the registers as the hardware does. In this mode iced reports a displacement of -8 as `0xfffffff8`, so the wrap is also needed when the upper halves are zero. EIP-relative operands are rejected because the hardware adds the low 32 bits of the runtime RIP, which an RVA binding cannot represent. `cpu_aot_address_size` builds `lea`, load and store forms such as `lea rax, [ecx+edx*8-8]` and `mov [ecx+edx], r8d` from MASM source. It translates them and compares both images with a 32-bit reference over wrapped sums and upper-half noise. The loads and stores use a page committed below 4 GiB, and each store must leave the rest of the page unchanged. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_address_size$' -V`.
 
@@ -15866,6 +15958,30 @@ every lane. In the singleton model lanes 0 and 1 exit early with 1 and 2. Lanes 
 guarded block and take the latch until the counter reaches 4. The translator reports
 `loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture.
+
+### Scalar run before the EXEC restore at a compute exit target (#2645 T3)
+
+The 104-byte gfx1013 fixture `EXIT_RUN_*` in `tests/startup_gfx2hlsl_compute_check.py` narrows
+EXEC to lanes with `tid.x < 6` before a guarded block. Inside it, `s_andn2_b32` removes the
+breaking lanes from a saved EXEC mask and `s_cbranch_scc0` tests that mask. The staying path
+installs the same mask into EXEC before its vector work. Both paths reach a scalar descriptor
+load and wait, followed by `s_mov_b32 exec_lo, s21` to restore EXEC.
+
+For groups of up to 32 threads (`x * y * z <= 32`; larger workgroups are rejected and left for
+follow-up work), the translator accepts this straight exit when the staying path's vector work is
+lane-local and predicated off for exiting lanes. The shared run allows scalar ALU, loads and waits
+with regular SGPRs. It must reach a restore from an unchanged copy of EXEC, and the two paths must
+agree on the run's inputs and any scalar state used afterward.
+The wave and singleton traces both produce `[9, 9, 9, KEY^3, KEY^4, KEY^5, KEY^6, KEY^7]`.
+With three threads, the whole wave also takes the exit and both traces produce `[9, 9, 9]`.
+
+The wrong remask and a bypassed scalar write produce different values for lane 0 and are
+refused. Additional controls cover unsafe scalar effects, incoming EXEC and live SCC, clobbered
+and missing restores, invalid targets, and control flow or vector work in the run. The T2 loop
+keeps its backward-latch diagnostic. Removing its latch still leaves two different remasks and
+scalar counter work on the staying path, outside this proof. Run
+`python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
 ### Startup compute formatted buffer reads

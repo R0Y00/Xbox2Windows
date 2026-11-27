@@ -163,7 +163,7 @@ static void* desktop_pipeline(void* device)
 //   data-pointer     valid, with the first data qword pointing at state block A
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
-//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-heap,
+//   dispatch, dispatch-swapped, dispatch-none, dispatch-records32, dispatch-sampled, dispatch-sampled-unbound, dispatch-sampled-2x1, dispatch-heap,
 //   dispatch-heap-outside, dispatch-heap-word*, dispatch-input-*: one creation, then dispatch_slot67 below
 //   texture-store, texture-store-none, texture-store-denied, texture-store-occupied, texture-store-copied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
@@ -190,6 +190,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // in one allocation, so both alias this process's memory and the result is read from that memory after the queue's
 // fence. dispatch-swapped exchanges the two descriptors (the output then names the buffer without unordered
 // access); dispatch-none records everything but the Dispatch. The 320 output words go to X2W_TEST_DISPATCH_OUT.
+// dispatch-records32 writes the table as 32-byte records, the layout the C++ compiler reads a table in
+// (startup_compute_dispatch_native_check.py): the output's descriptor at byte 32 and none at byte 16.
 // dispatch-sampled adds what the sampling variant of the case reads: a committed 1x1 RGBA8 texture filled by
 // CopyTextureRegion (list slot 16) and a shader resource view of it (device slot 18) whose token the stand-in
 // writes at table byte 64. dispatch-sampled-unbound creates no view, so that entry holds no token.
@@ -314,6 +316,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         table_gpu += offset;
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    }
+    if (mode == "dispatch-records32") {  // the output's descriptor at table byte 32, none at byte 16
+        std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
+        std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
     void* other_heap = nullptr;
     if (change_table_heap &&
