@@ -635,6 +635,84 @@ struct DirectCompute {
                 select_float(is_y, major, nv),
                 select_float(is_x, select_float(negative, u, nu), select_float(is_y, select_float(negative, nv, v), major))};
     }
+    string texture_dimensions(const string &handle, const string &mip) {
+        return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
+                         {{"%dx.types.Handle", handle}, {"i32", mip}}, "nounwind readonly");
+    }
+    void explicit_gather_2d(const Inst &i, const State &s, const string &handle,
+                            const std::array<string, 3> &coords, unsigned mask) {
+        const unsigned sampler_base = ((i.b >> 21) & 31) * 4;
+        std::array<Word, 4> words{};
+        for (unsigned j = 0; j < words.size(); ++j) {
+            const auto &word = s.at(sampler_base + j);
+            if (word.type != Symbol::Type::constant)
+                refuse(i.pc, "explicit 2D gather requires a constant sampler");
+            words[j] = word.value;
+        }
+        // Match gfx2hlsl's normalized clamp profile. Point/bilinear XY and
+        // CLAMP_Z do not change this 2D footprint; the mip filter must be point.
+        constexpr Word xy_filter = (3u << 20) | (3u << 22);
+        if ((words[0] & ~(7u << 6)) != 0x12 || (words[1] & ~0x00fff000u) ||
+            (words[2] & ~xy_filter) != 0x04000000 || ((words[2] >> 20) & 3) > 1 ||
+            ((words[2] >> 22) & 3) > 1 || words[3])
+            refuse(i.pc, "unsupported explicit 2D gather sampler");
+        auto finite = [&](const string &bits) {
+            return cmp("ne", ir.binary("and", bits, "2139095040"), "2139095040");
+        };
+        auto valid = finite(coords[0]);
+        for (unsigned j = 1; j < coords.size(); ++j)
+            valid = ir.value("and i1 " + valid + ", " + finite(coords[j]));
+        auto safe_float = [&](unsigned j) {
+            return ir.value("bitcast i32 " + select(valid, coords[j], "0") + " to float");
+        };
+        auto clamp_float = [&](const string &value, const string &max) {
+            auto low = ir.invoke("float", "binary.f32", 35, {{"float", value}, {"float", "0.0"}}, "nounwind readnone");
+            return ir.invoke("float", "binary.f32", 36, {{"float", low}, {"float", max}}, "nounwind readnone");
+        };
+        auto floor = [&](const string &value) {
+            return ir.invoke("float", "unary.f32", 27, {{"float", value}}, "nounwind readnone");
+        };
+        auto dimension = [&](const string &dims, unsigned j) {
+            return ir.value("extractvalue %dx.types.Dimensions " + dims + ", " + to_string(j));
+        };
+        auto last = [&](const string &count) {
+            return select(cmp("ne", count, "0"), ir.binary("sub", count, "1"), "0");
+        };
+        auto max_lod = ir.value("uitofp i32 " + to_string(words[1] >> 12) + " to float");
+        max_lod = ir.value("fmul float " + max_lod + ", 3.906250e-03"); // unsigned 4.8 MAX_LOD
+        auto bounded = clamp_float(safe_float(2), max_lod);
+        auto rounded = ir.value("fptoui float " + floor(ir.value("fadd float " + bounded + ", 0.5")) + " to i32");
+        auto count = dimension(texture_dimensions(handle, "0"), 3);
+        auto last_mip = last(count);
+        auto mip = select(cmp("ult", rounded, last_mip), rounded, last_mip);
+        auto dimensions = texture_dimensions(handle, mip);
+        auto have_view = ir.value("and i1 " + valid + ", " + cmp("ne", count, "0"));
+        std::array<std::array<string, 2>, 2> taps;
+        for (unsigned axis = 0; axis < 2; ++axis) {
+            auto size = dimension(dimensions, axis);
+            auto edge = last(size);
+            // Clamping UV first keeps the conversion in range. Outside [0,1]
+            // both taps clamp to the edge, as with clamping after flooring.
+            auto uv = clamp_float(safe_float(axis), "1.0");
+            auto scaled = ir.value("fmul float " + uv + ", " + ir.value("uitofp i32 " + size + " to float"));
+            auto origin = ir.value("fptosi float " + floor(ir.value("fsub float " + scaled + ", 0.5")) + " to i32");
+            for (unsigned j = 0; j < 2; ++j) {
+                auto index = j ? ir.binary("add", origin, "1") : origin;
+                auto nonnegative = select(cmp("slt", index, "0"), "0", index);
+                taps[axis][j] = select(cmp("ugt", nonnegative, edge), edge, nonnegative);
+            }
+        }
+        unsigned channel = 0;
+        while (!(mask & (1u << channel))) ++channel;
+        constexpr unsigned x[]{0, 1, 1, 0}, y[]{1, 1, 0, 0};
+        for (unsigned j = 0; j < 4; ++j) {
+            auto texel = ir.invoke("%dx.types.ResRet.f32", "textureLoad.f32", 66,
+                {{"%dx.types.Handle", handle}, {"i32", mip}, {"i32", taps[0][x[j]]}, {"i32", taps[1][y[j]]},
+                 {"i32", "undef"}, {"i32", "undef"}, {"i32", "undef"}, {"i32", "undef"}}, "nounwind readonly");
+            auto value = ir.value("extractvalue %dx.types.ResRet.f32 " + texel + ", " + to_string(channel));
+            vector_write(256 + i.dst + j, select(have_view, ir.value("bitcast float " + value + " to i32"), "0"));
+        }
+    }
     void image_io(const Inst &i, const State &s) {
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
         // image_gather4_c_lz (79) is the comparison gather at the view's first mip (#2969): DXIL textureGatherCmp.
@@ -644,6 +722,7 @@ struct DirectCompute {
         if (implicit && !pixel_stage)
             refuse(i.pc, "implicit derivatives require a pixel stage");
         const bool gather = i.op == 64 || i.op == 71 || compare_gather;
+        const bool gather_lod = i.op == 68;
         const bool sample = (!gather && implicit) || (compare && !gather) || gradient || i.op == 39 || i.op == 36,
                    store = i.op == 8,
                    half = store && (i.b >> 31);
@@ -652,7 +731,7 @@ struct DirectCompute {
         constexpr unsigned dx_kind[]{1, 2, 4, 5, 6, 7, 3, 8};
         constexpr unsigned coord_count[]{1, 2, 3, 3, 2, 3, 2, 3};
         const unsigned coords = coord_count[dim];
-        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
             (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
@@ -662,6 +741,8 @@ struct DirectCompute {
             (store && !half && mask != 15) || (half && mask != 1 && mask != 3 && mask != 15) ||
             s.at(base).type != Symbol::Type::descriptor)
             refuse(i.pc, "direct image opcode or descriptor modifiers");
+        if (gather_lod && (dim != 1 || (mask & (mask - 1)) || (i.a & 0x1006u) || (i.b & 0xc0000000u) || i.dst > 252))
+            refuse(i.pc, "unsupported explicit 2D gather operands");
         if ((dim == 3 && ((!sample && !gather && !dimensions) || (i.a & 0x1000u))) ||
             (dim >= 6 && (sample || gather || store || lod)))
             refuse(i.pc, "unsupported cube or multisample operation");
@@ -696,12 +777,12 @@ struct DirectCompute {
                 refuse(i.pc, "image coordinate register overflow");
             return read(256 + r);
         };
-        auto texture_dimensions = [&](const string &mip) {
-            return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
-                             {{"%dx.types.Handle", h}, {"i32", mip}}, "nounwind readonly");
-        };
+        if (gather_lod) {
+            explicit_gather_2d(i, s, h, {coordinate(0), coordinate(1), coordinate(2)}, mask);
+            return;
+        }
         if (dimensions) {
-            auto info = texture_dimensions(coordinate(0));
+            auto info = texture_dimensions(h, coordinate(0));
             unsigned dst = i.dst;
             for (unsigned ch = 0; ch < 4; ++ch) {
                 if (!(mask & (1u << ch))) continue;
@@ -739,7 +820,7 @@ struct DirectCompute {
                 auto sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
                 using Arg = std::pair<string, string>;
                 std::vector<Arg> args{{"%dx.types.Handle", h}, {"%dx.types.Handle", sampler}};
-                const auto size = (i.a & 0x1000u) ? texture_dimensions("0") : string{};
+                const auto size = (i.a & 0x1000u) ? texture_dimensions(h, "0") : string{};
                 for (unsigned j = 0; j < coords; ++j) {
                     c[j] = a16 ? ir.invoke("float", "legacyF16ToF32", 131, {{"i32", c[j]}}, "nounwind readnone") :
                                  ir.value("bitcast i32 " + c[j] + " to float");
