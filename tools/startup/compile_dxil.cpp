@@ -34,6 +34,51 @@ static double elapsed_ms(Clock::time_point since) {
 
 namespace fs = std::filesystem;
 
+// FNV-1a over the pixel-input sidecars. The digest, not a timestamp, decides whether a published manifest
+// still describes the sidecar bytes: a content change with a preserved or older mtime must invalidate it.
+static void sidecar_hash_bytes(uint64_t& hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+static bool pixel_sidecar_hash(const fs::path& marker, std::string& digest) {
+    uint64_t hash = 1469598103934665603ull;
+    bool any = false;
+    for (const auto& path : {fs::path(marker).replace_extension(L".psin"),
+                             fs::path(marker).replace_extension(L".ps57in")}) {
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec))
+            continue;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            return false;
+        const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const auto name = path.extension().wstring();
+        sidecar_hash_bytes(hash, name.data(), name.size() * sizeof(wchar_t));
+        const uint64_t count = bytes.size();
+        sidecar_hash_bytes(hash, &count, sizeof(count));
+        sidecar_hash_bytes(hash, bytes.data(), bytes.size());
+        any = true;
+    }
+    if (!any)
+        return false;
+    char text[17]{};
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+    digest = text;
+    return true;
+}
+
+static bool read_published_digest(const fs::path& path, std::string& digest) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    digest.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    return !digest.empty();
+}
+
 static void publish_atomic(const fs::path& destination, const void* data, size_t size) {
     static std::atomic<unsigned long long> serial{};
     auto temp=destination;
@@ -717,7 +762,16 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
     if (has_manifest && !lost) {
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
-        if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
+        bool sidecar_changed = false;
+        if (!req.compute) {
+            std::string sidecar_digest;
+            if (pixel_sidecar_hash(req.marker, sidecar_digest)) {
+                std::string published_digest;
+                sidecar_changed = !read_published_digest(fs::path(stem) += L".psinh", published_digest) ||
+                                  published_digest != sidecar_digest;
+            }
+        }
+        if (!ec && !sidecar_changed && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
                 if (has_complete_dxbc(fs::path(stem) += L".cs.cso"))
                     return false;
@@ -816,6 +870,11 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
     else
         fs::remove(psdep_path, ignored);
+    std::string sidecar_digest;
+    if (pixel_sidecar_hash(req.marker, sidecar_digest))
+        publish_atomic(fs::path(stem) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+    else
+        fs::remove(fs::path(stem) += L".psinh", ignored);
     publish_atomic(manifest_path, manifest->data(), manifest->size());
     fs::remove(fail_path, ignored);
     return "compiled graphics";
@@ -1085,6 +1144,7 @@ int wmain(int argc, wchar_t** argv) {
                 if(graphics_batch) {
                     reserve_output(fs::path(stems[i]) += L".ps.cso");
                     reserve_output(fs::path(stems[i]) += L".psdep");
+                    reserve_output(fs::path(stems[i]) += L".psinh");
                     if(rectangles) reserve_output(fs::path(stems[i]) += L".gs.cso");
                 }
             }
@@ -1141,6 +1201,11 @@ int wmain(int argc, wchar_t** argv) {
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+                std::string sidecar_digest;
+                if (pixel_sidecar_hash(inputs[i], sidecar_digest))
+                    publish_atomic(fs::path(stems[i]) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
+                else
+                    fs::remove(fs::path(stems[i]) += L".psinh", ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
             fs::remove(fs::path(stems[i]) += L".fail", ignored);
