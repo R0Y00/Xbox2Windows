@@ -34,6 +34,7 @@
 #include "startup_stubs/indexed_indirect_guard.h"
 #include "startup_stubs/indexed_rect_geometry.h"
 #include "startup_stubs/list_dispatch.h"
+#include "startup_stubs/compute_builder_gate.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -80,6 +81,10 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "startup_stubs/xmem_section_buffer.h"
+#ifdef X2W_NATIVE_SHADERS  // d3d12_xs_shim only: the C++ shader compiler (startup_stubs/d3d12_compute_dispatch.inl)
+#include "gfx1013_compute_native.h"
+#include "shader_dxil_compiler.h"
+#endif
 #include <d3d12sdklayers.h>
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
@@ -188,6 +193,8 @@ struct alignas(16) WrapperOwn {
     u64 retire_written_gen;          // Snapshotted written_textures() generation for stale-entry cleanup.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
+    bool builder_pipeline;   // PipelineState: slot 62 created it for XboxBvhBuilder.dll (X2W_COMPUTE_BUILDER_GATE)
+    x2w_startup::BuilderGateState* compute_builder_gate;  // Device: tracked builder pipelines, or null until needed
     u64 compute_trace_key;   // Opt-in trace: selected slot 62 container hash
     const void* compute_trace_root;
     LONG compute_trace_dispatches;
@@ -2880,6 +2887,8 @@ struct Pass {
     std::vector<OpenQuery> ended_queries;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
+LONG compute_builder_gate_refusals;  // builder Dispatches refused by X2W_COMPUTE_BUILDER_GATE
+SRWLOCK compute_builder_lock = SRWLOCK_INIT;
 // Heap-indexed title root signatures not set on the desktop list, and real draws refused under one, by decision.
 LONG heap_roots_deferred, heap_root_refusals[x2w_startup::real_root_decision_count];
 
@@ -2888,6 +2897,210 @@ Pass& pass_of(Wrapper* self)
 {
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
+}
+
+bool compute_builder_gate_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_COMPUTE_BUILDER_GATE");
+    return on;
+}
+
+// The module holding the slot 62 return address. GetModuleHandleExW with FROM_ADDRESS is the same
+// resolution RtlPcToFileHeader performs, is safe for any pointer and leaves no module reference.
+bool compute_builder_caller_module(const void* return_address) noexcept
+{
+    if (!return_address) return false;
+    const DWORD saved = GetLastError();
+    HMODULE module = nullptr;
+    bool matches = false;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(return_address), &module) && module) {
+        std::wstring path(MAX_PATH, L'\0');
+        for (;;) {
+            const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+            if (!length) break;
+            if (length < path.size()) {
+                matches = x2w_startup::is_compute_builder_module(std::wstring_view(path.data(), length));
+                break;
+            }
+            if (path.size() >= 32768) break;  // longer than any supported Windows path
+            path.resize(path.size() * 2);
+        }
+    }
+    SetLastError(saved);
+    return matches;
+}
+
+x2w_startup::BuilderGateState* compute_builder_gate_for(Wrapper* device)
+{
+    if (!device || device->own().kind != device_kind) return nullptr;
+    if (!device->own().compute_builder_gate) {
+        auto* gate = new (std::nothrow) x2w_startup::BuilderGateState(true);
+        if (gate) device->own().compute_builder_gate = gate;
+    }
+    return device->own().compute_builder_gate;
+}
+
+// A structurally valid desktop DXIL compute container. Console DXBC containers (the 52 builder
+// programs) have a console DXIL target, so they are refused here instead of being submitted.
+const char* desktop_compute_program_reason(const D3D12_SHADER_BYTECODE& code) noexcept
+{
+    if (!readable_shader_container(code)) return "the console compute program is missing or unreadable";
+    const auto* data = static_cast<const unsigned char*>(code.pShaderBytecode);
+    const auto word = [data](std::size_t offset) {
+        UINT value;
+        std::memcpy(&value, data + offset, sizeof(value));
+        return value;
+    };
+    const std::size_t bytes = code.BytecodeLength;
+    if (bytes < 32 || word(24) != bytes) return "the console compute container is malformed";
+    const std::size_t parts = word(28);
+    if (parts > (bytes - 32) / 4) return "the console compute container is malformed";
+    const std::size_t header = 32 + parts * 4;
+    bool found = false;
+    for (std::size_t i = 0; i < parts; ++i) {
+        const std::size_t part = word(32 + i * 4);
+        if (part < header || part > bytes - 8) return "the console compute container is malformed";
+        const std::size_t size = word(part + 4);
+        if (size > bytes - part - 8) return "the console compute container is malformed";
+        if (std::memcmp(data + part, "DXIL", 4)) continue;
+        if (found) return "the console compute container has more than one DXIL part";
+        found = true;
+        const std::size_t program = part + 8;
+        if (size < 24 || word(program) >> 16 != D3D12_SHVER_COMPUTE_SHADER) return "the DXIL program is not a compute shader";
+        const std::size_t bitcode = word(program + 16);
+        const std::size_t bitcode_size = word(program + 20);
+        if (word(program + 4) * 4ull != size || std::memcmp(data + program + 8, "DXIL", 4) || bitcode < 16 ||
+            bitcode > size - 8 || bitcode_size < 4 || bitcode_size > size - 8 - bitcode ||
+            std::memcmp(data + program + 8 + bitcode, "BC\xc0\xde", 4))
+            return "the DXIL program is malformed";
+    }
+    return found ? nullptr : "the console compute program is not desktop DXIL";
+}
+
+// The on-the-spot creation for one tracked builder pipeline. This task has no translation step: a
+// console program fails by name before reaching D3D12. A future translation can attach its desktop
+// pipeline through the same entry point.
+bool make_compute_builder_pipeline(Wrapper* device, Wrapper* pipeline, const char** reason) noexcept
+{
+    if (reason) *reason = nullptr;
+    if (!device || !pipeline || pipeline->own().kind != pipeline_kind) {
+        if (reason) *reason = "the tracked object is not a pipeline";
+        return false;
+    }
+    if (pipeline->own().real) return true;
+    const PipelineInfo* info = pipeline_info(pipeline);
+    if (!info || info->path != 62 || info->desc.size() < sizeof(D3D12_COMPUTE_PIPELINE_STATE_DESC)) {
+        if (reason) *reason = "the slot 62 description is unavailable";
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    std::memcpy(&desc, info->desc.data(), sizeof(desc));
+    if (const char* program_reason = desktop_compute_program_reason(desc.CS)) {
+        if (reason) *reason = program_reason;
+        return false;
+    }
+    Wrapper* root = as_wrapper(desc.pRootSignature);
+    if (!root || root->own().kind != root_signature_kind || !root->own().real) {
+        if (reason) *reason = "the builder root signature has no desktop object";
+        return false;
+    }
+    desc.pRootSignature = static_cast<ID3D12RootSignature*>(root->own().real);
+    x2w_startup::ComPtr<ID3D12PipelineState> created;
+    const HRESULT hr = device_of(device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(created.GetAddressOf()));
+    if (FAILED(hr)) {
+        static LONG logged;
+        if (first_calls(logged, 4))
+            log("x2w-render compute builder gate: desktop pipeline creation failed 0x%08lx", hr);
+        if (reason) *reason = "desktop pipeline creation failed";
+        return false;
+    }
+    pipeline->own().real = created.Detach();
+    pipeline->own().compute_pipeline = true;
+    pipeline->own().pipeline_root = desc.pRootSignature;
+    return true;
+}
+
+void note_compute_builder_pipeline(Wrapper* device, Wrapper* pipeline, const void* return_address)
+{
+    if (!compute_builder_gate_enabled() || !device || !pipeline) return;
+    if (!compute_builder_caller_module(return_address)) return;
+    pipeline->own().builder_pipeline = true;
+    AcquireSRWLockExclusive(&compute_builder_lock);
+    x2w_startup::BuilderGateState* gate = compute_builder_gate_for(device);
+    if (!gate) {
+        static LONG logged;
+        if (first_calls(logged, 1)) log("x2w-render compute builder gate: no gate state; builder pipelines stay untracked");
+    } else {
+        gate->note_pipeline(pipeline, true, pipeline->own().real != nullptr);
+    }
+    ReleaseSRWLockExclusive(&compute_builder_lock);
+}
+
+// Called before the normal Dispatch path. It returns true for a non-builder Dispatch, for the gate
+// being off, or when every tracked builder pipeline has a desktop PSO. A refusal has already been
+// counted and logged once.
+bool compute_builder_dispatch_allowed(Wrapper* list, const char* stage)
+{
+    if (!compute_builder_gate_enabled() || !list) return true;
+    Pass& pass = pass_of(list);
+    if (!pass.pipeline || !pass.pipeline->own().builder_pipeline) return true;
+    Wrapper* device = list->own().list_device;
+    AcquireSRWLockExclusive(&compute_builder_lock);
+    x2w_startup::BuilderGateState* gate = compute_builder_gate_for(device);
+    if (!gate) {
+        InterlockedIncrement(&compute_builder_gate_refusals);
+        static LONG logged;
+        if (first_calls(logged, 1))
+            log("x2w-render compute builder gate: %s refused; no gate state is available", stage);
+        ReleaseSRWLockExclusive(&compute_builder_lock);
+        return false;
+    }
+    x2w_startup::BuilderGateDecision decision = gate->decide(true);
+    if (decision == x2w_startup::BuilderGateDecision::refuse_missing && gate->tracked() == 0)
+        gate->note_failed("no builder pipeline was tracked");
+    if (decision == x2w_startup::BuilderGateDecision::refuse_missing) {
+        for (unsigned i = 0; i < gate->tracked(); ++i) {
+            const void* missing = gate->missing_at(i);
+            if (!missing) continue;
+            const char* reason = nullptr;
+            if (!make_compute_builder_pipeline(device, const_cast<Wrapper*>(static_cast<const Wrapper*>(missing)), &reason)) {
+                gate->note_failed(reason);
+                break;
+            }
+            gate->note_pso(missing);
+        }
+        decision = gate->decide(true);
+    }
+    if (decision == x2w_startup::BuilderGateDecision::allow) {
+        // The title bound a placeholder wrapper earlier; the gate has just published its real
+        // desktop PSO. Refresh the recording's cached compute state and bind the PSO so the
+        // caller's Dispatch decision sees the completed pipeline instead of the placeholder.
+        if (auto* host = recording(list); host && pass.pipeline && pass.pipeline->own().real) {
+            pass.pipeline_real = true;
+            pass.compute_pipeline = true;
+            pass.compute_pipeline_root = pass.pipeline->own().pipeline_root;
+            host->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+            if (pass.compute_root && pass.compute_pipeline_root == pass.compute_root)
+                host->SetComputeRootSignature(pass.compute_root);
+        }
+        static LONG logged;
+        if (first_calls(logged, 1))
+            log("x2w-render compute builder gate: %u tracked pipelines, all have a desktop PSO; %s allowed",
+                gate->tracked(), stage);
+        ReleaseSRWLockExclusive(&compute_builder_lock);
+        return true;
+    }
+    gate->note_refusal();
+    InterlockedIncrement(&compute_builder_gate_refusals);
+    static LONG logged;
+    if (first_calls(logged, 1)) {
+        const char* reason = gate->first_reason();
+        log("x2w-render compute builder gate: %u tracked pipelines, %u with a desktop PSO; %s refused: %s",
+            gate->tracked(), gate->with_pso(), stage, reason ? reason : "not every builder pipeline has a desktop PSO");
+    }
+    ReleaseSRWLockExclusive(&compute_builder_lock);
+    return false;
 }
 
 bool indirect_copy_ranges()
@@ -3319,6 +3532,7 @@ constexpr const char* count_missing_resource = "count_missing_resource";
 constexpr const char* count_invalid_offset = "count_invalid_offset";
 constexpr const char* count_outside_placed_buffer = "count_outside_placed_buffer";
 constexpr const char* count_not_common_state = "count_not_common_state";
+constexpr const char* builder_gate = "builder_gate";
 constexpr const char* unknown = "unknown";
 }  // namespace indirect_other_refusal_code
 
@@ -3330,6 +3544,15 @@ bool split_indirect_dispatch_enabled()
 }
 
 // The guest method has independent resource and byte-offset arguments.
+// X2W_D3D12_ROOT_SRV_AT_DRAW=1 (opt-in): slot 44 makes no desktop copy of a root SRV without an upload mapping; the
+// translated draws read it from its title address at the draw (list_root_srv).
+bool root_srv_at_draw()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_D3D12_ROOT_SRV_AT_DRAW", nullptr, 0) != 0;
+    return on;
+}
+LONG root_srv_copies_skipped, root_srv_copies_made;
+
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
@@ -3381,6 +3604,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
     refusal_pipeline = pass.pipeline;
+    // A slot 62 builder pipeline is tracked by the wrapper itself, not by a slot 67 request key.
+    // Gate its indirect Dispatch before the signature and argument checks so a partial builder
+    // cannot reach ExecuteIndirect.
+    if (command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().builder_pipeline &&
+        !compute_builder_dispatch_allowed(self, "ExecuteIndirect"))
+        return refuse("the compute builder gate refused the Dispatch", indirect_compute_pipeline, indirect_other_refusal_code::builder_gate);
     const bool translated_compute = command == IndirectCommand::dispatch && pass.pipeline && pass.pipeline->own().compute_request_key;
     const bool translated = (command == IndirectCommand::draw || indexed) && pass.pipeline && !pass.pipeline->own().real &&
         (pass.graphics_root || pass.deferred_root) && x2w_local::env_on("X2W_TRANSLATED_INDIRECT_DRAW");
@@ -4148,6 +4377,17 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         pass.srv_bound |= 1u << parameter;
         return;
     }
+    // Without an upload mapping a 64 KiB window of title memory is copied into the upload ring for the desktop binding.
+    // No draw reads that binding: translated draws set their own root signature and read the SRV from root_address at
+    // the draw; every desktop graphics pipeline is an indirect one (build_stream_pipeline sets its root), so list_draw
+    // forwards only with a compute pipeline; and an indirect graphics draw binds a pipeline over the list's root, an
+    // empty one or, for a cached mesh pipeline, the title's root, whose only SRV it binds from its lease. With
+    // X2W_D3D12_ROOT_SRV_AT_DRAW=1 the copy is skipped and the parameter stays unbound (srv_bound clear). A desktop
+    // graphics pipeline that reads a root SRV would need the copy at its draw.
+    if (root_srv_at_draw()) {
+        InterlockedIncrement(&root_srv_copies_skipped);
+        return;
+    }
     const std::size_t bytes = readable_window(address, 0x10000);
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(self, address, bytes) : 0;
     static LONG logged;
@@ -4157,9 +4397,19 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         log("x2w-render root SRV %u at title 0x%llx: %zu bytes -> desktop 0x%llx [%s]", parameter, address, bytes, desktop, head);
     }
     if (!desktop) return;
+    InterlockedIncrement(&root_srv_copies_made);
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
 }
+
+// Fixture export (startup_root_srv_draw): slot 44 root SRVs without an upload mapping since the process started.
+// `skipped` counts only with X2W_D3D12_ROOT_SRV_AT_DRAW=1; `copied` counts every copy into the upload ring.
+extern "C" __declspec(dllexport) void x2w_d3d12_root_srv_copies(LONG* skipped, LONG* copied)
+{
+    if (skipped) *skipped = root_srv_copies_skipped;
+    if (copied) *copied = root_srv_copies_made;
+}
+
 // List slot 42 (desktop 38 + 4), SetGraphicsRootConstantBufferView(parameter, title GPU address).
 // A translated shader reads a root CBV through the same pointer source as a root SRV (root_address). Nothing
 // is forwarded to the desktop list and srv_bound is left alone: bit 0 means a vertex-fetch SRV is bound.
@@ -4183,6 +4433,10 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
     auto* list = recording(self);
     const Pass& pass = pass_of(self);
+    // Slot 62 marks the wrapper itself. Slot 67 has no builder tag, so its request path is
+    // unchanged; a builder Dispatch is gated here regardless of the request-key field.
+    if (list && pass.pipeline && pass.pipeline->own().builder_pipeline &&
+        !compute_builder_dispatch_allowed(self, "Dispatch")) return;
     if (list && pass.pipeline && pass.pipeline->own().compute_request_key) {
         record_translated_dispatch(self, {{x, y, z}});
         return;
@@ -6455,7 +6709,7 @@ HRESULT __stdcall placeholder_ok(Wrapper*, u64, u64, u64) { return S_OK; }
 // XboxBvhBuilder.dll, followed by SetName on the result. The bytecode is console GPU code, not DXIL,
 // so no desktop pipeline is built: the result is a placeholder PipelineState until shader translation
 // exists. Logs the root signature, bytecode address, length and first 32 bytes.
-HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
+HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
                                                    u64 extra1, const GUID* iid, void** out)
 {
     char text[48];
@@ -6477,6 +6731,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     auto* pipeline = static_cast<Wrapper*>(*out);
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
+    note_compute_builder_pipeline(self, pipeline, _ReturnAddress());
     return S_OK;
 }
 
@@ -7070,6 +7325,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
+        log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): skipped %ld, copied %ld", root_srv_copies_skipped,
+            root_srv_copies_made);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
@@ -7088,8 +7346,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
             pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
     if (render_mode() && frame % 300 == 0) {
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
-            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
+            compute_builder_gate_refusals);
         log_compute_census();
     }
     if (render_mode() && frame % 300 == 0) {
