@@ -1954,6 +1954,16 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(backend IN ITEMS hardware warp)
+        add_test(NAME native_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(native_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_test(NAME startup_compute_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" runtime "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(startup_compute_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endforeach()
     add_test(NAME native_direct_container
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")

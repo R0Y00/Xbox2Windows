@@ -96,6 +96,9 @@ Bytes encode(const NativeComputeShader &program) {
     for (const auto &c : program.constants)
         for (unsigned n : {c.root_parameter, c.first_sgpr, c.count})
             word(out, n);
+    word(out, static_cast<unsigned>(program.stride_srvs.size()));
+    for (unsigned srv : program.stride_srvs)
+        word(out, srv);
     word(out, static_cast<uint32_t>(program.samplers.size()));
     for (const auto &s : program.samplers) {
         for (auto n : s.words)
@@ -144,6 +147,9 @@ NativeComputeShader decode(std::string_view bytes) {
             throw std::runtime_error("invalid cached constants");
         shader.constants.push_back(c);
     }
+    n = in.count(32);
+    for (unsigned j = 0; j < n; ++j)
+        shader.stride_srvs.push_back(in.count(31));
     n = in.count(2048);
     for (unsigned j = 0; j < n; ++j) {
         ComputeSampler sampler{};
@@ -729,6 +735,7 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             return std::nullopt;
         ud_count += block.count;
     }
+    ud_count += static_cast<unsigned>(program.stride_srvs.size());
     if (ud_count > 32)
         return std::nullopt;
 
@@ -796,6 +803,12 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     for (const auto &block : program.constants)
         for (unsigned j = 0; j < block.count; ++j)
             out << "udsrc " << ud_index++ << " rootconst " << block.root_parameter << ' ' << j << '\n';
+    for (unsigned srv : program.stride_srvs) {
+        if (srv >= srv_count || sorted[srv].kind != ComputeViewKind::raw_vector_srv ||
+            sorted[srv].array_count != 1)
+            return std::nullopt;
+        out << "udsrc " << ud_index++ << " stride " << srv << '\n';
+    }
     out << srv_lines.str() << uav_lines.str() << sampler_lines.str();
     return out.str();
 }
