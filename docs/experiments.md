@@ -16824,6 +16824,14 @@ The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_ma
 
 Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal, the missing `s_wqm`, the loop fixture and the divergent-EXEC control; the WARP and hardware draws compare all 256 pixels of the integer, float and loop fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
 
+### Pixel image descriptor size fields
+
+A pixel stage can read the GFX10 size fields of an 8-dword image descriptor that an image instruction uses. `s_bfe_u32`, `s_and_b32` and `s_lshr_b32` lower only when the control or mask is exactly the field. WIDTH is word 1 bits 31:30 and word 2 bits 11:0, stored as width minus one. HEIGHT is word 2 bits 27:14, stored as height minus one. DEPTH is word 4 bits 12:0 and is lowered only for a 3D image. The HLSL reads that component from `GetDimensions(0)` on the texture the image instruction binds. That matches the descriptor when the bound view starts at resource mip 0, the same base-mip contract as the image loads. A whole word, any other word or field, a shift of word 2 that keeps the resource-level bit, depth of a 1D, 2D or 2D-array image, height of a 1D image, a modified word and `m0` stay refused. A 4-dword buffer descriptor and the compute and vertex stages are unchanged.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_image_desc_word' -V
+```
+
 ## Startup root signature changes
 
 `tests/startup_root_reset.cpp` and `tests/startup_root_reset_check.py` bind a 1D texture through a descriptor table

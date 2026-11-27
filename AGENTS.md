@@ -225,6 +225,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bfm_b64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_data_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_get_lod_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_image_desc_word_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_add_sub_co_ci_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_saveexec_same_reg_check.py

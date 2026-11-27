@@ -3911,6 +3911,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: image_get_lod on 2D and 2D-array textures.
     add_test(NAME startup_gfx2hlsl_image_get_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_get_lod_check.py")
+    # Pixel image descriptor words used as numbers: exact width, height and 3D depth fields only.
+    add_test(NAME startup_gfx2hlsl_image_desc_word_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_desc_word_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_image_get_lod_view_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_get_lod_view_check.py" "${DXC_EXECUTABLE}"
