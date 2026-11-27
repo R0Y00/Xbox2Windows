@@ -1601,7 +1601,9 @@ struct DirectCompute {
             write(i.dst, value);
             return;
         }
-        if (n == "v_lshrrev_b64" || n == "v_lshlrev_b64") {
+        if (n == "v_lshrrev_b64" || n == "v_lshlrev_b64" || n == "v_ashrrev_i64") {
+            // v_ashrrev_i64 (#2991) sign-extends a 32-bit literal, as gfx2hlsl.py's i64_words(signed=True) does.
+            const bool arithmetic = n == "v_ashrrev_i64";
             unsigned src = i.src[1];
             const bool sgpr_pair = src <= 104 && (src & 1) == 0;
             const bool vgpr_pair = src >= 256 && src < 511;
@@ -1615,11 +1617,14 @@ struct DirectCompute {
                     hi = operand32(i, src + 1);
                 else if (inline_int && src >= 193)
                     hi = "4294967295";
+                else if (src == 255 && arithmetic)
+                    hi = ir.binary("ashr", lo, "31");
                 auto low = ir.value("zext i32 " + lo + " to i64"), high = ir.value("zext i32 " + hi + " to i64");
                 auto bits = ir.value("shl i64 " + high + ", 32");
                 bits = ir.value("or i64 " + bits + ", " + low);
                 auto amt = ir.value("zext i32 " + ir.binary("and", val(0), "63") + " to i64");
-                bits = ir.value(string(n == "v_lshrrev_b64" ? "lshr" : "shl") + " i64 " + bits + ", " + amt);
+                bits = ir.value(string(arithmetic ? "ashr" : n == "v_lshrrev_b64" ? "lshr" : "shl") + " i64 " + bits +
+                                ", " + amt);
                 lo = ir.value("trunc i64 " + bits + " to i32");
                 hi = ir.value("trunc i64 " + ir.value("lshr i64 " + bits + ", 32") + " to i32");
                 ir.features |= 1048576;
@@ -1875,7 +1880,11 @@ struct DirectCompute {
             z = ir.binary(op, ir.binary(op, a, b), val(2));
         } else if (n == "v_add_lshl_u32")
             z = shift("shl", ir.binary("add", a, b), val(2));
-        else if (n == "v_mul_u32_u24" || n == "v_mad_u32_u24") {
+        else if (n == "v_mad_i32_i24") {
+            // sext(S0[23:0]) * sext(S1[23:0]) + S2 modulo 2^32 (#2991, gfx2hlsl.py's VOP3 table).
+            auto sext24 = [&](const string &x) { return ir.binary("ashr", ir.binary("shl", x, "8"), "8"); };
+            z = ir.binary("add", ir.binary("mul", sext24(a), sext24(b)), val(2));
+        } else if (n == "v_mul_u32_u24" || n == "v_mad_u32_u24") {
             z = ir.binary("mul", ir.binary("and", a, "16777215"), ir.binary("and", b, "16777215"));
             if (n == "v_mad_u32_u24")
                 z = ir.binary("add", z, val(2));
