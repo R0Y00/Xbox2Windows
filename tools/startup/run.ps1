@@ -27,6 +27,7 @@ param(
     [switch]$GpuMirror,                        # map CPU-view pages into the paired GPU-view reservation
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
+    [string]$NativeShaders = "",               # with -Render: the directory of dxcompiler.dll and dxil.dll; compute requests are translated in the stand-in (X2W_NATIVE_SHADERS)
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
@@ -64,7 +65,9 @@ if ($Render) {
     New-Item -ItemType Directory -Force $ShaderCache | Out-Null
     $env:X2W_D3D12_RENDER = "1"; $env:X2W_DRAW_NULL_IDENTITY = "1"
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path
+    if ($NativeShaders) { $env:X2W_NATIVE_SHADERS = (Resolve-Path $NativeShaders).Path }
 }
+if ($NativeShaders -and -not $Render) { Write-Warning "-NativeShaders needs -Render (no shader requests without it); ignored" }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
