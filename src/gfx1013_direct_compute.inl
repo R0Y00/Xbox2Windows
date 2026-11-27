@@ -509,12 +509,15 @@ struct DirectCompute {
     }
     void image_io(const Inst &i, const State &s) {
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
-        const bool compare = i.op == 40 || i.op == 47;
+        // image_gather4_c_lz (79) is the comparison gather at the view's first mip (#2969): DXIL textureGatherCmp.
+        const bool compare_gather = i.op == 79;
+        const bool compare = i.op == 40 || i.op == 47 || compare_gather;
         const bool implicit = i.op == 32 || i.op == 40 || bias || query || i.op == 64;
         if (implicit && !pixel_stage)
             refuse(i.pc, "implicit derivatives require a pixel stage");
-        const bool gather = i.op == 64 || i.op == 71;
-        const bool sample = (!gather && implicit) || compare || gradient || i.op == 39 || i.op == 36, store = i.op == 8,
+        const bool gather = i.op == 64 || i.op == 71 || compare_gather;
+        const bool sample = (!gather && implicit) || (compare && !gather) || gradient || i.op == 39 || i.op == 36,
+                   store = i.op == 8,
                    half = store && (i.b >> 31);
         const bool lod = i.op == 1 || i.op == 36;
         const unsigned mask = (i.a >> 8) & 15, addr = i.b & 255, base = ((i.b >> 16) & 31) * 4, dim = (i.a >> 3) & 7;
@@ -525,6 +528,7 @@ struct DirectCompute {
             (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
+            (compare_gather && dim == 3) ||
             ((sample || gather) && (i.a & 0x1000u) && gradient) ||
             (dimensions && (dim == 4 || dim >= 6 || (i.b & 0x40000000u))) ||
             (store && !half && mask != 15) || (half && mask != 1 && mask != 3 && mask != 15) ||
@@ -600,7 +604,8 @@ struct DirectCompute {
         if (!store) {
             string r;
             if (sample || gather) {
-                auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71, implicit || gradient, compare);
+                auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                                                          implicit || gradient, compare);
                 if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
                     refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
                 auto sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
@@ -647,14 +652,17 @@ struct DirectCompute {
                 const unsigned offsets = dim == 3 ? 0 : spatial;
                 for (unsigned j = 0; j < (sample ? 3u : 2u); ++j)
                     args.emplace_back("i32", j < offsets ? "0" : "undef");
-                if (compare) {
-                    args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
-                    if (implicit)
-                        args.emplace_back("float", "undef");
-                } else if (gather) {
+                if (gather) {
                     unsigned channel = 0;
                     while (!(mask & (1u << channel))) ++channel;
                     args.emplace_back("i32", to_string(channel));
+                    // textureGatherCmp takes the reference after the channel; the comparison reads red.
+                    if (compare_gather)
+                        args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
+                } else if (compare) {
+                    args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
+                    if (implicit)
+                        args.emplace_back("float", "undef");
                 } else if (gradient) {
                     // Victory emit/lower.rs: d/dx and then d/dy of spatial
                     // coordinates precede the coordinates, excluding array slices.
@@ -674,10 +682,12 @@ struct DirectCompute {
                     args.emplace_back("float", "undef"); // no per-instruction minimum LOD clamp
                 } else
                     args.emplace_back("float", lod ? ir.value("bitcast i32 " + level + " to float") : "0.0");
-                const char *method = compare ? (implicit ? "sampleCmp.f32" : "sampleCmpLevelZero.f32") :
+                const char *method = compare_gather ? "textureGatherCmp.f32" :
+                                     compare ? (implicit ? "sampleCmp.f32" : "sampleCmpLevelZero.f32") :
                                      gather ? "textureGather.f32" : gradient ? "sampleGrad.f32" :
                                      bias ? "sampleBias.f32" : implicit ? "sample.f32" : "sampleLevel.f32";
-                const unsigned opcode = compare ? (implicit ? 64 : 65) : gather ? 73 : gradient ? 63 : bias ? 61 : implicit ? 60 : 62;
+                const unsigned opcode = compare_gather ? 74 : compare ? (implicit ? 64 : 65) : gather ? 73 :
+                                        gradient ? 63 : bias ? 61 : implicit ? 60 : 62;
                 r = ir.invoke("%dx.types.ResRet.f32", method, opcode, args, "nounwind readonly");
             } else
                 r = ir.invoke("%dx.types.ResRet.f32", "textureLoad.f32", 66,
