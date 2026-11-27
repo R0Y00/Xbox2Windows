@@ -34,9 +34,18 @@ with tempfile.TemporaryDirectory() as tmp:
     with open(fail, "w") as f:
         # An uncaught assertion exits 1 and writes its traceback to stderr, the usual way a check fails.
         f.write("assert False, 'fail ran'\n")
-    ok = run(good, good)
+    also_good = os.path.join(tmp, "also_good.py")
+    with open(also_good, "w") as f:
+        f.write("print('good ran')\n")
+    ok = run(good, also_good)
     assert ok.returncode == 0 and ok.stdout.count("good ran") == 2, ok.stdout
     assert "all 2 checks passed" in ok.stdout, ok.stdout
+    # The same script twice on the command line fails like a command listed twice across the
+    # tests/checks files: one error line, status 1, and nothing runs.
+    twice = run(good, bad, good)
+    assert twice.returncode == 1, twice.stdout
+    assert twice.stdout.strip() == "duplicate command-line script: " + good, twice.stdout
+    assert "good ran" not in twice.stdout and "::group::" not in twice.stdout, twice.stdout
     mixed = run(bad, good)
     assert mixed.returncode == 1, mixed.stdout
     assert "bad ran" in mixed.stdout and "good ran" in mixed.stdout and "FAILED: " + bad in mixed.stdout, mixed.stdout
@@ -64,6 +73,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert both.returncode == 1, both.stdout
     assert "FAILED: " + bad + "\n" in both.stdout, both.stdout
     assert "SKIPPED: " + skip + "\n" in both.stdout, both.stdout
+    # Equivalent script path spellings on the command line (e.g. a.py vs ./a.py) count as duplicates.
+    dot_good = os.path.join(tmp, ".", "good.py")
+    spelled_twice = run(good, dot_good)
+    assert spelled_twice.returncode == 1, spelled_twice.stdout
+    assert spelled_twice.stdout.strip() == "duplicate command-line script: " + dot_good, spelled_twice.stdout
+    assert "good ran" not in spelled_twice.stdout and "::group::" not in spelled_twice.stdout, spelled_twice.stdout
     # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
     serial = run(good, jobs="0")
     assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout

@@ -58,7 +58,7 @@ inline bool fits(int slot, unsigned view_dimension, unsigned resource_dimension)
 inline bool typeless(unsigned format) noexcept
 {
     switch (format) {
-    case 1: case 5: case 9: case 15: case 19: case 23: case 27: case 33: case 39: case 44: case 48: case 53: case 59:
+    case 1: case 5: case 9: case 15: case 19: case 23: case 27: case 33: case 39: case 44: case 48: case 53: case 60:
     case 70: case 73: case 76: case 79: case 82: case 90: case 92: case 94: case 97:
         return true;
     default:

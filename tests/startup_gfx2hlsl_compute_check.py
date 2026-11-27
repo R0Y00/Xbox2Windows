@@ -4,7 +4,7 @@
   binary <llvm-mc>                                reassemble the fixture sources and compare them with the words below
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                                   translate, compile with DXC cs_6_0, dispatch and compare every word
-  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched|n-unmasked|o-mask-kept> <dxc> <offscreen_check> <warp|hardware>
+  control <swapped-axes|dropped-store|b-offset|c-unpredicated|j-scalar-dropped|h-inner-unpredicated|m-else-unswitched|n-unmasked|o-mask-kept|s-min-strict|s-borrow-flipped> <dxc> <offscreen_check> <warp|hardware>
                                                   the same dispatch with a mutated translation, which must mismatch
 
 The fixtures are source-built gfx1013 compute programs. The root signature puts two root constants (key, stride)
@@ -386,6 +386,42 @@ WORDS_O = bytes.fromhex(
     '6a3c80be' '030088bf' '8300887d' '7e6a7e87' '007e008a' '0003febe' '04060a3a' '001070e004050480' '1503febe'
     '000081bf')
 
+# The two-mask loop from #2645. The displacements name the join, exit and head, respectively.
+LOOP_BREAK_SOURCE = """\
+v_lshlrev_b32 v4, 2, v0
+v_mov_b32 v5, 9
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 s22, exec_lo, vcc_lo
+s_mov_b32 s23, s22
+s_mov_b32 s24, 1
+s_mov_b32 exec_lo, s22
+s_cbranch_execz 6
+v_cmpx_gt_u32 s24, v0
+s_andn2_b32 s22, s22, exec_lo
+s_andn2_b32 s23, s23, exec_lo
+s_cbranch_scc0 6
+s_mov_b32 exec_lo, s22
+v_mov_b32 v5, s24
+s_mov_b32 exec_lo, s23
+s_add_u32 s24, s24, 1
+s_cmp_ge_u32 s24, 4
+s_cbranch_scc0 65524
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_mov_b32 exec_lo, s21
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+LOOP_BREAK_WORDS = bytes.fromhex(
+    '82000834 89020a7e 7e0395be 8300887d 7e6a1687 160397be 810398be 1603febe '
+    '060088bf 1800a87d 167e168a 177e178a 060084bf 1603febe 18020a7e 1703febe '
+    '18811880 188409bf f4ff84bf 06038abe 80038bbe 05030cf4000000fa 7fc08cbf '
+    '1503febe 001070e004050480 000081bf')
+
+
 def saveexec_fixture():
     # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
     # A single-thread group makes the lane bit the whole participating wave mask.
@@ -564,6 +600,80 @@ WORDS_CARRY = bytes.fromhex(
     '06038abe 80038bbe 05030cf4000000fa 7fc08cbf 07811493 14c21480 80fd1580 81801685'
     ' 0784178f 1702087e 1402107e 1502127e 1602147e 00107ce004080480 000081bf')
 
+
+SCC_EDGES = (0, 0xffffffff, 0x7fffffff, 0x80000000)
+SCC_OPS = ('s_add_u32', 's_sub_u32', 's_add_i32', 's_sub_i32', 's_min_u32', 's_max_u32', 's_min_i32', 's_max_i32')
+
+
+def scc_fixture():
+    """Group (x, y) of the 4 x 4 grid takes S0 = edge[x], S1 = edge[y] (0, -1, INT_MAX, INT_MIN); the runner accepts at most 5 groups per axis. Each s_add/s_sub/s_min/s_max forms is run
+    twice (the destination apart from S0, then the destination that is S0) and its SCC read right after; word 0 of the
+    group holds the 16 SCC bits, word 1 a hash of the 16 results. RDNA 2 ISA: s_add_u32 carry out, s_sub_u32 borrow,
+    s_add_i32 / s_sub_i32 signed overflow, s_min / s_max SCC = (D == S0)."""
+    lines = ['s_mov_b32 s10, s6', 's_mov_b32 s11, 0', 's_load_dwordx8 s[12:19], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)',
+             's_lshl_b32 s24, s8, 2', 's_add_u32 s24, s24, s7', 'v_lshlrev_b32 v4, 3, s24', 's_mov_b32 s22, s7',
+             's_mov_b32 s23, s8']
+    for reg, index in (('s20', 's22'), ('s21', 's23')):
+        lines.append('s_mov_b32 %s, 0' % reg)
+        for n, value in ((1, '-1'), (2, '0x7fffffff'), (3, '0x80000000')):
+            lines += ['s_cmp_eq_u32 %s, %d' % (index, n), 's_cselect_b32 %s, %s, %s' % (reg, value, reg)]
+    lines += ['s_mov_b32 s27, 0', 's_mov_b32 s28, 0']
+    bit = 0
+    for op in SCC_OPS:
+        for dst, init in (('s24', None), ('s26', 's_mov_b32 s26, s20')):
+            lines += ([init] if init else []) + [
+                '%s %s, %s, s21' % (op, dst, dst if init else 's20'), 's_cselect_b32 s25, 1, 0',
+                's_lshl_b32 s25, s25, %d' % bit, 's_or_b32 s27, s27, s25', 's_xor_b32 s28, s28, %s' % dst,
+                's_lshl_b32 s28, s28, 1']
+            bit += 1
+    lines += ['v_mov_b32 v5, s27', 'buffer_store_dword v5, v4, s[16:19], 0 offen', 'v_add_nc_u32 v4, 4, v4',
+              'v_mov_b32 v5, s28', 'buffer_store_dword v5, v4, s[16:19], 0 offen', 's_endpgm']
+    return '\n'.join(lines) + '\n'
+
+
+def scc_reference(a, b):
+    """(SCC bits, result hash) of the fixture for S0 = a, S1 = b, from the ISA rules (no code shared with the translator)."""
+    def signed(x):
+        return x - (1 << 32) if x >> 31 else x
+    bits = hashed = 0
+    for n, op in enumerate(SCC_OPS):
+        for alias in (0, 1):
+            x = a  # the aliased run starts from a copy of S0, which is S0 again
+            if op.endswith('add_u32'):
+                total = x + b
+                result, scc = total & MASK, total > MASK
+            elif op == 's_sub_u32':
+                result, scc = (x - b) & MASK, x < b
+            elif op == 's_add_i32':
+                result = (x + b) & MASK
+                scc = not -(1 << 31) <= signed(x) + signed(b) < (1 << 31)
+            elif op == 's_sub_i32':
+                result = (x - b) & MASK
+                scc = not -(1 << 31) <= signed(x) - signed(b) < (1 << 31)
+            else:
+                view = signed if op.endswith('i32') else (lambda v: v)
+                pick = min if 'min' in op else max
+                result = pick(x, b, key=view)
+                scc = result == x
+            bits |= int(scc) << (2 * n + alias)
+            hashed = ((hashed ^ result) << 1) & MASK
+    return bits, hashed
+
+WORDS_S = bytes.fromhex(
+    '06038abe80038bbe05030cf4000000fa7fc08cbf0882188f1807188004001ad583300000070396be080397be800394be'
+    '168106bfc1141485168206bfff141485ffffff7f168306bfff14148500000080800395be178106bfc1151585178206bf'
+    'ff151585ffffff7f178306bfff1515850000008080039bbe80039cbe14151880818019851980198f1b191b881c181c89'
+    '1c811c8f14039abe1a151a80818019851981198f1b191b881c1a1c891c811c8f14159880818019851982198f1b191b88'
+    '1c181c891c811c8f14039abe1a159a80818019851983198f1b191b881c1a1c891c811c8f14151881818019851984198f'
+    '1b191b881c181c891c811c8f14039abe1a151a81818019851985198f1b191b881c1a1c891c811c8f1415988181801985'
+    '1986198f1b191b881c181c891c811c8f14039abe1a159a81818019851987198f1b191b881c1a1c891c811c8f14159883'
+    '818019851988198f1b191b881c181c891c811c8f14039abe1a159a83818019851989198f1b191b881c1a1c891c811c8f'
+    '1415988481801985198a198f1b191b881c181c891c811c8f14039abe1a159a8481801985198b198f1b191b881c1a1c89'
+    '1c811c8f1415188381801985198c198f1b191b881c181c891c811c8f14039abe1a151a8381801985198d198f1b191b88'
+    '1c1a1c891c811c8f1415188481801985198e198f1b191b881c181c891c811c8f14039abe1a151a8481801985198f198f'
+    '1b191b881c1a1c891c811c8f1b020a7e001070e0040504808408084a1c020a7e001070e004050480000081bf'
+)
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -586,6 +696,7 @@ CASES = {
     'G': (SOURCE_G, WORDS_G, USER7 | TGID_X | (1 << 15), (64, 1, 1), (2, 1, 1)),
     **{name: (SOURCE_L, WORDS_L, USER7, (16, 1, 1), (1, 1, 1)) for name in L_WORD3},
     'N': (SOURCE_N, WORDS_N, USER7 | tidig(1), (16, 1, 1), (1, 1, 1)),
+    'S': (scc_fixture(), WORDS_S, USER7 | TGID_X | TGID_Y | tidig(1), (1, 1, 1), (4, 4, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -648,6 +759,7 @@ SPLICE = {
     's_bfe_u32 s21, s29, 0xe0010': '1dff959310000e00',
     's_max_u32 s21, s21, 1': '15819584',
     's_max_u32 s21, s21, 2': '15829584',
+    'v_cmp_gt_u32_e64 s21, 3, v0': '1500c4d483000200',
     's_bfe_u32 s21, s17, 0xe0011': '11ff959311000e00',
     's_mul_i32 s18, s18, s21': '12151293',
     's_mul_i32 s18, s18, 4': '12841293',
@@ -694,6 +806,15 @@ RAW_CONVERSION = (STRIDE_EXTRACT, STRIDE_CLEAR, SCALE_RECORDS, OOB_CLEAR, OOB_RA
 CASES['I-raw'] = (SOURCE_A.replace('buffer_store_dword', '\n'.join((*RAW_CONVERSION, 'buffer_store_dword'))),
                   splice(*RAW_CONVERSION), *CASES['A'][2:])
 
+# Case I-raw-mask: s21 first holds a lane mask (a compare in a 24-lane group), then the clamped stride of the same
+# conversion. The descriptor-data write ends the mark, so the clamp is not a lane-mask read and the store lands as
+# in case A. The translator before that change refused it: s_max_u32 reads lane mask s21 as numeric data.
+MASK_S21 = 'v_cmp_gt_u32_e64 s21, 3, v0'
+CLAMPED_CONVERSION = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
+CASES['I-raw-mask'] = (SOURCE_A.replace('buffer_store_dword',
+                                        '\n'.join((MASK_S21, *CLAMPED_CONVERSION, 'buffer_store_dword'))),
+                       splice(MASK_S21, *CLAMPED_CONVERSION), *CASES['A'][2:])
+
 # Replace the nonzero stride constant in s5 with the first active lane of a
 # fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
 CASES['A-ff1'] = ('s_ff1_i32_b32 s5, exec_lo\n' + SOURCE_A,
@@ -725,6 +846,25 @@ WORDS_O_SHIFT = bytes.fromhex(OFF_PROLOGUE_WORDS + '040394be' '050395be' '078416
                               '80020e7e' '000078e000040416' '000081bf')
 CASES['O-dword'] = (SOURCE_O_DWORD, WORDS_O_DWORD, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1))
 CASES['O-shift'] = (SOURCE_O_SHIFT, WORDS_O_SHIFT, USER7 | TGID_X | tidig(1), (32, 1, 1), (4, 1, 1))
+
+# Two groups reach the same load from different branch arms. Each of their lanes must read its group's word.
+SOURCE_JOIN_LOAD = OFF_PROLOGUE + """\
+s_cmp_eq_u32 s7, 0
+s_cbranch_scc0 1
+s_nop 0
+s_lshl_b32 s3, s7, 2
+buffer_load_dword v7, off, s[12:15], s3
+s_waitcnt vmcnt(0)
+v_readfirstlane_b32 s24, v7
+v_mov_b32_e32 v7, s24
+v_lshl_add_u32 v4, s7, 3, v0
+v_lshlrev_b32_e32 v4, 2, v4
+buffer_store_dword v7, v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_JOIN_LOAD = bytes.fromhex(OFF_PROLOGUE_WORDS + '078006bf 010084bf 000080bf 0782038f 000030e000070303 '
+                                '703f8cbf 0705307e 18020e7e 040046d707060104 82080834 001070e004070480 000081bf')
+CASES['join-load'] = (SOURCE_JOIN_LOAD, WORDS_JOIN_LOAD, USER7 | TGID_X, (8, 1, 1), (2, 1, 1))
 
 
 def root_blob(constants=2, table_range=False):
@@ -779,9 +919,13 @@ def formatted_input():
 
 
 def expected(name):
-    if name in ('I', 'I-raw'):
+    if name in ('I', 'I-raw', 'I-raw-mask'):
         return expected('A')
     out = [SENTINEL] * WORDS
+    if name == 'join-load':
+        for i in range(16):
+            out[i] = input_word(i // 8)
+        return out
     if name == 'O-dword':
         for group in range(4):
             out[2 + group] = KEY ^ group
@@ -815,6 +959,10 @@ def expected(name):
         return out
     if name == 'N':
         out[:16] = [input_word(0) ^ input_word(lane) for lane in range(16)]
+        return out
+    if name == 'S':
+        for group in range(16):
+            out[2 * group:2 * group + 2] = scc_reference(SCC_EDGES[group & 3], SCC_EDGES[group >> 2])
         return out
     producer_offsets = {'G': (1, 32), 'G-offset0-only': (31, 0), 'G-offset1-only': (0, 31)}
     if name in producer_offsets:
@@ -947,6 +1095,40 @@ MBCNT_REFUSALS = (
 )
 
 
+def check_execz_loop_break():
+    # Trace the fixture once as a wave and once per singleton. Both saved masks lose
+    # the same lanes. SCC tests the entire remaining mask at the early exit.
+    def trace(lanes):
+        remaining = {lane for lane in lanes if lane < 3}
+        values = dict.fromkeys(lanes, 9)
+        counter = 1
+        while counter < 4:
+            if remaining:  # otherwise execz goes straight to the join
+                remaining = {lane for lane in remaining if lane >= counter}
+                if not remaining:
+                    break
+                values.update(dict.fromkeys(remaining, counter))
+            counter += 1
+        return values, counter
+
+    lanes = range(8)
+    wave, counter = trace(lanes)
+    singles = [trace([lane]) for lane in lanes]
+    assert list(wave.values()) == [values[lane] for lane, (values, _) in enumerate(singles)] == [9, 1, 2, 9, 9, 9, 9, 9]
+    # Make the scalar counter observable after restoring EXEC. Lane 0 leaves before
+    # the wave, while lanes 3..7 follow the latch even after the wave has left.
+    assert counter == 3 and [c for _, c in singles] == [1, 2, 3, 4, 4, 4, 4, 4]
+    store = '001070e004050480'
+    with_counter = patch(LOOP_BREAK_WORDS, store, '18020a7e' + store)
+    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: loop exit crosses a backward s_cbranch_scc0'
+    for program in (LOOP_BREAK_WORDS, with_counter):
+        refused(reason, lambda: translate('O', code=program).hlsl_cs())
+    # Remove just the latch or just the guard to isolate the control-flow diagnostic.
+    refused('s_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block',
+            lambda: translate('O', code=patch(LOOP_BREAK_WORDS, 'f4ff84bf', '000080bf')).hlsl_cs())
+    translate('O', code=patch(LOOP_BREAK_WORDS, '060088bf', '000080bf')).hlsl_cs()
+
+
 def check_mbcnt():
     for _, words, reason in MBCNT_REFUSALS:
         refused(reason, lambda: translate('D', code=bytes.fromhex(words + '000081bf')))
@@ -963,6 +1145,225 @@ def check_mbcnt():
         stage.kind = 'ps'
         refused(f'v_mbcnt_{op}_u32_b32', lambda: emit(['v0', '-1', '0'], []))
     assert 'uav 0 table 1 0' in translate('D').manifest()
+
+
+LANE_MASK_DATA = (
+    ('v_cvt_f32_u32 v5, vcc_lo', '6a0c0a7e'),   # the llvm.amdgcn.ballot word converted to float
+    ('v_add_nc_u32 v5, vcc_lo, v5', '6a0a0a4a'),
+)
+
+
+def check_lane_mask_data():
+    """A wave mask read as a number holds every lane's bit on hardware; the one-lane model has only its own."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    select = bytes.fromhex('800a0a02')    # v_cndmask_b32 v5, 0, v5, vcc_lo: the mask as a per-lane select
+    assert 'vcc = ' in translate('A', code=splice_words(compare, select)).hlsl_cs()
+    for _, word in LANE_MASK_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+
+
+LANE_MASK_SCALAR_DATA = (
+    ('s_cmpk_gt_u32 vcc_lo, 0x64', '6400eab5'),   # c7_ballot_cmp: the ballot word compared as a number
+    ('s_cmp_lg_u32 vcc_lo, 0', '6a8007bf'),
+    ('s_lshr_b32 s6, vcc_lo, 1', '6a810690'),
+    ('s_add_u32 s6, vcc_lo, 1', '6a810680'),
+)
+
+
+def check_lane_mask_scalar_data():
+    """A scalar op that reads a wave mask as a number sees every lane's bit on hardware; mask-only scalar ops stay."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    for _, word in LANE_MASK_SCALAR_DATA:
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex(word))))
+    translate('A', code=splice_words(compare, bytes.fromhex('6a7e0687'))).hlsl_cs()   # s_and_b32 s6, vcc_lo, exec_lo
+
+
+def check_lane_mask_derived_word():
+    """A bitwise result of a lane mask is still a mask word: a later numeric read of it is refused."""
+    compare = bytes.fromhex('8500027d')              # v_cmp_lt_i32 vcc_lo, 5, v0
+    mask_and = bytes.fromhex('6aff0687ff000000')     # s_and_b32 s6, vcc_lo, 0xff
+    for use in ('060a887d', '060a0a4a'):   # v_cmp_gt_u32 vcc_lo, s6, v5 ; v_add_nc_u32 v5, s6, v5
+        refused('as numeric data', lambda: translate('A', code=splice_words(compare, mask_and, bytes.fromhex(use))))
+    refused('as numeric data', lambda: translate('A', code=splice_words(compare, bytes.fromhex('6a0c0a7e'))))  # v_cvt_f32_u32 v5, vcc_lo
+
+
+def check_lane_mask_single_thread_group():
+    """A one-thread group has one participating lane per wave: its lane bit is the whole mask (high word 0), so the one-lane
+    model is exact and a numeric read stays lowered (dispatch case E). With two threads the same program is refused."""
+    compare = bytes.fromhex('8500027d')   # v_cmp_lt_i32 vcc_lo, 5, v0
+    cvt = bytes.fromhex('6a0c0a7e')       # v_cvt_f32_u32 v5, vcc_lo: the mask as a number
+    code = splice_words(compare, cvt)
+    assert 'v5 = ' in translate('A', code=code, group=(1, 1, 1)).hlsl_cs()
+    for group in ((2, 1, 1), (1, 2, 1), (1, 1, 2), (4, 1, 1)):
+        refused('as numeric data', lambda: translate('A', code=code, group=group))
+    xor_chunks = [bytes.fromhex(w) for w in ('000084d491000200', '8004027d', '6a008089')]
+    high = splice_words(*xor_chunks, bytes.fromhex('01020a7e'))   # v_mov_b32 v5, s1: the high word
+    assert 'v5 = ' in translate('A', code=high, group=(1, 1, 1)).hlsl_cs()
+    refused('as numeric data', lambda: translate('A', code=high, group=(2, 1, 1)))
+
+
+def check_lane_mask_high_word():
+    """The high word of a wave64 mask (the ballot's upper 32 bits) is modelled as 0: a move of it is refused."""
+    chunks = [bytes.fromhex(w) for w in ('0000 84d4 9100 0200'.replace(' ', ''),   # v_cmp_gt_i32 s[0:1], 17, v0
+                                         '8004027d',                                 # v_cmp_lt_i32 vcc, 0, v2
+                                         '6a008089')]                                # s_xor_b64 s[0:1], vcc, s[0:1]
+    for word in ('01020a7e',    # v_mov_b32 v5, s1
+                 '010a0a4a',    # v_add_nc_u32 v5, s1, v5
+                 '010c0a7e',    # v_cvt_f32_u32 v5, s1
+                 '010a0a36',    # v_and_b32 v5, s1, v5
+                 '01810780',    # s_add_u32 s7, s1, 1
+                 '018006bf',    # s_cmp_eq_u32 s1, 0
+                 '010387be'):   # s_mov_b32 s7, s1
+        refused('as numeric data', lambda: translate('A', code=splice_words(*chunks, bytes.fromhex(word))))
+    # The compare alone leaves its high word unknown: refused too (earlier, by the unknown-SGPR rule).
+    refused('s1', lambda: translate('A', code=splice_words(chunks[0], bytes.fromhex('010a0a4a'))))
+    assert 'v5 = ud0;' in translate('A', code=splice_words(*chunks, bytes.fromhex('04020a7e'))).hlsl_cs()
+
+
+def check_lane_mask_compare_pair():
+    """A wave64 compare or carry-out into an even SGPR pair s[N:N+1] (the decoder names only sN) leaves the other 32 lanes in
+    s(N+1). Here s[4:5] are the two root constants, so s5 is a known register: a numeric read of it after the compare must
+    be refused, directly, through a copy of the pair, and through a copy of the high word."""
+    reads = ('05020a7e', '050c0a7e', '050a0a36', '050a0a4a',   # v_mov / v_cvt_f32_u32 / v_and / v_add with s5
+             '05810781', '058006bf', '050387be')                  # s_add_i32 s7, s5, 1 / s_cmp_eq_u32 s5, 0 / s_mov_b32 s7, s5
+    for write in ('040084d491000200',                            # v_cmp_gt_i32 s[4:5], 17, v0
+                  '06040fd700030200'):                           # v_add_co_u32 v6, s[4:5], v0, v1
+        for read in reads:
+            refused('as numeric data', lambda write=write, read=read: translate('A', code=splice_words(
+                bytes.fromhex(write), bytes.fromhex(read))))
+        for copy, use in (('040488be', '09810781'),             # s_mov_b64 s[8:9], s[4:5]; s_add_i32 s7, s9, 1
+                          ('050388be', '08810781')):            # s_mov_b32 s8, s5; s_add_i32 s7, s8, 1
+            refused('as numeric data', lambda write=write, copy=copy, use=use: translate('A', code=splice_words(
+                bytes.fromhex(write), bytes.fromhex(copy), bytes.fromhex(use))))
+    # before the compare s5 is the root constant: still a number the model has
+    translate('A', code=splice_words(bytes.fromhex('05810781'), bytes.fromhex('040084d491000200'))).hlsl_cs()
+
+
+def check_lane_mask_copy_of_data_clears_tag():
+    """A copy of plain data into a register that held a lane mask on an earlier path (a loop back edge) leaves no mask tag:
+    `s_load` through that pair is not a read of a mask. A copy of the mask itself is refused too."""
+    loop = bytes.fromhex('0e00c4d483000200'   # v_cmp_gt_u32 s14, 3, v0
+                         '800394be'           # s_mov_b32 s20, 0
+                         '06038ebe'           # L: s_mov_b32 s14, s6  (the table pointer)
+                         '80038fbe'           # s_mov_b32 s15, 0
+                         '070608f4000000fa'   # s_load_dwordx4 s[24:27], s[14:15], 0x0
+                         '7fc08cbf' '14811481' '14830abf'   # s_waitcnt; s_add_i32 s20, s20, 1; s_cmp_lt_u32 s20, 3
+                         'f7ff85bf')          # s_cbranch_scc1 L
+    translate('A', code=splice_words(loop)).hlsl_cs()
+    mask_copy = loop.replace(bytes.fromhex('06038ebe'), bytes.fromhex('0e038ebe'))   # s_mov_b32 s14, s14: the mask itself
+    refused('s_load through s14', lambda: translate('A', code=splice_words(mask_copy)).hlsl_cs())
+
+
+def check_lane_mask_pair_copy_of_data_stays_refused():
+    """A 64-bit copy of plain data (root constants s[4:5]) is lowered as a mask copy (the lane bit only), so its low word
+    must not be read as a number in a multi-thread group: the store would write 1, not the root constant."""
+    copy = bytes.fromhex('040494be')    # s_mov_b64 s[20:21], s[4:5]
+    use = bytes.fromhex('14020a7e')     # v_mov_b32 v5, s20
+    refused('is a lane mask', lambda: translate('A', code=splice_words(copy, use), group=(2, 1, 1)).hlsl_cs())
+    # a 32-bit copy of the same plain word is a full-word copy and stays readable
+    word = bytes.fromhex('040394be')    # s_mov_b32 s20, s4
+    assert 'v5 = s20' in translate('A', code=splice_words(word, use), group=(2, 1, 1)).hlsl_cs()
+
+
+def check_lane_mask_wqm_keeps_tag():
+    """s_wqm_b32 is a no-op here (it writes nothing), so a mask it nominally rewrites from plain data keeps its tag:
+    the v_mov after it still reads a lane mask in a multi-thread group."""
+    cmp_ = bytes.fromhex('140084d491000200')   # v_cmp_gt_i32_e64 s20, 17, v0
+    wqm = bytes.fromhex('800994be')            # s_wqm_b32 s20, 0
+    use = bytes.fromhex('14020a7e')            # v_mov_b32 v5, s20
+    refused('is a lane mask', lambda: translate('A', code=splice_words(cmp_, wqm, use), group=(4, 1, 1)).hlsl_cs())
+
+
+def check_lane_mask_high_word_copy_and_overwrite():
+    """A copy of a mask's high word is itself only a high word (no low-word tag, so no '& 1' on a numeric use in a one-thread
+    group), and a wide write over a tagged pair ends the tag (no false refusal of the new value)."""
+    save = bytes.fromhex('7e0494be')                      # s_mov_b64 s[20:21], exec
+    copy = bytes.fromhex('150396be')                      # s_mov_b32 s22, s21: the high word
+    use = bytes.fromhex('16821788')                       # s_or_b32 s23, s22, 2
+    cvt = bytes.fromhex('170c0a7e')                       # v_cvt_f32_u32 v5, s23
+    one = translate('A', code=splice_words(save, copy, use, cvt), group=(1, 1, 1)).hlsl_cs()
+    assert 's23 = s22 | 0x00000002u;' in one, one
+    refused('as numeric data', lambda: translate('A', code=splice_words(save, copy, use, cvt), group=(2, 1, 1)))
+    shifted = splice_words(save, bytes.fromhex('0407948f'), bytes.fromhex('15020a7e'))   # s_lshl_b64 s[20:21], s[4:5], s7 ; v_mov_b32 v5, s21
+    assert 'v5 = ' in translate('A', code=shifted, group=(4, 1, 1)).hlsl_cs()
+
+
+LANE_MASK_TAG = {
+    'zero_s1': '800381be',           # s_mov_b32 s1, 0: the high word the one-lane model holds as 0
+    'cmp_pair': '000084d491000200',  # v_cmp_gt_i32 s[0:1], 17, v0 (writes only the low word of the pair)
+    'cselect_pair': 'c1808085',      # s_cselect_b64 s[0:1], -1, 0
+    'cmp_vcc': '8004027d',           # v_cmp_lt_i32 vcc, 0, v2
+    'saveexec': '6a2480be',          # s_and_saveexec_b64 s[0:1], vcc
+    'copy_pair': '000488be',         # s_mov_b64 s[8:9], s[0:1]
+    'copy_vcc': '6a0488be',          # s_mov_b64 s[8:9], vcc
+    'copy_copy': '08048abe',         # s_mov_b64 s[10:11], s[8:9]
+    'xor_pair': '6a008089',          # s_xor_b64 s[0:1], vcc, s[0:1]
+    'clear_s9': '800389be',          # s_mov_b32 s9, 0: a plain write ends the tag
+    'read_s1': '01020a7e',           # v_mov_b32 v5, s1
+    'read_s9': '09020a7e',           # v_mov_b32 v5, s9
+    'read_s11': '0b020a7e',          # v_mov_b32 v5, s11
+    'add_s9': '09810780',            # s_add_u32 s7, s9, 1
+}
+
+
+def check_lane_mask_tag_propagation():
+    """The mask tag is set where a mask is written and moves with every copy: one case per way a tagged word is made, each
+    read back through a numeric use (a no-op tag at any of them lets a case translate)."""
+    w = {k: bytes.fromhex(v) for k, v in LANE_MASK_TAG.items()}
+    cases = [
+        ('cselect writes a pair', ['zero_s1', 'cselect_pair', 'read_s1']),
+        ('saveexec writes a pair', ['zero_s1', 'cmp_vcc', 'saveexec', 'read_s1']),
+        ('bitwise op writes a pair', ['zero_s1', 'cmp_pair', 'cmp_vcc', 'xor_pair', 'read_s1']),
+        ('b64 copy of a pair', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'read_s9']),
+        ('b64 copy of vcc', ['cmp_vcc', 'copy_vcc', 'read_s9']),
+        ('copy of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'copy_copy', 'read_s11']),
+        ('scalar use of a copy', ['cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'add_s9']),
+    ]
+    for label, steps in cases:
+        try:
+            translate('A', code=splice_words(*[w[s] for s in steps]))
+        except G.Unsupported as reason:
+            assert 'as numeric data' in str(reason), (label, str(reason))
+        else:
+            raise AssertionError("%s accepted, expected a refusal naming as numeric data" % label)
+    # A plain write ends the tag: the copy is overwritten with a constant before the read.
+    assert 'v5 = ' in translate('A', code=splice_words(*[w[s] for s in (
+        'cmp_pair', 'cmp_vcc', 'xor_pair', 'copy_pair', 'clear_s9', 'read_s9')])).hlsl_cs()
+
+
+def splice_words(*chunks, at=STORE_A):
+    return WORDS_A[:at] + b''.join(chunks) + WORDS_A[at:]
+
+
+def check_scc_modelled():
+    # s_add / s_sub / s_min / s_max write SCC (carry, borrow, signed overflow, S0 chosen). The lowering used to leave the
+    # emitted SCC as it was, so a later s_cbranch_scc or s_cselect read a stale value. Each form now emits its SCC from
+    # its sources, ahead of the branch.
+    words = {'s_add_u32 s23, s7, -1': '07c11780', 's_sub_u32 s23, s7, 1': '07819780',
+             's_add_i32 s23, s7, 0x7fffffff': '07ff1781ffffff7f', 's_sub_i32 s23, s7, 1': '07819781',
+             's_min_u32 s23, s7, 4': '07849783', 's_max_i32 s23, s7, 4': '07841784', 's_wqm_b32 s23, s7': '070997be',
+             's_cselect_b32 s24, 1, 0': '81801885', 's_cbranch_scc1 1': '010085bf'}
+    SPLICE.update(words)
+    for line, word in words.items():  # the decoder prints each hand-assembled word as its line (literals in hex)
+        (_, _, name, text), = G.decode(bytes.fromhex(word))
+        # the decoder prints a branch with its target label and a -1 literal in hex
+        assert text == line or text == line.replace('-1', '0xffffffff') or (
+            name.startswith('s_cbranch') and text.startswith(name + ' ')), (line, text)
+    for op, scc in (('s_add_u32 s23, s7, -1', 'scc = (s7 + 0xffffffffu) < (s7);'),
+                    ('s_sub_u32 s23, s7, 1', 'scc = (s7) < (0x00000001u);'),
+                    ('s_add_i32 s23, s7, 0x7fffffff',
+                     'scc = (((((s7) ^ (s7 + 0x7fffffffu)) & ((0x7fffffffu) ^ (s7 + 0x7fffffffu))) >> 31) != 0);'),
+                    ('s_sub_i32 s23, s7, 1', 'scc = (((((s7) ^ (0x00000001u)) & ((s7) ^ (s7 - 0x00000001u))) >> 31) != 0);'),
+                    ('s_min_u32 s23, s7, 4', 'scc = ((s7) <= (0x00000004u));'),
+                    ('s_max_i32 s23, s7, 4', 'scc = (int(s7) >= int(0x00000004u));')):
+        text = translate('A', code=splice(op, 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')).hlsl_cs()
+        assert scc in text and text.index(scc) < text.index('pc = (scc)'), (op, text)
+    # A reader whose last SCC writer the lowering still does not model is refused by name (s_wqm is not lowered).
+    refused('scc from an SCC write that is not modelled in s_cbranch_scc1', lambda: translate(
+        'A', code=splice('s_wqm_b32 s23, s7', 's_cbranch_scc1 1', 'v_mov_b32 v3, 0')))
+    refused('scc from an SCC write that is not modelled in s_cselect_b32', lambda: translate(
+        'A', code=splice('s_wqm_b32 s23, s7', 's_cselect_b32 s24, 1, 0')))
+    translate('A', code=splice('s_wqm_b32 s23, s7')).hlsl_cs()  # nothing reads that SCC
 
 
 def check_descriptor_scc():
@@ -1247,13 +1648,18 @@ def check_controls():
     assert 's21 = (scc ? 1u : 0u);' in carry
     lo, hi, end = (bytes.fromhex(x) for x in ('04051480', '80fd1580', '000081bf'))
     for near_miss in (
-            lo + bytes.fromhex('81809e80') + hi,             # intervening s_sub_u32 writes SCC
-            lo + bytes.fromhex('000080bf') + hi,             # non-adjacent
             bytes.fromhex('010084bf') + lo + hi,             # branch into the high add
-            bytes.fromhex('06811480') + hi,                  # elided descriptor arithmetic
-            lo + bytes.fromhex('81fd1580'),                  # high addend is one
-            lo + bytes.fromhex('80fd1680')):                 # high register is not the next SGPR
+            bytes.fromhex('06811480') + hi):                 # elided descriptor arithmetic
         refused('src_scc', lambda: translate('address-carry', code=near_miss + end))
+    # Every SCC writer is modelled, so src_scc after a plain add reads the carry the add computed, whatever sits between
+    # (an intervening s_sub_u32 writes the borrow) or follows: the add's own carry is emitted ahead of its use.
+    for name, ok in (('s_sub_u32 between', lo + bytes.fromhex('81809e80') + hi),
+                     ('non-adjacent', lo + bytes.fromhex('000080bf') + hi),
+                     ('high addend is one', lo + bytes.fromhex('81fd1580')),
+                     ('high register is not the next SGPR', lo + bytes.fromhex('80fd1680'))):
+        text = translate('address-carry', code=ok + end).hlsl_cs()
+        want = '(0x00000001u) < (0x00000000u)' if name.startswith('s_sub') else '(ud0 + ud1) < (ud0)'
+        assert want in text and text.index(want) < text.index('(scc ? 1u : 0u)'), (name, text)
     refused('lane mask', lambda: translate('address-carry', code=bytes.fromhex('7e811480') + hi + end))
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
@@ -1268,7 +1674,20 @@ def check_controls():
     assert expected('A-ff1') != expected('A')
     check_lds()
     check_descriptor_scc()
+    check_scc_modelled()
     check_mbcnt()
+    check_execz_loop_break()
+    check_lane_mask_data()
+    check_lane_mask_high_word()
+    check_lane_mask_compare_pair()
+    check_lane_mask_copy_of_data_clears_tag()
+    check_lane_mask_pair_copy_of_data_stays_refused()
+    check_lane_mask_wqm_keeps_tag()
+    check_lane_mask_single_thread_group()
+    check_lane_mask_high_word_copy_and_overwrite()
+    check_lane_mask_derived_word()
+    check_lane_mask_scalar_data()
+    check_lane_mask_tag_propagation()
     check_formatted_loads()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
@@ -1373,6 +1792,13 @@ def check_controls():
     # Captured programs clamp the extracted stride to at least 1 before scaling NUM_RECORDS.
     clamped = (STRIDE_EXTRACT, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])
     assert translate('A', code=splice(*clamped)).hlsl_cs() == raw.hlsl_cs()
+    # After a lane mask in s21 the clamped conversion still matches case I-raw apart from the compare itself; the
+    # dispatch of case I-raw-mask stores through it. Control: a clamp that reads the mask itself stays refused.
+    masked = translate('I-raw-mask').hlsl_cs().splitlines()
+    assert [line for line in masked if line not in raw.hlsl_cs().splitlines()] == [
+        '    s21 = ((0x00000003u > v0) ? 1u : 0u);'], masked
+    refused('s_max_u32 reads lane mask s21 as numeric data', lambda: translate(
+        'A', code=splice(MASK_S21, 's_max_u32 s21, s21, 1', *RAW_CONVERSION[1:])).hlsl_cs())
     refused('buffer store through a modified descriptor', lambda: translate(
         'A', code=splice(STRIDE_EXTRACT, 's_max_u32 s21, s21, 2', *RAW_CONVERSION[1:])).hlsl_cs())
     reload = ('s_load_dwordx8 s[24:31], s[10:11], 0x0', 's_waitcnt lgkmcnt(0)')
@@ -1555,6 +1981,7 @@ def check_controls():
     assert translate('M').hlsl_cs().endswith('''\
     if (pc == 1) {
         s22 = s7 * ud1;
+        scc = (s22 + ud0) < (s22);
         s22 = s22 + ud0;
         if (exec & 1) v5 = s22 ^ v3;
         vcc = (exec & ((0x00000003u > v0) ? 1u : 0u));
@@ -1851,6 +2278,7 @@ def assemble(llvm_mc, source):
 
 
 def check_binary(llvm_mc):
+    assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
@@ -1866,6 +2294,11 @@ def check_binary(llvm_mc):
 MBCNT_LANE = '(tid.x + 4u * (tid.y + 2u * tid.z))'
 MBCNT_COUNT = f'countbits(0x85241249u & ((1u << {MBCNT_LANE}) - 1u))'
 CONTROLS = {
+    'join-load-zero': ('join-load', 's24 = ul24_7;', 's24 = 0u;'),
+    # s_min_u32 sets SCC when S0 is chosen, equal operands included: a strict compare differs at S0 == S1.
+    's-min-strict': ('S', '(s20) <= (s21)', '(s20) < (s21)'),
+    # s_sub_u32 borrow: the first source is the smaller one.
+    's-borrow-flipped': ('S', '(s20) < (s21);\n    s24 = s20 - s21;', '(s21) < (s20);\n    s24 = s20 - s21;'),
     'swapped-axes': ('A', '    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n'),
     'dropped-store': ('A', '    u0.Store(a, v5);\n', ''),
     'b-offset': ('B', '    a = (v4 + 8) & 0xfffffffcu;\n', '    a = (v4 + 0) & 0xfffffffcu;\n'),
@@ -1903,6 +2336,7 @@ CONTROLS = {
 
 # First bad word for controls with a pinned mismatch.
 CONTROL_MISMATCH = {
+    'join-load-zero': 'word=0 expected=8b02a7f1 actual=00000000',
     'f-second-fill': 'word=1 expected=00000094 actual=00000000',
     'd-mask': 'word=8 expected=00000008 actual=00000009',
     'd-whole-mask': 'word=0 expected=00000007 actual=00000011',
@@ -1966,6 +2400,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             runs = [(CONTROLS[control][0], control)]
         else:
             runs = [(name, None) for name in CASES]
+            runs.append(('join-load', 'join-load-zero'))
             runs += [(case, mutation) for mutation, (case, _, _) in CONTROLS.items() if case in L_WORD3]
             runs += [('masked-tid', 'mask-shift-dropped'), ('extracted-tid', 'extract-shift-dropped')]
         for name, mutation in runs:
