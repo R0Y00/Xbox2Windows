@@ -424,12 +424,15 @@ struct DirectCompute {
     }
     #include "gfx1013_compute_mtbuf.inl"
 
-    // global_load_dword in the saddr form (#2962): ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
+    // Global DWORD loads in the saddr form: ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
     // FLAT/GLOBAL addressing), with SADDR the unadvanced root address of a root SRV, as for the scalar root loads.
-    // The byte offset zext(VADDR) + OFFSET is guarded to [0, 2^32) before it becomes a 32-bit view offset, so a
-    // wrapped address reads zero instead of an in-bounds word (gfx2hlsl.py op_global_load_dword). The low two
-    // address bits are dropped, as for buffer_load_dword in this path (DWORD alignment mode).
+    // Guard the first and last DWORD offsets against 32-bit wrap. The low two address bits are dropped,
+    // as for buffer_load_dword in this path (DWORD alignment mode).
     void global_load(const Inst &i, const State &s) {
+        constexpr unsigned widths[]{1, 2, 4, 3}; // GFX10 opcodes 12..15.
+        const unsigned count = widths[i.op - 12];
+        if (i.dst + count > 256)
+            refuse(i.pc, "global load destination register range");
         const unsigned base = (i.b >> 16) & 127;
         if (base > 104 || (base & 1))
             refuse(i.pc, "global load base must be an aligned SGPR pair");
@@ -442,7 +445,7 @@ struct DirectCompute {
         const int offset = int(Word(i.a) << 20) >> 20;
         if (offset % 4)
             refuse(i.pc, "global load at an unaligned immediate offset");
-        const unsigned span = offset > 0 ? unsigned(offset) + 4 : 4;
+        const unsigned span = static_cast<unsigned>((std::max)(offset, 0)) + count * 4;
         auto &bindings = analysis.result.bindings;
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
             return b.kind == ComputeViewKind::root_buffer_srv && b.root_parameter == low.value;
@@ -455,23 +458,25 @@ struct DirectCompute {
         ir.features |= 16;
         const auto h = ir.handle({0, binding->shader_register, 11});
         const auto vaddr = read(256 + (i.b & 255));
-        string in_range, addr = vaddr;
-        if (offset > 0) {
-            in_range = cmp("ule", vaddr, to_string(0xffffffffu - unsigned(offset)));
-            addr = ir.binary("add", vaddr, to_string(offset));
-        } else if (offset < 0) {
+        string in_range;
+        if (offset < 0)
             in_range = cmp("uge", vaddr, to_string(-offset));
-            addr = ir.binary("sub", vaddr, to_string(-offset));
+        const int last_offset = offset + static_cast<int>((count - 1) * 4);
+        if (last_offset > 0) {
+            const auto upper = cmp("ule", vaddr, to_string(0xffffffffu - static_cast<unsigned>(last_offset)));
+            in_range = in_range.empty() ? upper : ir.value("and i1 " + in_range + ", " + upper);
         }
-        addr = ir.binary("and", addr, "4294967292");
-        const auto ret = load_buffer(h, addr, true, 1);
-        auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", 0");
-        if (!in_range.empty())
-            value = ir.value("select i1 " + in_range + ", i32 " + value + ", i32 0");
-        vector_write(256 + i.dst, value);
+        const auto addr = offset ? ir.binary("add", vaddr, to_string(offset)) : vaddr;
+        const auto ret = load_buffer(h, ir.binary("and", addr, "4294967292"), true, count);
+        for (unsigned j = 0; j < count; ++j) {
+            auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(j));
+            if (!in_range.empty())
+                value = ir.value("select i1 " + in_range + ", i32 " + value + ", i32 0");
+            vector_write(256 + i.dst + j, value);
+        }
     }
     void memory(const Inst &i, const State &s) {
-        if (i.name == "global_load_dword") {
+        if (i.name.substr(0, 17) == "global_load_dword") {
             global_load(i, s);
             return;
         }

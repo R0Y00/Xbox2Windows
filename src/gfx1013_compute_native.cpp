@@ -224,16 +224,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
     } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
-        // FLAT encoding, segment 2 (GLOBAL). Only the one-dword load with an SGPR-pair base (the saddr form,
-        // ADDR = SADDR + zext(VADDR) + sext(OFFSET)) is lowered, as gfx2hlsl.py op_global_load_dword does.
+        // FLAT encoding, segment 2 (GLOBAL), with an SGPR-pair base:
+        // ADDR = SADDR + zext(VADDR) + sext(OFFSET).
         // SADDR 125 is `off` on gfx10. LDS, the other segments and opcodes stay refused.
         i.b = take();
         i.op = (a >> 18) & 127;
         const unsigned saddr = (i.b >> 16) & 127;
-        if (((a >> 14) & 3) != 2 || i.op != 12 || (a & 0x2000u) || saddr == 125 || saddr == 127)
-            refuse(pc, "direct global memory supports only global_load_dword with a scalar address pair");
+        if (((a >> 14) & 3) != 2 || i.op < 12 || i.op > 15 || (a & 0x2000u) || saddr == 125 || saddr == 127)
+            refuse(pc, "direct global memory supports only DWORD loads with a scalar address pair");
         i.enc = Encoding::Mubuf;
-        i.name = "global_load_dword";
+        i.name = encoded.name;
         i.dst = i.b >> 24;
     } else if ((a & 0xfc000000u) == 0xd8000000) {
         i.enc = Encoding::Lds;
