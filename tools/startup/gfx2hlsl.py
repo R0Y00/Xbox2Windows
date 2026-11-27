@@ -1011,7 +1011,7 @@ UNIFORM_LOAD_WORDS = {'buffer_load_dword': 1, 'buffer_load_dwordx2': 2, 'buffer_
                       'buffer_load_format_x': 1, 'buffer_load_format_xy': 2, 'buffer_load_format_xyz': 3,
                       'buffer_load_format_xyzw': 4}
 UNIFORM_LOADS = frozenset(UNIFORM_LOAD_WORDS)
-UNIFORM_IMAGE_LOADS = frozenset(('image_load',))
+UNIFORM_IMAGE_LOADS = frozenset(('image_load', 'image_load_mip'))
 
 
 # DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
@@ -4389,7 +4389,7 @@ class Stage:
             return ()
         if not dmask or (dmask & ~0xf):
             return ()
-        packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+        packed_2d = base == 'image_load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
         allowed = ('unorm', 'glc', 'slc', 'dlc') + (('a16',) if packed_2d else ())
         if any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods):
             return ()
@@ -4401,7 +4401,8 @@ class Stage:
             if not r or r[0] != 'v':
                 return ()
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        expected_addr = 1 if packed_2d else (3 if dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') else 2)
+        axes = 3 if dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY') else 2
+        expected_addr = 1 if packed_2d else (axes + 1 if base == 'image_load_mip' else axes)
         if len(cs) != expected_addr:
             return ()
         if not all(re.fullmatch(r'v\d+', c) and int(c[1:]) <= 255 and self.uniform_source(c) for c in cs):
