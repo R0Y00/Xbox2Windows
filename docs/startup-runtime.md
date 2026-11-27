@@ -1532,6 +1532,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -3257,21 +3258,64 @@ view (`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view 
 slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
 82 ms with shared sections and views).
 
+Start-up maps nearly every page with a call of its own, and under Wine each map costs more the
+more views the process has. With `X2W_XMEM_JOIN_CALLS=1` as well (off by default; `tools/startup/run.sh`
+sets it, `run.ps1 -LazyMemory` does not), a mapping call whose pages all continue the view that ends at its
+address, on the next slots of the same section and inside the same reservation of the shim, joins
+that view: the view is unmapped, its placeholder is joined with the new pages' placeholder, and one
+view is mapped over both. It is taken apart the same way as in an unmap (below), and if a step is
+refused the view is mapped again as it was and the new pages get a view of their own. A joined
+view stops at 64 pages (`max_merged_run_pages`): a page that would make it longer starts a view of
+its own, which the next pages join. Every later unmap inside a joined view takes the whole view
+apart, so the cap bounds that work too. Only joined views are capped: a view mapped by one call
+covers as many of its pages as follow each other in address and in their section, and an unmap inside it maps the surviving pages again
+with one view per contiguous stretch, as long as before the cap. Measured under Wine with every byte of the view written
+(`xmem_cross_call_merge_check timing`): an unmap inside a view of 64 pages took 0.28 ms, of 512
+pages 2.1 ms and of 4096 pages 13 ms; joining a page to a view of 63 took 1.5 ms, about what a page
+mapped on its own costs (1.4 ms).
+
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
-that touches one of those pages in between takes an access violation. A vectored handler retries
-it only when the address is inside a view that the unmap in progress, or the last finished one,
-took apart, the page is recorded and covered by a view once that unmap is over, and the thread
-has not already retried that page for that unmap. Any other fault is passed on, after at most one
-retry.
+that touches one of those pages in between takes an access violation. Each view mapped inside an
+unmap, a join or a page batch keeps that one's id. A vectored handler retries the fault only when,
+once the one in progress (if any) is over, the page is recorded, covered by a view, and that view
+carries such an id, and the thread has not already retried that page for that id. A handler that
+runs late, after any number of later unmaps or joins of other views (one call joins a CPU view and
+then its GPU mirror), still finds the one that mapped the page again. Any other fault is passed on,
+after at most one retry for each unmap or join that mapped the page's view. A fault with none in
+progress or beginning or ending around a region query of the page, and no mapped view there, is
+passed on without waiting for the mapping lock.
 
 Shared views are opt-in. The caller chooses before the first mapping call by setting
-`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call.
+`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call. It also
+reads it once when `xmem.dll` loads: with it set then, the main module's `VirtualQueryEx`,
+`ReadFile` and `WriteFile` imports are wrapped (see below), and the module is pinned at load when
+one is.
+
+A region query or a kernel copy does not fault, so inside an unmap it would see the pages of the
+view being taken apart as reserved. With shared views such readers run through the export
+`x2w_xmem_stable_call`: the reader runs once, and runs again after the unmap if one began or ended
+around it. `XMemVirtualQuery`, the main module's `VirtualQueryEx` imports and the shim's own
+`VirtualQuery` and `ReadProcessMemory` readers (`src/startup_stubs/local_log.h`, slot 133,
+the sampler snapshot) use it. Without shared views every page has a view of its own and readers
+run once, as before.
+
+Inside an unmap a kernel copy into or out of a page of that view fails at once. Measured under
+Wine: `ReadFile` fails with `ERROR_NOACCESS` and leaves the file position as it was, `WriteFile`
+with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` imports therefore
+run again, up to 4 times in all, when a synchronous call on a disk file fails with one of those
+errors while an unmap or join was in progress or began or ended around it, and its buffer lies in
+a view of a run; they wait for that one to end first. A call on a pipe, socket or console is not
+run again. Under Wine an anonymous pipe read inside an unmap fails with `ERROR_NOACCESS` and leaves
+its data queued (measured). Whether Windows consumes or sends any data in a call that fails this way
+is unmeasured, and if it does, running the call again would lose or repeat that data.
+Overlapped I/O (the copy happens at completion), a call cut short after part of the copy, and I/O
+from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|
-| Views | one per page | one per run of adjacent pages |
+| Views | one per page | one per run of adjacent pages of one call; with `X2W_XMEM_JOIN_CALLS=1` a call can also join the view that ends at its address |
 | Fault handler | none | registered by the first mapping call, never removed |
-| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, `ReadFile` or `WriteFile`, else at the first mapping call) |
 
 The handler is process-wide, and Windows has no removal that also waits for a dispatch already
 under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
