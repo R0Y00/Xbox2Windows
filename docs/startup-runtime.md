@@ -2908,7 +2908,16 @@ The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=
 installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
 must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
 its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
-completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+completions on, a type `3` command then decodes one Opus packet. For a connection with processing kind
+`1`, activate (type `1`) supplies the stream channel count at `+0x18`. The decoder runs at 48 kHz.
+Process skips the leading frames at `+0x20` and returns at most the frame count at `+0x24` and the output
+capacity at `+0x34`. Connection option bit `4` selects planar stereo. The result echoes the first 24
+command bytes, reports kept frames at `+0x30` and byte count at `+0x34`, and returns the output pointer,
+input byte count and input pointer at `+0x38`, `+0x44` and `+0x48`. Pitch conversion and result events
+are outside the tested subset. The source-built stereo check compares both output orders to libopus and
+verifies that a 960-frame packet with a 312-frame prefix produces 648 frames.
+
+The earlier packet-only fixture path uses the following fields:
 `+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
 `+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
 (interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output
