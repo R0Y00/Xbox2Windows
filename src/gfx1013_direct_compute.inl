@@ -1427,8 +1427,29 @@ struct DirectCompute {
         }
         return scc_live[program.at.at(definition.next)];
     }
+    string saturated_add(const string &a, const string &b, bool sign) {
+        auto sum = ir.binary("add", a, b);
+        if (!sign)
+            return select(cmp("ult", sum, a), "4294967295", sum);
+        auto overflow = ir.binary("and", ir.binary("xor", a, sum), ir.binary("xor", b, sum));
+        return select(cmp("slt", overflow, "0"), select(cmp("slt", a, "0"), "2147483648", "2147483647"), sum);
+    }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
+        if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
+            // Integer dot products use both packed words as-is. Require the
+            // canonical VOP3P OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
+            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+                refuse(i.pc, "unsupported packed byte dot operand modifiers");
+            const bool sign = n == "v_dot4_i32_i8";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            // The dot alone fits into i32 even for four unsigned 255*255
+            // products. Saturate only the final addition to the accumulator.
+            auto dot = ir.invoke("i32", "dot4AddPacked.i32", sign ? 163 : 164,
+                                 {{"i32", i.clamp ? "0" : acc}, {"i32", a}, {"i32", b}}, "nounwind readnone");
+            vector_write(i.dst, i.clamp ? saturated_add(dot, acc, sign) : dot);
+            return;
+        }
         if (n == "v_mad_u32_u16" || n == "v_mad_i32_i16") {
             // AMD RDNA 2 ISA, VOP3A opcodes 883/885. Only the two
             // multiplicands are halfwords. The addend and result are dwords.
@@ -1443,14 +1464,7 @@ struct DirectCompute {
             };
             auto product = ir.binary("mul", half(0), half(1));
             auto addend = operand32(i, i.src[2]);
-            auto sum = ir.binary("add", product, addend);
-            if (i.clamp) {
-                if (sign) {
-                    auto overflow = ir.binary("and", ir.binary("xor", product, sum), ir.binary("xor", addend, sum));
-                    sum = select(cmp("slt", overflow, "0"),
-                                 select(cmp("slt", product, "0"), "2147483648", "2147483647"), sum);
-                } else sum = select(cmp("ult", sum, product), "4294967295", sum);
-            }
+            auto sum = i.clamp ? saturated_add(product, addend, sign) : ir.binary("add", product, addend);
             vector_write(i.dst, sum);
             return;
         }
