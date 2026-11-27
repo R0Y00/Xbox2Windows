@@ -97,11 +97,14 @@ std::string native_rectangle_geometry(const std::vector<GraphicsLinkage> &output
         auto &p = position[i], &a = position[(i + 1) % 3], &b = position[(i + 2) % 3];
         auto across = distance2(a, b), to_a = distance2(p, a), to_b = distance2(p, b);
         // (p - a) . (p - b), squared, against 1e-6 of |p - a|^2 |p - b|^2: the two sides meet at a right angle.
+        // 1e-6 is not exactly representable; build it from its bit pattern because the DXIL assembler rejects
+        // the decimal literal.
         auto diff = [&](const string &u, const string &v) { return ir.value("fsub float " + u + ", " + v); };
         auto times = [&](const string &u, const string &v) { return ir.value("fmul float " + u + ", " + v); };
         auto dot = ir.value("fadd float " + times(diff(p[0], a[0]), diff(p[0], b[0])) + ", " +
                             times(diff(p[1], a[1]), diff(p[1], b[1])));
-        auto limit = ir.value("fmul float " + times(to_a, to_b) + ", 1.000000e-06");
+        auto tolerance = ir.value("bitcast i32 897988541 to float"); // 0x358637bd = 1e-6f
+        auto limit = ir.value("fmul float " + times(to_a, to_b) + ", " + tolerance);
         geometric[i] = both(both(compare("ogt", across, to_a), compare("ogt", across, to_b)),
                             compare("ole", times(dot, dot), limit));
     }
