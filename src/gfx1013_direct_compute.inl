@@ -1452,13 +1452,15 @@ struct DirectCompute {
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
                     n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
                     n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
-                    n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32";
+                    n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32" ||
+                    n == "s_bfe_u64" || n == "s_bfe_i64";
                 const bool preserves_pair = n == "s_mul_i32" || n == "s_mul_hi_i32" || n == "s_mul_hi_u32" ||
                     n == "s_bfm_b32" || n == "s_bfm_b64" || n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" ||
                     n == "s_pack_hh_b32_b16";
                 const bool uncertain_scalar = (inst.enc == Encoding::Sopk && n != "s_movk_i32") ||
                     (inst.enc == Encoding::Sop2 && !overwrites && !preserves_pair) ||
-                    (inst.enc == Encoding::Sop1 && !overwrites && n != "s_mov_b32" && n != "s_mov_b64");
+                    (inst.enc == Encoding::Sop1 && !overwrites && n != "s_mov_b32" && n != "s_mov_b64" &&
+                     n != "s_brev_b64");
                 if (reads_scc || uncertain_scalar || (inst.branch() && (inst.op == 4 || inst.op == 5))) {
                     scc_live[j] = true;
                     pending.push_back(j);
@@ -1838,6 +1840,56 @@ struct DirectCompute {
                                     " i64 " + wide + ", " + amt);
             auto out_lo = ir.value("trunc i64 " + shifted + " to i32");
             auto out_hi = ir.value("trunc i64 " + ir.value("lshr i64 " + shifted + ", 32") + " to i32");
+            ir.features |= 1048576;
+            write(i.dst, out_lo);
+            write(i.dst + 1, out_hi);
+            write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", out_lo, out_hi), "0") + " to i32"));
+            return;
+        }
+        if (compute && (n == "s_brev_b64" || n == "s_bfe_u64" || n == "s_bfe_i64")) {
+            if ((i.dst & 1) || i.dst > 104)
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0];
+            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_int = s0 >= 128 && s0 <= 208;
+            const bool sign = n == "s_bfe_i64";
+            if (!(s0_pair || s0 == 125 || s0_int || s0 == 255))
+                refuse(i.pc, "invalid " + string(n) + " source");
+            if (n != "s_brev_b64") {
+                const unsigned s1 = i.src[1];
+                if (!(s1 <= 105 || s1 == 125 || (s1 >= 128 && s1 <= 208) || s1 == 255))
+                    refuse(i.pc, "invalid " + string(n) + " source");
+            }
+            // Read all inputs before writing the destination pair so overlapping registers stay intact (#3086).
+            auto lo = s0 == 125 ? "0" : operand32(i, s0);
+            string hi = "0";
+            if (s0_pair)
+                hi = operand32(i, s0 + 1);
+            else if (s0 >= 193 && s0 <= 208)
+                hi = "4294967295";
+            else if (s0 == 255 && sign && (i.literal & 0x80000000u))
+                hi = "4294967295";
+            if (n == "s_brev_b64") {
+                auto rev_lo = ir.invoke("i32", "unary.i32", 30, {{"i32", hi}}, "nounwind readnone");
+                auto rev_hi = ir.invoke("i32", "unary.i32", 30, {{"i32", lo}}, "nounwind readnone");
+                write(i.dst, rev_lo);
+                write(i.dst + 1, rev_hi);
+                return;
+            }
+            auto ctrl = i.src[1] == 125 ? "0" : operand32(i, i.src[1]);
+            auto offset = ir.binary("and", ctrl, "63");
+            auto width = ir.binary("and", ir.binary("lshr", ctrl, "16"), "127");
+            auto wide = ir.value("or i64 " + ir.value("shl i64 " + ir.value("zext i32 " + hi + " to i64") + ", 32") +
+                                 ", " + ir.value("zext i32 " + lo + " to i64"));
+            auto off64 = ir.value("zext i32 " + offset + " to i64");
+            auto shifted = ir.value(string(sign ? "ashr" : "lshr") + " i64 " + wide + ", " + off64);
+            auto pad = ir.value("zext i32 " + ir.binary("and", ir.binary("sub", "64", width), "63") + " to i64");
+            auto narrow = ir.value(string(sign ? "ashr" : "lshr") + " i64 " + ir.value("shl i64 " + shifted + ", " + pad) +
+                                   ", " + pad);
+            auto non_zero = ir.value("select i1 " + cmp("uge", width, "64") + ", i64 " + shifted + ", i64 " + narrow);
+            auto result = ir.value("select i1 " + cmp("eq", width, "0") + ", i64 0, i64 " + non_zero);
+            auto out_lo = ir.value("trunc i64 " + result + " to i32");
+            auto out_hi = ir.value("trunc i64 " + ir.value("lshr i64 " + result + ", 32") + " to i32");
             ir.features |= 1048576;
             write(i.dst, out_lo);
             write(i.dst + 1, out_hi);
