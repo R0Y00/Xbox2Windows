@@ -687,6 +687,13 @@ one on the desktop list, as before; a flagged one is deferred (`root signature .
 the desktop list`, first three). Root SRVs (slot 44) are not forwarded under a deferred root. Translated draws use
 their own root signature (no flags) and are unaffected.
 
+A root SRV (slot 44) at a title address without an upload mapping copies a 64 KiB window of title memory into the
+upload ring for the desktop binding. No draw reads that binding today: translated draws set their own root signature
+and copy the SRV from its title address at the draw, a forwarded slot 12 draw needs a desktop pipeline without an
+indirect graphics root (only compute pipelines), and an indirect graphics draw binds a pipeline over the list's root.
+With the opt-in `X2W_D3D12_ROOT_SRV_AT_DRAW=1`, slot 44 skips the copy and leaves the parameter unbound on the desktop
+list (`startup_root_srv_draw_*`; see [the experiment note](experiments/startup-root-srv-at-draw.md)).
+
 A real draw under a deferred root is decided by `src/startup_stubs/heap_indexed_root.h`: it may bind only when the
 list holds a mirror of every heap the root indexes, covering the indices the draw reads, and every root constant,
 descriptor table and root descriptor can be set again. A one-entry sampler heap covers only index 0 and never stands
@@ -907,27 +914,56 @@ and Dispatch takes). The cache persists: a later run reads every published `<key
 requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
 requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
 ready marker is not retried during the run (the runtime writes each request once and never rewrites
-it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
-to `<key>.fail` as `translator error: ...`, ending with the function, file name and line that raised
-it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`), instead of
-stopping the scan. An operand refusal
+it). The one-shot `--pending` scan retries every failure unless `--skip-failed` (`-s`) or
+`X2W_SKIP_FAILED=1` is set, which skips requests whose `<key>.fail` is already up to date with their
+ready marker and stream description. During `--watch`, published requests are kept in an in-memory
+completion set so repeated passes skip re-reading container bytecode from disk when
+request files, descriptions and published stage metadata are unchanged. An unexpected
+translator error is written to `<key>.fail` as `translator error: ...`, ending with the function, file
+name and line that raised it, skipping standard-library frames (`(in scalar_select, gfx2hlsl.py line 1234)`),
+instead of stopping the scan. An operand refusal
 in `<key>.fail` names the instruction that refused it (`operand '-v30' in v_and_b32_e64`); the
 refusal's own message, which `--refusals` counts, stays `operand '-v30'`. A worker killed from outside
 (for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
 FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
 one pending request translates them in parallel processes, one per logical processor (at most 61 on
-Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request
-writes only its own files. On a 16-thread host,
+Windows, the `ProcessPoolExecutor` limit) unless `--jobs <n>` (`-j <n>` or `--jobs=<n>`) or
+`X2W_TRANSLATE_JOBS` sets the count; each request writes only its own files. On a 16-thread host,
 3,513 requests (132 translated, 3,381 refused) took 56.9 s with one process and 7.8 s in parallel,
 with byte-identical results.
 
 Check with `python3 -B tests/startup_gfx2hlsl_watch_check.py` (ctest `startup_gfx2hlsl_watch`): a
 request without its ready marker is not consumed, the watcher retries an earlier failure once and
-then leaves failures alone, it translates a request written while it runs, four parallel workers
+then leaves failures alone, `--skip-failed` skips up-to-date failures, the in-memory cache skips
+published requests without re-checking container bytecode, four parallel workers
 print the same results and write the same failures as one, an unexpected translator error becomes
 `<key>.fail`, and an invalid `X2W_TRANSLATE_JOBS` falls back to the processor count.
 `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
 with a child process.
+
+### Translating compute programs in the stand-in
+
+With `X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>` (`run.ps1 -Render -NativeShaders <dir>`),
+the stand-in translates a device slot 67 request itself, with the C++ compiler in
+`src/gfx1013_compute_native.cpp`, on the first Dispatch of its pipeline. No watcher is needed for those
+pipelines, and the cache can start empty: the request files the stand-in wrote are read back, checked
+against their key, translated and compiled to DXIL in the process. The compiler's own cache goes to
+`<shader cache>\native`. Nothing is published as `<key>.txt`.
+
+The existing dispatch path records the result, and a program is accepted only with the bindings a
+fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
+and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
+scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
+not lower) is refused. The first 16 refusals of a process are logged as
+`compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
+published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
+wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
+translation is tried once per key and before a published `<key>.txt`. It covers compute only; graphics
+pipelines still need a published translation.
+
+Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
+([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
+[route, controls and results](experiments/startup-compute-native-dispatch.md)).
 
 ### Compute pipeline requests
 
@@ -1500,8 +1536,10 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_NATIVE_SHADERS=<dir>` (`run.ps1 -NativeShaders <dir>`) | experimental, in render mode: translates device slot 67 compute requests in the stand-in with the C++ compiler; `<dir>` holds `dxcompiler.dll` and `dxil.dll`. See [Translating compute programs in the stand-in](#translating-compute-programs-in-the-stand-in) |
 | `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it (private allocations larger than 256 MiB are skipped only with `X2W_D3D12_CAP_EXISTING_HEAP=1`), otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
+| `X2W_D3D12_ROOT_SRV_AT_DRAW=1` | opt-in, render mode: a graphics root SRV (slot 44) without an upload mapping is not copied into the upload ring, since no draw reads that desktop binding (default: a 64 KiB copy at every slot 44 call). Translated draws copy the SRV themselves and are unaffected (`startup_root_srv_draw_*`). See [the experiment note](experiments/startup-root-srv-at-draw.md) |
 | `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1` | opt-in, render mode: a closed command list releases its upload ring chunks once its submit is fenced instead of holding them until Reset, and the ring grows in 16 MiB chunks up to 512 MiB (default: doubling chunks up to 256 MiB, holds until Reset). The larger ring can add up to about 1 GiB of process commit at peak (startup runs in the experiment note). A later submit of the same list before its Reset fences its unchanged chunks again; if one was reused in between, that list is refused before the execute and logged (`startup_address_console_gate_ring_keep_*`, `upload_reservation`). See [the experiment note](experiments/startup-upload-ring-release-at-submit.md) |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
@@ -3344,9 +3382,18 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+
+A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one mip, one
+sample, at most 2048 texels on each side and an uncompressed format with a known element size,
+viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+(`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
+`GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
+16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
+every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
-textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
+other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
+swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
@@ -3355,7 +3402,7 @@ for the address wrote desktop-footprint rows, so the bytes are not in the layout
 names. As for a partial-tile view, a texture already published there samples the null view while
 that is so. `console_layout_beyond_xg_size`: the layout runs past the size the XG stand-in reports
 for the description (the desktop copyable footprints of a slice rounded up to 64 KiB, times the
-slices), which the title may not own.
+slices; a volume is one slice, whose footprints span every depth layer), which the title may not own.
 
 Upload lifetime: each upload of a console-layout texture is written into an upload buffer of its own
 (`x2w_upload::make_page`), not into the shared upload ring. The recording keeps a reference to the
@@ -3385,6 +3432,9 @@ Limits and choices that are not measured against a console:
   elements are checked only against the addrlib pattern rows restated from the addrlib source text
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
+- The thick `0x105` volume layout is compared with addrlib itself when the build has it
+  (`startup_gfx10_volume_addrlib`: every element address of 190 volumes). Mip chains, block-compressed
+  volumes and volumes in the other modes are not handled; they stay refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
@@ -3399,7 +3449,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
 Checks (reproduction in `docs/experiments.md`, "Sample by-address textures of the non-XOR console
 layouts"):
 
-- `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
+- `ctest --preset release --no-tests=error -R '^startup_gfx10_(layout|volume)' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
 
 ## Linear buffer backing (device slot 133, opt-in)
@@ -3479,7 +3529,7 @@ Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, kee
 
 A shared or copied placement logs `x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer ... existing-heaps=<hr> share=<hr> -> <hr> shared|copied at submit`. A kept default logs the usual slot 133 line with `(kept default backing: linear refusal <hr>, use=... type=... existing-heaps=<hr> share=<hr>)` appended. `x2w_d3d12_linear_buffer_info` reports path 3 with `refusal_hr`, and `stale`, `refresh_failures` and `last_refresh_hr` for a copied buffer. A refused submission logs `x2w-d3d12 linear buffers: submission on queue <queue> refused: its refresh would have to wait for queue <queue> (<reason>), so it has no safe completion order; none of its lists ran` (the first eight). `x2w_d3d12_linear_buffer_totals` counts `kept_default`, `refresh_failures` and `unsafe_refresh_refusals`. Fixtures read the same facts through `x2w_d3d12_linear_buffer_info` and `x2w_d3d12_linear_buffer_totals` (`src/startup_stubs/linear_buffer_report.h`). Fixture-only switches: `X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1` makes the feature query report no support, as an adapter with `EXISTING_HEAPS = 0` does. `X2W_TEST_LINEAR_REFRESH_FAIL=<n>` makes staging requests 2, 2 + n, 2 + 2n and so on fail with `E_OUTOFMEMORY`. `X2W_TEST_LINEAR_STAGING_LIMIT=<n>` shrinks the staging pool from 256 buffers to `n`. `x2w_d3d12_linear_buffer_internal_queue` hands fixtures the internal queue, so they can hold refreshes in flight behind a fence of their own. `x2w_d3d12_linear_buffer_test_pause` parks the next refresh at one point (before staging, after staging, or after its copy executed and before it is published), so a fixture can order two threads' refreshes or release a buffer while one is parked. Point 3 instead parks the next title `Wait` (queue slot 17) after the desktop `Wait` and before it is recorded, while it holds that queue's order lock. `X2W_TEST_LINEAR_BUFFER_MUTANT=<name>` removes one guarantee for a negative control. Results and commands: [Production slice: slot 133 linear buffers](experiments.md#production-slice-slot-133-linear-buffers-1914).
 
-Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind. Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
+Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind (not with `X2W_D3D12_ROOT_SRV_AT_DRAW=1`). Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
 
 ## Buffer memory SRVs (device slot 70)
 

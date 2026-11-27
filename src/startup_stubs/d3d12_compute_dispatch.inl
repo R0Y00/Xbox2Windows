@@ -77,6 +77,23 @@ bool float_output_format(DXGI_FORMAT format)
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 
+// The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
+// unavailable, or null when it is ready.
+const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, std::size_t bytes)
+{
+    // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
+    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+        return "root signature creation failed";
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = tr.root.Get();
+    desc.CS = {code, bytes};
+    if (FAILED(device_of(the_device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(&tr.pipeline))))
+        return "pipeline creation failed";
+    tr.state = 1;
+    return nullptr;
+}
+
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
 const char* load_compute_translation(ComputeTranslation& tr)
 {
@@ -176,19 +193,75 @@ const char* load_compute_translation(ComputeTranslation& tr)
     }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
-    // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
-        return "root signature creation failed";
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = tr.root.Get();
-    desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    if (FAILED(device_of(the_device)->CreateComputePipelineState(&desc, IID_PPV_ARGS(&tr.pipeline))))
-        return "pipeline creation failed";
-    tr.state = 1;
+    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) return failure;
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
+}
+
+// X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>: the first Dispatch of a slot 67 request translates
+// it in this process with the C++ compiler (src/gfx1013_compute_native.cpp), before a published <key>.txt is read
+// and with no offline translator running. The dispatch path below binds the result, so a program is accepted only
+// with root constants, raw table buffers it loads per lane (buffer_load_dword) and raw table buffers it stores to.
+// A refusal is logged and leaves the key to the published translations. draw_lock held. Returns whether tr is ready.
+bool translate_compute_natively(ComputeTranslation& tr)
+{
+#ifdef X2W_NATIVE_SHADERS
+    wchar_t sdk[MAX_PATH], path[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
+    if (!cache_path(path, L"req_", tr.key, L".c67")) return false;
+    try {
+        // The request as this runtime published it. The reader checks the six parts against the key in the name.
+        // Entry 0: a source-built program starts there, and the frontend reads a capture's v_nop prefix as code.
+        auto program = x2w::translate_compute(x2w::read_compute_request(path), 0, true);
+        for (const auto& block : program.constants)
+            for (unsigned word = 0; word < block.count; ++word)
+                tr.uds.push_back({static_cast<int>(block.root_parameter), static_cast<int>(word)});
+        std::sort(program.bindings.begin(), program.bindings.end(),
+                  [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
+        for (const auto& view : program.bindings) {
+            // The two kinds a fixture has run through this path: a raw buffer read per lane, and one written.
+            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav;
+            auto& slots = output ? tr.uavs : tr.srvs;
+            if ((!output && view.kind != x2w::ComputeViewKind::raw_vector_srv) || view.array_count != 1 ||
+                view.root_parameter >= 16 || view.shader_register != slots.size())
+                throw std::runtime_error("view kind " + std::to_string(static_cast<unsigned>(view.kind)) +
+                                         " is not bound for a natively translated program");
+            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset)});
+        }
+        if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
+            throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
+        // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+        if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))) ||
+            !waves.WaveOps || waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32)
+            throw std::runtime_error("the adapter has no 32-lane waves");
+        // Never released: a static destructor would release DXC after its module may have detached.
+        static x2w::ShaderDxilCompiler* const compiler =
+            new x2w::ShaderDxilCompiler(x2w::ShaderDxilCompiler::runtime_worker(sdk));
+        const auto shader = compiler->compile(program.dxil_ir, L"cs_6_6", std::filesystem::path(path).parent_path() / L"native",
+                                              x2w::ShaderSourceFormat::dxil_ir);
+        if (const char* failure = create_compute_pipeline(tr, shader.dxil.data(), shader.dxil.size()))
+            throw std::runtime_error(failure);
+        log("x2w-draw compute pipeline %016llx translated natively: %zu entry values, %zu inputs, %zu outputs", tr.key,
+            tr.uds.size(), tr.srvs.size(), tr.uavs.size());
+        return true;
+    } catch (const std::exception& error) {
+        tr.uds.clear();
+        tr.srvs.clear();
+        tr.uavs.clear();
+        tr.root.Reset();
+        tr.pipeline.Reset();
+        static LONG logged;
+        if (first_calls(logged, 16))
+            log("x2w-draw compute pipeline %016llx not translated natively: %s", tr.key, error.what());
+        return false;
+    }
+#else
+    (void)tr;
+    return false;
+#endif
 }
 
 // Resolve a compute root SRV (`srv <i> buf root <param>`) from the guest address recorded by slot 43 for <param>
@@ -292,8 +365,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
         if (!tr->state || tr->manifest_retry.due(GetTickCount64())) {
-            tr->unmodelled = load_compute_translation(*tr);
-            if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+            // The in-process translation is tried once per key, before a published one.
+            if (tr->state || !translate_compute_natively(*tr)) {
+                tr->unmodelled = load_compute_translation(*tr);
+                if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
+            }
         }
         if (tr->state != 1) {
             // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.

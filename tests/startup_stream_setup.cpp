@@ -160,11 +160,13 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
+    // X2W_TEST_ROOT_SRV_DRAW (startup_root_srv_draw.cpp) declares it as a shader resource view as well.
     D3D12_ROOT_PARAMETER root_cbv{};
     char cbv_mode[16]{};
-    if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
-        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
-                                                                          : D3D12_ROOT_PARAMETER_TYPE_CBV;
+    const bool root_srv_draw = GetEnvironmentVariableW(L"X2W_TEST_ROOT_SRV_DRAW", nullptr, 0) != 0;
+    if (!textured && (root_srv_draw || GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode)))) {
+        root_cbv.ParameterType = root_srv_draw || std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                                                                                           : D3D12_ROOT_PARAMETER_TYPE_CBV;
         root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = &root_cbv;
