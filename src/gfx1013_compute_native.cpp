@@ -568,8 +568,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
-             i.name.substr(i.name.size() - 4) == "_u64")) ||
-            i.name == "s_bitreplicate_b64_b32")
+             i.name.substr(i.name.size() - 4) == "_u64") &&
+            i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
             set(i.dst + 1, {});
     }
     return s;

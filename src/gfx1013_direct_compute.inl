@@ -1538,7 +1538,8 @@ struct DirectCompute {
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
                     n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
                     n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
-                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
+                const bool overwrites = mask_scc || n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
+                    inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
                     n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
@@ -2023,6 +2024,60 @@ struct DirectCompute {
             write(i.dst, out_lo);
             write(i.dst + 1, out_hi);
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", out_lo, out_hi), "0") + " to i32"));
+            return;
+        }
+        if (compute && (n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
+                        n == "s_ff0_i32_b64" || n == "s_ff1_i32_b64" ||
+                        n == "s_flbit_i32_b64" || n == "s_flbit_i32_i64")) {
+            // RDNA 2 ISA SOP1 / gfx2hlsl.py SCALAR_BITS (#3072): 64-bit source, 32-bit i32 destination.
+            // Uses only 32-bit DXIL unaryBits.i32 (31=Countbits, 32=FirstbitLo, 33=FirstbitHi).
+            // Only the counts write SCC (D != 0); all four scans preserve SCC and return ~0 when no bit qualifies.
+            if (i.dst > 105)
+                refuse(i.pc, "invalid " + string(n) + " destination");
+            const unsigned s0 = i.src[0];
+            const bool s0_pair = s0 <= 104 && !(s0 & 1);
+            const bool s0_int = s0 >= 128 && s0 <= 208;
+            if (!(s0_pair || s0_int || s0 == 255))
+                refuse(i.pc, "invalid " + string(n) + " source");
+            const bool signed_flbit = n == "s_flbit_i32_i64";
+            auto lo = operand32(i, s0);
+            string hi = "0";
+            if (s0_pair)
+                hi = operand32(i, s0 + 1);
+            else if (s0 >= 193 && s0 <= 208)
+                hi = "4294967295";
+            else if (s0 == 255 && signed_flbit && (i.literal & 0x80000000u))
+                hi = "4294967295";
+            if (n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64") {
+                if (n == "s_bcnt0_i32_b64") {
+                    lo = ir.binary("xor", lo, "4294967295");
+                    hi = ir.binary("xor", hi, "4294967295");
+                }
+                auto clo = ir.invoke("i32", "unaryBits.i32", 31, {{"i32", lo}}, "nounwind readnone");
+                auto chi = ir.invoke("i32", "unaryBits.i32", 31, {{"i32", hi}}, "nounwind readnone");
+                auto count = ir.binary("add", clo, chi);
+                write(i.dst, count);
+                write(128, ir.value("zext i1 " + cmp("ne", count, "0") + " to i32"));
+            } else if (n == "s_ff0_i32_b64" || n == "s_ff1_i32_b64") {
+                if (n == "s_ff0_i32_b64") {
+                    lo = ir.binary("xor", lo, "4294967295");
+                    hi = ir.binary("xor", hi, "4294967295");
+                }
+                auto ilo = ir.invoke("i32", "unaryBits.i32", 32, {{"i32", lo}}, "nounwind readnone");
+                auto ihi = ir.invoke("i32", "unaryBits.i32", 32, {{"i32", hi}}, "nounwind readnone");
+                auto hi_pos = select(cmp("ne", hi, "0"), ir.binary("add", ihi, "32"), "4294967295");
+                write(i.dst, select(cmp("ne", lo, "0"), ilo, hi_pos));
+            } else {
+                if (signed_flbit) {
+                    auto neg = cmp("slt", hi, "0");
+                    lo = select(neg, ir.binary("xor", lo, "4294967295"), lo);
+                    hi = select(neg, ir.binary("xor", hi, "4294967295"), hi);
+                }
+                auto lzhi = ir.invoke("i32", "unaryBits.i32", 33, {{"i32", hi}}, "nounwind readnone");
+                auto lzlo = ir.invoke("i32", "unaryBits.i32", 33, {{"i32", lo}}, "nounwind readnone");
+                auto lo_pos = select(cmp("ne", lo, "0"), ir.binary("add", lzlo, "32"), "4294967295");
+                write(i.dst, select(cmp("ne", hi, "0"), lzhi, lo_pos));
+            }
             return;
         }
         auto a = val(0);
