@@ -859,6 +859,20 @@ that its fixture's module and export are in that list, that a source-built DLL l
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
+**Window pictures.** At the end of a run that is still going, `debug_launch.py` saves the client area of the
+title's window as `window.png`. `--capture-every <seconds>` (`run.ps1 -CaptureEvery`, `run.sh --capture-every`)
+also saves it every N seconds (N is at least 1; 0, the default, is off) as `window_<sss>s.png`, with the seconds
+since the process started, so a run that passes several screens leaves one picture per screen. A frame whose
+pixels equal the previous frame is not saved, at most 120 files are written (later changes are counted, not
+saved), and the summary prints one line such as `window captures: 12 saved, 7 unchanged skipped, first change
+at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
+conversion to PNG uses whole-buffer slices instead of a per-byte loop. The end-of-run `window.png` is
+unchanged. `tests/startup_window_capture_check.py` checks the file names, the skip, the cap, the summary line
+and the pixels of the PNG against a per-pixel reference. `tests/startup_debug_window_check.py` runs the
+source-built `tests/startup_window_probe.cpp` (a window that is red, then blue after 3.5 s) with
+`--capture-every 1`: one red and one blue frame are saved, the others are skipped, the reported first change
+falls in the second the probe changes it, and without the option no `window_<sss>s.png` exists.
+
 `run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
 `x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
 the debugger breakpoints described above. The switches work independently and
@@ -1530,8 +1544,10 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
+| `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -1632,6 +1648,18 @@ Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
 D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
 budget in bytes for node 0 of the adapter matching the desktop device LUID.
 An unavailable segment reads `n/a`.
+
+The line ends with the system commit and the physical-page pool (#1199):
+`commit=<used>/<limit> avail=<free>` in MiB (all processes: RAM plus page files, what a new commit can still
+get) and `sections=<n> slabs=<n> slots=<in use>/<free>` (live 64 KiB physical-page sections, open slabs, slots in
+the open slabs), then `job_peak=<MiB> job_limit=<MiB>`: the peak commit of the job the title runs in and its memory
+limit (`run.ps1 -MemoryGiB`; `none` without a limit). Each reads `n/a` when it cannot be read. A run that ends on error 1455 shows from these whether
+the pool (a flat `sections`) or the resources below (committed texture bytes) grew. The first three commit failures
+(error 1455 or 8) of the page pool also
+log `x2w-xmem commit exhausted at <call> (error N): job memory limit N GiB reached (run.ps1 -MemoryGiB)` when the job peak is within 256 MiB of its limit (otherwise `job memory limit not reached`), then the job numbers, `system commit=... avail=...` and `pool sections=... slabs=...
+slots=.../...` with the hint that `X2W_XMEM_LAZY_COMMIT=1` (`run.ps1 -LazyMemory`) keeps untouched pages out of
+the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/startup_triage_run_check.py` that
+`triage_run.py` still reads the line with and without these fields.
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
@@ -2558,6 +2586,16 @@ These are measured on one executable; treat them as hypotheses for others.
   · [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview#geterroreventretrieveerrorrecord)
   · [DSTORAGE_ERROR_RECORD](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_error_record?view=gdk-2604)
   · [DSTORAGE_COMMAND_TYPE](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_command_type?view=gdk-2604)
+- **DirectStorage request totals (#2816).** The heartbeat's totals line and the first `Queue::EnqueueStatus` lines print
+  `requests raw=<n> inflated=<n> failed=<n> bcpack-blank=<n> completed=<n>`. `raw` counts the uncompressed copies only
+  (it was printed as `done=`, which read as zero for a title whose requests are all compressed), `inflated` every
+  compressed stream that was decoded (zlib, standalone or embedded BCPack), `bcpack-blank` the BCPack requests that
+  completed without decoded data, and `completed` is `raw + inflated + bcpack-blank`: every request that finished and
+  wrote its destination (a failed request is not in it). The text `inflated=<n> failed=<n>` is unchanged;
+  `tools/startup/live_view.py` parses it, takes `completed` from new lines and rebuilds it from `done`, `inflated` and
+  `bcpack-blank` on older ones. `startup_storage_failure_counts` checks the totals of a mixed run and of a run with only zlib
+  requests (`raw=0`, `completed` equal to the finished requests); `startup_live_telemetry_check.py` checks both line formats.
+  [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview)
 - **DirectStorage failure causes (#1198).** After its totals line, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: failed requests by cause` with one count for each of
   `read-at-or-past-eof`, `read-crossing-eof`, `read-other`, `destination-capacity`,
@@ -3257,21 +3295,64 @@ view (`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view 
 slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
 82 ms with shared sections and views).
 
+Start-up maps nearly every page with a call of its own, and under Wine each map costs more the
+more views the process has. With `X2W_XMEM_JOIN_CALLS=1` as well (off by default; `tools/startup/run.sh`
+sets it, `run.ps1 -LazyMemory` does not), a mapping call whose pages all continue the view that ends at its
+address, on the next slots of the same section and inside the same reservation of the shim, joins
+that view: the view is unmapped, its placeholder is joined with the new pages' placeholder, and one
+view is mapped over both. It is taken apart the same way as in an unmap (below), and if a step is
+refused the view is mapped again as it was and the new pages get a view of their own. A joined
+view stops at 64 pages (`max_merged_run_pages`): a page that would make it longer starts a view of
+its own, which the next pages join. Every later unmap inside a joined view takes the whole view
+apart, so the cap bounds that work too. Only joined views are capped: a view mapped by one call
+covers as many of its pages as follow each other in address and in their section, and an unmap inside it maps the surviving pages again
+with one view per contiguous stretch, as long as before the cap. Measured under Wine with every byte of the view written
+(`xmem_cross_call_merge_check timing`): an unmap inside a view of 64 pages took 0.28 ms, of 512
+pages 2.1 ms and of 4096 pages 13 ms; joining a page to a view of 63 took 1.5 ms, about what a page
+mapped on its own costs (1.4 ms).
+
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
-that touches one of those pages in between takes an access violation. A vectored handler retries
-it only when the address is inside a view that the unmap in progress, or the last finished one,
-took apart, the page is recorded and covered by a view once that unmap is over, and the thread
-has not already retried that page for that unmap. Any other fault is passed on, after at most one
-retry.
+that touches one of those pages in between takes an access violation. Each view mapped inside an
+unmap, a join or a page batch keeps that one's id. A vectored handler retries the fault only when,
+once the one in progress (if any) is over, the page is recorded, covered by a view, and that view
+carries such an id, and the thread has not already retried that page for that id. A handler that
+runs late, after any number of later unmaps or joins of other views (one call joins a CPU view and
+then its GPU mirror), still finds the one that mapped the page again. Any other fault is passed on,
+after at most one retry for each unmap or join that mapped the page's view. A fault with none in
+progress or beginning or ending around a region query of the page, and no mapped view there, is
+passed on without waiting for the mapping lock.
 
 Shared views are opt-in. The caller chooses before the first mapping call by setting
-`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call.
+`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call. It also
+reads it once when `xmem.dll` loads: with it set then, the main module's `VirtualQueryEx`,
+`ReadFile` and `WriteFile` imports are wrapped (see below), and the module is pinned at load when
+one is.
+
+A region query or a kernel copy does not fault, so inside an unmap it would see the pages of the
+view being taken apart as reserved. With shared views such readers run through the export
+`x2w_xmem_stable_call`: the reader runs once, and runs again after the unmap if one began or ended
+around it. `XMemVirtualQuery`, the main module's `VirtualQueryEx` imports and the shim's own
+`VirtualQuery` and `ReadProcessMemory` readers (`src/startup_stubs/local_log.h`, slot 133,
+the sampler snapshot) use it. Without shared views every page has a view of its own and readers
+run once, as before.
+
+Inside an unmap a kernel copy into or out of a page of that view fails at once. Measured under
+Wine: `ReadFile` fails with `ERROR_NOACCESS` and leaves the file position as it was, `WriteFile`
+with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` imports therefore
+run again, up to 4 times in all, when a synchronous call on a disk file fails with one of those
+errors while an unmap or join was in progress or began or ended around it, and its buffer lies in
+a view of a run; they wait for that one to end first. A call on a pipe, socket or console is not
+run again. Under Wine an anonymous pipe read inside an unmap fails with `ERROR_NOACCESS` and leaves
+its data queued (measured). Whether Windows consumes or sends any data in a call that fails this way
+is unmeasured, and if it does, running the call again would lose or repeat that data.
+Overlapped I/O (the copy happens at completion), a call cut short after part of the copy, and I/O
+from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|
-| Views | one per page | one per run of adjacent pages |
+| Views | one per page | one per run of adjacent pages of one call; with `X2W_XMEM_JOIN_CALLS=1` a call can also join the view that ends at its address |
 | Fault handler | none | registered by the first mapping call, never removed |
-| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, `ReadFile` or `WriteFile`, else at the first mapping call) |
 
 The handler is process-wide, and Windows has no removal that also waits for a dispatch already
 under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
@@ -3442,7 +3523,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
   for each new combination of format, layout, one or several mips, one or several slices, flags,
   dimension, view format, view dimension and outcome (at most 200). The outcome is
   `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
-  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+  `published console layout`, one of the two hold reasons, `texture_no_resource` (no live resource at that base and description), `texture_unreadable` (the texels are not readable), `texture_over_64mib` (more than the 64 MiB single-copy limit) or `texture_unavailable` (publication failed otherwise).
 - `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
   submits that drop retained uploads.
 

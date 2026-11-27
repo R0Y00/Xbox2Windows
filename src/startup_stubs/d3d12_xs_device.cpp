@@ -15,6 +15,7 @@
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
+#include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/manifest_retry.h"
@@ -26,6 +27,7 @@
 #include "startup_stubs/pixel_history.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/export_write_mask.h"
+#include "startup_stubs/pso_recipe.h"
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/formatted_buffer.h"
@@ -7148,7 +7150,25 @@ void report_budget(ID3D12CommandQueue* queue)
         if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
         used += n;
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
+    // System commit and the physical-page pool behind it: a run that ends on a commit limit (error 1455) shows
+    // whether the pool (sections, slots) or the resources above grew (#1199).
+    char commit[80];
+    x2w_local::format_commit(commit, sizeof(commit), x2w_local::system_commit());
+    char job[64];
+    x2w_local::format_job(job, sizeof(job), x2w_local::job_memory());
+    char pool[96] = "sections=n/a slabs=n/a slots=n/a";
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    using SlabStats = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*, ULONGLONG*);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {  // adds a reference: released below
+        ULONGLONG sections = 0, slabs = 0, in_use = 0, free_slots = 0;
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        const auto slab_stats = reinterpret_cast<SlabStats>(GetProcAddress(xmem, "x2w_xmem_slab_stats"));
+        if (page_stats && slab_stats && page_stats(&sections) && slab_stats(&slabs, &in_use, &free_slots))
+            std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
+        FreeLibrary(xmem);
+    }
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7341,6 +7361,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+    if (render_mode() && frame % 300 == 0 && (pso_recipes_loaded || pso_recipes_precreated || pso_recipe_mismatches || pso_recipe_fallbacks))
+        log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
+            pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
     if (render_mode() && frame % 300 == 0) {
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,

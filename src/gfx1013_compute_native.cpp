@@ -276,7 +276,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             static const std::set<Name> bits{
                 "v_mov_b32", "v_not_b32", "v_cndmask_b32", "v_bfrev_b32", "v_mul_u32_u24",
                 "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
-                "v_and_b32", "v_or_b32", "v_xor_b32", "v_min_u32", "v_max_u32",
+                "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_min_u32", "v_max_u32",
                 "v_min_i32", "v_max_i32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"};
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
@@ -418,6 +418,8 @@ static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
         return i.wide ? (i.a >> 8) & 127 : 106;
+    if (i.name == "v_mad_u64_u32")  // VOP3B: the carry-out of the 64-bit add (#3000)
+        return (i.a >> 8) & 127;
     return {};
 }
 struct Symbol {
@@ -566,7 +568,10 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     {
         set(i.dst, {});
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
-            i.name.size() >= 4 && i.name.substr(i.name.size() - 4) == "_b64") || i.name == "s_bitreplicate_b64_b32")
+            i.name.size() >= 4 &&
+            (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
+             i.name.substr(i.name.size() - 4) == "_u64") &&
+            i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
             set(i.dst + 1, {});
     }
     return s;

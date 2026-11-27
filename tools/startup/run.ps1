@@ -29,8 +29,10 @@ param(
     [switch]$Translate,                        # with -Render: translate new shader requests during the run (gfx2hlsl.py --watch)
     [string]$NativeShaders = "",               # with -Render: the directory of dxcompiler.dll and dxil.dll; compute requests are translated in the stand-in (X2W_NATIVE_SHADERS)
     [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$LowAddresses,                     # start the title with bottom-up ASLR off, so its own allocations stay below 2^40 (X2W_LOW_ADDRESSES, #1758)
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
+    [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
     [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
@@ -58,6 +60,7 @@ if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
 if ($TraceApi) { $env:X2W_TRACE_API = "1" }
 if ($StartupBelow40) { $env:X2W_XMEM_STARTUP_BELOW_40 = "1" }
+if ($LowAddresses) { $env:X2W_LOW_ADDRESSES = "1" }
 if ($LazyMemory) {
     $env:X2W_XMEM_LAZY_COMMIT = "1"; $env:X2W_XMEM_LAZY_STARTUP = "1"; $env:X2W_XMEM_SHARED_VIEWS = "1"
 }
@@ -80,9 +83,11 @@ if ($Translate -and $Render) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$captureArgs = @()
+if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 try {
     & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
+        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.
