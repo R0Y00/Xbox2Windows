@@ -504,19 +504,21 @@ static int texture_slot67(void* device, const std::string& mode)
     const UINT first_mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
     const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
+    const bool atomic_uint = mode == "texture-store-atomic";
     const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
     const UINT subresources = volume ? 1 : layers;
     const bool swapped = mode == "texture-store-mips-swapped";
     const bool dual = swapped || mode == "texture-store-mips";
     const UINT mips = dual ? 2 : 1;
-    const UINT pixel_bytes = fp32 ? 16 : 8, pitch = width * pixel_bytes;
+    const UINT pixel_bytes = atomic_uint ? 4 : fp32 ? 16 : 8;
+    const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
     const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
     const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+    const DXGI_FORMAT format = atomic_uint ? DXGI_FORMAT_R32_UINT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
         D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -531,7 +533,12 @@ static int texture_slot67(void* device, const std::string& mode)
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    if (fp32) {
+    if (atomic_uint) {
+        auto* words = static_cast<UINT*>(memory);
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x)
+                words[y * pitch / sizeof(UINT) + x] = 0x10f00000u + y * width + x;
+    } else if (fp32) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT i = 0; i < slice_bytes / 4; ++i)
                 static_cast<UINT*>(memory)[layer * slice_bytes / 4 + i] = 0xbf000000u | (layer << 12) | i;

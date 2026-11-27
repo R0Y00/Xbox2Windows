@@ -713,7 +713,52 @@ struct DirectCompute {
             vector_write(256 + i.dst + j, select(have_view, ir.value("bitcast float " + value + " to i32"), "0"));
         }
     }
+    static bool is_image_atomic(const Inst &i) {
+        return i.enc == Encoding::Image && (i.op == 16 || i.op == 17 || i.op == 23);
+    }
+    void image_atomic(const Inst &i, const State &s) {
+        const bool compare_exchange = i.op == 16;
+        const bool return_old = (i.a & 0x2000u) != 0; // GLC returns the pre-operation value.
+        const unsigned coord = i.b & 255, base = ((i.b >> 16) & 31) * 4;
+        const unsigned mask = (i.a >> 8) & 15, dim = (i.a >> 3) & 7;
+        if (graphics_input || dim != 1 || (i.a & 0x3c0c6u) || (i.b & 0xffe00000u) ||
+            mask != (compare_exchange ? 3u : 1u) || coord == 255 || (compare_exchange && i.dst == 255) ||
+            s.at(base).type != Symbol::Type::descriptor)
+            refuse(i.pc, "unsupported typed 2D image atomic operands");
+        constexpr auto kind = ComputeViewKind::uint_texture_uav;
+        analysis.binding(i, s, base, 8, kind, 0, dim);
+        const auto &bindings = analysis.result.bindings;
+        const auto &descriptor = s.at(base);
+        const auto it = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
+            return b.kind == kind && b.root_parameter == descriptor.value && b.byte_offset == descriptor.offset;
+        });
+        if (it == bindings.end())
+            throw std::logic_error("missing image atomic binding");
+        const auto handle = ir.handle({1, it->shader_register, 2, 5, 1, 0}); // RWTexture2D<uint>
+        const auto label = to_string(label_number++);
+        const auto enabled = active();
+        ir.body << "  br i1 " << enabled << ", label %imageAtomic" << label << ", label %imageAtomicEnd" << label
+                << "\nimageAtomic" << label << ":\n";
+        std::vector<std::pair<string, string>> args{{"%dx.types.Handle", handle}};
+        if (!compare_exchange)
+            args.emplace_back("i32", i.op == 17 ? "0" : "7"); // AtomicBinOp IADD or UMAX.
+        args.emplace_back("i32", read(256 + coord));
+        args.emplace_back("i32", read(257 + coord));
+        args.emplace_back("i32", "undef");
+        if (compare_exchange)
+            args.emplace_back("i32", read(257 + i.dst));
+        args.emplace_back("i32", read(256 + i.dst));
+        const auto previous = ir.invoke("i32", compare_exchange ? "atomicCompareExchange.i32" : "atomicBinOp.i32",
+                                        compare_exchange ? 79 : 78, args, "nounwind");
+        if (return_old)
+            write(256 + i.dst, previous);
+        ir.body << "  br label %imageAtomicEnd" << label << "\nimageAtomicEnd" << label << ":\n";
+    }
     void image_io(const Inst &i, const State &s) {
+        if (is_image_atomic(i)) {
+            image_atomic(i, s);
+            return;
+        }
         const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
         // image_gather4_c_lz (79) is the comparison gather at the view's first mip (#2969): DXIL textureGatherCmp.
         const bool compare_gather = i.op == 79;
@@ -3009,7 +3054,7 @@ struct DirectCompute {
         half_mode_known = !(half_binary && mode_write && conditional);
         const bool writes_uavs = std::any_of(p.code.begin(), p.code.end(), [](const Inst &i) {
             return i.name.substr(0, 12) == "buffer_store" || i.name.substr(0, 13) == "buffer_atomic" ||
-                   (i.enc == Encoding::Image && i.op == 8);
+                   (i.enc == Encoding::Image && i.op == 8) || is_image_atomic(i);
         });
         std::set<unsigned> labels{entry};
         ir.body << "  br label %pc" << entry << "\n";

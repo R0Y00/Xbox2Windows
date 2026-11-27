@@ -35,6 +35,7 @@ struct ComputeTranslation {
         Source source = root_constant;
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
         bool root = false;
+        bool atomic_uint_texture = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -163,6 +164,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
+                 whole() && i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            tr.uavs.back().atomic_uint_texture = true;
+        }
         else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels 4%n", &i, name, &a, &b, &used) == 4 && whole() &&
                  i == tr.uavs.size() && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
             tr.uavs.push_back({a, b, true});
@@ -511,7 +518,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
+                reason = "an image atomic requires an R32_UINT UAV";
+            if (!reason && !slot.atomic_uint_texture && !float_output_format(format))
+                reason = "an output texture format is not a float or normalized one";
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
