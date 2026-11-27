@@ -11138,7 +11138,7 @@ BVH_HELPERS = (
     # return mode is zero and is checked separately by each box helper.
     'bool x2w_bvh_triangle_descriptor_ok(uint word0, uint word1, uint word2, uint word3) {',
     '    return (word1 & 0x7fffff00u) == 0u && (word3 & 0x0fffffffu) == 0x01000000u &&',
-    '        (word3 >> 28u) == 8u && word2 >= 1u && word2 < 0x04000000u &&',
+    '        (word3 >> 28u) == 8u && word2 < 0x04000000u &&',
     '        (word0 != 0u || (word1 & 0x000000ffu) != 0u);',
     '}',
     'uint4 x2w_bvh_intersect_triangle(ByteAddressBuffer nodes, uint node, uint word0, uint word1,',
@@ -11148,7 +11148,7 @@ BVH_HELPERS = (
     '    uint kind = node & 7u;',
     '    if (kind > 3u || !x2w_bvh_triangle_descriptor_ok(word0, word1, word2, word3)) return miss;',
     '    uint offset = (node & 0xfffffff8u) << 3u;',
-    '    if ((offset >> 6u) + 1u > word2) return miss;',
+    '    if ((offset >> 6u) > word2) return miss;',
     '    uint id = nodes.Load(offset + 60u);',
     '    uint id_byte = (id >> (8u * kind)) & 0xffu;',
     '    uint i = id_byte & 3u;',

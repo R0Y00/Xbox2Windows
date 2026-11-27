@@ -87,12 +87,24 @@ def controls():
     check("translated triangle shader embeds the dispatch-tested helpers",
           hlsl is not None and helpers in hlsl, "")
 
+    # Size is a count minus one in 64-byte units. A triangle uses one unit.
+    for node, word2, label in ((0x00, 0, "triangle at offset zero in a one-unit span"),
+                               (0x08, 1, "triangle in the last unit of a two-unit span")):
+        pipe, hlsl, refusals = translate_triangle(node=node, word2=word2)
+        check("exact-fit %s translates" % label, pipe is not None and not refusals, str(refusals))
+    pipe, hlsl, refusals = translate_triangle(0x08, word2=0)
+    check("too-short triangle in the last unit of a one-unit span refuses",
+          len(refusals) == 1 and "outside descriptor size" in refusals[0], str(refusals))
+    pipe, hlsl, refusals = translate_triangle(0x00, word2=0x03ffffff)
+    check("largest decoded extent translates", pipe is not None and not refusals, str(refusals))
+    pipe, hlsl, refusals = translate_triangle(0x00, word2=0x04000000)
+    check("extent above 4 GiB refuses", len(refusals) == 1 and "above 4 GiB" in refusals[0], str(refusals))
+
     cases = [
         ("triangle return mode 0", dict(node=0x00, word3=RESOURCE_TYPE), "does not match node kind 0"),
         ("box return mode 1", dict(node=0x05, word3=RESOURCE_TYPE | TRIANGLE_MODE), "does not match node kind 5"),
         ("unknown node kind", dict(node=0x06), "node kind 6"),
-        ("size zero", dict(node=0x00, word2=0), "does not cover the node"),
-        ("node outside size", dict(node=0x20, word2=4), "outside descriptor size"),
+        ("node outside size", dict(node=0x20, word2=3), "outside descriptor size"),
         ("absolute base", dict(node=0x00, word0=0, word1=0), "absolute node base"),
         ("loaded descriptor", dict(node=0x00, loaded_descriptor=True), "loaded at run time"),
         ("descriptor type", dict(node=0x00, word3=0x60000000), "descriptor type 6 is not 8"),
@@ -230,6 +242,57 @@ def dispatch_hlsl(mutation=None):
     return "\n".join(lines) + "\n"
 
 
+TRIANGLE_BOUNDARY_RESULT_OFFSET = 64
+TRIANGLE_BOUNDARY_BUFFER_SIZE = 96
+
+
+def boundary_hlsl():
+    witness = TRIANGLES[0]
+    helpers = "\n".join(G.BVH_HELPERS).replace("ByteAddressBuffer", "RWByteAddressBuffer")
+    lines = [helpers, "RWByteAddressBuffer data : register(u0);", "[numthreads(1, 1, 1)]", "void main() {"]
+    for i in range(16):
+        lines.append("    data.Store(%du, 0x%08xu);" % (4 * i, struct.unpack_from("<I", witness.image, 4 * i)[0]))
+    lines.append("    DeviceMemoryBarrierWithGroupSync();")
+    origin, direction, inverse, _extent = witness.ray
+    expected = []
+    for case, pointer, word2, result in ((0, 0x00, 0, witness.expected),
+                                         (1, 0x08, 0, (0x7f800000, 0x3f800000, 0, 0))):
+        lines.append(
+            "    uint4 b%d = x2w_bvh_intersect_triangle(data, 0x%08xu, 0x1000u, 0x80000000u, "
+            "0x%08xu, 0x81000000u, float3(%s, %s, %s), float3(%s, %s, %s), float3(%s, %s, %s));" % (
+                case, pointer, word2, ffloat(origin[0]), ffloat(origin[1]), ffloat(origin[2]),
+                ffloat(direction[0]), ffloat(direction[1]), ffloat(direction[2]),
+                ffloat(inverse[0]), ffloat(inverse[1]), ffloat(inverse[2])))
+        for word in range(4):
+            lines.append("    data.Store(%du, b%d.%s);" % (
+                TRIANGLE_BOUNDARY_RESULT_OFFSET + 16 * case + 4 * word, case, "xyzw"[word]))
+        expected.append(result)
+    lines.append("}")
+    return "\n".join(lines) + "\n", expected
+
+
+def run_boundary_dispatch(dxc, runner, adapter, directory):
+    source = directory / "bvh_triangle_boundary.hlsl"
+    cso = directory / "bvh_triangle_boundary.cso"
+    output = directory / "bvh_triangle_boundary.bin"
+    hlsl, expected = boundary_hlsl()
+    source.write_text(hlsl, encoding="ascii")
+    compiled = subprocess.run([dxc, "-Gis", "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(source)],
+                              capture_output=True, text=True)
+    if compiled.returncode or compiled.stderr:
+        raise AssertionError(compiled.stderr or "dxc exited with %d" % compiled.returncode)
+    result = subprocess.run([runner, adapter, "--raw-uav-dump", str(cso), "1", str(TRIANGLE_BOUNDARY_BUFFER_SIZE), str(output)],
+                            capture_output=True, text=True)
+    print(result.stdout, end="")
+    if result.returncode == 77:
+        return 77, None, expected
+    if result.returncode or result.stderr:
+        raise AssertionError(result.stderr or "offscreen_check exited with %d" % result.returncode)
+    data = output.read_bytes()
+    assert len(data) == TRIANGLE_BOUNDARY_BUFFER_SIZE, (len(data), TRIANGLE_BOUNDARY_BUFFER_SIZE)
+    return 0, struct.unpack("<%dI" % (len(data) // 4), data), expected
+
+
 def run_dispatch(dxc, runner, adapter, directory, mutation=None):
     _images, _offsets, _result_offset, buffer_size = triangle_layout()
     name = "bvh_triangle_" + mutation if mutation else "bvh_triangle"
@@ -283,6 +346,15 @@ def check_dispatch(dxc, runner, adapter):
             changed = sum(tuple(mutant[result_word + 4 * case:result_word + 4 * case + 4]) != witness.expected
                           for case, witness in enumerate(TRIANGLES))
             check("dispatch %s control changes a triangle result" % mutation, changed > 0, str(changed))
+        status, boundary_words, boundary_expected = run_boundary_dispatch(dxc, runner, adapter, directory)
+        if status == 77:
+            print("dispatch boundary: skip (adapter unavailable)")
+            return 77
+        for case, wanted in enumerate(boundary_expected):
+            start = TRIANGLE_BOUNDARY_RESULT_OFFSET // 4 + 4 * case
+            got = tuple(boundary_words[start:start + 4])
+            check("triangle decoded extent case %d" % case, got == wanted,
+                  "got %s expected %s" % (["%08x" % w for w in got], ["%08x" % w for w in wanted]))
     if failures:
         print("FAILED: %s" % ", ".join(failures))
         return 1

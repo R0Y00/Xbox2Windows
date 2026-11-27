@@ -34,13 +34,15 @@ The accepted slice uses:
 - compute stage only;
 - `image_bvh_intersect_ray v[4], v[11], s[4]` with the packed address form;
 - a constant inline T# built by four SGPR constants, type 8, nonzero encoded base, box growing zero,
-  size at least one 64-byte unit and below 4 GiB;
+  size field (a count minus one in 64-byte units) whose decoded extent covers the node; `size=0` is
+  a one-unit span, and the field stays below 4 GiB;
 - a constant node pointer whose low three bits are 0..3 and whose address is inside the descriptor
   size and the 48-bit absolute address space;
 - either value of the sort bit; it is ignored for triangles.
 
 The manifest still names the allocation with `srv <i> bvh base 0x<base> size 0x<size>`, using the
-decoded byte address for `base`. The host binding of that line remains outside this change.
+decoded byte address for `base`. The host binds `(size + 1) * 64` bytes. That binding remains
+outside this change.
 
 ## Refused by name
 
