@@ -1660,8 +1660,11 @@ struct DirectCompute {
             return true;
         }
         if (n == "v_cvt_pkrtz_f16_f32") {
-            if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
+            if (i.clamp || i.scale || (i.wide && (i.a & 0x7800)))
                 refuse(i.pc, "unsupported packed half conversion modifier");
+            // SDWA: both sources are full f32 words (src_sel DWORD); only the destination placement differs.
+            if (i.subword && (i.src_select[0] != 6 || i.src_select[1] != 6))
+                refuse(i.pc, "unsupported packed half conversion SDWA source selection");
             auto pack = [&](unsigned j) {
                 auto bits = operand32(i, i.src[j]);
                 if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
@@ -1675,7 +1678,8 @@ struct DirectCompute {
                 return ir.binary("and", ir.binary("sub", h, ir.value("zext i1 " + rounded_up + " to i32")), "65535");
             };
             auto low = pack(0), high = pack(1);
-            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            auto result = ir.binary("or", low, ir.binary("shl", high, "16"));
+            vector_write(i.dst, place_subword(i, result));
             return true;
         }
         if (n == "v_add_f16" || n == "v_sub_f16" || n == "v_subrev_f16" || n == "v_mul_f16") {
@@ -2324,13 +2328,17 @@ struct DirectCompute {
             return;
         }
         if (auto dst = carry_destination(i)) {
-            if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.subword || i.dpp_control || i.clamp || i.neg || i.scale)
+            if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.dpp_control || i.clamp || i.neg || i.scale)
                 refuse(i.pc, "unsupported carry instruction stage or operand modifiers");
             // Victory add_sub_carry and pixel_aot model unsigned carry/borrow
             // as lane bits. Snapshot both operands and carry-in before writing
             // the result VGPR or its possibly aliased scalar mask.
             const bool add = n.substr(0, 5) == "v_add";
             auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            if (i.subword) {
+                a = subword(a, i.src_select[0], i.src_sext[0]);
+                b = subword(b, i.src_select[1], i.src_sext[1]);
+            }
             if (n.substr(0, 8) == "v_subrev") std::swap(a, b);
             auto result = ir.binary(add ? "add" : "sub", a, b);
             auto carry = add ? cmp("ult", result, a) : cmp("ult", a, b);
@@ -2350,7 +2358,7 @@ struct DirectCompute {
                 carry = ir.value("or i1 " + carry + ", " + extra);
                 result = ir.binary(add ? "add" : "sub", result, ir.value("zext i1 " + bit + " to i32"));
             }
-            vector_write(i.dst, result);
+            vector_write(i.dst, place_subword(i, result));
             if (graphics_input) {
                 if (!graphics_predicate.empty()) carry = ir.value("and i1 " + graphics_predicate + ", " + carry);
                 auto bit = ir.value("zext i1 " + carry + " to i32");

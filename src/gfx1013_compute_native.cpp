@@ -298,7 +298,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             // decoder. Admit only profiles with a direct result placement.
             static const std::set<Name> bits{
                 "v_mov_b32", "v_not_b32", "v_cndmask_b32", "v_bfrev_b32", "v_mul_u32_u24",
-                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
+                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_co_ci_u32",
                 "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_min_u32", "v_max_u32",
                 "v_min_i32", "v_max_i32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"};
             static const std::set<Name> floats{
@@ -307,11 +307,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
-                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" ||
+                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
                                   (sdwa_compare && (name.substr(name.size()-4) == "_f32" || name.substr(name.size()-4) == "_f16"));
             const bool conversion = name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" ||
                                     name.substr(0,15) == "v_cvt_f32_ubyte";
-            if (!(fp_input || conversion || bits.count(name) || sdwa_compare))
+            if (!(fp_input || conversion || bits.count(name) || sdwa_compare) ||
+                (graphics && (name == "v_cvt_pkrtz_f16_f32" || name == "v_add_co_ci_u32")))
                 refuse(pc, "unimplemented direct SDWA operand profile");
             const Word ext = take();
             const unsigned sources = i.enc == Encoding::Vop1 ? 1 : 2;
@@ -443,7 +444,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     if(i.next-pc!=encoded.size)refuse(pc,"instruction extent mismatch for "+string(encoded.name));
     return i;
 }
-// VOP3B carries a scalar destination in the field used for ABS in VOP3A.
+// VOP2 (including SDWA) writes carry to VCC. VOP3B encodes its own scalar destination.
 static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
