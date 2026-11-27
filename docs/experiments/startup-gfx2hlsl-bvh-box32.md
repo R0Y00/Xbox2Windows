@@ -25,7 +25,8 @@ in `min.x`.
 - `image_bvh_intersect_ray v[4], v[11], s[4]` with the packed address form (the disassembler prints `v[16:31]`
   for the eleven consumed dwords);
 - a constant inline T# built by four SGPR constants, type 8, nonzero encoded base, box growing zero,
-  size that covers the node (one 64-byte unit for binary16, two for FP32) and below 4 GiB;
+  size field (a count minus one in 64-byte units) whose decoded extent covers the node (one unit
+  for binary16, two for FP32; `size=0` is a one-unit span) and below 4 GiB;
 - a constant node pointer whose low three bits are 4 (64-byte aligned) or 5 (128-byte aligned) and inside the
   same 4 GiB relative address window; the entire node must fit within the 48-bit absolute address space;
 - either value of the sort bit.
