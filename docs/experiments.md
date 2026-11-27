@@ -186,7 +186,9 @@ written to `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: `draw=` is the copy ordin
 frame that recorded it, `x=` and `y=` name the texel, `key=` is the translated manifest key, and
 `rgba=` is decoded for R8G8B8A8/B8G8R8A8 UNORM or sRGB.
 The same 48-copy bound as the full dump applies. A reader can follow the value after every draw and
-name the one that last changed the texel.
+name the one that last changed the texel. [`tools/startup/scene_color_report.py`](../tools/startup/scene_color_report.py)
+turns a dump directory into a bounded Markdown report that selects a frame and pixel and names the
+first retained change as well as the last writer; see [the report note](experiments/startup-scene-color-report.md).
 
 `startup_pixel_history` builds three draws on a 4x4 target. The first and third are scissored to the
 top-left texel; only the second covers the watched texel (1, 1). The report must name draw 2 with its
