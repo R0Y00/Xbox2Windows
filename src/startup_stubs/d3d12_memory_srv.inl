@@ -513,13 +513,15 @@ u64 address_texture_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
 //   copy records a tiled write; the 0x109 BC chains, which XG writes in their layout, keep their own
 //   path and never come through here);
 // - the layout runs past the size the XG stand-in reports for the description (the desktop copyable
-//   footprints of a slice rounded up to 64 KiB, times the slices), which the title may not own.
+//   footprints of a slice rounded up to 64 KiB, times the slices), which the title may not own. A volume
+//   has one slice: its footprints already span every depth layer.
 const char* console_address_hold(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     if (latest_texture_write_is_rows(address)) return "console_layout_xg_rows";
     const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), desc.MipLevels);
     if (plan.size == UINT64_MAX || !plan.size) return "console_layout_without_footprints";
-    const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * desc.DepthOrArraySize;
+    const u64 slices = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+    const u64 reported = ((plan.size + 0xFFFF) & ~u64{0xFFFF}) * slices;
     return x2w_startup::gfx10::Layout(desc).bytes() > reported ? "console_layout_beyond_xg_size" : nullptr;
 }
 
