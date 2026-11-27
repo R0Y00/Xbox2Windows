@@ -135,6 +135,28 @@ int main()
     expect(!pso_recipe_targets_match(recipe, 2, recipe.target_formats, DXGI_FORMAT_D24_UNORM_S8_UINT),
            "DSV-format mismatch rejected");
 
+    // The writer stops where the parser stops. At 63 records the next append is still readable;
+    // at 64 it would become the record the next process rejects, so it is refused instead.
+    std::string sixty_three;
+    for (unsigned i = 0; i < pso_recipe_record_limit - 1; ++i) sixty_three += text;
+    const PsoRecipeParseResult at_63 = parse_pso_recipe_file(sixty_three);
+    expect(at_63.rejected == 0 && at_63.recipes.size() == pso_recipe_record_limit - 1, "63 records parse");
+    expect(pso_recipe_append_allowed(sixty_three, text), "63 records accept one more append");
+    expect(pso_recipe_append_allowed("", text), "an empty file accepts the first record");
+
+    const std::string sixty_four = sixty_three + text;
+    const PsoRecipeParseResult at_64 = parse_pso_recipe_file(sixty_four);
+    expect(at_64.rejected == 0 && at_64.recipes.size() == pso_recipe_record_limit, "64 records parse");
+    expect(!pso_recipe_append_allowed(sixty_four, text), "64 records refuse a 65th append");
+
+    const PsoRecipeParseResult at_65 = parse_pso_recipe_file(sixty_four + text);
+    expect(at_65.recipes.size() == pso_recipe_record_limit && at_65.rejected == 1 &&
+               at_65.error == "recipe record limit reached",
+           "65 records reject the extra record");
+    expect(!pso_recipe_append_allowed(replace_state_key(text), text), "a malformed file is not appended to");
+    expect(!pso_recipe_append_allowed(std::string(pso_recipe_file_limit, 'x'), text),
+           "an unparseable full-size file is not appended to");
+
     std::printf("startup pso recipe checks: %d failed\n", failures);
     return failures ? 1 : 0;
 }

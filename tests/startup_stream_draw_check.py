@@ -1,4 +1,6 @@
 """Draw two source-built gfx1013 pixel shaders through a slot-86 wrapper and check every RGBA byte."""
+import ctypes
+from ctypes import wintypes
 import os
 from pathlib import Path
 import subprocess
@@ -73,6 +75,27 @@ def check(directory, consumer, backend):
         assert replay.returncode == 0, replay.stderr
         assert "pso recipes" in replay.stderr and "precreated" in replay.stderr, replay.stderr
         assert output.read_bytes() == pixels, "the recipe replay changed the drawn pixels"
+        # A second writer cannot enter while this process owns the recipe file exclusively. The
+        # draw must still render through the PSO it creates; only the cache append is skipped.
+        recipe_key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
+        recipe_file = recipes / f"pso_{recipe_key:016x}.txt"
+        assert recipe_file.is_file(), f"missing recipe {recipe_file}"
+        size_before = recipe_file.stat().st_size
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateFileW(str(recipe_file), 0x80000000, 0, None, 3, 0, None)
+        assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
+        try:
+            locked = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
+            assert locked.returncode == 0, locked.stderr
+            assert output.read_bytes() == pixels, "the locked recipe path changed the drawn pixels"
+            assert recipe_file.stat().st_size == size_before, "a contending draw appended to the locked recipe"
+        finally:
+            kernel32.CloseHandle(handle)
+        print(f"{backend}: exclusive recipe ownership keeps the draw on the fallback path")
     # Hold back the last-published marker while keeping the generated shader bytecode in place.
     key = gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())
     manifest = cache / f"{key:016x}.txt"

@@ -634,4 +634,17 @@ inline PsoRecipeParseResult parse_pso_recipe_file(std::string_view text)
     return result;
 }
 
+// The parser accepts at most pso_recipe_record_limit complete records. The writer must stop at
+// the same boundary instead of appending a record the next process will reject. A file with any
+// rejected line is left alone: one more append cannot make it parse cleanly.
+inline bool pso_recipe_append_allowed(std::string_view existing, std::string_view record)
+{
+    if (record.empty() || record.size() > pso_recipe_file_limit) return false;
+    if (existing.size() > pso_recipe_file_limit || record.size() > pso_recipe_file_limit - existing.size())
+        return false;
+    const PsoRecipeParseResult parsed = parse_pso_recipe_file(existing);
+    if (parsed.rejected != 0) return false;
+    return parsed.recipes.size() < pso_recipe_record_limit;
+}
+
 }  // namespace x2w_startup

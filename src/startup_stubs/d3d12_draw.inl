@@ -277,7 +277,9 @@ bool pso_recipe_path(wchar_t* out, u64 translation_key)
 bool read_pso_recipe_text(const wchar_t* path, std::string& out, bool& too_large)
 {
     too_large = false;
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    // Deny writers for the whole read: a concurrent append holds the file exclusively, and this
+    // reader either sees the previous complete file or no file at all.
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > static_cast<LONGLONG>(x2w_startup::pso_recipe_file_limit)) {
@@ -337,12 +339,31 @@ bool append_pso_recipe(const wchar_t* path, const x2w_startup::PsoRecipe& recipe
 {
     const std::string record = x2w_startup::serialize_pso_recipe(recipe);
     if (record.size() > x2w_startup::pso_recipe_file_limit) return false;
-    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+    // One writer owns the file for the whole count/size check and append. A second process that
+    // reaches this path at the same time fails to open it and keeps the PSO it already created;
+    // that draw simply does not add a record. Readers also deny writers, so neither side observes
+    // a half-written record.
+    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
     bool ok = GetFileSizeEx(file, &size) && size.QuadPart >= 0 &&
-              static_cast<std::uint64_t>(size.QuadPart) <= x2w_startup::pso_recipe_file_limit - record.size();
+              static_cast<std::uint64_t>(size.QuadPart) <= x2w_startup::pso_recipe_file_limit;
+    std::string existing;
+    if (ok) {
+        existing.resize(static_cast<std::size_t>(size.QuadPart));
+        LARGE_INTEGER begin{};
+        ok = SetFilePointerEx(file, begin, nullptr, FILE_BEGIN) != 0;
+        std::size_t read = 0;
+        while (ok && read < existing.size()) {
+            DWORD got = 0;
+            const DWORD wanted = static_cast<DWORD>(std::min<std::size_t>(existing.size() - read, 1u << 20));
+            ok = ReadFile(file, existing.data() + read, wanted, &got, nullptr) != 0 && got != 0;
+            read += got;
+        }
+        ok = ok && read == existing.size();
+    }
+    ok = ok && x2w_startup::pso_recipe_append_allowed(existing, record);
     LARGE_INTEGER at{};
     at.QuadPart = size.QuadPart;
     if (ok) ok = SetFilePointerEx(file, at, nullptr, FILE_BEGIN) != 0;

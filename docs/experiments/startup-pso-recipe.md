@@ -23,6 +23,16 @@ not match the key it names, whose target formats or DSV do not match the current
 version is unknown is ignored and the unchanged creation path runs. A malformed or oversized file
 is counted and ignored.
 
+The writer applies the same parser before it appends. It refuses to add a record when the file
+already holds 64 complete records, when any existing line is rejected, or when the new record
+would cross 64 KiB. A 65th record would never be read back, so refusing it keeps the cache and the
+parser at the same boundary.
+
+The read, count/size check and append share one exclusive file handle. A second process that
+reaches the append path while the file is owned keeps the PSO it already created and skips the
+cache write; a reader denied by that handle also falls back to the unchanged creation path.
+Neither side can seek to an end offset that another writer selected.
+
 ## Scope and limits
 
 This is state reconstruction, not a D3D12 pipeline library. A replayed record still calls
@@ -31,10 +41,13 @@ moves the state reconstruction and the first-use creation earlier, and makes the
 available without a title run. It does not claim to eliminate driver compilation.
 
 The device-free test `startup_pso_recipe` covers the serializer/parser round trip, two appended
-records, a corrupt state key, an unknown version, an oversized file, and target-format and DSV
-mismatches. `startup_stream_draw_warp` runs the two-process replay: the first translated stream
-draw writes a recipe, a second process with the same directory loads and precreates it, and all
-32 RGBA bytes match. That test also covers the unused depth-stencil normalisation.
+records, a corrupt state key, an unknown version, an oversized file, target-format and DSV
+mismatches, and the 63/64/65 record boundary (63 accepts one more, 64 refuses a 65th, and the
+parser rejects a 65th). `startup_stream_draw_warp` runs the two-process replay: the first
+translated stream draw writes a recipe, a second process with the same directory loads and
+precreates it, and all 32 RGBA bytes match. It also holds the recipe file exclusively during a
+draw and checks that the draw still renders with exact pixels while the file size stays unchanged.
+That test covers the unused depth-stencil normalisation as well.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_pso_recipe$' -V
