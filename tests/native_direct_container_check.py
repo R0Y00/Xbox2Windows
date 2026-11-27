@@ -329,6 +329,16 @@ def main():
         check("descriptor-saveexec-bypass", cs,
               compute(words(*address_field, 0xbf880001, saveexec, read_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        pair_zero = [0xbe960380, 0xbe970380]  # s_mov_b32 s22, 0 / s23, 0 (both preserve SCC)
+        ff1_pair = 0xbe8e1416  # s_ff1_i32_b64 s14, s[22:23]
+        brev = 0xbe8f0b0e  # s_brev_b32 s15, s14
+        use_scan = 0x7e00020f  # v_mov_b32 v0, s15
+        select_scc = 0x85198e80  # s_cselect_b32 s25, 0, s14
+        check("descriptor-sop1-preserves-scc", cs,
+              compute(words(*address_field, *pair_zero, ff1_pair, brev, use_scan, end), table=True))
+        check("descriptor-sop1-before-scc-read", cs,
+              compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
+              "numeric SCC from a symbolic descriptor field")
         # The previous symbolic SCC is dead at WQM. Reading it before WQM
         # must still refuse. The nonzero high word supplies the new SCC.
         numeric_wqm = [0xbe9a0380, 0xbe9b0381, 0xbe980a1a]  # s[24:25] = WQM(s[26:27])

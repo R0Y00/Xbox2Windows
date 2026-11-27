@@ -10,6 +10,8 @@ wave32 scalar pair read of VCC reads s106 and s107, as the hardware does. In
 wave64, `vcc_hi` holds the high half of the VCC mask. Refills carry
 numeric values and clear the destination's symbolic provenance.
 
+Direct compute `s_mov_b32 exec_hi` stores a readable high word in wave32 and updates the upper-half EXEC mask in split wave64.
+
 The source-built hardware fixture compares two 32-thread workgroups with
 a CPU reference and checks the untouched buffer words. It covers constant
 and SGPR selectors, writes to an EXEC-disabled lane, and lane reads feeding
