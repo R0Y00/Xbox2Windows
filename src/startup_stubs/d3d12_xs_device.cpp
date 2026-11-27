@@ -3543,6 +3543,15 @@ bool split_indirect_dispatch_enabled()
 }
 
 // The guest method has independent resource and byte-offset arguments.
+// X2W_D3D12_ROOT_SRV_AT_DRAW=1 (opt-in): slot 44 makes no desktop copy of a root SRV without an upload mapping; the
+// translated draws read it from its title address at the draw (list_root_srv).
+bool root_srv_at_draw()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_D3D12_ROOT_SRV_AT_DRAW", nullptr, 0) != 0;
+    return on;
+}
+LONG root_srv_copies_skipped, root_srv_copies_made;
+
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
@@ -4367,6 +4376,17 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         pass.srv_bound |= 1u << parameter;
         return;
     }
+    // Without an upload mapping a 64 KiB window of title memory is copied into the upload ring for the desktop binding.
+    // No draw reads that binding: translated draws set their own root signature and read the SRV from root_address at
+    // the draw; every desktop graphics pipeline is an indirect one (build_stream_pipeline sets its root), so list_draw
+    // forwards only with a compute pipeline; and an indirect graphics draw binds a pipeline over the list's root, an
+    // empty one or, for a cached mesh pipeline, the title's root, whose only SRV it binds from its lease. With
+    // X2W_D3D12_ROOT_SRV_AT_DRAW=1 the copy is skipped and the parameter stays unbound (srv_bound clear). A desktop
+    // graphics pipeline that reads a root SRV would need the copy at its draw.
+    if (root_srv_at_draw()) {
+        InterlockedIncrement(&root_srv_copies_skipped);
+        return;
+    }
     const std::size_t bytes = readable_window(address, 0x10000);
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(self, address, bytes) : 0;
     static LONG logged;
@@ -4376,9 +4396,19 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         log("x2w-render root SRV %u at title 0x%llx: %zu bytes -> desktop 0x%llx [%s]", parameter, address, bytes, desktop, head);
     }
     if (!desktop) return;
+    InterlockedIncrement(&root_srv_copies_made);
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
 }
+
+// Fixture export (startup_root_srv_draw): slot 44 root SRVs without an upload mapping since the process started.
+// `skipped` counts only with X2W_D3D12_ROOT_SRV_AT_DRAW=1; `copied` counts every copy into the upload ring.
+extern "C" __declspec(dllexport) void x2w_d3d12_root_srv_copies(LONG* skipped, LONG* copied)
+{
+    if (skipped) *skipped = root_srv_copies_skipped;
+    if (copied) *copied = root_srv_copies_made;
+}
+
 // List slot 42 (desktop 38 + 4), SetGraphicsRootConstantBufferView(parameter, title GPU address).
 // A translated shader reads a root CBV through the same pointer source as a root SRV (root_address). Nothing
 // is forwarded to the desktop list and srv_bound is left alone: bit 0 means a vertex-fetch SRV is bound.
@@ -7294,6 +7324,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
+        log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): skipped %ld, copied %ld", root_srv_copies_skipped,
+            root_srv_copies_made);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "

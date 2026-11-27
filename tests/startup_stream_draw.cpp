@@ -487,6 +487,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_SRV_DRAW", nullptr, 0)) {
+        extern int draw_root_srv(void*);
+        if (const int result = draw_root_srv(list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_CBV", nullptr, 0)) {
         extern int root_heap_control(ID3D12Device*);
         extern int draw_root_cbv(void*);

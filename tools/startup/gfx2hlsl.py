@@ -6215,6 +6215,79 @@ class Stage:
             self.masks.difference_update((d, d + 1))
         return None
 
+    def op_s_brev_b64(self, ops, mods):
+        """s_brev_b64: 64-bit bit reverse of S0 into SGPR pair D; SCC unchanged.
+
+        RDNA 2 ISA SOP1 0x0c: D.u[31:0] = reversebits(S0.u[63:32]), D.u[63:32] = reversebits(S0.u[31:0]).
+        When D == S0 (in-place reversal), a scoped temporary preserves both halves before overwriting.
+        """
+        name = 's_brev_b64'
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands, expected 2 unmodified' % (name, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[1] % 2 != 0 or dst[2] > 105:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        d = dst[1]
+        masks = getattr(self, 'masks', ())
+        mask_high = getattr(self, 'mask_high', ())
+        if self.is_lane_mask(ops[0]) or any(w in masks or w in mask_high for w in (d, d + 1)):
+            raise Unsupported('%s on a lane mask' % name)
+        if self.is_lane_mask(ops[1]):
+            raise Unsupported('%s on a lane mask' % name)
+        src = reg_range(ops[1])
+        src_reg = None
+        if src:
+            if src[0] != 's' or src[2] != src[1] + 1 or src[1] % 2 != 0 or src[2] > 105:
+                raise Unsupported('%s source %s' % (name, ops[1]))
+            src_reg = src[1]
+            if any(w in masks or w in mask_high for w in (src_reg, src_reg + 1)):
+                raise Unsupported('%s on a lane mask' % name)
+            for r in (src_reg, src_reg + 1):
+                sym = self.sym.get(r)
+                if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                    raise Unsupported('%s on %s data' % (name, sym[0]))
+            lo, hi = self.S(src_reg), self.S(src_reg + 1)
+            c_lo = self.scalar_const('s%d' % src_reg)
+            c_hi = self.scalar_const('s%d' % (src_reg + 1))
+        elif ops[1] == 'null':
+            lo, hi, c_lo, c_hi = '0u', '0u', 0, 0
+        else:
+            lo, hi = self.i64_words(ops[1], False, True)
+            c_lo, c_hi = int(lo[:-1]), int(hi[:-1])
+        if c_lo is not None and c_hi is not None:
+            rev_lo = int('{:032b}'.format(c_hi & 0xffffffff)[::-1], 2)
+            rev_hi = int('{:032b}'.format(c_lo & 0xffffffff)[::-1], 2)
+            self.set_s(d, '0x%08xu' % rev_lo, ('const', rev_lo))
+            self.set_s(d + 1, '0x%08xu' % rev_hi, ('const', rev_hi))
+            return None
+        if src_reg == d:
+            tracks = self.tracks_uniformity()
+            u_lo = self.scalar_expr_uniform(hi) if tracks else None
+            u_hi = self.scalar_expr_uniform(lo) if tracks else None
+            self.emit('{ uint _t0 = reversebits(%s); s%d = reversebits(%s); s%d = _t0; }' % (hi, d + 1, lo, d))
+            for r, u in ((d, u_lo), (d + 1, u_hi)):
+                if tracks:
+                    self.record_scalar_uniformity(r, u)
+                getattr(self, 'masks', set()).discard(r)
+                getattr(self, 'mask_high', set()).discard(r)
+                getattr(self, 'float_const_s', {}).pop(r, None)
+                if isinstance(self.align4_s, set):
+                    self.align4_s.discard(r)
+                self.sym.pop(r, None)
+                self.used_s.add(r)
+            return None
+        if c_hi is not None:
+            rev_lo = int('{:032b}'.format(c_hi & 0xffffffff)[::-1], 2)
+            self.set_s(d, '0x%08xu' % rev_lo, ('const', rev_lo))
+        else:
+            self.set_s(d, 'reversebits(%s)' % hi)
+        if c_lo is not None:
+            rev_hi = int('{:032b}'.format(c_lo & 0xffffffff)[::-1], 2)
+            self.set_s(d + 1, '0x%08xu' % rev_hi, ('const', rev_hi))
+        else:
+            self.set_s(d + 1, 'reversebits(%s)' % lo)
+        return None
+
     def scalar_cmov(self, ops, mods, pair, name=None):
         """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
         name = name or 's_cmov_b%d' % (64 if pair else 32)

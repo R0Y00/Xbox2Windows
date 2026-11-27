@@ -687,6 +687,13 @@ one on the desktop list, as before; a flagged one is deferred (`root signature .
 the desktop list`, first three). Root SRVs (slot 44) are not forwarded under a deferred root. Translated draws use
 their own root signature (no flags) and are unaffected.
 
+A root SRV (slot 44) at a title address without an upload mapping copies a 64 KiB window of title memory into the
+upload ring for the desktop binding. No draw reads that binding today: translated draws set their own root signature
+and copy the SRV from its title address at the draw, a forwarded slot 12 draw needs a desktop pipeline without an
+indirect graphics root (only compute pipelines), and an indirect graphics draw binds a pipeline over the list's root.
+With the opt-in `X2W_D3D12_ROOT_SRV_AT_DRAW=1`, slot 44 skips the copy and leaves the parameter unbound on the desktop
+list (`startup_root_srv_draw_*`; see [the experiment note](experiments/startup-root-srv-at-draw.md)).
+
 A real draw under a deferred root is decided by `src/startup_stubs/heap_indexed_root.h`: it may bind only when the
 list holds a mirror of every heap the root indexes, covering the indices the draw reads, and every root constant,
 descriptor table and root descriptor can be set again. A one-entry sampler heap covers only index 0 and never stands
@@ -1532,6 +1539,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_NATIVE_SHADERS=<dir>` (`run.ps1 -NativeShaders <dir>`) | experimental, in render mode: translates device slot 67 compute requests in the stand-in with the C++ compiler; `<dir>` holds `dxcompiler.dll` and `dxil.dll`. See [Translating compute programs in the stand-in](#translating-compute-programs-in-the-stand-in) |
 | `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it (private allocations larger than 256 MiB are skipped only with `X2W_D3D12_CAP_EXISTING_HEAP=1`), otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
+| `X2W_D3D12_ROOT_SRV_AT_DRAW=1` | opt-in, render mode: a graphics root SRV (slot 44) without an upload mapping is not copied into the upload ring, since no draw reads that desktop binding (default: a 64 KiB copy at every slot 44 call). Translated draws copy the SRV themselves and are unaffected (`startup_root_srv_draw_*`). See [the experiment note](experiments/startup-root-srv-at-draw.md) |
 | `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1` | opt-in, render mode: a closed command list releases its upload ring chunks once its submit is fenced instead of holding them until Reset, and the ring grows in 16 MiB chunks up to 512 MiB (default: doubling chunks up to 256 MiB, holds until Reset). The larger ring can add up to about 1 GiB of process commit at peak (startup runs in the experiment note). A later submit of the same list before its Reset fences its unchanged chunks again; if one was reused in between, that list is refused before the execute and logged (`startup_address_console_gate_ring_keep_*`, `upload_reservation`). See [the experiment note](experiments/startup-upload-ring-release-at-submit.md) |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
@@ -3374,9 +3382,18 @@ after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken
 The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+
+A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one mip, one
+sample, at most 2048 texels on each side and an uncompressed format with a known element size,
+viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+(`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
+`GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
+16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
+every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
-textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
+other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
+swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
@@ -3385,7 +3402,7 @@ for the address wrote desktop-footprint rows, so the bytes are not in the layout
 names. As for a partial-tile view, a texture already published there samples the null view while
 that is so. `console_layout_beyond_xg_size`: the layout runs past the size the XG stand-in reports
 for the description (the desktop copyable footprints of a slice rounded up to 64 KiB, times the
-slices), which the title may not own.
+slices; a volume is one slice, whose footprints span every depth layer), which the title may not own.
 
 Upload lifetime: each upload of a console-layout texture is written into an upload buffer of its own
 (`x2w_upload::make_page`), not into the shared upload ring. The recording keeps a reference to the
@@ -3415,6 +3432,9 @@ Limits and choices that are not measured against a console:
   elements are checked only against the addrlib pattern rows restated from the addrlib source text
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
+- The thick `0x105` volume layout is compared with addrlib itself when the build has it
+  (`startup_gfx10_volume_addrlib`: every element address of 190 volumes). Mip chains, block-compressed
+  volumes and volumes in the other modes are not handled; they stay refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
@@ -3429,7 +3449,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
 Checks (reproduction in `docs/experiments.md`, "Sample by-address textures of the non-XOR console
 layouts"):
 
-- `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
+- `ctest --preset release --no-tests=error -R '^startup_gfx10_(layout|volume)' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
 
 ## Linear buffer backing (device slot 133, opt-in)
@@ -3509,7 +3529,7 @@ Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, kee
 
 A shared or copied placement logs `x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer ... existing-heaps=<hr> share=<hr> -> <hr> shared|copied at submit`. A kept default logs the usual slot 133 line with `(kept default backing: linear refusal <hr>, use=... type=... existing-heaps=<hr> share=<hr>)` appended. `x2w_d3d12_linear_buffer_info` reports path 3 with `refusal_hr`, and `stale`, `refresh_failures` and `last_refresh_hr` for a copied buffer. A refused submission logs `x2w-d3d12 linear buffers: submission on queue <queue> refused: its refresh would have to wait for queue <queue> (<reason>), so it has no safe completion order; none of its lists ran` (the first eight). `x2w_d3d12_linear_buffer_totals` counts `kept_default`, `refresh_failures` and `unsafe_refresh_refusals`. Fixtures read the same facts through `x2w_d3d12_linear_buffer_info` and `x2w_d3d12_linear_buffer_totals` (`src/startup_stubs/linear_buffer_report.h`). Fixture-only switches: `X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1` makes the feature query report no support, as an adapter with `EXISTING_HEAPS = 0` does. `X2W_TEST_LINEAR_REFRESH_FAIL=<n>` makes staging requests 2, 2 + n, 2 + 2n and so on fail with `E_OUTOFMEMORY`. `X2W_TEST_LINEAR_STAGING_LIMIT=<n>` shrinks the staging pool from 256 buffers to `n`. `x2w_d3d12_linear_buffer_internal_queue` hands fixtures the internal queue, so they can hold refreshes in flight behind a fence of their own. `x2w_d3d12_linear_buffer_test_pause` parks the next refresh at one point (before staging, after staging, or after its copy executed and before it is published), so a fixture can order two threads' refreshes or release a buffer while one is parked. Point 3 instead parks the next title `Wait` (queue slot 17) after the desktop `Wait` and before it is recorded, while it holds that queue's order lock. `X2W_TEST_LINEAR_BUFFER_MUTANT=<name>` removes one guarantee for a negative control. Results and commands: [Production slice: slot 133 linear buffers](experiments.md#production-slice-slot-133-linear-buffers-1914).
 
-Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind. Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
+Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind (not with `X2W_D3D12_ROOT_SRV_AT_DRAW=1`). Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
 
 ## Buffer memory SRVs (device slot 70)
 

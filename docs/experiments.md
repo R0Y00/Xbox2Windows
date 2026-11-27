@@ -26,6 +26,11 @@ DPP16 quad permutations reuse the row mirror's EXEC and operand handling.
 The compute fixture checks arithmetic, lane selection and disabled sources.
 [Experiment and reproduction commands](experiments/native-dpp-quad-compute.md)
 
+## Guest DPP16 row shifts and rotates in direct compute
+
+Full-mask row shifts and rotates stay inside each 16-lane row and apply
+BOUND_CTRL to unusable sources. [Experiment and reproduction commands](experiments/native-dpp-row.md)
+
 ## Guest lane reads and writes in direct compute
 
 `v_readlane_b32` and `v_writelane_b32` lower with a constant or SGPR lane; lane writes ignore EXEC.
@@ -16560,6 +16565,37 @@ ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_l
 ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_(console|console_gate|console_gate_ring|bc_view|srv)_(hardware|warp)$'
 ```
 
+#### Volumes in the 4 KiB standard layout
+
+Slot 70 also reads a single-mip, uncompressed 3D texture whose layout is `0x105`. addrlib lays it
+out in thick 4 KiB blocks (`GFX10_SW_4K_S3_PATINFO`). `startup_gfx10_volume` needs no device. It
+checks the address bit of every x, y and z bit against the restated one-pipe rows for the five element
+sizes, the block sizes, and the order of blocks in a 17 by 17 by 17 RGBA8 volume. It also checks that
+the elements of ten volumes (odd sides included) have their own bytes, that they tile and detile back
+to their rows, 15 layouts on either side of the accepted set, six slot 70 descriptions and seven
+views. `startup_gfx10_volume_thin_control` lays each volume out as a thin 2D array of its layers and
+must fail. `startup_gfx10_volume_addrlib` compares the size and every element address of 190 volumes
+(276,885 addresses) with `Addr2ComputeSurfaceInfo` and `Addr2ComputeSurfaceAddrFromCoord`
+(`ADDR_RSRC_TEX_3D`, `ADDR_SW_4KB_S`) on the Navi21 configuration the other addrlib checks use; it
+skips (77) when the build has no addrlib (`-DXBOX2WINDOWS_ADDRLIB_DIR`).
+
+`startup_address_console_{warp,hardware}` now also draws two volumes, RGBA8 17 by 17 by 17 and 33 by
+9 by 18, whose backing it builds in Python from the same S3 row. Each target tile of the volume's
+width and height loads one depth layer, and every layer must appear. All 65,536 pixels must match.
+A third volume, RGBA8 64 by 8 by 40, takes 163,840 bytes in the layout, but its desktop footprint
+rounded to 64 KiB is only 131,072. It must be held as `console_layout_beyond_xg_size`. Before this
+change the hold counted that footprint once for each of the 40 layers, and the volume would have been
+published.
+
+Two local mutations were run once and are not registered tests: the layer pitch of the upload set
+to zero, and the hold counting one footprint per layer. Each fails `startup_address_console_warp`:
+the first on the first volume's pixels, the second on the held volume.
+
+```powershell
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_volume'
+ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_console_(hardware|warp)$'
+```
+
 ### Six BC5/BC7 mips on a 64 KiB standard layout
 
 `startup_xg_bc_chain_{warp,hardware}` uses a source-built 1024×1024 BC5_UNORM or BC7_UNORM texture with six mip levels, one slice, one sample, explicit layout `0x109` (64 KiB standard, no XOR), default alignment and zero flags. The guest chain occupies `0x160000` bytes. The six offsets starting at mip 0 are `0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000`. The three smallest mips share tile zero. These offsets and all 87,360 visible block addresses were checked with `Addr2ComputeSurfaceInfo` and `Addr2ComputeSurfaceAddrFromCoord` on the pinned Navi21 configuration. [AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib) · [XCL comparison](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/gpu/tiling.rs)
@@ -17077,9 +17113,11 @@ With a device slot 67 placeholder bound, command-list slot 14 looks up the trans
 
 `tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The two entry values arrive through slot 37 and slot 39, with other values written through slot 40 in between; `dispatch-same-root` must still give the expected words, and five refused modes must log their reason and keep the sentinels: a missing word, another compute root set and the first set again, a list reset, a compute root that is not the pipeline's, and one buffer named as input and output. `tests/startup_compute_dispatch_texture_check.py` does the same for a program that stores to a 32x8 RGBA16_FLOAT texture (1024 halves read back through CopyTextureRegion; controls: before translation, without a Dispatch, a texture without unordered access) and for the raw buffer program with a level-zero sample of a 1x1 texture XORed into each stored word (control: no view at the table entry). The texture output program is also bound under a manifest edited to declare no entry values.
 
+`startup_compute_dispatch_two_mips_` writes two distinct patterns through two UAVs of one RGBA16_FLOAT texture in the same translated Dispatch. The test compares all 1,280 half values in the 32×8 and 16×4 subresources, including the sentinel values outside the written rectangles. Before translation both mips keep their sentinels. Exchanging the two views moves the patterns to opposite mips and changes 64 half values relative to the ordered case.
+
 The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>` follows the render totals; "not modelled" counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
 
-Measured on three fixture programs. The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
+The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
 
 The `startup_compute_live_retry_warp` and `startup_compute_live_retry_hardware` tests keep the device and
 slot 67 pipeline alive across two fenced Dispatch calls. The first observes the missing translation and
