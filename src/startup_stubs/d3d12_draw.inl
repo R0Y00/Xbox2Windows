@@ -2312,6 +2312,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool indices_ok = indexed && !indirect && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
     D3D12_INDEX_BUFFER_VIEW live_indices{};
     ID3D12Resource* live_index_resource = nullptr;
+    bool index_read_as_table = false;  // live_index_resource is also bound as a table SRV (X2W_D3D12_TABLE_ALIAS)
     const auto stream_needs_slicing = [&](const Translation::Srv& srv) {
         if (srv.source != 1) return false;
         if (srv.a < 0 || srv.a >= 8) return true;
@@ -2586,16 +2587,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // binds that alias, as vertex streams do, instead of a frame copy. The GPU then reads the bytes at execution,
         // not as they were when the draw was recorded, and the range is not cut at 16 MiB.
         static const bool table_alias = x2w_local::env_on("X2W_D3D12_TABLE_ALIAS");
-        if (table_alias && srv.source == 0 && !formatted.entry && address && view_bytes && view_bytes <= (512u << 20)) {
-            const auto table_placed = placed_buffer_range(self->own().list_device, address, view_bytes);
+        // The raw view covers whole DWORDs, so the alias must hold the rounded range.
+        const std::size_t raw_bytes = (view_bytes + 3) & ~std::size_t{3};
+        if (table_alias && srv.source == 0 && !formatted.entry && address && view_bytes && raw_bytes <= (512u << 20)) {
+            const auto table_placed = placed_buffer_range(self->own().list_device, address, raw_bytes);
             if (!table_placed.reject && table_placed.alias && table_placed.owner &&
                 InterlockedCompareExchange(&table_placed.owner->own().refs, 0, 0)) {
                 const u64 view_offset = address - reinterpret_cast<u64>(table_placed.owner->own().title_memory);
                 if (view_offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 &&
                     retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(table_placed.alias))) {
-                    require_state(self, table_placed.alias,
-                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                    buffer_view(dest, table_placed.alias, view_offset, view_bytes);
+                    // The same alias can also be this draw's live index buffer; it then keeps both read states.
+                    const bool shared_index = table_placed.alias == live_index_resource;
+                    index_read_as_table |= shared_index;
+                    require_state(self, table_placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                  (shared_index ? D3D12_RESOURCE_STATE_INDEX_BUFFER : D3D12_RESOURCE_STATE_COMMON));
+                    buffer_view(dest, table_placed.alias, view_offset, raw_bytes);
                     count_buffer(true);
                     continue;
                 }
@@ -2748,7 +2755,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ID3D12Resource* index_chunk = nullptr;
         auto view = live_indices;
         if (live_index_resource) {
-            require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+            require_state(self, live_index_resource, D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                          (index_read_as_table ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                               : D3D12_RESOURCE_STATE_COMMON));
         } else if (indices_ok && frame_copy(self, index_address, index_total, &offset, &index_chunk) && index_chunk) {
             view = {index_chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(index_total),
                     index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
