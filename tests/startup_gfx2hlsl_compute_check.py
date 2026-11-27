@@ -521,6 +521,27 @@ ACCUM_SCC_SOURCE = ACCUM_SOURCE.replace(
     'v_mov_b32 v5, s28\n')
 ACCUM_SCC_WORDS = ACCUM_WORDS.replace(
     bytes.fromhex('050001d5050d6a00'), bytes.fromhex('1a7e1b8781801c851c020a7e'))
+# cndmask of s26, then s_mov_b32 s26, 0, then cndmask of s25. s26 dies, so the later read is s25, which is still
+# live at the exit. The wave cleared a leaving lane's bit of s25; the model kept the entry bit.
+ACCUM_KEPT_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    'v_cndmask_b32 v5, v5, v6, s26\n'
+    's_mov_b32 s26, 0\n'
+    'v_cndmask_b32 v5, v5, v6, s25\n')
+ACCUM_KEPT_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'),
+    bytes.fromhex('050001d5050d6a0080039abe050001d5050d6600'))
+# s_and_saveexec_b32 s28, s26 sets SCC from the whole new EXEC. Restoring exec from s28 and s_cselect of that SCC
+# stores 1 on every lane of the wave and 0 for a leaving lane's singleton.
+ACCUM_SAVEEXEC_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    's_and_saveexec_b32 s28, s26\n'
+    's_mov_b32 exec_lo, s28\n'
+    's_cselect_b32 s29, 1, 0\n'
+    'v_mov_b32 v5, s29\n')
+ACCUM_SAVEEXEC_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'),
+    bytes.fromhex('1a3c9cbe1c03febe81801d851d020a7e'))
 
 
 def saveexec_fixture():
@@ -1410,6 +1431,14 @@ def check_execz_accumulated_mask():
     finally:
         G.Stage.accum_scc_dead = original_scc
     refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+    # s25 stays live at the exit. The first cndmask reads s26 per lane, s_mov clears s26, and the second
+    # cndmask reads s25. A leaving lane's bit of s25 is clear in the wave and set in the model.
+    assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
+    refused(reason, lambda: translate('O', code=ACCUM_KEPT_WORDS).hlsl_cs())
+    # saveexec of the accumulated word sets SCC from the whole new EXEC, and s_cselect reads it.
+    assert trace(lanes, observe='scc') == [1] * 8
+    assert singletons(lanes, observe='scc') == [0, 0, 0, 1, 1, 1, 1, 1]
+    refused(reason, lambda: translate('O', code=ACCUM_SAVEEXEC_WORDS).hlsl_cs())
     # The same words are refused when the accumulation is not recognised, which is the translator without this pass.
     original = G.Stage.execz_accumulated_mask
 
@@ -2710,6 +2739,8 @@ def check_binary(llvm_mc):
     assert assemble(llvm_mc, ACCUM_SOURCE) == ACCUM_WORDS
     assert assemble(llvm_mc, ACCUM_AND_SOURCE) == ACCUM_AND_WORDS
     assert assemble(llvm_mc, ACCUM_SCC_SOURCE) == ACCUM_SCC_WORDS
+    assert assemble(llvm_mc, ACCUM_KEPT_SOURCE) == ACCUM_KEPT_WORDS
+    assert assemble(llvm_mc, ACCUM_SAVEEXEC_SOURCE) == ACCUM_SAVEEXEC_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
