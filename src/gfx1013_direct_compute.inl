@@ -2074,16 +2074,24 @@ struct DirectCompute {
             auto field = shift("ashr", a, b);
             z = select(cmp("eq", width, "0"), "0", shift("ashr", shift("shl", field, pad), pad));
         } else if (n == "v_cvt_pk_u8_f32") {
-            // (S2 & ~(0xff << 8 * S1[1:0])) | (flt32_to_uint8(S0) << 8 * S1[1:0]) (#2997), with the conversion
-            // gfx2hlsl.py measured on RDNA 2: round to nearest even, saturate to [0, 255], zero for NaN, both zeros
-            // and negatives. (bits - 1) < 0x7f800000 holds exactly from the smallest subnormal to +inf, as an integer
-            // test that fast-math cannot fold.
+            // Round and saturate the binary32 bits directly. Literal 0.5 through DXIL Round_ne
+            // and fptoui read back as 1 on some NVIDIA drivers (#3052).
+            constexpr auto half_bits = "1056964608";      // 0x3f000000
+            constexpr auto max_byte_bits = "1132396544";  // 0x437f0000 (255.0)
+            auto positive = cmp("ult", ir.binary("sub", a, "1"), "2139095040");  // subnormal through +inf
+            auto bounded = select(cmp("ugt", a, max_byte_bits), max_byte_bits, a);
+            // Values at or below 0.5 yield zero, so clamp them and invalid inputs to
+            // exactly 0.5 to keep the significand shift in the range 16..24.
+            auto in_range = ir.value("and i1 " + positive + ", " + cmp("uge", bounded, half_bits));
+            bounded = select(in_range, bounded, half_bits);
+            auto discard = ir.binary("sub", "150", ir.binary("lshr", bounded, "23"));  // 23 + exponent bias
+            auto significand = ir.binary("or", ir.binary("and", bounded, "8388607"), "8388608");
+            auto truncated = ir.binary("lshr", significand, discard);
+            auto halfway = ir.binary("shl", "1", ir.binary("sub", discard, "1"));
+            // Bias by halfway - 1, then add the low retained bit so only odd ties round up.
+            auto bias = ir.binary("add", ir.binary("sub", halfway, "1"), ir.binary("and", truncated, "1"));
+            auto byte = ir.binary("lshr", ir.binary("add", significand, bias), discard);
             auto amount = ir.binary("shl", ir.binary("and", b, "3"), "3");
-            auto positive = cmp("ult", ir.binary("sub", a, "1"), "2139095040");
-            auto bounded = ir.invoke("float", "binary.f32", 36, {{"float", ir.value("bitcast i32 " + a + " to float")},
-                                     {"float", "2.550000e+02"}}, "nounwind readnone");
-            auto rounded = ir.invoke("float", "unary.f32", 26, {{"float", bounded}}, "nounwind readnone");
-            auto byte = select(positive, ir.binary("and", ir.value("fptoui float " + rounded + " to i32"), "255"), "0");
             auto keep = ir.binary("xor", ir.binary("shl", "255", amount), "4294967295");
             z = ir.binary("or", ir.binary("and", val(2), keep), ir.binary("shl", byte, amount));
         } else if (n == "s_orn2_b32")
