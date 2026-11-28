@@ -35,9 +35,16 @@ enum class ComputeViewKind {
     indexed_atomic_uav,
     d16_sample_srv,
     byte_window_srv,
-    heap_buffer_srv // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
+    // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
+    // fallback and never read.
+    heap_sampler,
+    uint_texture_uav
 };
 inline constexpr unsigned compute_resource_heap = ~0u;
+// the directly indexed sampler heap; entry n is title byte offset 16 * n
+inline constexpr unsigned compute_sampler_heap = ~0u - 1;
 // A binding of the whole descriptor heap: it has no table register and no root parameter.
 inline bool compute_heap_binding(ComputeViewKind kind) { return kind == ComputeViewKind::heap_buffer_srv; }
 inline bool compute_buffer_uav(ComputeViewKind kind) {
@@ -49,7 +56,8 @@ struct IndexedAtomicView {
 };
 inline bool compute_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::texture_uav || kind == ComputeViewKind::half_scalar_uav ||
-           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav || compute_buffer_uav(kind);
+           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav ||
+           kind == ComputeViewKind::uint_texture_uav || compute_buffer_uav(kind);
 }
 struct ComputeViewBinding {
     ComputeViewKind kind;
@@ -112,6 +120,11 @@ struct NativeComputeShader {
 // The view class a GPU-selected descriptor heap slot is read as. none: the slot and its view type are not known, so a
 // heap read is refused. raw_buffer: the capture says the selected slot is a raw buffer SRV. other: the capture names a
 // view type that is not translated (refused when the shader reads the heap).
+// Under raw_buffer the direct path also reads the byte-address rewrite of the selected descriptor (stride read,
+// max(stride, 1), byte count, stride cleared, raw out-of-bounds mode) as the same raw view. The caller guarantees that
+// every slot the program can select is a raw view whose size is the guest range num_records * max(stride, 1); the
+// translator does not check that, nor the swizzle bits (word 1 bits 31:30) or the other word 3 fields, and a program
+// with two heap loads from different selectors is outside what one captured selection covers.
 enum class HeapViewContract : unsigned { none, raw_buffer, other };
 NativeComputeShader translate_compute(const ComputeRequest &request, unsigned entry_byte_offset,
                                       bool direct_dxil = false);
@@ -125,6 +138,8 @@ struct NativeVertexElement {
 struct DirectGraphicsPair {
     NativeComputeShader vertex, pixel;
     std::vector<NativeVertexElement> input_layout;
+    // GuestShaderStage::target_components of the pixel stage: the target types an RTV variant asked for.
+    std::array<unsigned char, 8> target_components{};
     GraphicsConstantLayout constant_layout() const {
         GraphicsConstantLayout layout;
         for (auto *stage : {&vertex, &pixel})
@@ -135,7 +150,8 @@ struct DirectGraphicsPair {
 };
 DirectGraphicsPair translate_graphics_pair(std::string_view a, std::string_view b,
                                           const D3D12_ROOT_SIGNATURE_DESC1 &layout, std::string_view pixel_entry = {},
-                                          std::optional<GpuStage> first_stage = {});
+                                          std::optional<GpuStage> first_stage = {},
+                                          const std::array<unsigned char, 8> &target_components = {});
 DirectGraphicsPair translate_graphics_pair(std::string_view a, std::string_view b);
 DirectGraphicsPair translate_reflected_graphics(GuestShaderStage &vs, GuestShaderStage &ps,
                                                 const D3D12_ROOT_SIGNATURE_DESC1 &layout);

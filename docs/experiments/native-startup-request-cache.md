@@ -1,19 +1,19 @@
 # Startup request consumption and runtime cache publication in `compile_dxil` (#2933)
 
 [The fixture](../../tests/native_startup_request_cache_check.py) verifies that `compile_dxil --requests` consumes
-revision-28 startup graphics (`x2w-startup-shader-28`, including ASCII `req_<key>.psin` pixel-input descriptions)
-and compute (`x2w-startup-shader-28cs`, `req_<key>.c67`) requests, publishes runtime-named stage binaries and
+revision-29 startup graphics (`x2w-startup-shader-29`, including ASCII `req_<key>.psin` pixel-input descriptions)
+and compute (`x2w-startup-shader-29cs`, `req_<key>.c67`) requests, publishes runtime-named stage binaries and
 manifests (`<key>.vs.cso` / `<key>.ps.cso` or `<key>.cs.cso`, followed by `<key>.txt`), and loads directly through
 the startup runtime cache loaders on WARP and hardware without manual renaming or conversion.
 
 ## Alignment between `compile_dxil --requests` and the startup cache
 
 1. **Request keys and `.psin` stream descriptions (`src/shader_compute_request.cpp`):**
-   - Graphics requests validate `x2w-startup-shader-28` over `.a`, `.b`, `.root`, and optional `.ia`. When
+   - Graphics requests validate `x2w-startup-shader-29` or the archived revision 28 over `.a`, `.b`, `.root`, and optional `.ia`. When
      `req_<key>.psin` is present, the reader parses `psin1 <key> ena=0x<mask> addr=0x<mask>`, checks that the
      embedded key matches `<key>` and `(ena & ~addr) == 0`, and folds `b"psin1" + struct.pack("<II", ena, addr)`
      into the FNV-1a key identically to `tools/startup/gfx2hlsl.py:pipeline_key`.
-   - Compute requests validate `x2w-startup-shader-28cs` over length-framed `.c67`, `.data`, `.root`, `.desc`,
+   - Compute requests validate `x2w-startup-shader-29cs` or the archived revision 28 over length-framed `.c67`, `.data`, `.root`, `.desc`,
      `.sa`, and `.sb` identically to `d3d12_draw.inl:publish_compute_request` and `gfx2hlsl.py:compute_key`.
    - In raw graphics translation (`src/gfx1013_compute_native.cpp`, `src/gfx1013_direct_graphics.inl`), pixel
      entry VGPR offsets follow `SPI_PS_INPUT_ADDR` while only inputs enabled in `SPI_PS_INPUT_ENA` are readable.

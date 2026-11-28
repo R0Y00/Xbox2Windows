@@ -2,7 +2,9 @@
 
 Each source contributes its low 16 bits. abs clears bit 15 of that half, then neg toggles it.
 The operation runs in f32 and rounds to binary16 the way v_cvt_f16_f32 does. The result is the low
-16 bits and the high half is zero. The reference is half_op in f16_packed_model.py (sub is an add of
+16 bits and the destination's high half keeps its value (LLVM GCNSubtarget::zeroesHigh16BitsOfDest:
+"On gfx10, all 16-bit instructions preserve the high bits"). Every destination holds HI_A in its high
+half before the operation, so each stored word is HI_A | result. The reference is half_op in f16_packed_model.py (sub is an add of
 the negated second source, subrev swaps the sources). NaN payloads are compared by class.
 
   native_f16_alu_check.py model
@@ -10,7 +12,7 @@ the negated second source, subrev swaps the sources). NaN payloads are compared 
   native_f16_alu_check.py ir DUMPER
       build one compute container, dump its DXIL text, evaluate it, and require the named refusals
   native_f16_alu_check.py gpu STORE_REPLAY SDK
-      compute readback of the same words (exit 77 when the adapter cannot run a wave32 shader)
+      compute readback of the same words and the DPP16 cases (exit 77 without wave32)
 """
 import re
 import struct
@@ -26,6 +28,7 @@ from native_scalar_lds_check import scalar, sop1, vmove
 
 GROUPS = 2
 WORDS = 2064
+SENTINEL = 0x69696969  # native_store_replay fills untouched words with 0x69
 BASE = 8
 STRIDE = 128
 SHIFT = 9
@@ -45,6 +48,15 @@ PAIRS = [
 ]
 HI_A = 0xABCD0000
 HI_B = 0x789A0000
+DPP_EXEC = 0xFFFFFEFD  # Lanes 1 and 8 are inactive during the DPP instructions.
+DPP_OLD = HI_A | 0x3555
+DPP_CASES = (
+    # op, DPP_CTRL, FI, BOUND_CTRL, row mask, bank mask, src1 low half
+    ('add', 0xB1, True, False, 0xF, 0xF, 0x1000),  # quad_perm:[1,0,3,2], ties to even
+    ('mul', 0x111, False, False, 0xF, 0xF, 0x3C01),  # row_shr:1, preserve at row edges
+    ('sub', 0xB1, True, False, 0x5, 0xF, 0x3C01),
+    ('subrev', 0xB1, False, True, 0xF, 0x5, 0x3C01),
+)
 
 
 def binary16(op, a, b):
@@ -67,13 +79,20 @@ def modified(bits, abs_mask, neg, index):
 
 
 def same_half(got, want):
-    """Bit equality of two results. The high half must be zero. Any NaN matches any NaN."""
-    if (got | want) >> 16:
+    """Bit equality of two stored words: the high half must be the kept HI_A, the low halves equal. Any NaN
+    matches any NaN."""
+    if got >> 16 != HI_A >> 16 or want >> 16 not in (0, HI_A >> 16):
         return False
-    left, right = got & 0xffff, want & 0xffff
-    if M.is_nan(left) or M.is_nan(right):
-        return M.is_nan(left) and M.is_nan(right)
-    return left == right
+    return same_binary16(got & 0xffff, want & 0xffff)
+
+
+def same_binary16(got, want):
+    """Bit equality of two binary16 values (16 bits each). Any NaN matches any NaN."""
+    if got >> 16 or want >> 16:
+        return False
+    if M.is_nan(got) or M.is_nan(want):
+        return M.is_nan(got) and M.is_nan(want)
+    return got == want
 
 
 def _u32(value):
@@ -198,11 +217,15 @@ def all_cases():
     return items
 
 
-def program(items):
-    """Preamble plus one store per case. s4 is the descriptor table and s5 is the group id."""
-    code = [sop1(3, 20, 4), sop1(3, 21, 128), 0xf408080a, 0xfa000020,
+def preamble():
+    """s4 is the descriptor table and s5 is the group id."""
+    return [sop1(3, 20, 4), sop1(3, 21, 128), 0xf408080a, 0xfa000020,
             scalar(0x1e, 7, 5, 128 + SHIFT), vmove(8, 7), sop1(3, 126, 129),
             0xbfa40000, 0xbfa40010, 0xbfa5000f, 0xba800881, 0]
+
+
+def program(items):
+    code = preamble()
     want = []
     for case in items:
         code += case.emit()
@@ -212,18 +235,49 @@ def program(items):
     return code, want
 
 
+def dpp_program():
+    assert STRIDE == 32 * len(DPP_CASES)
+    code = preamble()
+    code += [sop1(3, 126, 193)]  # the preamble leaves EXEC at lane 0; set up every lane
+    code += vop2(0x1A, 8, 132, 0) + vop2(0x25, 8, 7, 8)  # 16 * lane + group byte base
+    code += mov(1, HI_B | 0x3c00) + vop2(0x1C, 1, 256, 1)  # lane-distinct src0
+    for slot, (op, pattern, fi, bound_zero, rows, banks, src1) in enumerate(DPP_CASES):
+        control = 1 | pattern << 8 | fi << 18 | bound_zero << 19 | banks << 24 | rows << 28
+        code += mov(2, HI_B | src1) + mov(3, DPP_OLD)
+        code += [sop1(3, 126, 255), DPP_EXEC, *vop2(OP_CODE[op], 3, 250, 2), control]
+        # Store under full EXEC to observe both lane masks and preserved destinations.
+        code += [sop1(3, 126, 193), *store(4 * slot, 3)]
+    return code + [0xbf810000]
+
+
+def dpp_reference():
+    results = []
+    for lane in range(32):
+        for op, _, fi, bound_zero, rows, banks, src1 in DPP_CASES:
+            peer = lane - 1 if op == 'mul' else lane ^ 1
+            in_row = peer // 16 == lane // 16
+            usable = in_row and (fi or DPP_EXEC & (1 << peer))
+            row, bank = lane // 16, lane // 4 % 4
+            enabled = DPP_EXEC & (1 << lane) and rows & (1 << row) and banks & (1 << bank)
+            if enabled and (usable or bound_zero):
+                results.append(HI_A | binary16(op, 0x3c00 + peer if usable else 0, src1))
+            else:
+                results.append(DPP_OLD)
+    return results
+
+
 def swapped_want(case):
     op = {'sub': 'subrev', 'subrev': 'sub'}.get(case.op, case.op)
     return binary16(op, modified(case.a, case.abs_mask, case.neg, 0), modified(case.b, case.abs_mask, case.neg, 1))
 
 
 def reject_mutants(items):
-    """The comparator must fail a sub/subrev swap and a result whose high half was left in place."""
+    """The comparator must fail a sub/subrev swap and a result whose high half was zeroed."""
     wants = [case.want for case in items]
     swapped = [swapped_want(case) for case in items]
     assert any(left != right for left, right in zip(wants, swapped))
-    assert not all(same_half(got, want) for got, want in zip(swapped, wants))
-    assert not all(same_half(got | HI_A, want) for got, want in zip(wants, wants))
+    assert not all(same_half(HI_A | got, want) for got, want in zip(swapped, wants))
+    assert not any(same_half(got, want) for got, want in zip(wants, wants))
 
 
 def check_model(items):
@@ -241,7 +295,7 @@ def check_model(items):
         left = modified(case.a, case.abs_mask, case.neg, 0)
         right = modified(case.b, case.abs_mask, case.neg, 1)
         got = f32_half(case.op, left, right)
-        assert same_half(got, case.want), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
+        assert same_half(HI_A | got, case.want), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
     wants = [case.want for case in items]
     assert 0x8000 in wants and 0x0000 in wants and 0x7c00 in wants and 0x3c00 in wants and 0x3c02 in wants
     assert any(M.is_nan(value) for value in wants)
@@ -252,8 +306,9 @@ def check_model(items):
 def refusal_programs():
     add = vop2(0x32, 3, 257, 2)
     programs = []
-    for name, op in OP_CODE.items():
-        programs.append((vop2(op, 3, 250, 2) + [0, 0xbf810000], 'unsupported v_%s_f16 DPP form' % name))
+    programs.append((vop2(0x32, 3, 233, 2) + [0xfac68801, 0xbf810000], 'SDWA or DPP vector operands'))
+    # Clamp needs a wide encoding. A VOP3 with clamp and the DPP16 source selector is invalid.
+    programs.append((vop3(0x32, 3, 250, 258, clamp=1) + [0xbf810000], 'unsupported v_add_f16 clamp or omod'))
     programs.append((vop3(0x35, 3, 257, 258, clamp=1) + [0xbf810000], 'unsupported v_mul_f16 clamp or omod'))
     programs.append((vop3(0x33, 3, 257, 258, omod=1) + [0xbf810000], 'unsupported v_sub_f16 clamp or omod'))
     programs.append((vop3(0x34, 3, 257, 258, opsel=1) + [0xbf810000], 'unsupported v_subrev_f16 high-half op_sel'))
@@ -264,7 +319,7 @@ def refusal_programs():
     programs.append(([0xb98005c1] + add + [0xbf810000], 'unsupported binary16 rounding or denormal mode'))
     programs.append(([0xbfa40001] + add + [0xbf810000], 'unsupported compute control instruction s_round_mode'))
     programs.append(([0xbfa5000c] + add + [0xbf810000], 'unsupported compute control instruction s_denorm_mode'))
-    programs.append((vop2(0x36, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_fmac_f16'))
+    programs.append((vop2(0x3c, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_pk_fmac_f16'))
     programs.append((vop2(0x3a, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_min_f16'))
     return programs
 
@@ -448,6 +503,10 @@ def _exec(line, values, memory, stores):
         elif 'legacyF16ToF32' in rhs:
             argument = re.search(r'i32 (\S+)\)$', rhs)
             values[name] = ('float', _widen(_i32(argument.group(1), values)))
+        elif 'unaryBits.i32(i32 33,' in rhs:
+            argument = re.search(r'i32 33,\s*i32 ([^,\s\)]+)\)', rhs)
+            x = _i32(argument.group(1), values) & 0xffffffff
+            values[name] = ('i32', (32 - x.bit_length()) if x else 0xffffffff)
         elif 'createHandleFromBinding' in rhs or 'annotateHandle' in rhs:
             values[name] = ('handle', 0)
         else:
@@ -505,7 +564,7 @@ def run_model():
     assert vop2(0x32, 0, 257, 2) == [0x64000501]
     assert len(want) == len(items) and len(code) > len(want)
     print('native_f16_alu model: %d results match f32-then-round; '
-          'a sub/subrev swap and a non-zero upper half are rejected' % len(items))
+          'a sub/subrev swap and a zeroed upper half are rejected' % len(items))
 
 
 def run_ir(dumper):
@@ -525,6 +584,8 @@ def run_ir(dumper):
         bad = [(i, hex(got), hex(expected)) for i, ((_, got), expected) in enumerate(zip(stores, want))
                if not same_half(got, expected)]
         assert not bad, bad[:8]
+        run = dump(dumper, work, dpp_program(), 'dpp')
+        assert run.returncode == 0 and 'waveReadLaneAt.i32' in run.stdout, (run.stdout, run.stderr)
         for refused, why in refusal_programs():
             run = dump(dumper, work, refused, 'refused')
             assert run.returncode != 0 and why in run.stderr, (why, run.returncode, run.stderr)
@@ -541,37 +602,32 @@ def group_offsets(count):
 
 
 def run_gpu(gpu, sdk):
-    items = all_cases()
-    code, want = program(items)
+    code, want = program(all_cases())
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         src, root = work / 'root.hlsl', work / 'root.bin'
         src.write_text('#define SIG "DescriptorTable(UAV(u0,numDescriptors=8))"')
         subprocess.run([str(Path(sdk) / 'dxc.exe'), '-T', 'rootsig_1_1', '-E', 'SIG', '-Fo', root, src], check=True)
-        sa = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1, 0, 0x80 | (5 << 1))
-        marker = write_request(work, code, root.read_bytes(), sa)
-        dest = work / 'f16-alu-readback.bin'
-        run = subprocess.run([gpu, sdk, str(marker), str(work / 'cache'), '0', str(dest), '--direct'])
-        if run.returncode == 77:
-            sys.exit(77)
-        run.check_returncode()
-        offsets = group_offsets(len(want))
-        expected = [0x69696969] * WORDS
-        results = {}
-        for group in range(GROUPS):
-            for slot, value in zip(offsets[group], want):
-                expected[slot] = value
-                results[slot] = value
-        actual = struct.unpack('<2064I', dest.read_bytes())
-        bad = []
-        for index, (got, model) in enumerate(zip(actual, expected)):
-            # NaN payloads are not portable. Finite values and infinities match bit for bit,
-            # and every result has a zero upper half. Words outside the stores stay at the fill.
-            ok = same_half(got, results[index]) if index in results else got == model
-            if not ok:
-                bad.append((index, hex(got), hex(model)))
-        assert not bad[:10], bad[:10]
-    print('native_f16_alu GPU: %d words matched the model, high half zero' % (GROUPS * len(want)))
+        sa = struct.pack('<7I', 0, 0, 0, 32 | (1 << 16), 1 | (1 << 20), 0, 0x80 | (5 << 1))
+        for name, instructions, reference in (('alu', code, want), ('dpp', dpp_program(), dpp_reference())):
+            marker = write_request(work, instructions, root.read_bytes(), sa)
+            dest = work / (name + '-readback.bin')
+            run = subprocess.run([gpu, sdk, str(marker), str(work / 'cache'), '0', str(dest), '--direct'])
+            if run.returncode == 77:
+                sys.exit(77)
+            run.check_returncode()
+            results = {slot: value for offsets in group_offsets(len(reference))
+                       for slot, value in zip(offsets, reference)}
+            actual = struct.unpack('<2064I', dest.read_bytes())
+            bad = []
+            for index, got in enumerate(actual):
+                model = results.get(index, SENTINEL)
+                # Compare NaNs by class, keep the destination high half, and check the guard words.
+                ok = same_half(got, model) if index in results else got == model
+                if not ok:
+                    bad.append((index, hex(got), hex(model)))
+            assert not bad, (name, bad[:10])
+            print('native_f16_alu GPU %s: %d words matched the model, high half kept' % (name, len(results)))
 
 
 if __name__ == '__main__':

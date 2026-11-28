@@ -127,11 +127,13 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_buffer_srv)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::uint_texture_uav)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
+        const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
         if (!b.array_count || b.array_position >= b.array_count ||
-            (b.root_parameter >= 16 && b.root_parameter != compute_resource_heap))
+            (sampler_heap ? b.root_parameter != compute_sampler_heap
+                          : b.root_parameter >= 16 && b.root_parameter != compute_resource_heap))
             throw std::runtime_error("invalid cached binding");
         shader.bindings.push_back(b);
     }
@@ -471,7 +473,27 @@ static std::vector<NativeVertexElement> vertex_layout(std::string_view text, con
 
 DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view b, const fs::path &cache,
                                            bool &cache_hit, std::string_view root, std::string_view input_layout,
-                                           std::string_view pixel_entry) {
+                                           std::string_view pixel_entry, bool write_cache,
+                                           const std::vector<unsigned> &rtv_formats) {
+    // An RTV variant types each color target by its format, as tools/startup/gfx2hlsl.py mrt_kind does: u32 or i32
+    // for the integer formats, f32 for every other format.
+    std::array<unsigned char, 8> targets{};
+    if (rtv_formats.size() > targets.size()) throw UnsupportedComputeShader("invalid RTV variant values");
+    for (size_t i = 0; i < rtv_formats.size(); ++i) {
+        const unsigned component = dxil_io_component(rtv_formats[i]);
+        targets[i] = static_cast<unsigned char>(component == 5 || component == 4 ? component : 9);
+    }
+    // The two three-channel 32-bit integer formats have no verified readback there. As there, one is refused by
+    // name only when the pixel stage exports to its target; the stage's cached form does not depend on which
+    // format of a type was asked for, so this is checked on a cache hit too.
+    const auto verified = [&](DirectGraphicsPair pair) {
+        for (size_t i = 0; i < rtv_formats.size(); ++i)
+            if (pair.pixel.pixel_writes[i] &&
+                (rtv_formats[i] == DXGI_FORMAT_R32G32B32_UINT || rtv_formats[i] == DXGI_FORMAT_R32G32B32_SINT))
+                throw UnsupportedComputeShader(std::string("unverified ") + (targets[i] == 5 ? "UINT" : "SINT") +
+                                               " RTV format " + std::to_string(rtv_formats[i]));
+        return pair;
+    };
     // A fixed PSO can expose a shorter serialized desktop root than the
     // guest's hardware descriptor table. An explicitly supplied companion
     // describes the guest ABI. Never use its executable code in the pair.
@@ -479,7 +501,7 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     const std::array<std::string_view, 2> raw{a, b};
     const std::array<Bytes, 2> digests{shader_digest(a), shader_digest(b)};
     Bytes identity = Bytes(X2W_NATIVE_SHADER_REVISION) + "/linked/vs_ps_6_6/";
-    if (a.substr(0,4) != "DXBC" && b.substr(0,4) != "DXBC") {
+    if (!cache.empty() && a.substr(0,4) != "DXBC" && b.substr(0,4) != "DXBC") {
         for (size_t i = 0; i < raw.size(); ++i) {
             auto file = cache / "interfaces" / (digests[i] + ".cdxil");
             if (std::filesystem::exists(file)) companions[i] = read_shader_container_bytes(file);
@@ -502,10 +524,13 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
     const bool reflected = !companions[0].empty();
     if (reflected != !companions[1].empty()) throw UnsupportedComputeShader("incomplete raw graphics interface pair");
     if (reflected && root.empty()) throw UnsupportedComputeShader("missing captured root for reflected graphics");
-    const auto key = shader_digest(identity + shader_digest(root) + shader_digest(input_layout) + shader_digest(pixel_entry));
+    // The base pair keeps its key. A variant adds its target types, so formats of one type share an entry.
+    const Bytes typed = rtv_formats.empty() ? Bytes{}
+        : shader_digest(std::string_view(reinterpret_cast<const char *>(targets.data()), targets.size()));
+    const auto key = shader_digest(identity + shader_digest(root) + shader_digest(input_layout) + shader_digest(pixel_entry) + typed);
     const auto path = cache / (key + ".pairir");
     Bytes payload;
-    cache_hit = lookup(path, key, payload);
+    cache_hit = write_cache && !cache.empty() && lookup(path, key, payload);
     auto effective_layout = [&](const NativeComputeShader &vs) {
         if (!input_layout.empty() || (pixel_entry.empty() && !reflected) || !vs.vertex_fetch) return std::string(input_layout);
         unsigned count = 0;
@@ -527,7 +552,9 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             Reader in{payload};
             auto vertex = decode(in.take(in.word()));
             auto elements = vertex_layout(effective_layout(vertex), vertex);
-            return {std::move(vertex), decode(in.remaining), std::move(elements)};
+            return verified({std::move(vertex), decode(in.remaining), std::move(elements), targets});
+        } catch (const UnsupportedComputeShader &) {
+            throw;
         } catch (const std::runtime_error &) {
             cache_hit = false;
         }
@@ -588,8 +615,10 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             stage.code.assign(raw[i]);
             stage.exports.clear();
         }
+        interfaces.at(GpuStage::ps).target_components = targets;
         pair = translate_reflected_graphics(interfaces.at(GpuStage::vs),interfaces.at(GpuStage::ps),layout);
-    } else pair = translate_graphics_pair(a, b, layout, pixel_entry, first_stage);
+    } else pair = translate_graphics_pair(a, b, layout, pixel_entry, first_stage, targets);
+    pair.target_components = targets;
     if (!entry.empty()) {
         const auto &attrs = interfaces.at(GpuStage::ps).attributes;
         std::vector<unsigned> channels(attrs.size());
@@ -680,13 +709,15 @@ DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view 
             }
         }
     }
-    auto vertex = encode(pair.vertex);
-    payload.clear();
-    word(payload, static_cast<uint32_t>(vertex.size()));
-    payload += vertex;
-    payload += encode(pair.pixel);
-    publish(path, key, payload);
-    return pair;
+    if (write_cache && !cache.empty()) {
+        auto vertex = encode(pair.vertex);
+        payload.clear();
+        word(payload, static_cast<uint32_t>(vertex.size()));
+        payload += vertex;
+        payload += encode(pair.pixel);
+        publish(path, key, payload);
+    }
+    return verified(std::move(pair));
 }
 
 std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program) {
@@ -733,6 +764,9 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
+                uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
+                          << b.byte_offset << " channels 1\n";
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
                        (b.image_dimension == 1 || b.image_dimension == 5) && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << (b.image_dimension == 5 ? " tex2da" : " tex2d")
@@ -766,14 +800,16 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     return out.str();
 }
 
-std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair) {
+std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair, std::string_view rtv_request) {
     if (pair.vertex.vertex_fetch || !pair.input_layout.empty())
         return std::nullopt;
     for (const auto &in : pair.vertex.inputs)
         if (in.name != "SV_VertexID" && in.name != "SV_InstanceID")
             return std::nullopt;
+    // An integer target is published only for the RTV variant whose format asked for that type.
     for (const auto &out : pair.pixel.outputs)
-        if (out.name == "SV_Target" && out.component != 9)
+        if (out.name == "SV_Target" && out.component != 9 &&
+            (out.index >= pair.target_components.size() || out.component != pair.target_components[out.index]))
             return std::nullopt;
 
     std::optional<NativeGraphicsBindings> maybe_bindings;
@@ -823,6 +859,14 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
         const auto &b = bindings.views[bindings.srv_count + j];
         if (b.root_parameter >= 16 || b.array_count != 1)
             return std::nullopt;
+        if (b.kind == ComputeViewKind::raw_buffer_uav) {
+            // First slice: one pixel UAV with no other resource views. Vertex stores,
+            // mixed views and aliases need their own runtime acceptance.
+            if (uav_count != 1 || bindings.srv_count || !pair.vertex.bindings.empty())
+                return std::nullopt;
+            uav_lines << "uav " << j << " raw table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+            continue;
+        }
         if (b.kind != ComputeViewKind::texture_uav && b.kind != ComputeViewKind::half4_texture_uav)
             return std::nullopt;
         if (b.image_dimension != 1 && b.image_dimension != 5)
@@ -874,6 +918,8 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
             out << line;
         }
     }
+    if (!rtv_request.empty())
+        out << rtv_request << '\n';
     return out.str();
 }
 } // namespace x2w

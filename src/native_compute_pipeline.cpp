@@ -35,6 +35,10 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
 
     UINT counts[2]{};
     for (const auto &binding : pipeline.bindings) {
+        if (binding.kind == ComputeViewKind::heap_sampler) {
+            pipeline.sampler_heap_indexed = true; // SamplerDescriptorHeap reads: no table register
+            continue;
+        }
         if (compute_heap_binding(binding.kind)) {
             pipeline.heap_indexed = true; // ResourceDescriptorHeap reads: no table register
             continue;
@@ -89,9 +93,10 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param.Constants = {b.shader_register + 1, 0, 2};
     }
+    const UINT root_flags = (pipeline.heap_indexed ? 0x400u : 0u)           // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                            | (pipeline.sampler_heap_indexed ? 0x800u : 0u); // SAMPLER_HEAP_DIRECTLY_INDEXED
     D3D12_ROOT_SIGNATURE_DESC desc{param_count, params.data(), static_cast<UINT>(samplers.size()), samplers.data(),
-                                   pipeline.heap_indexed ? static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400) // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                                                         : D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                                   static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(root_flags)};
     Microsoft::WRL::ComPtr<ID3DBlob> blob;
     if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -108,12 +113,24 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
 
 void NativeComputePipeline::bind(ID3D12GraphicsCommandList *list, ID3D12DescriptorHeap *heap,
                                  D3D12_GPU_DESCRIPTOR_HANDLE first, UINT increment, const unsigned *words,
-                                 const std::vector<IndexedAtomicView> &atomic) const {
+                                 const std::vector<IndexedAtomicView> &atomic, ID3D12DescriptorHeap *sampler_heap) const {
     if (constant_words && !words)
         throw std::runtime_error("compute root constants missing");
     if (atomic.size() != atomic_views)
         throw std::runtime_error("indexed atomic view metadata missing");
-    if (srv_count || uav_count || heap_indexed)
+    const bool views = srv_count || uav_count || heap_indexed;
+    if (sampler_heap_indexed) {
+        if (!sampler_heap)
+            throw std::runtime_error("a sampler heap is needed");
+        if (views) {
+            if (!heap)
+                throw std::runtime_error("a view heap is needed");
+            // Views first, then samplers, as bind_translated_heaps does.
+            ID3D12DescriptorHeap *heaps[2]{heap, sampler_heap};
+            list->SetDescriptorHeaps(2, heaps);
+        } else
+            list->SetDescriptorHeaps(1, &sampler_heap);
+    } else if (views)
         list->SetDescriptorHeaps(1, &heap);
     list->SetComputeRootSignature(root.Get());
     list->SetPipelineState(state.Get());

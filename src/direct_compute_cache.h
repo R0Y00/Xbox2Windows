@@ -13,7 +13,10 @@ NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, u
 DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view b,
                                           const std::filesystem::path &cache, bool &cache_hit,
                                           std::string_view root = {}, std::string_view input_layout = {},
-                                          std::string_view pixel_entry = {});
+                                          std::string_view pixel_entry = {}, bool write_cache = true,
+                                          const std::vector<unsigned> &rtv_formats = {});
 std::optional<std::string> format_compute_runtime_manifest(const NativeComputeShader &program);
-std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair);
+// rtv_request: the "rtv1 ..." text of an RTV variant, written as the manifest's last line for the runtime to match.
+std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphicsPair &pair,
+                                                            std::string_view rtv_request = {});
 }

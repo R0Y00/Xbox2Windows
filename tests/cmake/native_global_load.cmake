@@ -1,4 +1,4 @@
-# Direct C++ compute: global_load_dword through a root SRV address (#2962). Refusals and the module's guards run
+# Direct C++ compute: GLOBAL DWORD loads through a root SRV address. Refusals and the module's guards run
 # everywhere; the dispatch readback needs shader model 6.6 with wave32 and otherwise reports a skip (77).
 if(EXISTS "${INTAKE_PYTHON}" AND TARGET compile_dxil AND TARGET native_store_replay)
     add_test(NAME native_global_load_hardware COMMAND "${INTAKE_PYTHON}" -B

@@ -79,7 +79,28 @@ def _bounded_code(image, start):
     return image[start:end]
 
 
-def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
+def _calculated_early_out(code, instructions):
+    """Cross-check the decoded extent and instruction inventory before accepting a calculated continuation."""
+    if not any(line.startswith("s_getpc_b64 ") for line in instructions.values()):
+        return None
+    # gfx2hlsl imports pixel_aot symbols lazily too.
+    from startup import gfx2hlsl as G
+    ins = G.decode(code)
+    if [(off, name) for off, _n, name, _asm in ins] != [(off, line.split()[0]) for off, line in instructions.items()]:
+        raise ValueError("Calculated early-out: LLVM and the repository decoder disagree on the instruction inventory")
+    if ins[-1][0] + ins[-1][1] != len(code):
+        raise ValueError("Calculated early-out: the decoded instructions do not consume the bounded span")
+    try:
+        calculated = G.calculated_pc_proof(ins, None)
+        profile = G.terminal_continuation_proof(ins, calculated)
+    except G.Unsupported as reason:
+        raise ValueError(str(reason)) from None
+    if profile is None:
+        raise ValueError("Calculated early-out: no proven transfer onto a terminating continuation")
+    return profile
+
+
+def _check_two_exits(code, llvm, *, cpu, features, mesh=False, early_out=False):
     """Both decoded exits must be reachable from the single entry."""
     instructions = dict(disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
@@ -90,6 +111,7 @@ def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
     mesh_alloc = "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"
     if mesh and mesh_alloc not in instructions.values():
         raise ValueError("Unverified multi-exit program: missing mesh allocation")
+    early_out = _calculated_early_out(code, instructions) if early_out and not mesh else None
     # An aligned word can be a literal or the second half of an instruction.
     # Follow branches only from decoded PCs and reject unresolved transfers.
     pcs = list(instructions)
@@ -112,17 +134,22 @@ def _check_two_exits(code, llvm, *, cpu, features, mesh=False):
             pending.append(target)
             if op == "s_branch":
                 continue
-        elif not ((mesh and instructions[pc] in ("s_barrier", mesh_alloc))
-                  or op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
-                                 "scratch_", "exp", "s_load_", "s_buffer_load_", "s_cmp", "s_bitcmp",
-                                 "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
-                                 "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
-                                 "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
-                  or op in ("s_nop", "s_version", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
-                            "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
-                            "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
-                            "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
-                            "s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32")):
+        elif early_out is not None and pc == early_out[0]:
+            targets.add(early_out[1])
+            pending.append(early_out[1])
+            continue
+        elif not (early_out is not None and pc in early_out[2]) and not (
+                (mesh and instructions[pc] in ("s_barrier", mesh_alloc))
+                or op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
+                                  "scratch_", "exp", "s_load_", "s_buffer_load_", "s_cmp", "s_bitcmp",
+                                  "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
+                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
+                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
+                or op in ("s_nop", "s_version", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
+                          "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
+                          "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
+                          "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
+                          "s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
@@ -189,8 +216,9 @@ def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
         if markers == 1:
             return code
         mesh = stage == 13 and cpu == b"gfx1013" and features == MESH_WAVE64
+        pixel = stage == 0 and cpu == b"gfx1013" and not features
         if (stage in (0, 5) or mesh) and markers == 2 and llvm is not None:
-            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh)
+            _check_two_exits(code, llvm, cpu=cpu, features=features, mesh=mesh, early_out=pixel)
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.
@@ -1085,6 +1113,46 @@ uint class64(uint lo, uint hi) {
         "    return asuint(int(exp) - 14) & 0xffffu;\n"
         "}"
     ),
+    "cvt_norm_i16_f16": (
+        "uint cvt_norm_i16_f16(uint bits) {\n"
+        "    uint h = bits & 0xffffu;\n"
+        "    uint sign = h & 0x8000u;\n"
+        "    uint mag = h & 0x7fffu;\n"
+        "    if (mag == 0u) return 0u;\n"
+        "    uint q;\n"
+        "    if (mag >= 0x3c00u) {\n"
+        "        q = 32767u;\n"
+        "    } else {\n"
+        "        uint exp = mag >> 10u;\n"
+        "        uint mant = exp == 0u ? mag : (0x400u | (mag & 0x3ffu));\n"
+        "        uint shift = exp == 0u ? 24u : (25u - exp);\n"
+        "        uint prod = mant * 32767u;\n"
+        "        q = prod >> shift;\n"
+        "        uint mid = 1u << (shift - 1u);\n"
+        "        uint rem = prod & ((1u << shift) - 1u);\n"
+        "        if (rem > mid || (rem == mid && (q & 1u) != 0u)) q += 1u;\n"
+        "    }\n"
+        "    return sign != 0u ? ((0u - q) & 0xffffu) : q;\n"
+        "}"
+    ),
+    "cvt_norm_u16_f16": (
+        "uint cvt_norm_u16_f16(uint bits) {\n"
+        "    uint h = bits & 0xffffu;\n"
+        "    uint sign = h & 0x8000u;\n"
+        "    uint mag = h & 0x7fffu;\n"
+        "    if (sign != 0u || mag == 0u) return 0u;\n"
+        "    if (mag >= 0x3c00u) return 0xffffu;\n"
+        "    uint exp = mag >> 10u;\n"
+        "    uint mant = exp == 0u ? mag : (0x400u | (mag & 0x3ffu));\n"
+        "    uint shift = exp == 0u ? 24u : (25u - exp);\n"
+        "    uint prod = mant * 65535u;\n"
+        "    uint q = prod >> shift;\n"
+        "    uint mid = 1u << (shift - 1u);\n"
+        "    uint rem = prod & ((1u << shift) - 1u);\n"
+        "    if (rem > mid || (rem == mid && (q & 1u) != 0u)) q += 1u;\n"
+        "    return q;\n"
+        "}"
+    ),
     "dpp_dot4c_i32_i8": (
         "uint dpp_dot4c_i32_i8(uint a, uint b, uint acc) {\n"
         "    int s0 = (asint(a << 24) >> 24) * (asint(b << 24) >> 24);\n"
@@ -1935,6 +2003,50 @@ def f16_frexp_exp_result(bits):
     if exp == 0:
         return ((mant.bit_length() - 1) - 23) & 0xffff
     return (exp - 14) & 0xffff
+
+
+def f16_cvt_norm_result(signed, bits):
+    """Exact low 16 bits of v_cvt_norm_i16_f16 or v_cvt_norm_u16_f16 on a finite binary16 operand.
+
+    Computes round_rne(clamp(x, -1, 1) * 32767) for signed and round_rne(clamp(x, 0, 1) * 65535) for
+    unsigned in exact integer arithmetic (avoiding binary32 double-rounding on 0x3801..0x3804 /
+    0xb801..0xb802 and preserving subnormal inputs under -denorm ftz).
+    """
+    h = bits & 0xffff
+    if ((h >> 10) & 0x1f) == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    sign = h & 0x8000
+    mag = h & 0x7fff
+    if not signed:
+        if sign or mag == 0:
+            return 0
+        if mag >= 0x3c00:
+            return 0xffff
+        exp = mag >> 10
+        mant = mag if exp == 0 else (0x400 | (mag & 0x3ff))
+        shift = 24 if exp == 0 else (25 - exp)
+        prod = mant * 65535
+        q = prod >> shift
+        mid = 1 << (shift - 1)
+        rem = prod & ((1 << shift) - 1)
+        if rem > mid or (rem == mid and (q & 1)):
+            q += 1
+        return q
+    if mag == 0:
+        return 0
+    if mag >= 0x3c00:
+        q = 32767
+    else:
+        exp = mag >> 10
+        mant = mag if exp == 0 else (0x400 | (mag & 0x3ff))
+        shift = 24 if exp == 0 else (25 - exp)
+        prod = mant * 32767
+        q = prod >> shift
+        mid = 1 << (shift - 1)
+        rem = prod & ((1 << shift) - 1)
+        if rem > mid or (rem == mid and (q & 1)):
+            q += 1
+    return ((-q) & 0xffff) if sign else q
 
 
 def pk_fmac_f16_source(token, scalar, vector, pending, sample_dest, known_ssa_bits):
@@ -5951,6 +6063,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint hf{i}_0 = {s0_bits};")
             emit_sdwa_f16_dest(lines, i, dst, f"{helper}(hf{i}_0)", dst_sel, unused, vector,
                                known_ssa_bits, known_half, tag="half16" if is_mant else "low16", known_result=result)
+        elif m := match(r"v_cvt_norm_(i16|u16)_f16_sdwa (.+)"):
+            # SDWA binary16 to normalized i16/u16 conversion (exact RNE in 32-bit integer arithmetic).
+            kind, rest = m.groups()
+            parsed = SDWA_F16_UNARY_OPERANDS.fullmatch(rest)
+            if not parsed:
+                raise ValueError(f"Unsupported binary16 SDWA operands: v_cvt_norm_{kind}_f16_sdwa {rest}")
+            dst, src0, dst_sel, unused, sel0 = parsed.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid binary16 SDWA operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            s0_bits, b0 = half16_sdwa_source(
+                src0, sel0, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            result = f16_cvt_norm_result(kind == "i16", b0)
+            helper = f"cvt_norm_{kind}_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            emit_sdwa_f16_dest(lines, i, dst, f"{helper}(hf{i}_0)", dst_sel, unused, vector,
+                               known_ssa_bits, known_half, tag="low16", known_result=result)
         elif m := match(r"v_cvt_f16_(i16|u16)_sdwa (.+)"):
             # SDWA 16-bit integer to binary16 conversion (round to nearest even): integer src0 with
             # optional sext() and any SDWA selection. Runtime i16 is always finite; u16 requires a
@@ -7056,6 +7189,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 known_half[f"alu{i}"] = result
             else:
                 vector[dst] = ("low16", f"alu{i}")
+        elif m := match(r"v_cvt_norm_(i16|u16)_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 to normalized i16/u16 conversion under the finite-proof contract.
+            kind, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            f16_cvt_norm_result(kind == "i16", b0)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            helper = f"cvt_norm_{kind}_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0));")
+            vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_(fmac|ldexp)_f16_dpp (v\d+), (.+)"):
             # Quad-local DPP16/DPP8 binary16 fused multiply-accumulate (D = S0_swizzled * S1 + D)
             # and exponent scaling (D = S0_swizzled * 2^S1) under the static finite-proof contract
@@ -7734,6 +7890,25 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float hs{i} = widen16(hf{i}_0);")
             lines.append(f"    int cv{i}_0 = int(trunc(hs{i}));")
             lines.append(f"    precise float alu{i} = asfloat(asuint(cv{i}_0) & 0xffffu);")
+            vector[dst] = ("low16", f"alu{i}")
+        elif m := match(r"v_cvt_norm_(i16|u16)_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Plain e32/e64 binary16 to normalized i16/u16 conversion (issue #839): exact RNE in 32-bit
+            # integer arithmetic on finite inputs, producing ("low16", alu).
+            kind, encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 to integer conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            f16_cvt_norm_result(kind == "i16", proven)
+            helper = f"cvt_norm_{kind}_f16"
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hf{i}_0));")
             vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375

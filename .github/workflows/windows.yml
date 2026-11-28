@@ -146,6 +146,7 @@ jobs:
               (["tests/startup_compute_lds_b64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_compute_lds_b128_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_calculated_target_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_far_early_out_check.py", "binary", "llvm-mc-15", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_join_symbols_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_joined_table_pointer_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
@@ -274,6 +275,7 @@ jobs:
             tests/startup_image_sample_a16_check.py \
             tests/startup_image_load_d16_check.py \
             tests/startup_host_cpu_check.py \
+            tests/startup_window_capture_check.py \
             tests/startup_live_telemetry_check.py \
             tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_cvt_pk_u8_check.py \
@@ -302,6 +304,7 @@ jobs:
             tests/startup_compute_request_offline_check.py \
             tests/compute_container_index_check.py \
             tests/startup_shader_cache_rekey_check.py \
+            tests/startup_shader_cache_revision_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \
@@ -320,6 +323,7 @@ jobs:
             tests/startup_gfx2hlsl_heap_record_check.py \
             tests/startup_gfx2hlsl_heap_word_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
+            tests/startup_gfx2hlsl_far_early_out_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_run_sh_check.py \

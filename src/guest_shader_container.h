@@ -43,6 +43,8 @@ struct GuestShaderStage {
     std::vector<PixelExportPatch> exports;
     std::vector<ShaderSemantic> input_signature, output_signature;
     unsigned pixel_input_address{}, pixel_input_enable = ~0u, depth_control{};
+    // The signature component (9 f32, 5 u32, 4 i32) an RTV variant request asks of each color target; 0 when none.
+    std::array<unsigned char, 8> target_components{};
     unsigned mesh_clip_control{}, max_vertices{}, max_primitives{}, topology{};
     std::string full_precision_code() const;
 };

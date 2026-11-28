@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 namespace {
@@ -121,9 +122,64 @@ void parse_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry,
                   static_cast<unsigned long long>(expected), ena, addr);
     description = text;
 }
+// tools/startup/gfx2hlsl.py request_source: at most 256 bytes of "rtv1 <base key> <format> ..." in decimal with one to
+// eight formats and nothing else, whose FNV-1a hash is the key in the file name. The variant is translated from its
+// base request's parts, which are read and checked against the base key like any base request.
+x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
+    const auto stem = marker.stem().string();
+    if (stem.size() != 20 || stem.compare(0, 4, "req_"))
+        throw std::runtime_error("expected req_<16 hex digits>.rtv");
+    const uint64_t expected = parse_request_stem(stem, "invalid RTV variant request key");
+    Bytes text;
+    try {
+        text = part(marker, ".rtv", 256);
+    } catch (const std::runtime_error &) {
+        throw std::runtime_error("invalid RTV variant request");
+    }
+    uint64_t key = 1469598103934665603ull;
+    hash_bytes(key, text.data(), text.size());
+    std::vector<std::string_view> tokens;
+    std::string_view rest = text;
+    bool valid = rest.substr(0, 5) == "rtv1 ";
+    if (valid) rest.remove_prefix(5);
+    while (valid) {
+        const size_t end = rest.find(' ');
+        const auto token = rest.substr(0, end);
+        valid = !token.empty() && token.size() <= (tokens.empty() ? 20u : 10u) &&
+                token.find_first_not_of("0123456789") == token.npos;
+        tokens.push_back(token);
+        if (end == rest.npos) break;
+        rest.remove_prefix(end + 1);
+    }
+    if (!valid || tokens.size() < 2 || tokens.size() > 9 || key != expected)
+        throw std::runtime_error("invalid RTV variant request");
+    uint64_t base = 0;
+    std::vector<unsigned> formats;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        uint64_t value = 0;
+        const auto parsed = std::from_chars(tokens[i].data(), tokens[i].data() + tokens[i].size(), value);
+        if (parsed.ec != std::errc{} || (i && value > 0xffffffffull))
+            throw std::runtime_error("invalid RTV variant values");
+        if (!i) base = value;
+        else formats.push_back(static_cast<unsigned>(value));
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "req_%016llx.a", static_cast<unsigned long long>(base));
+    x2w::GraphicsRequest request;
+    try {
+        request = x2w::read_graphics_request(marker.parent_path() / name);
+    } catch (const std::runtime_error &error) {
+        throw std::runtime_error(std::string("RTV variant source: ") + error.what());
+    }
+    request.key = expected;
+    request.rtv_request = std::move(text);
+    request.rtv_formats = std::move(formats);
+    return request;
+}
 } // namespace
 
 x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
+    if (marker.extension() == ".rtv") return read_rtv_variant(marker);
     auto stem = marker.stem().string();
     if (marker.extension() != ".a" || stem.size() != 20 || stem.compare(0, 4, "req_"))
         throw std::runtime_error("expected req_<16 hex digits>.a");
@@ -134,14 +190,18 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
         request.input_layout = part(marker, ".ia", 1 << 20);
     if (fs::exists(fs::path(marker).replace_extension(".psin")))
         parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
-    constexpr char revision[] = "x2w-startup-shader-28";
-    uint64_t key = 1469598103934665603ull;
-    hash_bytes(key, revision, sizeof(revision) - 1);
-    for (const auto *p : {&request.a, &request.b, &request.root, &request.input_layout, &request.pixel_entry})
-        hash_bytes(key, p->data(), p->size());
+    const auto request_key = [&](std::string_view revision) {
+        uint64_t key = 1469598103934665603ull;
+        hash_bytes(key, revision.data(), revision.size());
+        for (const auto *p : {&request.a, &request.b, &request.root, &request.input_layout, &request.pixel_entry})
+            hash_bytes(key, p->data(), p->size());
+        return key;
+    };
     if (request.root.empty())
         throw std::runtime_error("graphics request key mismatch or missing root");
-    if (key != expected) {
+    // Match new runtime captures and keep revision-28 archives replayable.
+    constexpr char revision[] = "x2w-startup-shader-29";
+    if (request_key(revision) != expected && request_key("x2w-startup-shader-28") != expected) {
         if (!request.pixel_entry.empty())
             throw std::runtime_error("stale pixel input description: graphics request key mismatch");
         throw std::runtime_error("graphics request key mismatch or missing root");
@@ -160,20 +220,23 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
         read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
         throw std::runtime_error("inconsistent compute request");
-    uint64_t key = 1469598103934665603ull;
-    constexpr char revision[] = "x2w-startup-shader-28cs";
-    hash_bytes(key, revision, sizeof(revision) - 1);
-    for (const auto *p : {&code, &data, &root, &desc, &sa, &sb}) {
-        uint64_t size = p->size();
-        hash_bytes(key, &size, sizeof(size));
-        hash_bytes(key, p->data(), p->size());
-    }
-    if (key != expected)
+    const auto request_key = [&](std::string_view revision) {
+        uint64_t key = 1469598103934665603ull;
+        hash_bytes(key, revision.data(), revision.size());
+        for (const auto *p : {&code, &data, &root, &desc, &sa, &sb}) {
+            uint64_t size = p->size();
+            hash_bytes(key, &size, sizeof(size));
+            hash_bytes(key, p->data(), p->size());
+        }
+        return key;
+    };
+    constexpr char revision[] = "x2w-startup-shader-29cs";
+    if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
     if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
         throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
                                                  : "inconsistent compute request");
-    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), key};
+    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
 }
 
 std::string x2w::read_shader_container_bytes(const fs::path &file) {

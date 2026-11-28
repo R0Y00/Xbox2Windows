@@ -72,7 +72,7 @@ def request(work, root, program, threads=32):
 def controls(cli, sdk, work, root):
     for pattern, threads, error in (
             (0xB1, 32, None),
-            (0x101, 32, "unsupported DPP lane selection"),  # row_shl:1
+            (0x150, 32, "unsupported DPP lane selection"),  # row_share:0
             (0xB1, 30, "DPP quad_perm needs a thread count divisible by four")):
         marker = request(work, root, compute_program(OR, pattern), threads)
         output = marker.with_suffix(".cso")

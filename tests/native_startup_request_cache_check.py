@@ -192,6 +192,30 @@ def check_controls(cli: Path, sdk: Path) -> int:
         )
         assert G.pending_keys(str(cache), skip_failed=False) == [], "published entries not recognised as complete"
 
+        archive = work / "archive"
+        archive.mkdir()
+        ps = ps_words(4)
+        legacy_graphics_key = G.fnv(b"x2w-startup-shader-28")
+        for part in (VS_WORDS, ps, g_root, b"psin1" + struct.pack("<II", *TARGET_MASKS)):
+            legacy_graphics_key = G.fnv(part, legacy_graphics_key)
+        put_graphics_request(archive, VS_WORDS, ps, g_root, TARGET_MASKS, override_key=legacy_graphics_key)
+        legacy_desc = struct.pack("<12Q", 0, 0, len(c_sa), 0, len(STATE_B), 0, len(c_code), 0, len(DATA), 0, 0, 11)
+        legacy_compute_key = G.fnv(b"x2w-startup-shader-28cs")
+        for part in (c_code, DATA, c_root, legacy_desc, c_sa, STATE_B):
+            legacy_compute_key = G.fnv(part, G.fnv(struct.pack("<Q", len(part)), legacy_compute_key))
+        put_compute_request(archive, c_code, c_root, c_sa, override_key=legacy_compute_key)
+        for profile, key, current_key in (
+            ("gfx1013-container-pair", legacy_graphics_key, target_key),
+            ("gfx1013-direct-cs@0", legacy_compute_key, cs_key),
+        ):
+            result = subprocess.run(
+                [cli, sdk, frontend, profile, "--requests", archive, archive],
+                capture_output=True, text=True,
+            )
+            assert result.returncode == 0, (profile, result.stdout, result.stderr)
+            assert "requests=1 compiled=1 refused=0" in result.stdout, result.stdout
+            assert (archive / f"{key:016x}.txt").read_bytes() == (cache / f"{current_key:016x}.txt").read_bytes()
+
         # 2. Stale stage change on an already-published .psin entry refuses with diagnostic and withdraws <key>.txt.
         (cache / f"req_{target_key:016x}.b").write_bytes(ps_words(2))
         stale_run = subprocess.run(
@@ -277,7 +301,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
         assert not (bad_cs_dir / f"{bad_cs_key:016x}.txt").exists()
         assert not (bad_cs_dir / f"{bad_cs_key:016x}.cs.cso").exists()
 
-    print("native_startup_request_cache controls: rev-28 graphics (.psin) + compute (.c67) cache entries and 8 refusal controls passed")
+    print("native_startup_request_cache controls: current and archived graphics (.psin) + compute (.c67) cache entries and 8 refusal controls passed")
     return 0
 
 

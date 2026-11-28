@@ -17,7 +17,7 @@ def triangle():
     return vertex(program=code)
 
 
-def check(folder, consumer, sdk, adapter):
+def check(folder, consumer, cli, sdk, adapter):
     cache = folder / "cache"
     cache.mkdir()
     vs, ps, root, pixels = [folder / name for name in ("vs", "ps", "root", "pixels")]
@@ -42,6 +42,31 @@ def check(folder, consumer, sdk, adapter):
         print(run.stdout.strip())
         assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
         print(f"{adapter} {name}: cache={hits}, 16 red and 16 clear pixels")
+    # A published disk pair must be used without attempting native compilation.
+    offline = subprocess.run([cli, "--watch", sdk, folder / "offline", cache, "--once"],
+                             capture_output=True, text=True, timeout=45)
+    assert offline.returncode == 0 and "compiled graphics" in offline.stdout, (offline.stdout, offline.stderr)
+    key = next(cache.glob("req_*.a")).stem.removeprefix("req_")
+    published = [cache / f"{key}{suffix}" for suffix in (".txt", ".vs.cso", ".ps.cso")]
+    contents = [path.read_bytes() for path in published]
+    run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0 and "-> drawn;" in run.stderr, run.stderr
+    assert "native graphics " not in run.stderr, run.stderr
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    assert [path.read_bytes() for path in published] == contents
+    print(f"{adapter} published disk pair: 16 red and 16 clear pixels, cache files unchanged")
+
+    manifest = published[0]
+    manifest.rename(Path(str(manifest) + ".pending"))
+    retry_env = dict(env, X2W_NATIVE_SHADERS=str(folder / "missing-sdk"),
+                     X2W_TEST_PUBLISH_MANIFEST=str(manifest))
+    run = subprocess.run(args, env=retry_env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0 and "native graphics " in run.stderr and "refused:" in run.stderr, run.stderr
+    assert Path(str(pixels) + ".first").read_bytes() == clear * 32
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    assert [path.read_bytes() for path in published] == contents
+    print(f"{adapter} failed native attempt: disk publication recovers the next draw in the same process")
+
     ps.write_bytes(patched_pixel(1, [0xffffffff], export=(0xf800180f, 0x01000001)))
     run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
     assert run.returncode == 0 and "refused:" in run.stderr and "-> drawn;" not in run.stderr, run.stderr

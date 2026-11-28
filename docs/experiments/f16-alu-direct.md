@@ -9,6 +9,7 @@ Lowers VOP2 and VOP3 `v_add_f16`, `v_sub_f16`, `v_subrev_f16` and `v_mul_f16` in
 - The operation is an f32 add, sub or mul. An f32 value has a 24-bit significand, which covers a correctly rounded binary16 add, sub or mul.
 - The result is rounded with the same integer round-to-nearest-even conversion `v_cvt_f16_f32` uses. The low 16 bits are written and the high half is zero.
 - `v_subrev_f16` subtracts the first source from the second.
+- DPP16 VOP2 permutes the full src0 VGPR word before selecting its low half and honors FI, BOUND_CTRL, and row and bank write masks.
 
 The bit-exact reference is `half_op` in [`tests/f16_packed_model.py`](../../tests/f16_packed_model.py). NaN results match by class. The check is [`tests/native_f16_alu_check.py`](../../tests/native_f16_alu_check.py).
 
@@ -18,7 +19,7 @@ The SDWA operand profile is covered by the [SDWA experiment](native-sdwa-f16.md)
 
 Each of these is a named diagnostic:
 
-- DPP
+- DPP8
 - clamp or omod
 - a high-half `op_sel` (instruction bits 11 through 14)
 - a binary16 rounding mode other than round-to-nearest-even, an f16 denormal mode other than keep on input and output, or `FP16_OVFL`
@@ -26,7 +27,7 @@ Each of these is a named diagnostic:
 
 `s_round_mode` and `s_denorm_mode` that leave the f16 fields at that contract, and that leave the f32 fields unchanged, are accepted. A write that changes an f32 rounding or denormal field keeps the previous control-instruction refusal. A guest branch together with a MODE write makes the contract unprovable and is refused with the rounding diagnostic.
 
-fma, fmac, fmamk, fmaak, min, max, ldexp, the min3/max3/med3 forms, div_fixup, VOP1 and the `v_pk` forms stay on the generic direct-lowering diagnostic. The fixture checks `v_fmac_f16` and `v_min_f16`.
+For the plain scalar-half forms, fma, fmac, fmamk, fmaak, min, max, ldexp, the min3/max3/med3 forms, div_fixup and VOP1 stay on the generic direct-lowering diagnostic. The fixture checks `v_fmac_f16` and `v_min_f16`. VOP3P arithmetic has a [separate experiment](native-packed-f16.md).
 
 ## Linux
 
