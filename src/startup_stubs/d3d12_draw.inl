@@ -1584,51 +1584,7 @@ bool ensure_draw_heap(Wrapper* device)
     return true;
 }
 
-// A recorded table is immutable. Keep it alive until its submission completes,
-// including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
-std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
-struct SubmittedDrawSamplerHeaps {
-    x2w_startup::ComPtr<ID3D12Fence> fence;
-    std::vector<DrawSamplerHeap> heaps;
-};
-std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
-
-void discard_draw_sampler_heaps(ID3D12CommandList* list)
-{
-    AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(list);
-    ReleaseSRWLockExclusive(&draw_lock);
-}
-
-// draw_lock held. The lists have already been executed on this queue. A closed list can be
-// submitted again until its Reset, so each submit takes its own references and the recording
-// keeps its own until discard_draw_sampler_heaps.
-void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
-{
-    submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
-        submitted_draw_sampler_heaps.end(), [](const SubmittedDrawSamplerHeaps& batch) {
-            return batch.fence && batch.fence->GetCompletedValue() != 0;
-        }), submitted_draw_sampler_heaps.end());
-    SubmittedDrawSamplerHeaps batch;
-    for (auto* list : lists) {
-        auto it = recorded_draw_sampler_heaps.find(list);
-        if (it == recorded_draw_sampler_heaps.end()) continue;
-        for (const auto& heap : it->second) batch.heaps.push_back(heap);
-    }
-    if (batch.heaps.empty()) return;
-    x2w_startup::ComPtr<ID3D12Device> device;
-    HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
-    if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
-    if (FAILED(hr)) {
-        // Without a completion point the submitted descriptors still belong
-        // to the queue. Retain them instead of reclaiming them early.
-        batch.fence.Reset();
-        log("x2w-draw sampler heap retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
-    }
-    submitted_draw_sampler_heaps.push_back(std::move(batch));
-}
 
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
@@ -1766,7 +1722,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
 }
 
 // draw_lock held.
-bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
+bool prepare_draw_sampler_heap(Wrapper* self, Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
 {
     auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
     if (!pass.title_samplers.address && pass.sampler_heap_wrapper) {
@@ -1793,15 +1749,40 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap creation failed 0x%08lx", static_cast<unsigned long>(hr));
         return false;
     }
+    std::unique_ptr<x2w_startup::SamplerSnapshot> cached;
+    try {
+        cached = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+        x2w_startup::ExclusiveNoteLock lock(allocator_lock);
+        const auto recording = list_recordings.find(self);
+        if (!self->own().list_open || self->own().real != list ||
+            recording == list_recordings.end() || !recording->second)
+            return false;
+        recording->second->sampler_snapshots.push_back(heap);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
     static LONG reports;
     if (first_calls(reports, 12))
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    recorded_draw_sampler_heaps[list].push_back(heap);
     pass.sampler_heap = std::move(heap);
-    pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+    pass.sampler_snapshot = std::move(cached);
     return true;
+}
+
+// Fixture entry records a default sampler table through the translated draw path.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_record_sampler_snapshot(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind || !self->own().real || !the_device) return FALSE;
+    x2w_startup::ExclusiveNoteLock lock(draw_lock);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    Pass pass;
+    if (!prepare_draw_sampler_heap(self, pass, list, false)) return FALSE;
+    ID3D12DescriptorHeap* heaps[] = {pass.sampler_heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    return TRUE;
 }
 
 // Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
@@ -2565,7 +2546,16 @@ struct IndirectBufferView {
     u64 offset = 0, bytes = 0;
     UINT stride = 0;
     bool upload = false;
+    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
 };
+
+// X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
+// (a committed default buffer that holds zeros) is read from title memory, snapshotted into its own recycled pool.
+bool title_input_snapshot_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT");
+    return enabled;
+}
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
@@ -2573,7 +2563,8 @@ struct IndirectBufferView {
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         UINT alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                                         UINT alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT,
+                                         bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2631,12 +2622,23 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
+    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
+    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
+    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+        u64 zero_offset = 0;
+        ID3D12Resource* zero_ring = nullptr;
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring, true);
+        if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
+        std::memset(zero_bytes, 0, 16);
+        return {zero_ring, zero_offset, 16, 0, true, 3};
+    }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
     if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
         ? "an input buffer range is over 16 MiB or not whole dwords"
         : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
+    int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
@@ -2657,8 +2659,24 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
-            return refuse("an input is in a placed buffer that does not alias title memory");
+        if (!placed.alias) {
+            if (native && list_copied_gpu_range(self, native, offset, bytes)) {
+                input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
+            } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+                // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
+                // bytes the title wrote are only in title memory: snapshot the range into the snapshot pool now. A later
+                // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
+                u64 ring_offset = 0;
+                ID3D12Resource* ring = nullptr;
+                if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
+                    return refuse("an input range in title memory is not readable");
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring, true) || !ring)
+                    return refuse("an input range could not be copied from title memory");
+                return {ring, ring_offset, bytes, stride, true, 2};
+            } else {
+                return refuse("an input is in a placed buffer that does not alias title memory");
+            }
+        }
     } else if (own_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
     } else if (owner && !owner->own().title_memory) {
@@ -2684,7 +2702,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
     trace_compute_output_use(self, OutputUse::shader_gpu_read, "raw-SRV-range-resolved", owner, 0, offset, bytes);
-    return {native, offset, bytes, stride, upload};
+    return {native, offset, bytes, stride, upload, input_source};
 }
 
 struct FormattedBufferDescriptor {
@@ -2940,7 +2958,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
     }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(self, pass, list, tr->samplers.reserved_fallback))) {
         if (indirect && !(indexed_rect && !pipeline))
             indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
                                                : indirect_refusal_code::sampler_heap_unavailable;
@@ -3623,6 +3641,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::SamplerSource source;
     u64 sampler_wrapper = 0;
     x2w_startup::ViewTable heap_records;
+    UINT heap_entries = 0;
     x2w_startup::ViewHeapSelection view_heaps;
     UINT bound_view_heaps = 0, visible_view_count = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
@@ -3639,6 +3658,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     visible_view_count = heap.desktop_gpu ? heap.logical_count : 0;
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
                                                                    heap.increment, heap.desktop_gpu);
+                    if (heap_records.address) heap_entries = heap.logical_count;
                 }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu) {
@@ -3659,6 +3679,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.sampler_heap_wrapper = sampler_wrapper;
     pass.title_view_heap = heap_records;
     pass.mesh_heap_slots = bound_view_heaps == 1 && heap_records.address ? visible_view_count : 0;
+    pass.title_view_heap_entries = heap_entries;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).

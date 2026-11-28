@@ -29,6 +29,11 @@ static bool binary16_alu(std::string_view name) {
     return name == "v_add_f16" || name == "v_sub_f16" || name == "v_subrev_f16" || name == "v_mul_f16";
 }
 
+static bool binary16_unary(std::string_view name) {
+    return name == "v_rcp_f16" || name == "v_sqrt_f16" || name == "v_exp_f16" ||
+           name == "v_rsq_f16";
+}
+
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
     std::ostringstream out;
     out << "native compute +0x" << std::hex << pc << ": " << reason;
@@ -60,6 +65,7 @@ struct Inst {
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
     unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
+    std::optional<Word> dpp8_selectors;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -89,8 +95,8 @@ struct Inst {
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
 unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
-// Wave32 compute can use both VCC words as scalar data.
-unsigned smem_sgpr_limit(bool wave32_compute) { return wave32_compute ? 108 : 106; }
+// Direct compute stores both VCC words in scalar registers.
+unsigned smem_sgpr_limit(bool direct_compute) { return direct_compute ? 108 : 106; }
 
 Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
@@ -164,7 +170,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.dst = (a >> 6) & 127;
         i.src[0] = (a & 63) * 2;
         const unsigned soffset = i.b >> 25;
-        const unsigned limit = smem_sgpr_limit(direct && !graphics && !wave64);
+        const unsigned limit = smem_sgpr_limit(direct && !graphics);
         if ((i.b & 0x01f00000u) || (a & 0x14000) || (i.op & ~8u) > 4 ||
             (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset >= limit)))
             refuse(pc, "unsupported scalar memory addressing");
@@ -205,13 +211,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "formatted store needs an index-only linear view and supported component count");
             i.name = "buffer_store_format";
         } else if (i.op >= 0x1c && i.op <= 0x1f) {
-            if ((a & (direct && !graphics ? 0x32000u : 0x3e000u)) ||
-                (i.b & (direct && !graphics ? 0xa00000u : 0xe00000u)))
+            // Direct compute ignores GLC, DLC and SLC cache-policy hints on raw stores.
+            const bool compute = direct && !graphics;
+            if ((a & (compute ? 0x32000u : 0x3e000u)) ||
+                (i.b & (compute ? 0xa00000u : 0xe00000u)))
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
             if (direct && !graphics) {
-                if ((a & 0x0203e000u) || (i.b & 0x00e00000u))
+                // GLC, DLC and SLC are cache-policy hints on raw loads.
+                if ((a & 0x02032000u) || (i.b & 0x00a00000u))
                     refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
                 // The MUBUF encoding has no trailing literal word.
                 const unsigned soffset = i.b >> 24;
@@ -293,7 +302,11 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
-        const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
+        const bool half_alu = !graphics && ((i.enc == Encoding::Vop2 && binary16_alu(encoded.name)) ||
+                                           (i.enc == Encoding::Vop1 && binary16_unary(encoded.name)));
+        const bool dpp8 = i.src[0] == 233 || i.src[0] == 234;
+        if (direct && half_alu && (dpp8 || (i.enc == Encoding::Vop1 && i.src[0] == 250)))
+            refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && (i.op == 0x88 || (direct && i.op == 0x8f));
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -309,7 +322,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
                 "v_floor_f32", "v_ceil_f32", "v_fract_f32", "v_trunc_f32", "v_rndne_f32",
-                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
+                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
                                   name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
@@ -333,7 +346,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 if (half_alu && ((i.dst_select != 4 && i.dst_select != 5) ||
                                  (i.dst_unused != 0 && i.dst_unused != 2)))
                     refuse(pc, "unsupported SDWA destination modifier");
-                if (i.dst_select == 7 || i.dst_unused == 3 || ((i.clamp || i.scale) && !floats.count(name) && !conversion) ||
+                const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
+                if (i.dst_select == 7 || i.dst_unused == 3 ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }
@@ -341,8 +356,6 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 const unsigned control = (ext >> (16 + 8*j)) & 255;
                 i.src_select[j] = control & 7;
                 i.src_sext[j] = (control & 8) != 0;
-                if (half_alu && (control & 128))
-                    refuse(pc, "SDWA binary16 source must be a VGPR");
                 if (half_alu && i.src_select[j] < 4)
                     refuse(pc, "invalid SDWA source modifier");
                 if (i.src_select[j] == 7 || (control & 64) || (fp_input && i.src_sext[j]) || (!fp_input && (control & 0x30)))
@@ -406,7 +419,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.src[0]=256+(control&255);
             i.neg=((control>>20)&1)|((control>>21)&2);
             i.abs=((control>>21)&1)|((control>>22)&2);
-        } else if (graphics && (i.src[0] == 233 || i.src[0] == 234) && i.enc != Encoding::Vopc && !lit) {
+        } else if (direct && !graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
+            const Word control = take();
+            i.dpp8_selectors = control >> 8;
+            i.dpp_fetch_inactive = i.src[0] == 234;
+            i.src[0] = 256 + (control & 255);
+        } else if (graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
             // pixel_aot.parse_dpp: both halves of an octet must select the
             // same local 2x2 permutation to map to desktop quad operations.
             const Word control = take();
@@ -462,7 +480,8 @@ static std::optional<unsigned> carry_destination(const Inst &i) {
 }
 struct Symbol {
     enum class Type { unknown, constant, masked, table, descriptor, indexed_descriptor, sampler_heap, sampler_word, root_address, root_stride_one_high, primitive_mask,
-                      stride, byte_stride, zero_stride_word, byte_count, clear_oob, byte_oob, lane_mask, uniform_mask, unbound } type{};
+                      stride, byte_stride, zero_stride_word, byte_count, clear_oob, byte_oob, lane_mask, uniform_mask,
+                      heap_offset, heap_carry, unbound } type{};
     Word value = 0, offset = 0;
     unsigned index_mask = 0, definition = 0;
     bool numeric() const { return type == Type::unknown || type == Type::constant || type == Type::masked || type == Type::uniform_mask; }
@@ -474,6 +493,8 @@ struct State {
     // Encoded VGPR and guest lane. A join can lose the identity while
     // retaining the fact that some path omitted the runtime lane write.
     std::map<std::pair<unsigned, unsigned>, std::optional<Symbol>> lane_spills;
+    // SCC, tracked only as the carry of a heap offset add (see heap_offset_add).
+    Symbol scc{};
     Symbol &operator[](unsigned n) { return scalar[n]; }
     const Symbol &operator[](unsigned n) const { return scalar[n]; }
     const Symbol &at(unsigned n) const { return scalar.at(n); }
@@ -566,6 +587,30 @@ Symbol source(const Inst &i, unsigned code, const State &s) {
         return {Symbol::Type::constant, i.literal};
     return {};
 }
+// The low word of a resource-heap descriptor address formed by adding a byte offset, as in a waterfall loop over a
+// lane-selected slot: s_add_u32 lo, <resource heap>, <byte offset SGPR>, then the carry into the high word. Returns the
+// operand index of the offset. A constant offset is not matched: the selected slot must come from GPU data.
+static std::optional<unsigned> heap_offset_add(const Inst &i, const State &s) {
+    if (i.name != "s_add_u32" || i.dst > 105) return {};
+    for (unsigned k = 0; k < 2; ++k) {
+        const auto heap = source(i, i.src[k], s), offset = source(i, i.src[1 - k], s);
+        if (heap.type == Symbol::Type::table && heap.value == compute_resource_heap && !heap.offset &&
+            i.src[1 - k] <= 105 && offset.numeric() && offset.type != Symbol::Type::constant)
+            return 1 - k;
+    }
+    return {};
+}
+// The high word of that address: s_add_u32 hi, 0, src_scc or s_addc_u32 hi, 0, 0.
+static bool heap_offset_carry(const Inst &i) {
+    return i.dst <= 105 && ((i.name == "s_add_u32" && ((i.src[0] == 128 && i.src[1] == 253) ||
+                                                       (i.src[0] == 253 && i.src[1] == 128))) ||
+                            (i.name == "s_addc_u32" && i.src[0] == 128 && i.src[1] == 128));
+}
+// s[base:base+1] holds the resource-heap base plus a byte offset with its own carry in the high word.
+static bool heap_offset_address(const State &s, unsigned base) {
+    return base + 1 < s.size() && s[base].type == Symbol::Type::heap_offset &&
+           s[base + 1].type == Symbol::Type::heap_carry && s[base + 1].definition == s[base].definition;
+}
 // Derive the rewritten byte-address V# symbolically. Each field carries its
 // source table/slot identity. Numeric consumption still requires real bits.
 // heap_window: the direct path under HeapViewContract::raw_buffer also rewrites a
@@ -604,12 +649,17 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
         return field(a,T::byte_oob);
     return {};
 }
-State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct) {
+State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct,
+                 bool narrow_wave64 = false) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
         s[n] = v;
     };
+    const Symbol carry = s.scc;
+    if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Sopc || i.enc == Encoding::Sopk)
+        s.scc = {};
+    const auto heap_add = direct && !graphics ? heap_offset_add(i, s) : std::nullopt;
     if (direct && !graphics) {
         if (i.name == "v_writelane_b32") {
             if (auto lane = guest_spill_lane(i, wave64)) {
@@ -634,7 +684,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     const bool compared = graphics && i.enc == Encoding::Vopc && i.dst < 106 && i.name.substr(0,6) == "v_cmp_";
     if (mask || compared) {
         const unsigned dst = mask.value_or(i.dst);
-        if ((dst > 105 && dst != 106) || (wave64 && (dst & 1)))
+        const bool numeric_vcc_hi = dst == 107 && direct && !graphics && !wave64;
+        if ((dst > 106 && !numeric_vcc_hi) || (wave64 && (dst & 1)))
             refuse(i.pc, compared ? "unsupported comparison mask destination" : "unsupported carry mask destination");
         const bool tagged = graphics && dst != 106;
         set(dst, tagged ? Symbol{Symbol::Type::lane_mask,i.pc,0} : Symbol{});
@@ -643,6 +694,13 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
                (i.src[0] == 193 || i.src[0] == 128) && (i.src[1] == 193 || i.src[1] == 128)) {
         set(i.dst,{Symbol::Type::uniform_mask,i.pc,0});
         set(i.dst+1,{Symbol::Type::uniform_mask,i.pc,1});
+    } else if (heap_add) {
+        const auto offset = source(i, i.src[*heap_add], s);
+        set(i.dst, {Symbol::Type::heap_offset, compute_resource_heap, 0,
+                    offset.type == Symbol::Type::masked ? offset.value : ~0u, i.pc});
+        s.scc = {Symbol::Type::heap_carry, compute_resource_heap, 0, 0, i.pc};
+    } else if (direct && !graphics && carry.type == Symbol::Type::heap_carry && heap_offset_carry(i)) {
+        set(i.dst, carry);
     } else if (auto field = byte_descriptor_field(i,s,heap_window)) {
         set(i.dst,*field);
     } else if (i.enc == Encoding::FixedSetup) {
@@ -652,11 +710,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.enc == Encoding::Smem) {
         auto base = s[i.src[0]];
         const unsigned offset_reg = i.b >> 25;
-        const Symbol index = offset_reg < smem_sgpr_limit(!graphics && !wave64) ? s[offset_reg] : Symbol{};
+        const Symbol index = offset_reg < smem_sgpr_limit(direct && !graphics) ? s[offset_reg] : Symbol{};
         unsigned n = memory_count(i);
+        const bool heap_address = i.op == 2 && i.b >> 25 == 125 && heap_offset_address(s, i.src[0]);
         for (unsigned j = 0; j < n; ++j) {
             Symbol v{};
-            if (graphics && i.op == 3 && base.type == Symbol::Type::table && base.value == compute_resource_heap) {
+            if (heap_address) {
+                v = {Symbol::Type::indexed_descriptor, compute_resource_heap, (i.b & 0xfffff) + 4 * j, base.index_mask, i.pc};
+            } else if (graphics && i.op == 3 && base.type == Symbol::Type::table && base.value == compute_resource_heap) {
                 const bool fixed = offset_reg == 125 || index.type == Symbol::Type::constant;
                 const Word offset = (i.b & 0xfffff) + (offset_reg != 125 && fixed ? index.value : 0);
                 v = {Symbol::Type::indexed_descriptor, base.value, offset + 4*j,
@@ -677,6 +738,20 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
         if (i.name == "s_mov_b64")
             set(i.dst + 1, high);
+    } else if (!graphics && !wave64 && i.enc == Encoding::Sop1 &&
+               ((i.name.size() > 13 && i.name.substr(i.name.size() - 13) == "_saveexec_b32") ||
+                i.name == "s_andn1_wrexec_b32" || i.name == "s_andn2_wrexec_b32")) {
+        // Both the saved/written destination and the updated EXEC are numeric mask words.
+        set(i.dst, {});
+        set(126, {});
+    } else if (!graphics && i.enc == Encoding::Sop1 && i.name.size() >= 13 &&
+               (i.name.substr(i.name.size() - 13) == "_saveexec_b64" ||
+                i.name.substr(i.name.size() - 11) == "_wrexec_b64")) {
+        // These instructions also overwrite both EXEC words implicitly.
+        set(i.dst, {});
+        set(i.dst + 1, {});
+        set(126, {});
+        set(127, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};
@@ -712,7 +787,9 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
                i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
-        if ((wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+        const bool compare_pair = (wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) ||
+                                  (narrow_wave64 && i.enc == Encoding::Vopc && i.dst == 126);
+        if (compare_pair || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
              i.name.substr(i.name.size() - 4) == "_u64") &&
@@ -804,7 +881,7 @@ std::map<unsigned, Inst> fixed_vertex_loads(const string &code) {
     return found ? result : std::map<unsigned, Inst>{};
 }
 Program parse(const string &code, unsigned entry, const State &initial, bool graph, bool graphics=false, bool wave64=false, bool fixed_vertex=false,
-              bool heap_window=false) {
+              bool heap_window=false, bool narrow_wave64=false) {
     Program p;
     p.graphics_wave64 = graphics && wave64;
     if ((entry & 3) || entry >= code.size() || code.size() > 1u << 20)
@@ -853,7 +930,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
         auto k = work.front();
         work.pop_front();
         auto &i = p.code[k];
-        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph);
+        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph, narrow_wave64);
         auto merge = [&](size_t t) {
             bool changed = !p.reached[t];
             auto &in = p.before[t];
@@ -871,6 +948,10 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
                             changed = true;
                         }
                     }
+                if (!(in.scc == after.scc) && !(in.scc == Symbol{})) {
+                    in.scc = {};
+                    changed = true;
+                }
                 for (auto &[key, value] : in.lane_spills) {
                     const auto other = after.lane_spills.find(key);
                     if (value && (other == after.lane_spills.end() || !(other->second == value))) {
@@ -1734,14 +1815,17 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
-    // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
+    // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
+    // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
+    // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
+    // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
     const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
                               word(request.sa,4)==0x6c090102;
-    const bool wave64 = stage ? !stage->wave32 : packed_state && !(word(request.sa,16)&(1u<<20));
+    const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
+    const bool narrow_wave64 = !stage && direct_dxil && !request.wave32 && !wave64;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
-    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
+    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window, narrow_wave64);
     Emit emit{{}, program,layout->Desc_1_1};
     emit.result.constants = constants;
     if (!lds)
@@ -1749,13 +1833,24 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
             if (inst.enc == Encoding::Lds)
                 refuse(inst.pc, "LDS instruction without allocation");
     if (direct_dxil) {
+        const bool guest_wave32 = stage ? stage->wave32 : request.wave32;
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
+        compiler.narrow_wave64 = narrow_wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
         for (size_t i = 0; i < program.code.size(); ++i) {
             const auto& inst = program.code[i];
-            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            if (!program.reached[i]) continue;
+            // The narrow wave64 model still requires a guest-aligned carry destination pair.
+            if (!guest_wave32 && carry_destination(inst) == 107)
+                refuse(inst.pc, "unsupported carry mask destination");
+            // s107 is a numeric wave32 mask only for a guest wave32.
+            if (!guest_wave32 && inst.name == "v_cndmask_b32" && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported wave32 conditional mask source");
+            if (!guest_wave32 && inst.name.find("_ci_") != Name::npos && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported carry-in mask source");
+            if (inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
             const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
             if (symbol.type == Symbol::Type::descriptor)
                 compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);

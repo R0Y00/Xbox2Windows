@@ -58,17 +58,16 @@ uint64_t parse_request_stem(std::string_view stem, const char *error_message) {
         throw std::runtime_error(error_message);
     return expected;
 }
-void parse_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
-    fs::path path = marker;
-    path.replace_extension(".psin");
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    const auto size = file.tellg();
-    if (size < 0 || size > 128)
-        throw std::runtime_error("invalid pixel input description");
-    Bytes raw(static_cast<size_t>(size), 0);
-    file.seekg(0);
-    if (size && !file.read(raw.data(), size))
-        throw std::runtime_error("short read");
+} // namespace
+
+std::string x2w::format_pixel_input_description(uint64_t key, uint32_t ena, uint32_t addr) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "psin1 %016llx ena=0x%04x addr=0x%04x\n",
+                  static_cast<unsigned long long>(key), ena, addr);
+    return text;
+}
+
+x2w::PixelInputDescription x2w::parse_pixel_input_description(std::string_view raw, uint64_t expected) {
     std::string_view line = raw;
     if (!line.empty() && line.back() == '\n')
         line.remove_suffix(1);
@@ -119,30 +118,20 @@ void parse_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry,
         throw std::runtime_error("pixel input address mask missing from the stream description");
     if (ena & ~addr)
         throw std::runtime_error("contradictory pixel input enable/address masks");
-    entry.assign("psin1", 5);
+    PixelInputDescription parsed;
+    parsed.ena = ena;
+    parsed.addr = addr;
+    parsed.entry.assign("psin1", 5);
     const uint32_t words[2]{ena, addr};
-    entry.append(reinterpret_cast<const char *>(words), sizeof(words));
-    char text[64];
-    std::snprintf(text, sizeof(text), "psin1 %016llx ena=0x%04x addr=0x%04x\n",
-                  static_cast<unsigned long long>(expected), ena, addr);
-    description = text;
+    parsed.entry.append(reinterpret_cast<const char *>(words), sizeof(words));
+    parsed.canonical_text = format_pixel_input_description(expected, ena, addr);
+    return parsed;
 }
-// tools/startup/gfx2hlsl.py request_source: at most 256 bytes of "rtv1 <base key> <format> ..." in decimal with one to
-// eight formats and nothing else, whose FNV-1a hash is the key in the file name. The variant is translated from its
-// base request's parts, which are read and checked against the base key like any base request.
-x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
-    const auto stem = marker.stem().string();
-    if (stem.size() != 20 || stem.compare(0, 4, "req_"))
-        throw std::runtime_error("expected req_<16 hex digits>.rtv");
-    const uint64_t expected = parse_request_stem(stem, "invalid RTV variant request key");
-    Bytes text;
-    try {
-        text = part(marker, ".rtv", 256);
-    } catch (const std::runtime_error &) {
+
+x2w::RtvVariantDescription x2w::parse_rtv_variant_text(std::string_view text, uint64_t expected) {
+    if (text.size() > 256)
         throw std::runtime_error("invalid RTV variant request");
-    }
-    uint64_t key = 1469598103934665603ull;
-    hash_bytes(key, text.data(), text.size());
+    const uint64_t key = fnv1a_64(text);
     std::vector<std::string_view> tokens;
     std::string_view rest = text;
     bool valid = rest.substr(0, 5) == "rtv1 ";
@@ -158,18 +147,102 @@ x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
     }
     if (!valid || tokens.size() < 2 || tokens.size() > 9 || key != expected)
         throw std::runtime_error("invalid RTV variant request");
-    uint64_t base = 0;
-    std::vector<unsigned> formats;
+    RtvVariantDescription result;
     for (size_t i = 0; i < tokens.size(); ++i) {
         uint64_t value = 0;
         const auto parsed = std::from_chars(tokens[i].data(), tokens[i].data() + tokens[i].size(), value);
         if (parsed.ec != std::errc{} || (i && value > 0xffffffffull))
             throw std::runtime_error("invalid RTV variant values");
-        if (!i) base = value;
-        else formats.push_back(static_cast<unsigned>(value));
+        if (!i) result.base_key = value;
+        else result.formats.push_back(static_cast<unsigned>(value));
     }
+    return result;
+}
+
+std::string x2w::format_rtv_variant_text(uint64_t base_key, const std::vector<unsigned> &formats) {
+    std::string out = "rtv1 " + std::to_string(base_key);
+    for (unsigned format : formats) {
+        out.push_back(' ');
+        out += std::to_string(format);
+    }
+    return out;
+}
+
+uint64_t x2w::fnv1a_64(std::string_view bytes) {
+    uint64_t key = 1469598103934665603ull;
+    hash_bytes(key, bytes.data(), bytes.size());
+    return key;
+}
+
+uint64_t x2w::graphics_request_key(std::string_view a, std::string_view b, std::string_view root,
+                                   std::string_view input_layout, std::string_view pixel_entry,
+                                   std::string_view revision_override) {
+    constexpr char revision[] = "x2w-startup-shader-29";
+    uint64_t key = fnv1a_64(revision_override.empty() ? std::string_view(revision, sizeof(revision) - 1)
+                                                      : revision_override);
+    for (const auto part_view : {a, b, root, input_layout, pixel_entry})
+        hash_bytes(key, part_view.data(), part_view.size());
+    return key;
+}
+
+uint64_t x2w::compute_request_key(std::string_view code, std::string_view data, std::string_view root,
+                                  std::string_view description, std::string_view sa, std::string_view sb,
+                                  std::string_view revision_override) {
+    constexpr char revision[] = "x2w-startup-shader-29cs";
+    uint64_t key = fnv1a_64(revision_override.empty() ? std::string_view(revision, sizeof(revision) - 1)
+                                                      : revision_override);
+    for (const auto part_view : {code, data, root, description, sa, sb}) {
+        const uint64_t size = part_view.size();
+        hash_bytes(key, &size, sizeof(size));
+        hash_bytes(key, part_view.data(), part_view.size());
+    }
+    return key;
+}
+
+uint64_t x2w::mesh57_request_key(std::string_view code, std::string_view ps57, std::string_view root) {
+    constexpr char revision[] = "x2w-startup-mesh-57-3";
+    uint64_t key = fnv1a_64(std::string_view(revision, sizeof(revision) - 1));
+    for (const auto part_view : {code, ps57, root}) {
+        const uint64_t size = part_view.size();
+        hash_bytes(key, &size, sizeof(size));
+        hash_bytes(key, part_view.data(), part_view.size());
+    }
+    return key;
+}
+
+namespace {
+void parse_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
+    fs::path path = marker;
+    path.replace_extension(".psin");
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto size = file.tellg();
+    if (size < 0 || size > 128)
+        throw std::runtime_error("invalid pixel input description");
+    Bytes raw(static_cast<size_t>(size), 0);
+    file.seekg(0);
+    if (size && !file.read(raw.data(), size))
+        throw std::runtime_error("short read");
+    auto parsed = x2w::parse_pixel_input_description(raw, expected);
+    entry = std::move(parsed.entry);
+    description = std::move(parsed.canonical_text);
+}
+// tools/startup/gfx2hlsl.py request_source: at most 256 bytes of "rtv1 <base key> <format> ..." in decimal with one to
+// eight formats and nothing else, whose FNV-1a hash is the key in the file name. The variant is translated from its
+// base request's parts, which are read and checked against the base key like any base request.
+x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
+    const auto stem = marker.stem().string();
+    if (stem.size() != 20 || stem.compare(0, 4, "req_"))
+        throw std::runtime_error("expected req_<16 hex digits>.rtv");
+    const uint64_t expected = parse_request_stem(stem, "invalid RTV variant request key");
+    Bytes text;
+    try {
+        text = part(marker, ".rtv", 256);
+    } catch (const std::runtime_error &) {
+        throw std::runtime_error("invalid RTV variant request");
+    }
+    auto parsed = x2w::parse_rtv_variant_text(text, expected);
     char name[32];
-    std::snprintf(name, sizeof(name), "req_%016llx.a", static_cast<unsigned long long>(base));
+    std::snprintf(name, sizeof(name), "req_%016llx.a", static_cast<unsigned long long>(parsed.base_key));
     x2w::GraphicsRequest request;
     try {
         request = x2w::read_graphics_request(marker.parent_path() / name);
@@ -178,10 +251,32 @@ x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
     }
     request.key = expected;
     request.rtv_request = std::move(text);
-    request.rtv_formats = std::move(formats);
+    request.rtv_formats = std::move(parsed.formats);
     return request;
 }
+void read_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
+    if (fs::exists(fs::path(marker).replace_extension(".psin")))
+        parse_pixel_inputs(marker, expected, entry, description);
+    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
+        if (!entry.empty())
+            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
+        entry = part(marker, ".ps57in", 12);
+        if (entry.size() != 12 || entry.compare(0, 4, "PSI1"))
+            throw std::runtime_error("invalid slot-57 pixel entry record");
+        description = entry;
+    }
+}
 } // namespace
+
+std::string x2w::read_pixel_input_description(const fs::path &base_marker) {
+    const auto stem = base_marker.stem().string();
+    if (base_marker.extension() != ".a" || stem.size() != 20 || stem.compare(0, 4, "req_"))
+        throw std::runtime_error("expected req_<16 hex digits>.a");
+    const uint64_t expected = parse_request_stem(stem, "invalid graphics request key");
+    Bytes entry, description;
+    read_pixel_inputs(base_marker, expected, entry, description);
+    return description;
+}
 
 x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
     if (marker.extension() == ".rtv") return read_rtv_variant(marker);
@@ -193,28 +288,14 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
                             part(marker, ".root", 16 << 20), {}, {}, {}, expected};
     if (fs::exists(fs::path(marker).replace_extension(".ia")))
         request.input_layout = part(marker, ".ia", 1 << 20);
-    if (fs::exists(fs::path(marker).replace_extension(".psin")))
-        parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
-    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
-        if (!request.pixel_entry.empty())
-            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
-        request.pixel_entry = part(marker, ".ps57in", 12);
-        if (request.pixel_entry.size() != 12 || request.pixel_entry.compare(0, 4, "PSI1"))
-            throw std::runtime_error("invalid slot-57 pixel entry record");
-        request.pixel_input_description = request.pixel_entry;
-    }
-    const auto request_key = [&](std::string_view revision) {
-        uint64_t key = 1469598103934665603ull;
-        hash_bytes(key, revision.data(), revision.size());
-        for (const auto *p : {&request.a, &request.b, &request.root, &request.input_layout, &request.pixel_entry})
-            hash_bytes(key, p->data(), p->size());
-        return key;
-    };
+    read_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
     if (request.root.empty())
         throw std::runtime_error("graphics request key mismatch or missing root");
     // Match new runtime captures and keep revision-28 archives replayable.
-    constexpr char revision[] = "x2w-startup-shader-29";
-    if (request_key(revision) != expected && request_key("x2w-startup-shader-28") != expected) {
+    if (x2w::graphics_request_key(request.a, request.b, request.root, request.input_layout, request.pixel_entry) !=
+            expected &&
+        x2w::graphics_request_key(request.a, request.b, request.root, request.input_layout, request.pixel_entry,
+                                  "x2w-startup-shader-28") != expected) {
         if (!request.pixel_entry.empty())
             throw std::runtime_error("stale pixel input description: graphics request key mismatch");
         throw std::runtime_error("graphics request key mismatch or missing root");
@@ -230,22 +311,17 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     auto code = part(marker, ".c67", 1 << 20), data = part(marker, ".data", 1 << 20),
          root = part(marker, ".root", 16 << 20);
     auto desc = part(marker, ".desc", 96), sa = part(marker, ".sa", 4096), sb = part(marker, ".sb", 4096);
-    check_compute_extents(desc, code.size(), data.size(), sa.size(), sb.size());
-    const auto request_key = [&](std::string_view revision) {
-        uint64_t key = 1469598103934665603ull;
-        hash_bytes(key, revision.data(), revision.size());
-        for (const auto *p : {&code, &data, &root, &desc, &sa, &sb}) {
-            uint64_t size = p->size();
-            hash_bytes(key, &size, sizeof(size));
-            hash_bytes(key, p->data(), p->size());
-        }
-        return key;
-    };
-    constexpr char revision[] = "x2w-startup-shader-29cs";
-    if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
+    if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
+        read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
+        throw std::runtime_error("inconsistent compute request");
+    if (x2w::compute_request_key(code, data, root, desc, sa, sb) != expected &&
+        x2w::compute_request_key(code, data, root, desc, sa, sb, "x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
     ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
     validate_compute_request_shape(request);
+    // Bit 20 of dword 4 (bits 15:0 are Z): set for wave32, clear for wave64. Inferred from captured requests
+    // (docs/experiments/native-slot67-wave-size.md). Read only after the shape check has proved 28 bytes.
+    request.wave32 = (static_cast<unsigned char>(request.sa[18]) & 0x10) != 0;
     return request;
 }
 

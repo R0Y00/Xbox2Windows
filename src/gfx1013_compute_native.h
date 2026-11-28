@@ -42,9 +42,20 @@ enum class ComputeViewKind {
     // fallback and never read.
     heap_sampler,
     uint_texture_uav,
+    float_texture_uav,
+    float2_texture_uav,
+    float3_texture_uav,
     packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
     indexed_raw_srv // Fixed-stride record read. required_bytes is one complete record and its checked stride.
 };
+inline unsigned exact_texture_uav_channels(ComputeViewKind kind) {
+    switch (kind) {
+    case ComputeViewKind::float_texture_uav: return 1;
+    case ComputeViewKind::float2_texture_uav: return 2;
+    case ComputeViewKind::float3_texture_uav: return 3;
+    default: return 0;
+    }
+}
 inline bool accepts_cbv_window(ComputeViewKind kind) {
     return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
 }
@@ -64,7 +75,7 @@ struct IndexedAtomicView {
 inline bool compute_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::texture_uav || kind == ComputeViewKind::half_scalar_uav ||
            kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav ||
-           kind == ComputeViewKind::uint_texture_uav || compute_buffer_uav(kind);
+           kind == ComputeViewKind::uint_texture_uav || exact_texture_uav_channels(kind) || compute_buffer_uav(kind);
 }
 struct ComputeViewBinding {
     ComputeViewKind kind;
@@ -121,6 +132,8 @@ struct NativeComputeShader {
     std::vector<MeshHeapRead> mesh_heap_reads;
     std::vector<GraphicsLinkage> inputs, outputs;
     std::vector<ComputeConstants> constants;
+    // Additional b0 words, after root constants, read from these bound SRVs.
+    std::vector<unsigned> stride_srvs;
     std::string hlsl, dxil_ir;
     std::vector<ComputeViewBinding> bindings;
     std::vector<ComputeSampler> samplers;

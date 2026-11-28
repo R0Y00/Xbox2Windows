@@ -13,7 +13,7 @@ def words(*values):
     return struct.pack(f"<{len(values)}I", *values)
 
 
-def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=()):
+def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=(), *, group=None):
     body = bytearray(256)
     struct.pack_into("<Q", body, 0, 6)
     for offset in (8, 16, 24, 32, 40, 48, 72):
@@ -33,7 +33,8 @@ def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, u
     struct.pack_into("<I", body, record+20, 32 if wave32 else 0)
     struct.pack_into("<II", body, record+76, 512, 4)
     user_flags = 4 if root_descriptor else (0x1002 if table else 0)
-    struct.pack_into("<IIII", body, record+120, 0x8400 | user_flags, threads, 1, 1)
+    group = (threads, 1, 1) if group is None else group
+    struct.pack_into("<IIII", body, record+120, 0x8400 | user_flags, *group)
     body.extend(code)
     return pack(body)
 
@@ -196,7 +197,78 @@ def comparison_program(op=47, dim=1, sampler=0x08001012):
     return [*setup, 0xf0000100 | (dim << 3) | op << 18, 0x00220400]
 
 
+# Scalar ops whose direct lowering writes SCC. The byte-window field refuses when
+# the next instruction still looks like an SCC reader, so these have to sit in
+# uses_scc_after's overwrite list next to s_max_u32.
+SCC_WRITERS = ("s_absdiff_i32", "s_min_u32", "s_min_i32", "s_max_i32")
+
+
+def scc_overwrite_names(source):
+    start = source.index("const bool overwrites = ")
+    end = source.index("const bool preserves_pair", start)
+    return set(re.findall(r'n == "([^"]+)"', source[start:end]))
+
+
+def symbolic_field_scc_live(program, writers):
+    """Same backward walk as uses_scc_after, for a straight-line program.
+
+    Returns whether SCC is live at the instruction after program[0].
+    """
+    preserves = {"s_mov_b32", "s_mov_b64", "s_ff1_i32_b64", "s_brev_b32"}
+    readers = {"s_cselect_b32"}
+    live = [False] * len(program)
+    previous = [[] for _ in program]
+    pending = []
+    for index, name in enumerate(program):
+        scalar = name.startswith("s_") and name != "s_endpgm"
+        reads = name in readers
+        uncertain = scalar and not reads and name not in writers and name not in preserves
+        if reads or uncertain:
+            live[index] = True
+            pending.append(index)
+            continue
+        if name in writers or name == "s_endpgm":
+            continue
+        previous[index + 1].append(index)
+    while pending:
+        index = pending.pop()
+        for pred in previous[index]:
+            if live[pred]:
+                continue
+            live[pred] = True
+            pending.append(pred)
+    return live[1]
+
+
+def check_scc_writer_mutant():
+    source = pathlib.Path(__file__).resolve().parents[1].joinpath(
+        "src", "gfx1013_direct_compute.inl").read_text(encoding="utf-8")
+    start = source.index("const bool overwrites = ")
+    end = source.index("const bool preserves_pair", start)
+    block = source[start:end]
+    writers = scc_overwrite_names(source)
+    assert "s_and_b32" in writers and "s_max_u32" in writers
+    for name in SCC_WRITERS:
+        assert block.count(f'n == "{name}"') == 1, name
+    killed = ["s_and_b32", "s_mov_b32", "s_mov_b32", "s_absdiff_i32", "s_cselect_b32",
+              "v_mov_b32", "s_endpgm"]
+    select = ["s_and_b32", "s_mov_b32", "s_mov_b32", "s_ff1_i32_b64", "s_cselect_b32", "s_endpgm"]
+    assert symbolic_field_scc_live(select, writers)
+    assert not symbolic_field_scc_live(killed, writers)
+    mutant = block
+    for name in SCC_WRITERS:
+        mutant = mutant.replace(f'n == "{name}"', 'n == "s_endpgm"', 1)
+    dropped = set(re.findall(r'n == "([^"]+)"', mutant)) - {"s_endpgm"}
+    for name in SCC_WRITERS:
+        program = ["s_and_b32", "s_mov_b32", "s_mov_b32", name, "v_mov_b32", "s_endpgm"]
+        assert not symbolic_field_scc_live(program, writers), name
+        assert symbolic_field_scc_live(program, dropped), name
+    assert symbolic_field_scc_live(killed, dropped)
+    print("scc writer mutant: each new case is live once its overwrite entry is removed")
+
+
 def main():
+    check_scc_writer_mutant()
     if len(sys.argv) == 4 and sys.argv[1] in ("--sampler-pso", "--graphics-sampler-pso"):
         sdk, probe = sys.argv[2:]
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,6 +426,25 @@ def main():
         check("descriptor-sop1-before-scc-read", cs,
               compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        # s_min_i32 / s_min_u32 / s_max_i32 / s_absdiff_i32 write SCC, same as s_max_u32.
+        # After the address-field rewrite they kill that symbolic SCC. s_cselect with
+        # no such writer in between stays refused above. The source mutant in
+        # check_scc_writer_mutant drops each overwrite entry and the same shape is live.
+        use_diff = 0x7e00021a  # v_mov_b32 v0, s26
+        for name, word in (
+                ("s_min_i32", 0x831a1716),      # s_min_i32 s26, s22, s23
+                ("s_min_u32", 0x839a1716),
+                ("s_max_i32", 0x841a1716),
+                ("s_absdiff_i32", 0x961a1716)):
+            check("descriptor-" + name + "-kills-scc", cs,
+                  compute(words(*address_field, *pair_zero, word, use_diff, end), table=True))
+        check("descriptor-absdiff-then-cselect", cs,
+              compute(words(*address_field, *pair_zero, 0x961a1716, 0x85191716, use_diff, end),
+                      table=True))
+        or_saveexec = 0xbe983dc1  # s_or_saveexec_b32 s24, -1
+        check("descriptor-or-saveexec-kill", cs, compute(words(*address_field, or_saveexec, read_scc, end), table=True))
+        check("or-saveexec-exec-destination", cs, compute(words(0xbefe3dc1, end)),
+              "unsupported wave32 SAVEEXEC destination")
         # The previous symbolic SCC is dead at WQM. Reading it before WQM
         # must still refuse. The nonzero high word supplies the new SCC.
         numeric_wqm = [0xbe9a0380, 0xbe9b0381, 0xbe980a1a]  # s[24:25] = WQM(s[26:27])
@@ -456,13 +547,10 @@ def main():
         root_vs = vertex(constants=(0,2,1), program=[*root_load, 0x7e00020f, 0xf80008cf, 0, end])
         check("address-vs", "gfx1013-container-vs", root_vs)
         check("address-cs", cs, compute(words(*root_load, end), root_descriptor=True))
-        for offset in (106, 107):
-            check(f"wave64-smem-offset-{offset}", cs,
-                  compute(words(0xf4000200, offset << 25, end), threads=64,
-                          root_descriptor=True, wave32=False), "unsupported scalar memory addressing")
-        check("wave64-smem-vcc-dst", cs,
-              compute(words(0xf4000000 | 107 << 6, 125 << 25, end), threads=64,
-                      root_descriptor=True, wave32=False), "unsupported scalar memory destination range")
+        check("wave64-smem-symbolic-vcc-dst", cs,
+              compute(words(0xbe810380, 0xf4080000 | 104 << 6, 125 << 25, end),
+                      threads=64, table=True, wave32=False),
+              "symbolic scalar memory destination overlaps wave64 VCC")
         check("wave32-smem-cross-vcc", cs,
               compute(words(0xf40c0000 | 104 << 6, 125 << 25, end), root_descriptor=True),
               "unsupported scalar memory destination range")
@@ -755,6 +843,17 @@ def main():
                                   capture_output=True,text=True)
             assert result.returncode and not destination.exists(),(reason,result.stderr)
             if reason=="unbounded": assert "bounded aligned material index" in result.stderr,result.stderr
+        # Address bits 1, 11 and 15 allocate I/J, position W and packed XY.
+        # Reading v2 must use SV_Position.w, and v3 still uses screen XY.
+        position_entry = words(0x7e000302, 0x7e020303, 0xf800180f, 0x01010000, 0xbf810000)
+        (folder/"mesh-entry-w-xy.pslayout").write_text("meshps2 34818 64\n")
+        check("mesh-entry-w-xy", "gfx1013-raw-mesh-ps", position_entry)
+        w_xy = subprocess.check_output([pathlib.Path(sdk)/"dxc.exe", "-dumpbin",
+                                         folder/"mesh-entry-w-xy.cso"], text=True)
+        for channel in (0, 1, 3):
+            assert re.search(r"@dx.op.loadInput.f32\(i32 4, i32 \d+, i32 0, i8 " + str(channel) + r",", w_xy), w_xy
+        (folder/"mesh-entry-w-disabled.pslayout").write_text("meshps1 2 34818 64\n")
+        check("mesh-entry-w-disabled", "gfx1013-raw-mesh-ps", position_entry, "unsupported pixel entry VGPR 2")
         check("split-mask-two-arms", "gfx1013-container-ps", patched_pixel(len(two_arms), two_arms,
               input_address=1 << 8, input_signature=position_input))
         cmpx = [0xbefe0a7e, 0xbe8a047e, 0x7c2800f4, 0x7e0002f2,
@@ -862,7 +961,8 @@ def main():
                       0xbe840380, 0xbe8503ff, 0x00fff000, 0xbe8603ff, 0x04000000, 0xbe870380,
                       0x7e0002f0, 0x7e0202f2, 0x7e0402f4, 0xf0000108 | op << 18, 0x00220000]
             check(f"sample{op}", "gfx1013-container-ps", patched_pixel(len(prefix), prefix, True))
-            check(f"derivative{op}", cs, compute(words(*prefix, end), table=True),
+            # Six threads do not form complete compute quads, so implicit derivatives stay refused.
+            check(f"derivative{op}", cs, compute(words(*prefix, end), threads=6, table=True),
                   "implicit derivatives require a pixel stage")
         image_setup = prefix[:-2]
         # Reread v0 as the input record index before the instruction overwrites it.

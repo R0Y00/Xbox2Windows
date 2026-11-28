@@ -10,7 +10,7 @@ def write_request(work, words, root, sa=None):
     code = struct.pack(f"<{len(words)}I", *words)
     data = b"synthetic"
     if sa is None:
-        sa = struct.pack("<7I", 0, 0, 0, 32 | (8 << 16), 1, 0, (6 << 1) | (1 << 10))
+        sa = struct.pack("<7I", 0, 0, 0, 32 | (8 << 16), 1 | (1 << 20), 0, (6 << 1) | (1 << 10))
     desc = struct.pack("<12Q", 0, 0, len(sa), 0, 0, 0, len(code), 0, len(data), 0, 0, 0)
     parts = {".c67":code, ".data":data, ".root":root, ".desc":desc, ".sa":sa, ".sb":b""}
     payload = b"x2w-startup-shader-28cs" + b"".join(struct.pack("<Q", len(p))+p for p in parts.values())
@@ -57,6 +57,11 @@ def main(exe, sdk):
         broken=words[:-3]+[mov(37,128)]+words[-3:]
         assert "unsupported" in run(write_request(work,broken,root),"partial.cso",1)
         assert not (work/"partial.cso").exists()
+        # A correctly keyed request whose state block A is short must fail the shape check with its
+        # existing diagnostic. The wave-size bit is read only once 28 bytes are proved (#3241).
+        short=write_request(work,words,root,sa=struct.pack("<6I",0,0,0,32|(8<<16),1|(1<<20),0))
+        assert "compute state block A is not 28 bytes" in run(short,"short.cso",1)
+        assert not (work/"short.cso").exists()
     print("two-table request, register renaming, store order, cache, tamper and partial descriptor passed")
 
 

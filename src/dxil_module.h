@@ -173,6 +173,9 @@ class DxilModule {
              << "b, %dx.types.ResourceProperties { i32 14, i32 0 })\n";
         return h;
     }
+    // DXIL validator 1.8 accepts implicit-derivative operations in compute; every other
+    // module keeps validator 1.6.
+    unsigned validator_minor = 6;
     Text finish_compute(unsigned x, unsigned y, unsigned z, const Text &stage = "cs") {
         std::ostringstream out;
         out << "target datalayout = "
@@ -233,7 +236,13 @@ class DxilModule {
         // AMD's DXIL compiler (amdxc64.dll) dereferences Module::getNamedMetadata("llvm.ident") without a null check.
         const auto ident = node("!\"x2w\""), version = node("i32 1, i32 6"),
                    model = node("!\"" + stage + "\", i32 6, i32 6");
-        const unsigned flags = features | (uses_wave ? 524288 : 0);
+        // 0x8000: more than 8 UAV slots. DXC sums the declared UAV range sizes; the validator
+        // refuses a module whose flags do not match.
+        unsigned uav_slots = 0;
+        for (const auto &r : resources)
+            if (r.cls == 1)
+                uav_slots += (std::min)(r.count, 9u);
+        const unsigned flags = features | (uses_wave ? 524288 : 0) | (uav_slots > 8 ? 0x8000 : 0);
         Text properties = "null", signature = "null", view_state;
         if (stage == "cs") {
             const auto size =
@@ -314,7 +323,7 @@ class DxilModule {
                    "readnone\n"
                    "declare %dx.types.Handle "
                    "@dx.op.annotateHandle(i32,%dx.types.Handle,%dx.types.ResourceProperties) nounwind readnone\n";
-        out << "!llvm.ident = !{" << ident << "}\n!dx.version = !{" << version << "}\n!dx.valver = !{" << version
+        out << "!llvm.ident = !{" << ident << "}\n!dx.version = !{" << version << "}\n!dx.valver = !{" << node("i32 1, i32 " + std::to_string(validator_minor))
             << "}\n!dx.shaderModel = !{" << model << "}\n";
         if (res != "null")
             out << "!dx.resources = !{" << res << "}\n";

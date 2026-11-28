@@ -59,7 +59,8 @@ def check(folder, consumer, sdk, adapter, compiler):
     # Publish a verified disk pair, then hold back its ready marker until after the first draw.
     subprocess.run([compiler, "--watch", sdk, cache, cache, "--once"], check=True, timeout=45)
     marker, = cache.glob("req_*.a")
-    manifest = cache / (marker.stem.removeprefix("req_") + ".txt")
+    key = marker.stem.removeprefix("req_")
+    manifest = cache / f"{key}.txt"
     published = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in
                  (manifest, manifest.with_suffix(".vs.cso"), manifest.with_suffix(".ps.cso"))}
     published_draw = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
@@ -71,13 +72,17 @@ def check(folder, consumer, sdk, adapter, compiler):
     assert not changed, [(name, len(got), len(expected), got[:48].hex(), expected[:48].hex())
                          for name, got, expected in changed]
     print(f"{adapter} existing disk pair takes precedence with native enabled")
-    for fault, diagnostic in (("MANIFEST", "unsupported manifest version"), ("ROOT", "failed 0x80004005")):
+    faults = (
+        ("missing DXC", {"X2W_NATIVE_SHADERS": str(folder / "missing-sdk")}, f"native graphics {key} refused:"),
+        ("manifest", {"X2W_TEST_NATIVE_GRAPHICS_MANIFEST_FAILURE": "1"}, "unsupported manifest version"),
+        ("root", {"X2W_TEST_NATIVE_GRAPHICS_ROOT_FAILURE": "1"}, "failed 0x80004005"),
+    )
+    for fault, override, diagnostic in faults:
         manifest.rename(str(manifest) + ".pending")
         first = Path(str(pixels) + ".first")
         first.unlink(missing_ok=True)
         pixels.unlink()
-        fault_env = dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest), X2W_NATIVE_SHADERS_ONLY="0")
-        fault_env[f"X2W_TEST_NATIVE_GRAPHICS_{fault}_FAILURE"] = "1"
+        fault_env = dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest), X2W_NATIVE_SHADERS_ONLY="0", **override)
         run = subprocess.run(args, env=fault_env, capture_output=True, text=True, timeout=45)
         assert run.returncode == 0 and diagnostic in run.stderr and "-> drawn;" in run.stderr, run.stderr
         assert first.read_bytes() == clear * 32
