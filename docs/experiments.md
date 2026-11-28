@@ -24,6 +24,11 @@ ctest --preset dev --no-tests=error -V -R '^startup_native_graphics_draw_(hardwa
 State block A bit 20 of dword 4 selects the guest wave size.
 [Capture inference and hardware fixture](experiments/native-slot67-wave-size.md)
 
+## Guest wave64 groups whose waves branch apart in direct compute
+
+A multi-wave wave64 group with divergent control flow runs one host wave32 per guest wave64.
+[Lane-pair layout, fixture and limits](experiments/native-wave64-lane-pairs.md)
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
