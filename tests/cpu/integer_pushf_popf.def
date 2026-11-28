@@ -1,0 +1,26 @@
+LIBRARY cpu_integer_pushf_popf
+EXPORTS
+    op_add8_pushf
+    op_add16_pushfq
+    op_add32_pushfq
+    op_add64_pushfq
+    op_sub8_pushfq
+    op_sub16_pushf
+    op_sub32_pushfq
+    op_sub64_pushfq
+    op_cmp8_pushf
+    op_cmp16_pushfq
+    op_cmp32_pushf
+    op_cmp64_pushfq
+    op_add8_al_pushf
+    op_add32_imm_pushfq
+    op_sub32_imm_pushf
+    op_cmp64_imm_pushfq
+    op_popf_lahf_setcc
+    op_popfq_df_movsb
+    op_pushfq_std_movsb_popfq
+    op_nested_push_pop
+    op_popfq_normalize
+    op_popf_normalize
+    op_pushf_df_nt
+    op_discarded_read

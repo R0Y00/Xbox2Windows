@@ -6892,6 +6892,31 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_integer_flags_altered_lifted>"
         "$<TARGET_FILE:cpu_integer_flags_controls>")
     set_tests_properties(cpu_aot_integer_flags PROPERTIES SKIP_RETURN_CODE 77)
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_integer_pushf_popf_${variant} integer_pushf_popf)
+        set(cpu_integer_pushf_popf_${variant}_lifted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_pushf_popf_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${cpu_integer_pushf_popf_${variant}_lifted_cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_pushf_popf_check.py"
+                emit "$<TARGET_FILE:cpu_integer_pushf_popf_${variant}>" "${cpu_integer_pushf_popf_${variant}_lifted_cpp}"
+            DEPENDS cpu_integer_pushf_popf_${variant} tests/cpu/integer_pushf_popf_check.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_integer_pushf_popf_${variant}_lifted SHARED "${cpu_integer_pushf_popf_${variant}_lifted_cpp}")
+    endforeach()
+    target_compile_definitions(cpu_integer_pushf_popf_altered PRIVATE ALTER_IMM)
+    set(cpu_integer_pushf_popf_controls_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_integer_pushf_popf_controls.cpp")
+    add_custom_command(OUTPUT "${cpu_integer_pushf_popf_controls_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/integer_pushf_popf_check.py"
+            emit-controls "$<TARGET_FILE:cpu_integer_pushf_popf_original>" "${cpu_integer_pushf_popf_controls_cpp}"
+        DEPENDS cpu_integer_pushf_popf_original tests/cpu/integer_pushf_popf_check.py tools/ffx_version_query.py
+            tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_integer_pushf_popf_controls SHARED "${cpu_integer_pushf_popf_controls_cpp}")
+    add_test(NAME cpu_aot_integer_pushf_popf COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/integer_pushf_popf_check.py" check
+        "$<TARGET_FILE:cpu_integer_pushf_popf_original>"
+        "$<TARGET_FILE:cpu_integer_pushf_popf_original_lifted>"
+        "$<TARGET_FILE:cpu_integer_pushf_popf_altered_lifted>"
+        "$<TARGET_FILE:cpu_integer_pushf_popf_controls>")
+    set_tests_properties(cpu_aot_integer_pushf_popf PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_sse_fxsave_exports
         "op_fxrstor_fxsave,op_fxrstor64_fxsave64,op_fxrstor_fxsave64,"
         "op_fxrstor64_fxsave,op_fxrstor64_disp,op_pipeline,op_discarded_read,"

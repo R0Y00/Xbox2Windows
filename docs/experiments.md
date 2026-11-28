@@ -14834,8 +14834,8 @@ native `lahf` execution on `CPUID.80000001H:ECX[0]` (returning exit code 77 when
 or branch target between the writer and `lahf`, in functions with indirect branches, and
 after any other flag writer (`inc`/`dec`/`neg`/`adc`/`sbb`/`clc`/`stc`/`cmc`/`and`/`or`/
 `xor`/`test`/shifts/`imul`, or memory-operand `add`/`cmp`); `sahf` outside the x87 profile,
-`pushf`/`popf`/`pushfq`/`popfq`, `setp`, disallowed prefixes, EVEX forms, and EIP-relative
-operands also reject.
+`setp`, disallowed prefixes, EVEX forms, and EIP-relative operands also reject (`pushf`/
+`popf`/`pushfq`/`popfq` are handled separately in the bounded flag-stack slice below).
 
 ```powershell
 cmake --build --preset dev --target cpu_integer_flags_original cpu_integer_flags_original_lifted cpu_integer_flags_altered cpu_integer_flags_altered_lifted cpu_integer_flags_controls
@@ -14861,6 +14861,67 @@ binding that replaces the flag writer, and 11 end-to-end PE-patched DLL rejectio
 
 Not covered by this experiment: `sahf`, `inc`/`dec`/`neg`/`adc`/`sbb`, `pushf`/`popf`/
 `pushfq`/`popfq`, cross-block flag flow into `lahf`, and title CPU code execution.
+
+## Integer PUSHF/PUSHFQ/POPF/POPFQ flag-stack slice
+
+[The shared query translator](../tools/ffx_version_query.py) lowers `pushf`, `pushfq`,
+`popf`, and `popfq` from `docs/coverage/x64_zen2.tsv` group `Integer` using bounded
+frame-stack tracking (`flag_stack_depths`) and path-sensitive definedness analysis
+(`flag_definedness`):
+
+- Stack-depth and frame-bounds discipline (`flag_stack_depths`): starts `rsp` at the top
+  of the private `frame` array (`FRAME_WORDS = 16`, `FLAG_STACK_LIMIT = 128` bytes), steps
+  `rsp` by `2` (`pushf`/`popf`) or `8` (`pushfq`/`popfq`), requires depth `0` at every
+  `ret`, call, indirect branch, and external exit, rejects underflow, overflow past `128`
+  bytes, mismatched depths at control-flow joins, disallowed instruction prefixes, explicit
+  `rsp` register writes/reads or `lea` aliases, and `[rsp + disp]` accesses outside the
+  pushed region.
+- Flag definedness, `DF=0` exit discipline, and unmodeled control-bit rejection (`flag_definedness`):
+  under the default `entry_state="defined"`, status flags start undefined while `DF` is assumed
+  clear (`false`) at function entry per the Windows x64 ABI and `NT`, `ID`, and `AC` are assumed
+  clear under this profile (with
+  opt-in `entry_state="canonical"` assuming defined entry status flags, tested in the suite);
+  `pushf`/`pushfq` require all six status flags (`CF`, `PF`, `AF`, `ZF`, `SF`, `OF`)
+  to be defined by `add`, `sub`, `cmp`, `popf`, or `popfq` on every incoming path; `popf`/`popfq`
+  restore all six status flags and track per-byte may-be-1 bitmasks across GP registers and stack
+  pushes/`[rsp]` edits, rejecting `popf` unless `TF` (`0x0100`) is proven clear and `popfq` unless
+  both `TF` and `AC` (`0x040100`) are proven clear, and refusing any `ret`, call, indirect branch, or
+  exit where `DF` may be `1`.
+- Ring-3 RFLAGS normalization: `popf` updates bits `0..15` (`CF`, `PF`, `AF`, `ZF`, `SF`,
+  `DF`, `OF`, `NT`) while keeping bit `1` and `IF` (`0x0202`) set, clearing `IOPL` and
+  reserved bits, and preserving upper bits (`ID`); `popfq` additionally updates `ID`
+  (bit `21`) and clears `RF`, `VM`, `VIF`, `VIP`, and bits `63:22`.
+
+```powershell
+cmake --build --preset dev --target cpu_integer_pushf_popf_original cpu_integer_pushf_popf_original_lifted cpu_integer_pushf_popf_altered_lifted cpu_integer_pushf_popf_controls
+ctest --preset dev --no-tests=error -R '^cpu_aot_integer_pushf_popf$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/integer_pushf_popf.asm) exports 24 functions covering `add`,
+`sub`, and `cmp` across 8-, 16-, 32-, and 64-bit forms into `pushf`/`pushfq`, `popf`/`popfq`
+into `lahf`, `setcc` (`setb`, `setl`, `sete`, `sets`, `seto`, `setp`), and `cld`/`std`/
+`movsb`, nested `pushfq`/`pushf`/`popf`/`popfq`, 16-bit `pushf` capturing `DF=1`/`NT=1`
+(`op_pushf_df_nt`), ring-3 RFLAGS bit normalization, and a discarded-read fault-ordering
+control (`op_discarded_read`).
+[The differential check](../tests/cpu/integer_pushf_popf_check.py) verifies 519 cases across
+the 23 differential exports bit-for-bit against both the native MASM DLL and an independent
+Python RFLAGS model with 32-byte pre/post buffer guards across `dev` and `release` (`/O2`)
+builds (seeing `CF`, `PF`, `AF`, `ZF`, `SF`, `DF`, `OF`, `NT`, and `ID` each take both `0`
+and `1`), alongside dead-read fault ordering (`op_discarded_read`), 4 `ALTER_IMM` divergence
+controls (`op_add8_al_pushf`: `21`, `op_add32_imm_pushfq`: `23`, `op_sub32_imm_pushf`: `30`,
+`op_cmp64_imm_pushfq`: `26`), 10 mutated-C++ controls (`ctrl_bit1_cleared`: `30`,
+`ctrl_if_cleared`: `30`, `ctrl_af_bit5`: `6`, `ctrl_pf_full_width`: `8`, `ctrl_df_ignored`:
+`3`, `ctrl_of_dropped`: `3`, `ctrl_id_dropped`: `4`, `ctrl_rsp_step_wrong`: `4`,
+`ctrl_pushf_df_dropped`: `3`, `ctrl_pushf_nt_dropped`: `3`), an output-mutation control,
+15 alternate-encoding/stack-edit and `entry_state` checks (plus a direct `flag_definedness`
+accept/reject pair for `btr [rsp], imm`), 52 unit rejection controls, four rejected host/profile
+controls (replaced flag producer, host-op register reset, `x87` alongside flag stack, and
+explicit `RSP` binding), and 13 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: `sahf` outside the x87 profile, `TF`/`AC` trap semantics,
+and title CPU code execution.
 
 ## Lowering primitive topology 0x11 (rectangle list) to triangle list
 
