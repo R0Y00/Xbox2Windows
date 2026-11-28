@@ -630,19 +630,23 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
 {
     constexpr UINT width = 32;
     const bool exact = mode.rfind("texture-exact-", 0) == 0;
-    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume";
-    const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
-    const UINT first_mip = volume || line ? 1 : 0;
+    const bool half = mode.rfind("texture-exact-half-", 0) == 0;
+    const bool half_rg = mode == "texture-exact-half-rg" || mode == "texture-exact-half-rg-array";
+    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume" ||
+                        mode == "texture-exact-half-r-volume";
+    const bool line = mode == "texture-line" || mode == "texture-line-bad-mip" || mode == "texture-exact-half-r-line";
+    const UINT first_mip = volume || line || half ? 1 : 0;
     const UINT height = line ? 1 : 8;
     const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
     const bool atomic_uint = mode == "texture-store-atomic";
     const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ||
-                        mode == "texture-exact-array" ? 6 : 1;
+                        mode == "texture-exact-array" || mode == "texture-exact-half-rg-array" ? 6 : 1;
     const UINT subresources = volume ? 1 : layers;
     const bool swapped = mode == "texture-store-mips-swapped";
     const bool dual = swapped || mode == "texture-store-mips";
     const UINT mips = dual ? 2 : 1;
-    const UINT pixel_bytes = exact ? (mode == "texture-exact-rg" ? 8 : 4) : atomic_uint ? 4 : fp32 ? 16 : 8;
+    const UINT pixel_bytes = half ? (half_rg ? 4 : 2) :
+                             exact ? (mode == "texture-exact-rg" ? 8 : 4) : atomic_uint ? 4 : fp32 ? 16 : 8;
     const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
     const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
     const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
@@ -650,7 +654,8 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = mode == "texture-exact-r" ? DXGI_FORMAT_R32_FLOAT :
+    const DXGI_FORMAT format = half ? (half_rg ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R16_FLOAT) :
+        mode == "texture-exact-r" ? DXGI_FORMAT_R32_FLOAT :
         mode == "texture-exact-rg" ? DXGI_FORMAT_R32G32_FLOAT :
         mode == "texture-exact-rgba" ? DXGI_FORMAT_R8G8B8A8_UNORM :
         exact ? DXGI_FORMAT_R11G11B10_FLOAT :
@@ -669,8 +674,9 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     }
     const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
         D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const auto resource_format = mode == "texture-exact-half-r-typeless" ? DXGI_FORMAT_R16_TYPELESS : format;
     const D3D12_RESOURCE_DESC texture_desc{dimension, 0, width << first_mip, line ? 1 : height << first_mip,
-        static_cast<UINT16>(volume ? layers << first_mip : layers), static_cast<UINT16>(first_mip + mips), format,
+        static_cast<UINT16>(volume ? layers << first_mip : layers), static_cast<UINT16>(first_mip + mips), resource_format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -680,7 +686,15 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    if (exact) {
+    if (half) {
+        const UINT row_halves = width * pixel_bytes / sizeof(UINT16);
+        for (UINT layer = 0; layer < layers; ++layer)
+            for (UINT y = 0; y < height; ++y) {
+                auto* row = reinterpret_cast<UINT16*>(static_cast<char*>(memory) + offset(layer, 0) + y * pitch);
+                for (UINT x = 0; x < row_halves; ++x)
+                    row[x] = static_cast<UINT16>(0x5000 + (layer * height + y) * row_halves + x);
+            }
+    } else if (exact) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT y = 0; y < height; ++y) {
                 auto* row = reinterpret_cast<UINT*>(static_cast<char*>(memory) + offset(layer, 0) + y * pitch);
@@ -734,9 +748,9 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
         view.Texture1D.MipSlice = mode == "texture-line-bad-mip" ? first_mip + 1 : first_mip;
     } else if (layers > 1) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-        view.Texture2DArray = {0, 1, 4, 0}; // four selected slices, with untouched neighbors on both sides
+        view.Texture2DArray = {first_mip, 1, 4, 0}; // four selected slices, untouched neighbors on both sides
     } else {
-        view.Texture2D.MipSlice = swapped ? 1 : 0;
+        view.Texture2D.MipSlice = swapped ? 1 : first_mip;
     }
     if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
     if (mode == "texture-store-copied") {
@@ -770,7 +784,7 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
                 D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
                 image.SubresourceIndex = layer * texture_desc.MipLevels + first_mip + mip;
                 D3D12_TEXTURE_COPY_LOCATION rows{static_cast<ID3D12Resource*>(buffer), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-                rows.PlacedFootprint = {offset(layer, mip), {format, width >> mip, height >> mip, volume ? layers : 1, pitch}};
+                rows.PlacedFootprint = {offset(layer, mip), {resource_format, width >> mip, height >> mip, volume ? layers : 1, pitch}};
                 invoke(list, 16, word(to_texture ? &image : &rows), 0, 0, 0, word(to_texture ? &rows : &image), 0);
             }
     };

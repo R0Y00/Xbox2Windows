@@ -812,6 +812,12 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";
+            } else if ((b.kind == ComputeViewKind::half_scalar_uav || b.kind == ComputeViewKind::half2_texture_uav) &&
+                       b.array_count == 1 && (b.image_dimension < 3 || b.image_dimension == 5)) {
+                const char *dimension = b.image_dimension == 0 ? "tex1d" : b.image_dimension == 1 ? "tex2d" :
+                                        b.image_dimension == 2 ? "tex3d" : "tex2da";
+                uav_lines << "uav " << b.shader_register << ' ' << dimension << " half table " << b.root_parameter
+                          << ' ' << b.byte_offset << " channels " << (b.kind == ComputeViewKind::half_scalar_uav ? 1 : 2) << '\n';
             } else if (const auto channels = exact_texture_uav_channels(b.kind); channels && b.array_count == 1 &&
                        (b.image_dimension == 1 || b.image_dimension == 2 || b.image_dimension == 5)) {
                 const char *dimension = b.image_dimension == 2 ? "tex3d" : b.image_dimension == 5 ? "tex2da" : "tex2d";

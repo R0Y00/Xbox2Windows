@@ -24,3 +24,27 @@ starts at physical slice 1. Every other texel retains its sentinel.
 The format cases use R32_FLOAT, R32G32_FLOAT, and R11G11B10_FLOAT. The
 RGBA8 control leaves the complete image untouched and checks the runtime
 channel-count refusal.
+
+## Published one- and two-channel D16 stores
+
+The direct compiler already emits scalar and two-channel D16 image stores.
+The published manifest uses
+`uav <index> <tex1d|tex2d|tex2da|tex3d> half table <parameter> <byte> channels <1|2>`.
+The runtime requires an `R16_FLOAT` or `R16G16_FLOAT` UAV of the corresponding
+typed or typeless resource and checks desktop typed-store support on the
+view format. Dispatch retains the UAV's mip, first array slice or W slice,
+and range.
+
+The source-built fixture writes 1.0 and, for two channels, -2.0 to even
+columns of mip 1. It checks 1D, 2D, 2D array and volume readbacks, including
+an R16 typeless backing resource. The layered tests bind a view that starts
+at physical slice 1 and write relative slice 1. All other pixels and slices
+keep their original halfwords. The R32_FLOAT and R32G32_FLOAT controls
+exercise the format refusal with the same channel counts.
+
+The translated descriptor follows the [D3D12 UAV contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_unordered_access_view_desc),
+including the [W range of 3D views](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_tex3d_uav).
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_compute_half_image_uav_' -V
+```

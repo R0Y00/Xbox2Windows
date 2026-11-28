@@ -36,6 +36,7 @@ struct ComputeTranslation {
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
         bool root = false;
         bool atomic_uint_texture = false;
+        bool narrow_half_texture = false;
         unsigned channels = 4;
     };
     u64 key = 0;
@@ -201,6 +202,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().uav_dimension = uav_dimension();
             tr.uavs.back().channels = x;
+        }
+        else if (std::sscanf(line.c_str(), "uav %u %15s half table %d %d channels %u%n", &i, name, &a, &b, &x, &used) == 5 &&
+                 whole() && i == tr.uavs.size() && (x == 1 || x == 2) && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().uav_dimension = uav_dimension();
+            tr.uavs.back().channels = x;
+            tr.uavs.back().narrow_half_texture = true;
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
@@ -579,15 +587,25 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
                 reason = "an image atomic requires an R32_UINT UAV";
             if (!reason && slot.channels < 4) {
-                if (float_output_channels(format) != slot.channels || float_output_channels(resource.Format) != slot.channels)
+                auto store_format = resource.Format;
+                if (slot.narrow_half_texture) {
+                    const auto kind = slot.channels == 1 ? x2w::ComputeViewKind::half_scalar_uav
+                                                        : x2w::ComputeViewKind::half2_texture_uav;
+                    const auto half = x2w::native_half_store_format(kind);
+                    if (!half.accepts(format, resource.Format))
+                        reason = "a D16 image store requires a matching half-float UAV and resource";
+                    store_format = half.typed;
+                } else if (float_output_channels(format) != slot.channels ||
+                           float_output_channels(resource.Format) != slot.channels) {
                     reason = "an exact-width image store requires a matching output texture channel count";
-                else {
-                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{resource.Format};
+                }
+                if (!reason) {
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{store_format};
                     if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
                                                                          sizeof(support))) ||
                         !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
                         reason = "an exact-width image store requires typed UAV store support";
-                    desc.Format = resource.Format;
+                    desc.Format = store_format;
                 }
             }
             if (!reason && !slot.atomic_uint_texture && !float_output_channels(format))
