@@ -1677,6 +1677,52 @@ struct DirectCompute {
             vector_write(i.dst, res_bits);
             return true;
         }
+        if (n == "v_div_fixup_f16") {
+            if (graphics_input)
+                return false;
+            if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted || i.scale || (i.a & 0x7800))
+                refuse(i.pc, "unsupported v_div_fixup_f16 operand modifiers");
+            auto src_f16 = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                auto bits = r >= 240 && r <= 248 ? to_string(inline_half_words[r - 240])
+                                                 : ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto s0 = src_f16(0), s1 = src_f16(1), s2 = src_f16(2);
+            auto mag0 = ir.binary("and", s0, "32767");
+            auto mag1 = ir.binary("and", s1, "32767");
+            auto mag2 = ir.binary("and", s2, "32767");
+            auto sign_out = ir.binary("and", ir.binary("xor", s1, s2), "32768");
+            auto s1_nan = cmp("ugt", mag1, "31744");
+            auto s2_nan = cmp("ugt", mag2, "31744");
+            auto s1_inf = cmp("eq", mag1, "31744");
+            auto s2_inf = cmp("eq", mag2, "31744");
+            auto s1_zero = cmp("eq", mag1, "0");
+            auto s2_zero = cmp("eq", mag2, "0");
+            auto signed_inf = ir.binary("or", sign_out, "31744");
+            auto invalid = ir.value("or i1 " + ir.value("and i1 " + s1_zero + ", " + s2_zero) + ", " +
+                                    ir.value("and i1 " + s1_inf + ", " + s2_inf));
+            auto to_inf = ir.value("or i1 " + s1_zero + ", " + s2_inf);
+            auto to_zero = ir.value("or i1 " + s1_inf + ", " + s2_zero);
+            // RDNA 2 ISA V_DIV_FIXUP_F16 (section 12.12, opcode 863): S2 NaN takes priority over S1 NaN,
+            // 0/0 and Inf/Inf yield 0xfe00, and the default path sets the sign of S0 to sign(S1) ^ sign(S2).
+            string result = ir.binary("or", sign_out, mag0);
+            result = select(to_zero, sign_out, result);
+            result = select(to_inf, signed_inf, result);
+            result = select(invalid, "65024", result);
+            result = select(s1_nan, ir.binary("or", s1, "512"), result);
+            result = select(s2_nan, ir.binary("or", s2, "512"), result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         if ((i.subword || (!i.wide && !i.dpp_control && !permuted)) &&
             (n == "v_cvt_f16_f32" || n == "v_cvt_f32_f16")) {
             const bool narrow = n == "v_cvt_f16_f32";
