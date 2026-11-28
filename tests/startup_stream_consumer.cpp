@@ -387,6 +387,21 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
+    char input_mapping[16]{};
+    const auto mapping_chars = GetEnvironmentVariableA("X2W_TEST_DISPATCH_INPUT_VIEW", input_mapping, sizeof(input_mapping));
+    if (mode == "dispatch-records32" && mapping_chars && mapping_chars < sizeof(input_mapping)) {
+        if (std::strcmp(input_mapping, "cbv") == 0) {
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC view{invoke(placed[0], 11), 256};
+            invoke(device, 17, word(&view), cpu);
+        } else {
+            const UINT mapping = std::strcmp(input_mapping, "swapped") == 0
+                ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 0, 2, 3)
+                : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_BUFFER, mapping};
+            view.Buffer.NumElements = fields[0][0] * fields[0][1] / 4;
+            invoke(device, 18, word(placed[0]), word(&view), cpu);
+        }
+    }
     void* other_heap = nullptr;
     if (change_table_heap &&
         (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)),
