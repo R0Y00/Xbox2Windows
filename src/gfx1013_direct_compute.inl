@@ -3100,6 +3100,57 @@ struct DirectCompute {
             } else write_ballot(*dst, carry);
             return;
         }
+        if (n == "v_cvt_f64_f32") {
+            // Exact binary32 -> binary64 widening (#3368) using pure 32-bit integer ops and FirstbitHi
+            // (dx.op.unaryBits.i32 33); needs neither DoublePrecisionFloatShaderOps nor Int64ShaderOps.
+            if (pixel_stage || graphics_input || i.subword || i.dpp_control || permuted ||
+                i.clamp || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
+                refuse(i.pc, "unsupported v_cvt_f64_f32 stage or operand modifiers");
+            if (i.dst < 256 || i.dst >= 511)
+                refuse(i.pc, "v_cvt_f64_f32 requires a 64-bit VGPR destination pair");
+            auto x = operand32(i, i.src[0]);
+            if (i.abs & 1) x = ir.binary("and", x, "2147483647");
+            if (i.neg & 1) x = ir.binary("xor", x, "2147483648");
+            auto sign = ir.binary("and", x, "2147483648");
+            auto exp = ir.binary("and", ir.binary("lshr", x, "23"), "255");
+            auto mant = ir.binary("and", x, "8388607");
+            auto exp_zero = cmp("eq", exp, "0");
+            auto exp_max = cmp("eq", exp, "255");
+            auto mant_zero = cmp("eq", mant, "0");
+            auto is_zero = ir.value("and i1 " + exp_zero + ", " + mant_zero);
+            auto is_sub = ir.value("and i1 " + exp_zero + ", " + ir.value("xor i1 " + mant_zero + ", true"));
+            auto is_inf = ir.value("and i1 " + exp_max + ", " + mant_zero);
+            auto is_nan = ir.value("and i1 " + exp_max + ", " + ir.value("xor i1 " + mant_zero + ", true"));
+            // Normal path: exp64 = exp + 896 (1023 - 127), top 20 frac bits in hi, low 3 in lo[31:29].
+            auto norm_hi = ir.binary("or", sign, ir.binary("or", ir.binary("shl", ir.binary("add", exp, "896"), "20"),
+                                                           ir.binary("lshr", mant, "3")));
+            auto norm_lo = ir.binary("shl", mant, "29");
+            // Subnormal path: normalize mant via FirstbitHi so binary32 subnormal becomes exact binary64 normal.
+            auto lz = ir.invoke("i32", "unaryBits.i32", 33, {{"i32", mant}}, "nounwind readnone");
+            auto safe_lz = select(mant_zero, "0", lz);
+            auto sub_exp = ir.binary("sub", "905", safe_lz);
+            auto sub_frac = ir.binary("and", ir.binary("shl", mant, safe_lz), "2147483647");
+            auto sub_hi = ir.binary("or", sign, ir.binary("or", ir.binary("shl", sub_exp, "20"),
+                                                          ir.binary("lshr", sub_frac, "11")));
+            auto sub_lo = ir.binary("shl", sub_frac, "21");
+            // NaN path: quiet signaling NaN (bit 22) and preserve payload in hi[19:0] and lo[31:29].
+            auto mant_q = ir.binary("or", mant, "4194304");
+            auto nan_hi = ir.binary("or", sign, ir.binary("or", "2146435072", ir.binary("lshr", mant_q, "3")));
+            auto nan_lo = ir.binary("shl", mant_q, "29");
+            auto inf_hi = ir.binary("or", sign, "2146435072");
+            auto hi = select(is_sub, sub_hi, norm_hi);
+            auto lo = select(is_sub, sub_lo, norm_lo);
+            hi = select(is_zero, sign, hi);
+            lo = select(is_zero, "0", lo);
+            hi = select(is_inf, inf_hi, hi);
+            lo = select(is_inf, "0", lo);
+            hi = select(is_nan, nan_hi, hi);
+            lo = select(is_nan, nan_lo, lo);
+            vector_write(i.dst, lo);
+            vector_write(i.dst + 1, hi);
+            return;
+        }
         if (auto field = byte_descriptor_field(i,state,heap_window)) {
             // Keep derived words symbolic, including the status bit until a
             // later instruction overwrites it. Never let a numeric branch

@@ -538,7 +538,7 @@ static void clear_vector_spills(const Inst &i, State &s) {
     case Encoding::Vop1: case Encoding::Vop2: case Encoding::Vop3: case Encoding::Mix:
         if (i.dst >= 256 && i.name != "v_nop") {
             const bool pair = i.name == "v_mad_u64_u32" || i.name == "v_mad_i64_i32" || i.name == "v_lshlrev_b64" ||
-                              i.name == "v_lshrrev_b64" || i.name == "v_ashrrev_i64";
+                              i.name == "v_lshrrev_b64" || i.name == "v_ashrrev_i64" || i.name == "v_cvt_f64_f32";
             s.clear_spills(i.dst, pair ? 2 : 1);
             if (i.name == "v_swap_b32") s.clear_spills(i.src[0]);
         }
