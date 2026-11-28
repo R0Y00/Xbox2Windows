@@ -19,6 +19,7 @@
 #include "startup_stream_setup.h"
 
 extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_calls();
+extern "C" __declspec(dllimport) std::uint64_t x2w_d3d12_replay_record_carried_bytes();
 
 using Word = StreamWord;
 template <class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
@@ -37,8 +38,7 @@ struct Scene {
     void* allocator = nullptr;
     void* list = nullptr;
     void* static_list = nullptr;  // X2W_TEST_REPLAY_STATIC_LIST=1: recorded and closed once, before any present
-    void* static_allocator = nullptr;
-    bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: released in the window, its address reused by an empty list
+    bool release_static = false;  // X2W_TEST_REPLAY_STATIC_RELEASE=1: Released in the window without a submit
     void* fence = nullptr;
     SIZE_T rtv = 0, fallback_rtv = 0;
     TitleRange title_range = TitleRange::none;
@@ -246,7 +246,7 @@ int create_scene(void* device, Scene& s)
     // A list built and closed before the recorder's window, submitted again every frame: a green corner over the frame.
     char static_list[2]{};
     if (GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_LIST", static_list, sizeof(static_list)) == 1 && static_list[0] == '1') {
-        void*& allocator = s.static_allocator;
+        void* allocator = nullptr;
         const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
         const D3D12_RECT corner{0, 0, 12, 10};
         if (FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)),
@@ -383,22 +383,14 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
     if (s.release_static && frame == 6) {
-        // Inside the window: the carried list is Released without a submit, then lists are created until one gets its
-        // address (the others are Released at once). That list is closed empty and takes the old one's place in every submit.
-        const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
-        void* const old_address = s.static_list;
+        // Inside the window: the carried list is Released without a submit. Whatever address its memory gets next must
+        // not inherit its calls, so the recorder has to let go of them now (the bytes it still holds are printed).
+        const auto before = x2w_d3d12_replay_record_carried_bytes();
         invoke(s.static_list, 2);
         s.static_list = nullptr;
-        for (int attempt = 0; attempt < 512 && !s.static_list; ++attempt) {
-            void* candidate = nullptr;
-            if (FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(s.static_allocator), 0,
-                                                   arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&candidate)))))
-                return 23;
-            if (candidate == old_address) s.static_list = candidate;
-            else invoke(candidate, 2);
-        }
-        if (!s.static_list) return 33;  // the stand-in never gave the address back
-        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
+        std::fprintf(stderr, "replay quad: carried bytes %llu before the release, %llu after\n",
+                     static_cast<unsigned long long>(before),
+                     static_cast<unsigned long long>(x2w_d3d12_replay_record_carried_bytes()));
     }
     // X2W_TEST_REPLAY_EXEC_SLOT=35: the title's ExecuteCommandLists slot (a queue slot the stand-in dispatches by shape).
     static const UINT execute_slot = [] {
