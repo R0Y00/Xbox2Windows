@@ -106,7 +106,7 @@ int main(int argc, char** argv)
 
     // Two callers cross a barrier, then each Signal its own value. The fixture repeats this
     // so a stale post-call observation cannot disagree with the native fence or method.
-    unsigned concurrent_failures = 0;
+    std::atomic<unsigned> concurrent_failures{};
     for (unsigned pair = 0; pair < 128; ++pair) {
         std::atomic<unsigned> ready{};
         std::atomic<bool> go{};
@@ -130,8 +130,8 @@ int main(int argc, char** argv)
     const UINT64 concurrent_native = real->GetCompletedValue();
     std::printf("concurrent CPU signals: native=%llu method=%llu address=%llu %s\n",
                 concurrent_native, invoke<UINT64>(fence.Get(), 8),
-                static_cast<UINT64>(*shadow), concurrent_failures ? "FAIL" : "PASS");
-    failures += concurrent_failures ? 1 : 0;
+                static_cast<UINT64>(*shadow), concurrent_failures.load() ? "FAIL" : "PASS");
+    failures += concurrent_failures.load() ? 1 : 0;
 
     for (const UINT64 value : {UINT64{9}, UINT64{2}, UINT64{0}, UINT64{7}}) {
         if (FAILED(invoke(fence.Get(), 10, value))) return 5;
