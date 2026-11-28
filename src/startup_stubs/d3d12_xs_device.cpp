@@ -6379,6 +6379,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_fail_view_allocations(int site, 
     if (site >= 0 && site < view_allocation_sites) InterlockedExchange(&view_allocations_to_fail[site], count);
 }
 
+// Fixture export (startup_view_token): view token writes made through the guard since the process started; both stay 0
+// without X2W_D3D12_VIEW_TOKEN_GUARDED=1.
+extern "C" __declspec(dllexport) void x2w_d3d12_view_token_writes(LONG* written, LONG* refused)
+{
+    if (written) *written = view_tokens_guarded_written;
+    if (refused) *refused = view_tokens_guarded_refused;
+}
+
 // Fixture probe (startup_view_alloc): the sizes of the three view containers, the id + 1 that the tracked slot of a
 // title descriptor handle names (0: none), and whether a resource is still in the retire class.
 struct ViewStoreProbe {
@@ -7422,6 +7430,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
     }
+    if (render_mode() && frame % 300 == 0 && view_token_guarded())
+        log("x2w-render view tokens (X2W_D3D12_VIEW_TOKEN_GUARDED): written %ld, refused %ld", view_tokens_guarded_written,
+            view_tokens_guarded_refused);
     if (render_mode() && frame % 300 == 0 && root_srv_at_draw())
         log("x2w-render root SRV copies (X2W_D3D12_ROOT_SRV_AT_DRAW): skipped %ld, copied %ld", root_srv_copies_skipped,
             root_srv_copies_made);

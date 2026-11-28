@@ -1,0 +1,17 @@
+# The slot 18 view token in title descriptor memory, written after a check (unset) or under an exception guard
+# (opt-in X2W_D3D12_VIEW_TOKEN_GUARDED=1): the same tokens, and no write to a read-only page or through a guard page.
+add_executable(startup_view_token tests/startup_view_token.cpp)
+target_compile_features(startup_view_token PRIVATE cxx_std_17)
+target_link_libraries(startup_view_token PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS unset set)
+        set(token_test startup_view_token_${mode}_${backend})
+        add_test(NAME ${token_test} COMMAND startup_view_token ${backend} ${mode})
+        set(token_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+        list(APPEND token_env "X2W_TRAP_LOG=${CMAKE_CURRENT_BINARY_DIR}/${token_test}.log")
+        if(mode STREQUAL "set")
+            list(APPEND token_env "X2W_D3D12_VIEW_TOKEN_GUARDED=1")
+        endif()
+        set_tests_properties(${token_test} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${token_env}")
+    endforeach()
+endforeach()
