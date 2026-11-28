@@ -793,8 +793,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // A compute list accepts no pixel-shader or depth state in a transition.
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            device_of(the_device)->CreateShaderResourceView(view.resource,
-                view.described ? &view.desc.srv : nullptr, dest);
+            x2w_create_srv(device_of(the_device), view.resource,
+                view.described ? &view.desc.srv : nullptr, dest,
+                "compute-texture", log);
             continue;
         }
         if (i < inputs || i >= count) {
