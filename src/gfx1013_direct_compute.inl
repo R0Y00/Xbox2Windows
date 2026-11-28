@@ -965,8 +965,21 @@ struct DirectCompute {
         ir.features |= 0x40000000;
         return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
     }
+    static int image_atomic_binop(unsigned op) {
+        switch (op) {
+        case 0x0f: return 8; // Exchange
+        case 0x11: return 0; // IAdd
+        case 0x15: return 6; // UMin
+        case 0x17: return 7; // UMax
+        case 0x18: return 1; // And
+        case 0x19: return 2; // Or
+        case 0x1a: return 3; // Xor
+        // Signed min/max is not verified on this R32_UINT binding.
+        default: return -1;
+        }
+    }
     static bool is_image_atomic(const Inst &i) {
-        return i.enc == Encoding::Image && (i.op == 16 || i.op == 17 || i.op == 23);
+        return i.enc == Encoding::Image && (i.op == 0x10 || image_atomic_binop(i.op) >= 0);
     }
     void image_atomic(const Inst &i, const State &s) {
         const bool compare_exchange = i.op == 16;
@@ -993,7 +1006,7 @@ struct DirectCompute {
                 << "\nimageAtomic" << label << ":\n";
         std::vector<std::pair<string, string>> args{{"%dx.types.Handle", handle}};
         if (!compare_exchange)
-            args.emplace_back("i32", i.op == 17 ? "0" : "7"); // AtomicBinOp IADD or UMAX.
+            args.emplace_back("i32", to_string(image_atomic_binop(i.op)));
         args.emplace_back("i32", read(256 + coord));
         args.emplace_back("i32", read(257 + coord));
         args.emplace_back("i32", "undef");
