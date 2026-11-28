@@ -23,6 +23,35 @@ Word call(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Word
     return slot<Slot>(object, index)(object, a, b, c, d, e);
 }
 bool ok(Word result) { return SUCCEEDED(static_cast<HRESULT>(result)); }
+void pump_messages()
+{
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+bool wait_for_visibility(HWND window, bool visible, ULONGLONG timeout)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeout;
+    while (GetTickCount64() < deadline) {
+        pump_messages();
+        if ((IsWindowVisible(window) != FALSE) == visible) return true;
+        Sleep(10);
+    }
+    pump_messages();
+    return (IsWindowVisible(window) != FALSE) == visible;
+}
+bool stays_visible(HWND window, ULONGLONG duration)
+{
+    const ULONGLONG deadline = GetTickCount64() + duration;
+    while (GetTickCount64() < deadline) {
+        pump_messages();
+        if (!IsWindowVisible(window)) return false;
+        Sleep(10);
+    }
+    return true;
+}
 }
 
 int main(int argc, char** argv)
@@ -112,7 +141,15 @@ int main(int argc, char** argv)
         return finish();
     };
     if (close_test) {
+        const bool managed = GetEnvironmentVariableW(L"X2W_SESSION_CLOSE_EVENT", nullptr, 0) != 0;
+        HWND title_window = nullptr;
+        if (!managed) {
+            title_window = CreateWindowExW(0, L"STATIC", L"X2W close test title window", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                           0, 0, 320, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!title_window) return 18;
+        }
         if (!emit(blue) || !present()) return 18;
+        if (!managed && !wait_for_visibility(title_window, false, 5000)) return 19;
         HWND window = nullptr;
         EnumWindows([](HWND candidate, LPARAM found) -> BOOL {
             DWORD owner = 0;
@@ -123,18 +160,24 @@ int main(int argc, char** argv)
             *reinterpret_cast<HWND*>(found) = candidate;
             return FALSE;
         }, reinterpret_cast<LPARAM>(&window));
-        if (!window) return 19;
+        if (!window) return 20;
         DWORD_PTR result;
         if (!SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 5000, &result) ||
             !IsIconic(window) ||
             !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 5000, &result) ||
             IsIconic(window) ||
-            !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_CLOSE, 0, SMTO_ABORTIFHUNG, 5000, &result)) return 20;
-        if (GetEnvironmentVariableW(L"X2W_SESSION_CLOSE_EVENT", nullptr, 0)) {
+            !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_CLOSE, 0, SMTO_ABORTIFHUNG, 5000, &result)) return 21;
+        if (managed) {
             Sleep(10000);
-            return 21;  // The job owner must end the process before it reaches here.
+            return 22;  // The job owner must end the process before it reaches here.
         }
-        return !IsWindowVisible(window) && !IsIconic(window) && present() ? 0 : 22;
+        if (IsWindowVisible(window) || IsIconic(window) || !wait_for_visibility(title_window, true, 2000) ||
+            !present()) return 23;
+        if (!SendMessageTimeoutW(window, WM_TIMER, x2w_startup::hide_title_timer, 0,
+                                 SMTO_ABORTIFHUNG, 5000, &result)) return 24;
+        const bool stayed_visible = stays_visible(title_window, 750);
+        DestroyWindow(title_window);
+        return stayed_visible ? 0 : 25;
     }
     if (barriers) {
         D3D12_RESOURCE_DESC uav_desc = desc;
