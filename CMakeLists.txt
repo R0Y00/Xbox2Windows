@@ -2006,7 +2006,7 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_native_graphics_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_native_graphics_draw_check.py"
-            "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" ${adapter})
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}" ${adapter} "$<TARGET_FILE:compile_dxil>")
         set_tests_properties(startup_native_graphics_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     foreach(backend IN ITEMS hardware warp)
@@ -2060,10 +2060,10 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
     set_tests_properties(native_graphics_wqm_hardware PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     foreach(adapter warp hardware)
-        add_test(NAME native_graphics_sampler_table_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-            "${CMAKE_SOURCE_DIR}/tests/native_graphics_sampler_table_check.py" "$<TARGET_FILE:compile_dxil>"
+        add_test(NAME native_graphics_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_graphics_sampler_heap_check.py" "$<TARGET_FILE:compile_dxil>"
             "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}" ${adapter})
-        set_tests_properties(native_graphics_sampler_table_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(native_graphics_sampler_heap_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endforeach()
     add_test(NAME native_graphics_interface_library
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_graphics_interface_library_check.py"

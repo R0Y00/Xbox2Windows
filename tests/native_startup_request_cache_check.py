@@ -312,7 +312,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
         watch_psin = watch_cache / f"req_{watch_key:016x}.psin"
         watch_sidecar = watch_cache / f"req_{watch_key:016x}.ps57in"
         watch_fail = watch_cache / f"{watch_key:016x}.fail"
-        watch_digest = watch_cache / f"{watch_key:016x}.psinh"
+        watch_dep = watch_cache / f"{watch_key:016x}.psdep"
 
         def run_watch() -> list[str]:
             result = subprocess.run(
@@ -324,7 +324,7 @@ def check_controls(cli: Path, sdk: Path) -> int:
 
         first_lines = run_watch()
         assert any(line.endswith(": compiled graphics") for line in first_lines), first_lines
-        assert watch_manifest.is_file() and watch_digest.is_file()
+        assert watch_manifest.is_file() and watch_dep.is_file()
         published_ns = watch_manifest.stat().st_mtime_ns
 
         # Unchanged sidecar bytes: the published manifest is a cache hit and is not rewritten.

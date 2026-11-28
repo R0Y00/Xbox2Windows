@@ -254,7 +254,29 @@ x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
     request.rtv_formats = std::move(parsed.formats);
     return request;
 }
+void read_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
+    if (fs::exists(fs::path(marker).replace_extension(".psin")))
+        parse_pixel_inputs(marker, expected, entry, description);
+    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
+        if (!entry.empty())
+            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
+        entry = part(marker, ".ps57in", 12);
+        if (entry.size() != 12 || entry.compare(0, 4, "PSI1"))
+            throw std::runtime_error("invalid slot-57 pixel entry record");
+        description = entry;
+    }
+}
 } // namespace
+
+std::string x2w::read_pixel_input_description(const fs::path &base_marker) {
+    const auto stem = base_marker.stem().string();
+    if (base_marker.extension() != ".a" || stem.size() != 20 || stem.compare(0, 4, "req_"))
+        throw std::runtime_error("expected req_<16 hex digits>.a");
+    const uint64_t expected = parse_request_stem(stem, "invalid graphics request key");
+    Bytes entry, description;
+    read_pixel_inputs(base_marker, expected, entry, description);
+    return description;
+}
 
 x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
     if (marker.extension() == ".rtv") return read_rtv_variant(marker);
@@ -266,16 +288,7 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
                             part(marker, ".root", 16 << 20), {}, {}, {}, expected};
     if (fs::exists(fs::path(marker).replace_extension(".ia")))
         request.input_layout = part(marker, ".ia", 1 << 20);
-    if (fs::exists(fs::path(marker).replace_extension(".psin")))
-        parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
-    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
-        if (!request.pixel_entry.empty())
-            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
-        request.pixel_entry = part(marker, ".ps57in", 12);
-        if (request.pixel_entry.size() != 12 || request.pixel_entry.compare(0, 4, "PSI1"))
-            throw std::runtime_error("invalid slot-57 pixel entry record");
-        request.pixel_input_description = request.pixel_entry;
-    }
+    read_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
     if (request.root.empty())
         throw std::runtime_error("graphics request key mismatch or missing root");
     // Match new runtime captures and keep revision-28 archives replayable.
@@ -298,18 +311,18 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     auto code = part(marker, ".c67", 1 << 20), data = part(marker, ".data", 1 << 20),
          root = part(marker, ".root", 16 << 20);
     auto desc = part(marker, ".desc", 96), sa = part(marker, ".sa", 4096), sb = part(marker, ".sb", 4096);
-    check_compute_extents(desc, code.size(), data.size(), sa.size(), sb.size());
+    if (desc.size() != 96 || read<uint64_t>(desc, 48) != code.size() || read<uint64_t>(desc, 64) != data.size() ||
+        read<uint64_t>(desc, 16) != sa.size() || read<uint64_t>(desc, 32) != sb.size())
+        throw std::runtime_error("inconsistent compute request");
     if (x2w::compute_request_key(code, data, root, desc, sa, sb) != expected &&
         x2w::compute_request_key(code, data, root, desc, sa, sb, "x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
-    if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
-        throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
-                                                 : "inconsistent compute request");
+    ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
+    validate_compute_request_shape(request);
     // Bit 20 of dword 4 (bits 15:0 are Z): set for wave32, clear for wave64. Inferred from captured requests
-    // (docs/experiments/native-slot67-wave-size.md).
-    const bool wave32 = (static_cast<unsigned char>(sa[18]) & 0x10) != 0;
-    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected,
-            wave32};
+    // (docs/experiments/native-slot67-wave-size.md). Read only after the shape check has proved 28 bytes.
+    request.wave32 = (static_cast<unsigned char>(request.sa[18]) & 0x10) != 0;
+    return request;
 }
 
 void x2w::validate_compute_request_shape(const ComputeRequest &r) {

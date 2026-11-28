@@ -750,6 +750,12 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 
 ## Recovering a failed startup command-list recording
 
+The `startup_list_resubmit` fixture also records a translated sampler snapshot and
+submits its list to two queues. The second queue waits on a CPU-released fence.
+Releasing the list and resetting the allocator keeps the snapshot alive while the
+second submission is blocked. Once both tracked queues complete, reusing the first
+allocator releases the snapshot. The untracked-submit case keeps it retained.
+
 The source-built `startup_list_resubmit` fixture keeps a valid compute submission behind a
 queue wait, then calls `RSSetViewports` on a second recording of the same list. Desktop
 `Close` fails and the shim drops that recording. A `Reset` with a direct allocator must
@@ -17953,6 +17959,8 @@ python -B tests/docs_links_check.py
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
 
+See [fixed mesh pipelines through slot 57](experiments/native-fixed-mesh57.md) for the source-built indirect-draw fixtures.
+
 ## Binary16 normalized integer conversions (`v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`) across VOP1/VOP3/DPP16/DPP8/SDWA in pixel_aot
 
 [The pixel shader translator](../tools/pixel_aot.py) adds 10 exact binary16 normalized integer conversion forms across all 5 encodings (counted in both `docs/coverage/gfx1013.tsv` and `docs/coverage/rdna2.tsv`):
@@ -17970,8 +17978,6 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_cvt_norm_warp|pixel_aot_
 Linux controls (including exhaustive verification against `fractions.Fraction` across all 63,488 finite binary16 values and single-instruction DPP16/DPP8 permutation-to-intrinsic checks pinning `QuadReadAcross{X,Y,Diagonal}` and `QuadReadLaneAt` lane order), `form_coverage_check.check_f16_cvt_norm_forms`, and Python mutation checks ran locally; Ubuntu LLVM 15 `pixel_aot_binary` round-trips run on PR CI, while `pixel_aot_f16_cvt_norm_{warp,hardware}` runs in `dev`/`release` presets and `main` CI (not `ctest --preset pr`). The draw harness compiles each fixture both optimized (`-denorm preserve`) and unoptimized (`-Od -denorm ftz`) so DXC retains the pure-`uint` conversion arithmetic in DXIL rather than constant-folding `plain_e32`/`plain_e64`/`sdwa` to immediate stores (note: because no binary32 float ops are emitted in `cvt_norm_{i16,u16}_f16`, `-denorm ftz` produces the same integer instructions as `-denorm preserve`).
 
 Independent Windows 11 (`26200.9974`, DXC `1.9.2602.17`, `debug_layer=unavailable`) measurements on `bd8f6f42` ([comment 1](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7196200555)) and `3100f363` ([comment 2](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7200844836)) passed `pixel_aot_f16_cvt_norm_hardware` (`AMD Radeon RX 9070 XT` `1002:7550`, driver `32.0.32029.2010`) and `pixel_aot_f16_cvt_norm_warp` with `max_absolute_error=0`, all 20 mutation draws mismatching, and DXIL disassembly confirming the `-Od` pass retains the `mul`/`lshr`/`shl` integer path. Scope limits: under `#839`'s static finite-proof contract (`half16_arith_source` / `half16_dpp_source`), operands are statically known per-lane uniform values, so device draw readbacks do not distinguish lane-routing changes on `dpp16`/`dpp8` (the permutation-to-intrinsic mapping is pinned statically in `check_f16_cvt_norm_controls`), mutation draws compile optimized rather than `-Od`, and the exhaustive 63,488-value check runs in Python rather than on-device.
-
-See [fixed mesh pipelines through slot 57](experiments/native-fixed-mesh57.md) for the source-built indirect-draw fixtures.
 
 ## Native raw pixel buffer UAV binding
 

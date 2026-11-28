@@ -37,8 +37,6 @@ enum class ComputeViewKind {
     d16_sample_srv,
     byte_window_srv,
     heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
-    packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
-    indexed_raw_srv, // Fixed-stride record read. required_bytes is one complete record and its checked stride.
     // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
     // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
     // fallback and never read.
@@ -46,11 +44,10 @@ enum class ComputeViewKind {
     uint_texture_uav,
     float_texture_uav,
     float2_texture_uav,
-    float3_texture_uav
+    float3_texture_uav,
+    packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
+    indexed_raw_srv // Fixed-stride record read. required_bytes is one complete record and its checked stride.
 };
-inline bool accepts_cbv_window(ComputeViewKind kind) {
-    return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
-}
 inline unsigned exact_texture_uav_channels(ComputeViewKind kind) {
     switch (kind) {
     case ComputeViewKind::float_texture_uav: return 1;
@@ -58,6 +55,9 @@ inline unsigned exact_texture_uav_channels(ComputeViewKind kind) {
     case ComputeViewKind::float3_texture_uav: return 3;
     default: return 0;
     }
+}
+inline bool accepts_cbv_window(ComputeViewKind kind) {
+    return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
 }
 inline constexpr unsigned compute_resource_heap = ~0u;
 // the directly indexed sampler heap; entry n is title byte offset 16 * n

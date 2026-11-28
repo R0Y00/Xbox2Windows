@@ -249,11 +249,11 @@ struct DirectCompute {
     }
     void initialize(unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         unsigned threads = x * y * z;
+        complete_compute_quads = threads % 4 == 0;
         if (!virtual_waves) {
             lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
             lane_bit = ir.binary("shl", "1", lane);
         }
-        complete_compute_quads = threads % 4 == 0;
         write(126, ballot("true"));
         if (!wave64) {
             write(127, "0");
@@ -417,7 +417,8 @@ struct DirectCompute {
                          kind == ComputeViewKind::raw_vector_srv || kind == ComputeViewKind::byte_window_srv ||
                          kind == ComputeViewKind::indexed_atomic_uav || kind == ComputeViewKind::indexed_raw_srv;
         const bool half = kind == ComputeViewKind::half_buffer_uav;
-        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 : bytes / (half ? 2 : 4);
+        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 :
+                               kind == ComputeViewKind::packed_d16_x_uav ? 1 : bytes / (half ? 2 : 4);
         if (raw)
             ir.features |= 16;
         return ir.handle({unsigned(compute_uav(kind)), it->shader_register, raw ? 11u : 10u,
@@ -538,7 +539,7 @@ struct DirectCompute {
         return ir.handle({0, binding->shader_register, 11});
     }
 
-    // global_load_dword in the saddr form (#2962): ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
+    // Global DWORD loads in the saddr form: ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
     // FLAT/GLOBAL addressing), with SADDR the unadvanced root address of a root SRV, as for the scalar root loads.
     // Guard the first and last DWORD offsets against 32-bit wrap. The low two address bits are dropped,
     // as for buffer_load_dword in this path (DWORD alignment mode).
@@ -685,7 +686,7 @@ struct DirectCompute {
                     refuse(i.pc, "direct descriptor address outside bound table");
                 if (so != 125) {
                     const bool pixel_texture = pixel_stage && i.op == 3 && low.value != compute_resource_heap;
-                    if ((!pixel_texture && i.op != 2) || so >= limit || (pixel_texture && i.dst + 8 > 106))
+                    if ((!pixel_texture && i.op != 2) || so >= limit || (pixel_texture && i.dst + 8 > limit))
                         refuse(i.pc, "direct indexed descriptor load shape");
                     auto index = ir.binary("lshr", operand32(i, so, limit), "5");
                     for (unsigned j = 0; j < memory_count(i); ++j)
@@ -743,7 +744,9 @@ struct DirectCompute {
         unsigned n = raw ? widths[i.op & 3] : (i.op & 3) + 1, data = 256 + i.dst;
         if (i.dst + (half ? (n + 1) / 2 : n) > 256)
             refuse(i.pc, "direct buffer data overflow");
+        const bool packed_x = half && n == 1 && !graphics_input;
         auto kind = store ? (raw    ? ComputeViewKind::raw_buffer_uav
+                             : packed_x ? ComputeViewKind::packed_d16_x_uav
                              : half ? ComputeViewKind::half_buffer_uav
                                     : ComputeViewKind::typed_buffer_uav)
                     : raw && s.at(((i.b >> 16) & 31) * 4 + 1).type == Symbol::Type::zero_stride_word
@@ -820,20 +823,22 @@ struct DirectCompute {
             if (j < n || !raw) {
                 const unsigned component = (std::min)(j, n - 1);
                 value = read(data + (half ? component / 2 : component));
-                if (half) {
+                if (packed_x) {
+                    value = ir.binary("and", value, "65535");
+                } else if (half) {
                     if (component % 2)
                         value = ir.binary("lshr", value, "16");
                     value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", value}}, "nounwind readnone");
                 }
             }
-            args.emplace_back(half ? "float" : "i32", value);
+            args.emplace_back(half && !packed_x ? "float" : "i32", value);
         }
         args.emplace_back("i8", to_string(raw ? (1u << n) - 1 : 15));
         if (raw)
             args.emplace_back("i32", "4");
         ir.invoke("void",
                   raw    ? "rawBufferStore.i32"
-                  : half ? "bufferStore.f32"
+                  : half && !packed_x ? "bufferStore.f32"
                          : "bufferStore.i32",
                   raw ? 140 : 69, args, "nounwind");
         if (!graphics_input)
@@ -853,6 +858,40 @@ struct DirectCompute {
         return {select_float(is_x, major, select_float(is_y, u, select_float(negative, nu, u))),
                 select_float(is_y, major, nv),
                 select_float(is_x, select_float(negative, u, nu), select_float(is_y, select_float(negative, nv, v), major))};
+    }
+    string pixel_heap_texture(const Inst &i, const State &s, unsigned base, unsigned dim,
+                              std::optional<PixelHeapIndex> selected) {
+        const auto sym = s.at(base);
+        if (!pixel_heap_enabled || sym.type != Symbol::Type::indexed_descriptor ||
+            sym.value != compute_resource_heap || base+8>106 || (sym.offset & 31) || (dim != 1 && dim != 5))
+            refuse(i.pc, "unproven pixel heap Texture2D descriptor");
+        for (unsigned j=1;j<8;++j) {
+            auto expected = sym;
+            expected.offset += 4*j;
+            if (!(s.at(base+j)==expected)) refuse(i.pc,"mixed pixel heap texture descriptor words");
+        }
+        if (!selected) {
+            if ((sym.index_mask & 31) || sym.index_mask > UINT_MAX - sym.offset)
+                refuse(i.pc,"pixel texture heap requires a proven slot domain");
+            selected = PixelHeapIndex{read(base),sym.offset/32,(sym.offset+sym.index_mask)/32,false};
+        }
+        auto &spans = analysis.result.pixel_heap_spans;
+        const auto &key=*selected;
+        if (key.first>key.last || key.last>UINT_MAX/32) refuse(i.pc,"invalid pixel texture heap range");
+        auto it=std::find_if(spans.begin(),spans.end(),[&](const auto &v){
+            return v.first==key.first && v.last==key.last && v.dimension==dim;
+        });
+        if (it==spans.end()) {
+            const unsigned first=spans.empty()? first_pixel_heap_slot :
+                spans.back().host_first+(spans.back().last-spans.back().first+1);
+            if (uint64_t(first)+key.last-key.first+1 > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1-256)
+                refuse(i.pc,"pixel texture heap domain exceeds desktop descriptor capacity");
+            spans.push_back({key.first,key.last,dim,first});
+            it=std::prev(spans.end());
+        }
+        auto physical=ir.binary("add",key.index,to_string(it->host_first-key.first));
+        ir.features |= 0x40000000;
+        return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
     }
     string texture_dimensions(const string &handle, const string &mip) {
         return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
@@ -932,40 +971,6 @@ struct DirectCompute {
             vector_write(256 + i.dst + j, select(have_view, ir.value("bitcast float " + value + " to i32"), "0"));
         }
     }
-    string pixel_heap_texture(const Inst &i, const State &s, unsigned base, unsigned dim,
-                              std::optional<PixelHeapIndex> selected) {
-        const auto sym = s.at(base);
-        if (!pixel_heap_enabled || sym.type != Symbol::Type::indexed_descriptor ||
-            sym.value != compute_resource_heap || base+8>106 || (sym.offset & 31) || (dim != 1 && dim != 5))
-            refuse(i.pc, "unproven pixel heap Texture2D descriptor");
-        for (unsigned j=1;j<8;++j) {
-            auto expected = sym;
-            expected.offset += 4*j;
-            if (!(s.at(base+j)==expected)) refuse(i.pc,"mixed pixel heap texture descriptor words");
-        }
-        if (!selected) {
-            if ((sym.index_mask & 31) || sym.index_mask > UINT_MAX - sym.offset)
-                refuse(i.pc,"pixel texture heap requires a proven slot domain");
-            selected = PixelHeapIndex{read(base),sym.offset/32,(sym.offset+sym.index_mask)/32,false};
-        }
-        auto &spans = analysis.result.pixel_heap_spans;
-        const auto &key=*selected;
-        if (key.first>key.last || key.last>UINT_MAX/32) refuse(i.pc,"invalid pixel texture heap range");
-        auto it=std::find_if(spans.begin(),spans.end(),[&](const auto &v){
-            return v.first==key.first && v.last==key.last && v.dimension==dim;
-        });
-        if (it==spans.end()) {
-            const unsigned first=spans.empty()? first_pixel_heap_slot :
-                spans.back().host_first+(spans.back().last-spans.back().first+1);
-            if (uint64_t(first)+key.last-key.first+1 > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1-256)
-                refuse(i.pc,"pixel texture heap domain exceeds desktop descriptor capacity");
-            spans.push_back({key.first,key.last,dim,first});
-            it=std::prev(spans.end());
-        }
-        auto physical=ir.binary("add",key.index,to_string(it->host_first-key.first));
-        ir.features |= 0x40000000;
-        return ir.heap_handle(physical,dim==1?2u:7u,1033,false,key.nonuniform);
-    }
     static int image_atomic_binop(unsigned op) {
         switch (op) {
         case 0x0f: return 8; // Exchange
@@ -1039,6 +1044,8 @@ struct DirectCompute {
         if (implicit && !pixel_stage) {
             if (!complete_compute_quads)
                 refuse(i.pc, "implicit derivatives require a pixel stage");
+            if (virtual_waves)
+                refuse(i.pc, "implicit derivatives with virtual wave64 groups");
             compute_derivatives = true;
         }
         const bool gather = i.op == 64 || i.op == 71 || compare_gather;
@@ -3741,6 +3748,15 @@ struct DirectCompute {
             write(128, ir.value("zext i1 " + carry + " to i32"));
             return;
         }
+        if (compute && n == "s_bcnt1_i32_b64") {
+            const auto count = [&](const string &word) {
+                return ir.invoke("i32", "unaryBits.i32", 31, {{"i32", word}}, "nounwind readnone");
+            };
+            auto total = ir.binary("add", count(a), count(pair_high(i, i.src[0])));
+            write(i.dst, total);
+            write(128, ir.value("zext i1 " + cmp("ne", total, "0") + " to i32"));
+            return;
+        }
         auto combine_scalar_mask = [&](Name op, const string &left, const string &right) -> string {
             if (op == "and" || op == "or" || op == "xor")
                 return ir.binary(string(op), left, right);
@@ -4541,12 +4557,12 @@ struct DirectCompute {
                 }
             } else if (i.dpp_control || i.dpp8_selectors)
                 lower_dpp(i, p.before[k], x*y*z);
+            else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
+                lower_permlane(i, x*y*z);
             else if (i.name == "s_endpgm") {
                 if (virtual_waves) yield_virtual_wave("4294967295");
                 else ir.body << "  ret void\n";
             }
-            else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
-                lower_permlane(i, x*y*z);
             // Hardware scheduling and register-dependency waits have no SGPR
             // operands. SSA dependencies carry these constraints into DXIL.
             else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||
@@ -4591,9 +4607,9 @@ struct DirectCompute {
         // The wave64 split occurs at lane 32, a quad boundary.
         if (compute_derivatives)
             ir.validator_minor = 8;
-        r.dxil_ir = virtual_waves ? ir.finish_compute(64, 1, 1) :
-                    compute_derivatives ? ir.finish_compute(x * y * z, 1, 1) :
-                    ir.finish_compute(x, y, z);
+        r.dxil_ir = virtual_waves ? ir.finish_compute(64, 1, 1)
+                   : compute_derivatives ? ir.finish_compute(x * y * z, 1, 1)
+                   : ir.finish_compute(x, y, z);
         return std::move(r);
     }
 };

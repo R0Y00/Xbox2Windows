@@ -665,7 +665,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                 refuse(pc,"mesh scalar memory needs a verified guest root mapping: "+string(op.name));
             if (i.op<8 && offset_reg!=125 && state[i.src[0]].value!=compute_resource_heap)
                 refuse(pc,"indexed mesh descriptor table lacks a binding contract");
-            auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             const bool global=state[i.src[0]].value==compute_resource_heap && state[i.src[0]].type==Symbol::Type::table;
             if (global && layout.validate_uint_heap_reads) {
                 if (i.op!=2 || offset_reg>=106 || (i.b&0xfffff) ||
@@ -729,7 +729,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             }
         } else if (i.enc==Encoding::Vopc && i.name.substr(0,6)=="v_cmp_" && i.dst<=106 &&
                    !i.dpp_control && !i.scale && !i.clamp && (full_exec || !lane_active.empty())) {
-            auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto pred=alu.comparison(i);
             if (!full_exec) pred=ir.value("and i1 "+pred+", "+lane_active);
             const auto bit=ir.value("zext i1 "+pred+" to i32");
@@ -775,7 +775,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                 alu.write(vcc_words,word); alu.write(vcc_words+1,word); alu.write(vcc_nonempty,word);
                 state[106]={}; state[107]={};
             } else {
-                auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+                auto next=transfer(i, state, !layout.wave32, true, false, true);
                 const auto word=ir.binary("sub","0",bit);
                 alu.write(i.dst,word); alu.write(i.dst+1,word);
                 alu.write(1024+i.pc,bit);
@@ -925,7 +925,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
         } else if (i.name=="s_mov_b64" && i.dst==106 && i.src[0]<=104 && !(i.src[0]&1)) {
             const auto src=i.src[0];
             const auto old=state;
-            const auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+            const auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto physical=[&](unsigned r) {
                 auto it=alu.graphics_registers.find(r); return it==alu.graphics_registers.end() ? string{} : it->second;
             };
@@ -966,7 +966,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             full_exec=mask->full; lane_active=mask->lane; wave_active=mask->wave;
             exec_value[0]=mask->lo; exec_value[1]=mask->hi;
         } else if (i.name=="s_mov_b64" && i.dst<=104 && !(i.dst&1) && i.src[0]<=104 && !(i.src[0]&1)) {
-            auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto src=alu.graphics_registers.find(i.src[0]), high=alu.graphics_registers.find(i.src[0]+1);
             auto lo=src==alu.graphics_registers.end() ? string{} : src->second;
             auto hi=high==alu.graphics_registers.end() ? string{} : high->second;
@@ -974,7 +974,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             alu.write(i.dst+1,hi);
             state=next;
         } else if (i.name=="s_mov_b64" && i.dst<=104 && !(i.dst&1) && i.src[0]>=128 && i.src[0]<=208) {
-            auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             alu.write(i.dst,to_string(next[i.dst].value)); alu.write(i.dst+1,to_string(next[i.dst+1].value));
             state=next;
         } else if (i.name=="s_mov_b32" && i.dst==125 && constant32(i,i.src[0])) {
@@ -1036,7 +1036,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                         out.shift=5; root_values.emplace(value,out);
                     }
                 }
-                const auto next=transfer(i,state,!layout.wave32,true,false,true,false);
+                const auto next=transfer(i, state, !layout.wave32, true, false, true);
                 alu.write(i.dst,value);
                 state[i.dst]=next[i.dst];
                 alu.write(128,ir.value("zext i1 "+alu.cmp("ne",value,"0")+" to i32"));

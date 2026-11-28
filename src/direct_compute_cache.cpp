@@ -135,7 +135,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::float3_texture_uav)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::indexed_raw_srv)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -353,7 +353,7 @@ NativeComputeShader cached_compute_ir(const fs::path &cache, const Bytes &key, b
     return program;
 }
 Bytes pack_version(unsigned entry) {
-    Bytes version = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6/prepared-2";
+    Bytes version = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6/prepared-1";
     word(version, entry);
     return shader_digest(version);
 }
@@ -892,9 +892,9 @@ static const char *view_kind_name(ComputeViewKind kind) {
         "buffer_srv", "typed_buffer_srv", "texture_srv", "texture_uav", "raw_vector_srv", "half_scalar_uav",
         "heap_stride_srv", "raw_buffer_uav", "typed_buffer_uav", "half_buffer_uav", "root_buffer_srv",
         "comparison_texture_srv", "half2_texture_uav", "half4_texture_uav", "cube_sample_srv", "cube_comparison_srv",
-        "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "packed_d16_x_uav",
-        "indexed_raw_srv", "heap_sampler", "uint_texture_uav", "float_texture_uav", "float2_texture_uav",
-        "float3_texture_uav"};
+        "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "heap_sampler",
+        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav", "packed_d16_x_uav",
+        "indexed_raw_srv"};
     const auto index = static_cast<size_t>(kind);
     return index < std::size(names) ? names[index] : "unknown";
 }
@@ -976,9 +976,8 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
-            } else if ((b.kind == ComputeViewKind::packed_d16_x_uav && b.required_bytes == 2) ||
-                       (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
-                        (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8))) {
+            } else if (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
+                       (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8)) {
                 uav_lines << "uav " << b.shader_register << " bufhalf table " << b.root_parameter << ' '
                           << b.byte_offset << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {

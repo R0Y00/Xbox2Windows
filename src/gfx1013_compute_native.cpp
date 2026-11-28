@@ -218,19 +218,19 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
-            const unsigned soffset = i.b >> 24;
             if (direct && !graphics) {
                 // GLC, DLC and SLC are cache-policy hints on raw loads.
                 if ((a & 0x02032000u) || (i.b & 0x00a00000u))
                     refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
                 // The MUBUF encoding has no trailing literal word.
+                const unsigned soffset = i.b >> 24;
                 if (soffset > 105 && !(soffset >= 128 && soffset <= 208))
                     refuse(pc, "raw buffer load scalar offset needs an SGPR or inline integer");
             } else if (direct && graphics && !(a & 0x2000u)) {
-                // Linear MUBUF uses an optional OFFEN VGPR, scalar byte offset and OFFSET12.
+                const unsigned soffset = i.b >> 24;
                 if ((a & 0x02032000u) || (i.b & 0x00a00000u) || (soffset > 105 && soffset != 128))
                     refuse(pc, "raw graphics load requires linear addressing without LDS or TFE");
-            } else if (!(direct && graphics && (a & 0x0203f000u) == 0x2000u &&
+            } else if (!(direct && (a & 0x0203f000u) == 0x2000u &&
                         (i.b & 0xffe00000u) == 0x80000000u) &&
                        ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u)) {
                 refuse(pc, "raw buffer load needs offen with zero scalar offset and no modifiers");
@@ -650,7 +650,7 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
     return {};
 }
 State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct,
-               bool narrow_wave64) {
+                 bool narrow_wave64 = false) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
@@ -787,9 +787,9 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
                i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
-        if ((wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) ||
-            (narrow_wave64 && i.dst == 126 && i.enc == Encoding::Vopc) ||
-            ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+        const bool compare_pair = (wave64 && (i.enc == Encoding::Vopc || i.enc == Encoding::QuadCompare)) ||
+                                  (narrow_wave64 && i.enc == Encoding::Vopc && i.dst == 126);
+        if (compare_pair || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
              i.name.substr(i.name.size() - 4) == "_u64") &&
@@ -1815,14 +1815,12 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
-    // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
-    const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
-                               word(request.sa,4)==0x6c090102;
     // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
     // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
     // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
     // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
+    const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
+                              word(request.sa,4)==0x6c090102;
     const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
     const bool narrow_wave64 = !stage && direct_dxil && !request.wave32 && !wave64;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.

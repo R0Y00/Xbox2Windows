@@ -120,7 +120,7 @@ inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 // Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.., then bounded resheap SRVs (space 2).
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
                                       const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0,
-                                      UINT heap_srvs = 0, bool input_assembler = false)
+                                      bool input_assembler = false, UINT heap_srvs = 0)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

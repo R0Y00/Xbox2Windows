@@ -36,51 +36,6 @@ static double elapsed_ms(Clock::time_point since) {
 
 namespace fs = std::filesystem;
 
-// FNV-1a over the pixel-input sidecars. The digest, not a timestamp, decides whether a published manifest
-// still describes the sidecar bytes: a content change with a preserved or older mtime must invalidate it.
-static void sidecar_hash_bytes(uint64_t& hash, const void* data, size_t size) {
-    const auto* bytes = static_cast<const unsigned char*>(data);
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
-    }
-}
-
-static bool pixel_sidecar_hash(const fs::path& marker, std::string& digest) {
-    uint64_t hash = 1469598103934665603ull;
-    bool any = false;
-    for (const auto& path : {fs::path(marker).replace_extension(L".psin"),
-                             fs::path(marker).replace_extension(L".ps57in")}) {
-        std::error_code ec;
-        if (!fs::is_regular_file(path, ec))
-            continue;
-        std::ifstream file(path, std::ios::binary);
-        if (!file)
-            return false;
-        const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        const auto name = path.extension().wstring();
-        sidecar_hash_bytes(hash, name.data(), name.size() * sizeof(wchar_t));
-        const uint64_t count = bytes.size();
-        sidecar_hash_bytes(hash, &count, sizeof(count));
-        sidecar_hash_bytes(hash, bytes.data(), bytes.size());
-        any = true;
-    }
-    if (!any)
-        return false;
-    char text[17]{};
-    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
-    digest = text;
-    return true;
-}
-
-static bool read_published_digest(const fs::path& path, std::string& digest) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-        return false;
-    digest.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    return !digest.empty();
-}
-
 static void publish_atomic(const fs::path& destination, const void* data, size_t size) {
     static std::atomic<unsigned long long> serial{};
     auto temp=destination;
@@ -271,8 +226,20 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
         std::ifstream meta(fs::path(input_path).replace_extension(L".pslayout"));
         std::string tag, extra;
         unsigned enable, address, wave;
-        if (!(meta >> tag >> enable >> address >> wave) || tag != "meshps1")
-            throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        if (!(meta >> tag))
+            throw std::runtime_error("raw mesh PS needs a reviewed entry layout");
+        if (tag == "meshps1") {
+            if (!(meta >> enable >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        } else if (tag == "meshps2") {
+            // As in Victory's native PS reflection, this record names the
+            // inputs delivered by ADDR when a separate ENA mask is unavailable.
+            if (!(meta >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps2 input-address wave (decimal)");
+            enable = address;
+        } else {
+            throw std::runtime_error("unknown raw mesh PS entry layout version");
+        }
         const bool guest_root = bool(meta >> extra);
         if (guest_root && (extra!="guest_root" || (meta >> extra)))
             throw std::runtime_error("unexpected raw mesh PS layout field");
@@ -747,6 +714,18 @@ struct WatchRequest {
     bool compute = false;
 };
 
+static bool read_small_file(const fs::path& path, size_t max_bytes, std::string& out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        return false;
+    const auto size = file.tellg();
+    if (size < 0 || static_cast<size_t>(size) > max_bytes)
+        return false;
+    out.assign(static_cast<size_t>(size), '\0');
+    file.seekg(0);
+    return !size || static_cast<bool>(file.read(out.data(), size));
+}
+
 static bool is_watch_request_pending(const fs::path& request_dir, const WatchRequest& req, bool skip_failed) {
     std::error_code ec;
     const auto marker_mtime = fs::last_write_time(req.marker, ec);
@@ -758,22 +737,38 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     const fs::path psdep_path = fs::path(stem) += L".psdep";
 
     std::optional<fs::file_time_type> psin_mtime;
+    bool dependency_changed = false;
     bool lost = false;
+    bool sidecar_changed = false;
     if (!req.compute) {
         if (const auto psin_path = graphics_psin_path(req.marker)) {
-            for (const auto& path : {*psin_path, fs::path(*psin_path).replace_extension(L".ps57in")}) {
-                if (fs::is_regular_file(path, ec)) {
-                    const auto t = fs::last_write_time(path, ec);
-                    if (!ec && (!psin_mtime || t > *psin_mtime))
-                        psin_mtime = t;
+            const auto packed_path = fs::path(*psin_path).replace_extension(L".ps57in");
+            const bool stream = fs::is_regular_file(*psin_path, ec);
+            const bool packed = fs::is_regular_file(packed_path, ec);
+            if (stream || packed) {
+                const auto time = fs::last_write_time(stream ? *psin_path : packed_path, ec);
+                if (!ec)
+                    psin_mtime = time;
+            }
+            const bool has_psdep = fs::is_regular_file(psdep_path, ec);
+            std::string published_dep;
+            if (has_psdep && (!read_small_file(psdep_path, 256, published_dep) || published_dep.empty())) {
+                sidecar_changed = true;
+            } else {
+                try {
+                    const std::string current_dep =
+                        x2w::read_pixel_input_description(fs::path(*psin_path).replace_extension(L".a"));
+                    sidecar_changed = current_dep != published_dep;
+                } catch (const std::exception&) {
+                    sidecar_changed = true;
                 }
             }
-            lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
         }
+        lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
     }
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
-    if (has_manifest && !lost) {
+    if (has_manifest && !sidecar_changed && !lost && !dependency_changed) {
         if (req.compute) {
             // A native manifest from another revision, or an unmarked one without the Python translator's
             // <key>.cs.hlsl, is stale. Other outputs, and a manifest that cannot be read, go on to the usual
@@ -788,16 +783,7 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
             }
         }
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
-        bool sidecar_changed = false;
-        if (!req.compute) {
-            std::string sidecar_digest;
-            if (pixel_sidecar_hash(req.marker, sidecar_digest)) {
-                std::string published_digest;
-                sidecar_changed = !read_published_digest(fs::path(stem) += L".psinh", published_digest) ||
-                                  published_digest != sidecar_digest;
-            }
-        }
-        if (!ec && !sidecar_changed && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
+        if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
                 if (has_complete_dxbc(fs::path(stem) += L".cs.cso"))
                     return false;
@@ -809,7 +795,7 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
         }
     }
 
-    const bool recheck = lost && has_manifest;
+    const bool recheck = sidecar_changed && has_manifest;
     if (skip_failed && !recheck && fs::is_regular_file(fail_path, ec)) {
         const auto fail_mtime = fs::last_write_time(fail_path, ec);
         const auto latest_input =
@@ -900,11 +886,6 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
     else
         fs::remove(psdep_path, ignored);
-    std::string sidecar_digest;
-    if (pixel_sidecar_hash(req.marker, sidecar_digest))
-        publish_atomic(fs::path(stem) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
-    else
-        fs::remove(fs::path(stem) += L".psinh", ignored);
     publish_atomic(manifest_path, manifest->data(), manifest->size());
     fs::remove(fail_path, ignored);
     return "compiled graphics";
@@ -1453,7 +1434,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-group-clear@BYTE_OFFSET and gfx1013-compute-wave32@BYTE_OFFSET take a req_<key>.c67.\n"
                      "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps, gfx1013-container-ms.\n"
                      "gfx1013-raw-ms reads guest mesh bytes and an explicit .mslayout sidecar.\n"
-                     "gfx1013-raw-mesh-ps uses an explicit .pslayout sidecar.\n"
+                     "gfx1013-raw-mesh-ps uses a reviewed .pslayout sidecar (meshps1 or meshps2).\n"
                      "gfx1013-container-cs reads an optional req_<key>.views next to the .cdx (GPU-selected heap slot view types).\n"
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
@@ -1461,9 +1442,9 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
                      "Use --refusals REQUEST_DIRECTORY [--jobs N] [--json] for a read-only refusal summary.\n"
                      "Use --watch SDK_DIRECTORY CACHE_DIRECTORY REQUEST_DIRECTORY [--jobs N] [--interval MS] [--once] to translate pending requests.\n"
-                      "Use --rekey OLD_CACHE_DIR NEW_REQUEST_DIR [--jobs N] to copy requests under the current cache revision keys.\n"
-                      "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n"
-                      "Use --prepare-compute-pack REQUEST_DIRECTORY CACHE_DIRECTORY ENTRY_BYTE_OFFSET for captured compute.\n";
+                     "Use --rekey OLD_CACHE_DIR NEW_REQUEST_DIR [--jobs N] to copy requests under the current cache revision keys.\n"
+                     "Use --index-graphics-interfaces REVIEWED_DIRECTORY CACHE_DIRECTORY to index native graphics interfaces.\n"
+                     "Use --prepare-compute-pack REQUEST_DIRECTORY CACHE_DIRECTORY ENTRY_BYTE_OFFSET for captured compute.\n";
         return 2;
     }
     try {
@@ -1558,7 +1539,6 @@ int wmain(int argc, wchar_t** argv) {
                 if(graphics_batch) {
                     reserve_output(fs::path(stems[i]) += L".ps.cso");
                     reserve_output(fs::path(stems[i]) += L".psdep");
-                    reserve_output(fs::path(stems[i]) += L".psinh");
                     if(rectangles) reserve_output(fs::path(stems[i]) += L".gs.cso");
                 }
             }
@@ -1620,11 +1600,8 @@ int wmain(int argc, wchar_t** argv) {
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
-                std::string sidecar_digest;
-                if (pixel_sidecar_hash(inputs[i], sidecar_digest))
-                    publish_atomic(fs::path(stems[i]) += L".psinh", sidecar_digest.data(), sidecar_digest.size());
                 else
-                    fs::remove(fs::path(stems[i]) += L".psinh", ignored);
+                    fs::remove(psdep_path, ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
             fs::remove(fs::path(stems[i]) += L".fail", ignored);

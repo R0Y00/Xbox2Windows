@@ -157,6 +157,9 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    bool native_candidate = false;           // shaders and manifest were prepared in-process; a published disk pair may also exist
+    u64 revision = 0;                        // bumped when a disk pair replaces the native shaders, invalidating created PSOs
+    std::string rtv_request;                 // the RTV variant text this translation was prepared for, else empty
 #ifdef X2W_NATIVE_SHADERS
     bool native_graphics_attempted = false;
 #endif
@@ -182,9 +185,6 @@ struct Translation {
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     std::vector<x2w_startup::PsoRecipe> pso_recipes;  // opt-in X2W_PSO_RECIPE_DIR records for this key
     u64 key = 0;
-    bool native_candidate = false;  // shaders and manifest were prepared in-process; a published disk pair may also exist
-    u64 revision = 0;               // bumped when a disk pair replaces the native shaders, invalidating created PSOs
-    std::string rtv_request;        // the RTV variant text this translation was prepared for, else empty
     LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
@@ -576,7 +576,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     if (!provided && (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps)))) return;
     const HRESULT hr = provided && x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_ROOT_FAILURE") ? E_FAIL :
         x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
-        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), 0, fixed_manifest);
+        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), fixed_manifest);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
         return;
@@ -628,20 +628,17 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         candidate.ps = ps.Get();
         if (x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_MANIFEST_FAILURE"))
             manifest->append("\nx2w-manifest 999\n");
-        if (GetEnvironmentVariableW(L"X2W_TEST_NATIVE_GRAPHICS_BAD_MANIFEST", nullptr, 0))
-            *manifest = "x2w-manifest 0\n";
         load_translation(candidate, request.rtv_request, std::move(*manifest));
-        const bool ready = candidate.state == 1;
-        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
-            tr.key, ready, frontend_hit, vs_hit, ps_hit);
-        if (!ready) {
+        if (candidate.state != 1) {
             if (candidate.root) candidate.root->Release();
-            return false;
+            throw std::runtime_error("native graphics manifest or root signature refused");
         }
         candidate.vs = vs.Detach();
         candidate.ps = ps.Detach();
         candidate.native_candidate = true;
         tr = std::move(candidate);
+        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
+            tr.key, tr.state == 1, frontend_hit, vs_hit, ps_hit);
         return true;
     } catch (const std::exception& error) {
         log("x2w-draw native graphics %016llx refused: %s", tr.key, error.what());
@@ -877,21 +874,15 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         ReleaseSRWLockShared(&note_lock);
     }
     if (root_blob.empty()) return;
-    std::vector<unsigned char> mesh, pixel;
-    const auto copy_stage = [&words](int field, bool required, std::vector<unsigned char>& out) {
-        const auto* pointer = reinterpret_cast<const void*>(words[field]);
-        const auto bytes = words[field + 1];
-        if (!bytes) return !required && !pointer;
-        if (bytes > (1u << 20) || !x2w_local::readable(pointer, bytes)) return false;
-        out.resize(static_cast<std::size_t>(bytes));
-        return copy_title_bytes(out.data(), pointer, out.size());
-    };
-    if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
-    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
-                                                                                 sizeof(shader_cache::mesh57_revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
+    if (!info->fixed_ms) return;
+    const auto& mesh = *info->fixed_ms;
+    const std::vector<unsigned char> empty;
+    const auto& pixel = info->fixed_ps ? *info->fixed_ps : empty;
+    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
+                                                                                 sizeof(shader_cache::mesh57_revision) - 1))));
     if (x2w_local::env_on("X2W_MESH57_CAPTURE_STATE") &&
         words[2] == info->state_a.size() && words[4] == info->state_b.size()) {
         // Payload: request key, three uint32 lengths, normalized descriptor, state A, state B.
@@ -907,19 +898,18 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         if (!publish_shader_request(variant, L".s57", packed.data(), packed.size()))
             log("x2w-draw fixed mesh state %016llx could not be published", variant);
     }
-    if (written.count(key)) return;
     const unsigned char none = 0;
-    if (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
+    if (written.count(key) || (publish_shader_request(key, L".ps57", pixel.empty() ? &none : pixel.data(), pixel.size()) &&
         publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
-        publish_shader_request(key, L".m57", mesh.data(), mesh.size())) {
-        written.insert(key);
+        publish_shader_request(key, L".m57", mesh.data(), mesh.size()))) {
+        const bool first = written.insert(key).second;
         static LONG logged;
-        if (first_calls(logged, 12))
+        if (first && first_calls(logged, 12))
             log("x2w-draw mesh request %016llx: slot57, MS %zu bytes, PS %zu bytes",
                 key, mesh.size(), pixel.size());
+        info->fixed_ms.reset();
+        info->fixed_ps.reset();
     }
-    info->fixed_ms.reset();
-    info->fixed_ps.reset();
 }
 
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
@@ -1258,7 +1248,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
 #ifdef X2W_NATIVE_SHADERS
-        if (base->manifest_retry.pending() && !base->native_graphics_attempted) {
+        if ((base->manifest_retry.pending() || native_shaders_only()) && !base->native_graphics_attempted) {
             base->native_graphics_attempted = true;
             try_native_graphics(*base);
         }
@@ -1275,16 +1265,12 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         entry->key = key;
         entry->rtv_request = request;
         load_translation(*entry, request);
-#ifdef X2W_NATIVE_SHADERS
-        if (entry->state != 1 && entry->manifest_retry.pending() && !entry->native_graphics_attempted &&
-            GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", nullptr, 0) &&
-            publish_shader_request(key, L".rtv", request.data(), request.size())) {
-            entry->native_graphics_attempted = true;
-            try_native_graphics(*entry, true);
-        }
-#endif
         if (entry->state != 1) {
-            publish_shader_request(key, L".rtv", request.data(), request.size());
+            const bool published = publish_shader_request(key, L".rtv", request.data(), request.size());
+#ifdef X2W_NATIVE_SHADERS
+            if (published && (entry->manifest_retry.pending() || native_shaders_only()) &&
+                try_native_graphics(*entry, true)) return entry;
+#endif
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
     } else if (entry->manifest_retry.due(GetTickCount64())) {
@@ -1381,43 +1367,42 @@ bool prepare_translated_pso_desc(Translation& tr, bool indexed_rect, D3D12_GRAPH
     desc.InputLayout = {tr.fixed_stream.data(), static_cast<UINT>(tr.fixed_stream.size())};
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
-    if (indexed_rect) {
-        if (!tr.indexed_rect_geometry_attempted) {
-            tr.indexed_rect_geometry_attempted = true;
-            x2w_startup::ComPtr<ID3DBlob> errors;
-            HRESULT hr = E_NOTIMPL;
-            if (tr.fixed_stream.empty())
-                hr = x2w_startup::compile_indexed_rect_geometry(tr.vs, tr.ps, &tr.indexed_rect_geometry, &errors);
-            else if (tr.fixed_rectangle_on_disk) {
-                wchar_t path[MAX_PATH];
-                if (cache_path(path, L"", tr.key, L".gs.cso"))
-                    hr = D3DReadFileToBlob(path, &tr.indexed_rect_geometry);
-            }
+    if (!indexed_rect) return true;
+    if (!tr.indexed_rect_geometry_attempted) {
+        tr.indexed_rect_geometry_attempted = true;
+        x2w_startup::ComPtr<ID3DBlob> errors;
+        HRESULT hr = E_NOTIMPL;
+        if (tr.fixed_stream.empty())
+            hr = x2w_startup::compile_indexed_rect_geometry(tr.vs, tr.ps, &tr.indexed_rect_geometry, &errors);
+        else if (tr.fixed_rectangle_on_disk) {
+            wchar_t path[MAX_PATH];
+            if (cache_path(path, L"", tr.key, L".gs.cso"))
+                hr = D3DReadFileToBlob(path, &tr.indexed_rect_geometry);
+        }
 #ifdef X2W_NATIVE_SHADERS
-            else if (!tr.fixed_rectangle_ir.empty()) {
-                wchar_t sdk[MAX_PATH], path[MAX_PATH];
-                const auto n = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
-                if (n && n < MAX_PATH && cache_path(path, L"", tr.key, L".gs.cso")) {
-                    try {
-                        auto compiler = x2w::ShaderDxilCompiler::runtime_worker(sdk);
-                        const auto result = compiler.compile(tr.fixed_rectangle_ir, L"gs_6_6",
-                            std::filesystem::path(path).parent_path(), x2w::ShaderSourceFormat::dxil_ir);
-                        hr = D3DCreateBlob(result.dxil.size(), &tr.indexed_rect_geometry);
-                        if (SUCCEEDED(hr)) std::memcpy(tr.indexed_rect_geometry->GetBufferPointer(),
-                            result.dxil.data(), result.dxil.size());
-                    } catch (const std::exception& e) {
-                        log("x2w-draw %016llx native rectangle stage: %s", tr.key, e.what());
-                    }
+        else if (!tr.fixed_rectangle_ir.empty()) {
+            wchar_t sdk[MAX_PATH], path[MAX_PATH];
+            const auto n = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
+            if (n && n < MAX_PATH && cache_path(path, L"", tr.key, L".gs.cso")) {
+                try {
+                    auto compiler = x2w::ShaderDxilCompiler::runtime_worker(sdk);
+                    const auto result = compiler.compile(tr.fixed_rectangle_ir, L"gs_6_6",
+                        std::filesystem::path(path).parent_path(), x2w::ShaderSourceFormat::dxil_ir);
+                    hr = D3DCreateBlob(result.dxil.size(), &tr.indexed_rect_geometry);
+                    if (SUCCEEDED(hr)) std::memcpy(tr.indexed_rect_geometry->GetBufferPointer(),
+                        result.dxil.data(), result.dxil.size());
+                } catch (const std::exception& e) {
+                    log("x2w-draw %016llx native rectangle stage: %s", tr.key, e.what());
                 }
             }
-#endif
-            if (FAILED(hr))
-                log("x2w-draw %016llx: indexed rectangle geometry unavailable (0x%08lx) %s", tr.key,
-                    static_cast<unsigned long>(hr), errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
         }
-        if (!tr.indexed_rect_geometry) return false;
-        desc.GS = {tr.indexed_rect_geometry->GetBufferPointer(), tr.indexed_rect_geometry->GetBufferSize()};
+#endif
+        if (FAILED(hr))
+            log("x2w-draw %016llx: indexed rectangle geometry unavailable (0x%08lx) %s", tr.key,
+                static_cast<unsigned long>(hr), errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
     }
+    if (!tr.indexed_rect_geometry) return false;
+    desc.GS = {tr.indexed_rect_geometry->GetBufferPointer(), tr.indexed_rect_geometry->GetBufferSize()};
     return true;
 }
 
@@ -1480,8 +1465,9 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
     const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
-    const u64 key = x2w_startup::pso_state_key(pass.target_count, pass.target_formats, dsv_format, use_depth_stencil,
-                                               bound.depth_stencil, bound.has_rasterizer, bound.rasterizer, indexed_rect);
+    u64 key = x2w_startup::pso_state_key(pass.target_count, pass.target_formats, dsv_format, use_depth_stencil,
+                                         bound.depth_stencil, bound.has_rasterizer, bound.rasterizer, indexed_rect);
+    if (tr.revision) key = fnv_bytes(&tr.revision, sizeof(tr.revision), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_BLEND_DESC blend{};
@@ -1584,51 +1570,7 @@ bool ensure_draw_heap(Wrapper* device)
     return true;
 }
 
-// A recorded table is immutable. Keep it alive until its submission completes,
-// including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
-std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
-struct SubmittedDrawSamplerHeaps {
-    x2w_startup::ComPtr<ID3D12Fence> fence;
-    std::vector<DrawSamplerHeap> heaps;
-};
-std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
-
-void discard_draw_sampler_heaps(ID3D12CommandList* list)
-{
-    AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(list);
-    ReleaseSRWLockExclusive(&draw_lock);
-}
-
-// draw_lock held. The lists have already been executed on this queue. A closed list can be
-// submitted again until its Reset, so each submit takes its own references and the recording
-// keeps its own until discard_draw_sampler_heaps.
-void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
-{
-    submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
-        submitted_draw_sampler_heaps.end(), [](const SubmittedDrawSamplerHeaps& batch) {
-            return batch.fence && batch.fence->GetCompletedValue() != 0;
-        }), submitted_draw_sampler_heaps.end());
-    SubmittedDrawSamplerHeaps batch;
-    for (auto* list : lists) {
-        auto it = recorded_draw_sampler_heaps.find(list);
-        if (it == recorded_draw_sampler_heaps.end()) continue;
-        for (const auto& heap : it->second) batch.heaps.push_back(heap);
-    }
-    if (batch.heaps.empty()) return;
-    x2w_startup::ComPtr<ID3D12Device> device;
-    HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
-    if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
-    if (FAILED(hr)) {
-        // Without a completion point the submitted descriptors still belong
-        // to the queue. Retain them instead of reclaiming them early.
-        batch.fence.Reset();
-        log("x2w-draw sampler heap retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
-    }
-    submitted_draw_sampler_heaps.push_back(std::move(batch));
-}
 
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
@@ -1766,7 +1708,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
 }
 
 // draw_lock held.
-bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
+bool prepare_draw_sampler_heap(Wrapper* self, Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
 {
     auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
     if (!pass.title_samplers.address && pass.sampler_heap_wrapper) {
@@ -1793,15 +1735,40 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap creation failed 0x%08lx", static_cast<unsigned long>(hr));
         return false;
     }
+    std::unique_ptr<x2w_startup::SamplerSnapshot> cached;
+    try {
+        cached = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+        x2w_startup::ExclusiveNoteLock lock(allocator_lock);
+        const auto recording = list_recordings.find(self);
+        if (!self->own().list_open || self->own().real != list ||
+            recording == list_recordings.end() || !recording->second)
+            return false;
+        recording->second->sampler_snapshots.push_back(heap);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
     static LONG reports;
     if (first_calls(reports, 12))
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    recorded_draw_sampler_heaps[list].push_back(heap);
     pass.sampler_heap = std::move(heap);
-    pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+    pass.sampler_snapshot = std::move(cached);
     return true;
+}
+
+// Fixture entry records a default sampler table through the translated draw path.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_record_sampler_snapshot(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind || !self->own().real || !the_device) return FALSE;
+    x2w_startup::ExclusiveNoteLock lock(draw_lock);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    Pass pass;
+    if (!prepare_draw_sampler_heap(self, pass, list, false)) return FALSE;
+    ID3D12DescriptorHeap* heaps[] = {pass.sampler_heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    return TRUE;
 }
 
 // Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
@@ -2582,8 +2549,8 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool allow_title_snapshot = false,
-                                         UINT alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+                                         UINT alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT,
+                                         bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2679,6 +2646,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
+        // A view token already names a desktop resource and its range. Reading it does not require the
+        // title-memory alias used for raw guest addresses; the later resource/device/range checks still apply.
         if (!view_token_input && !placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
@@ -2985,7 +2954,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
     }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(self, pass, list, tr->samplers.reserved_fallback))) {
         if (indirect && !(indexed_rect && !pipeline))
             indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
                                                : indirect_refusal_code::sampler_heap_unavailable;
@@ -3679,7 +3648,8 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                {
                     ++bound_view_heaps;
                     visible_view_count = heap.desktop_gpu ? heap.logical_count : 0;
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,

@@ -111,7 +111,7 @@ const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, st
 {
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.heap_srvs)))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), false, tr.heap_srvs)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -333,12 +333,12 @@ bool translate_compute_natively(ComputeTranslation& tr)
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {
+            const unsigned channels = x2w::exact_texture_uav_channels(view.kind);
             const bool packed_x = view.kind == x2w::ComputeViewKind::packed_d16_x_uav;
             const bool half_typed = packed_x || view.kind == x2w::ComputeViewKind::half_buffer_uav;
             const bool texture_input = view.kind == x2w::ComputeViewKind::texture_srv && view.image_dimension == 1;
             const bool volume = view.kind == x2w::ComputeViewKind::texture_uav && view.image_dimension == 2;
-            const unsigned channels = x2w::exact_texture_uav_channels(view.kind);
-            const bool output = channels || view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume;
+            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume || channels;
             auto& slots = output ? tr.uavs : tr.srvs;
             if ((!output && !texture_input && view.kind != x2w::ComputeViewKind::raw_vector_srv && !x2w::accepts_cbv_window(view.kind)) || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
@@ -346,6 +346,10 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                          " is not bound for a natively translated program");
             slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset), volume || texture_input});
             if (volume) slots.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
+            slots.back().packed_d16_x = packed_x;
+            if (x2w::accepts_cbv_window(view.kind))
+                slots.back().scalar_window = view.required_bytes;
             if (channels) {
                 auto& slot = slots.back();
                 slot.texture = true;
@@ -354,10 +358,6 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                      view.image_dimension == 5 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY :
                                                                  D3D12_UAV_DIMENSION_TEXTURE2D;
             }
-            slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
-            slots.back().packed_d16_x = packed_x;
-            if (x2w::accepts_cbv_window(view.kind))
-                slots.back().scalar_window = view.required_bytes;
         }
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
@@ -774,14 +774,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            auto view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
-            // Native scalar loads may name a small CPU window outside every placed buffer.
-            // Resolve GPU-backed ranges first; never replace their contents with a CPU snapshot.
+            auto view = indirect_table_buffer(self, words, false, &reason, 16u << 20, D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, true);
             if (reason && slot.scalar_window && words[0] != view_token_magic &&
                 !std::strcmp(reason, "an input is in title memory outside any placed buffer")) {
                 const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
                 const UINT stride = (words[1] >> 16) & 0x3fff;
-                const u64 bytes = u64{stride ? stride : 1} * words[2];
+                const u64 extent = u64{stride ? stride : 1} * words[2];
+                const u64 bytes = extent;
                 u64 start{};
                 ID3D12Resource* chunk{};
                 if (bytes >= slot.scalar_window && bytes <= 65536 && bytes % 4 == 0 &&
@@ -809,9 +808,58 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
-        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
-        // Each refused condition has its own reason.
+        if (words[0] == view_token_magic) {
+            ComputeTokenOutput token{};
+            reason = compute_token_output(self, words, token);
+#ifdef X2W_NATIVE_SHADERS
+            if (!reason && slot.half_typed_bytes) {
+                const auto kind = slot.packed_d16_x ? x2w::ComputeViewKind::packed_d16_x_uav : x2w::ComputeViewKind::half_buffer_uav;
+                const x2w::ComputeViewBinding binding{kind, 0, 0, 0, slot.half_typed_bytes};
+                token.view.Format = desktop_format(token.view.Format);
+                if (!x2w::native_buffer_store_view(binding, token.view, token.backing.Width))
+                    reason = "formatted D16 write has an incompatible typed buffer UAV";
+            }
+#endif
+            if (reason && token.placement == Placement::copied_buffer &&
+                trace_copied_compute_output(key, token.guest_resource, token.guest_base, token.offset, token.bytes)) {
+                log("x2w-compute-output-watch key=%016llx groups=%u,%u,%u indirect=%u owner=0x%llx gpuva=0x%llx",
+                    key, x, y, z, dispatch.signature != nullptr, token.guest_resource, token.desktop_gpuva);
+                for (const auto& ud : tr->uds)
+                    if (ud.source == ComputeTranslation::root_constant)
+                        log("x2w-compute-output-constant key=%016llx root=%d word=%d value=0x%08x", key, ud.a, ud.b,
+                            pass.compute_constants.word(ud.a, ud.b));
+            }
+            for (const auto& ud : tr->uds)
+                if (ud.source >= ComputeTranslation::output_word3 && ud.a == static_cast<int>(i - inputs) && !reason)
+                    reason = "an output token has no original ISA descriptor words for entry constants";
+            for (std::size_t input = 0; input < inputs && !reason; ++input)
+                if (views[input].resource == token.resource) reason = "an output buffer is also an input";
+            if (!reason && !retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(token.resource)))
+                reason = "an output token's backing could not be retained with the recording";
+            if (!tr->logged_token_output || (!reason && !tr->logged_bound_token_output)) {
+                tr->logged_token_output = true;
+                if (!reason) tr->logged_bound_token_output = true;
+                log("x2w-draw compute UAV %016llx table=%d+%d entry=0x%llx token=%u created=%u dim=%u fmt=%u "
+                    "first=%llu elements=%u stride=%u flags=%u backing-dim=%u backing-bytes=%llu backing-flags=%u "
+                    "placement=%u owner=0x%llx guest-base=0x%llx counter=0x%llx desc-bytes=%u offset=%llu bytes=%llu result=%s",
+                    key, slot.a, slot.b, entry, words[1], token.created, token.view.ViewDimension, token.view.Format,
+                    token.view.Buffer.FirstElement, token.view.Buffer.NumElements, token.view.Buffer.StructureByteStride,
+                    token.view.Buffer.Flags, token.backing.Dimension, token.backing.Width, token.backing.Flags,
+                    static_cast<unsigned>(token.placement), token.guest_resource, token.guest_base, token.counter,
+                    token.description_bytes, token.offset, token.bytes, reason ? reason : "bound");
+            }
+            views[i] = {token.resource, token.offset, token.bytes, true};
+            if (!reason && slot.half_typed_bytes) {
+                views[i].described = true;
+                views[i].desc.uav = token.view;
+            }
+            continue;
+        }
+        if (slot.half_typed_bytes) {
+            reason = "formatted D16 write needs the original typed buffer view";
+            break;
+        }
+        // Hardware descriptors address guest memory directly and must name a unique writable alias.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const unsigned half_bytes = slot.half_buffer_bytes;

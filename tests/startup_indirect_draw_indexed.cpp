@@ -1933,8 +1933,56 @@ bool check_indirect_other_refusal_census(const std::wstring& log_path)
     for (const auto& line : entries) std::printf("%s\n", line.c_str());
     return true;
 }
+bool mesh57_descriptor_relocations()
+{
+    using Bytes = std::vector<unsigned char>;
+    const auto put = [](Bytes& bytes, size_t offset, auto value) {
+        std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    };
+    const auto build = [&](uint64_t section, uint64_t allocation) {
+        Bytes bytes(0x300);
+        constexpr size_t offsets[]{
+            0x38, 0x78, 0x120, 0x128, 0x168, 0x178, 0x198, 0x1d8,
+            0x280, 0x288, 0x2c8, 0x2d8, 0x2f8
+        };
+        for (size_t i = 0; i < std::size(offsets); ++i)
+            put(bytes, offsets[i], section + i * 16);
+        put(bytes, 0x78, section - 16);
+        put(bytes, 0x110, static_cast<uint32_t>(section + 8 * 16));
+        put(bytes, 0x270, static_cast<uint32_t>(section + 16));
+        put(bytes, 0x30, uint64_t{512});
+        put(bytes, 0x70, uint64_t{1024});
+        put(bytes, 0x11c, uint32_t{0x04010000});
+        put(bytes, 0x27c, uint32_t{0x04010000});
+        put(bytes, 0x160, allocation);
+        put(bytes, 0x2c0, allocation);
+        return bytes;
+    };
+    constexpr uint64_t first_section = 0x10020000;
+    const auto original = build(first_section, 0x30030000);
+    const auto relocated = build(0x140050000, 0x260070000);
+    const auto normalized = x2w_startup::normalize_mesh57_descriptor(original);
+    if (normalized == original || normalized != x2w_startup::normalize_mesh57_descriptor(relocated) ||
+        normalized != x2w_startup::normalize_mesh57_descriptor(normalized))
+        return false;
+
+    auto different_metadata = original;
+    different_metadata[0x207] = 1;
+    auto different_offset = original;
+    put(different_offset, 0x1d8, first_section + 0x400);
+    auto unknown_layout = original;
+    put(unknown_layout, 0x2c0, uint64_t{0x30070000});
+    if (normalized == x2w_startup::normalize_mesh57_descriptor(different_metadata) ||
+        normalized == x2w_startup::normalize_mesh57_descriptor(different_offset) ||
+        unknown_layout != x2w_startup::normalize_mesh57_descriptor(unknown_layout))
+        return false;
+    std::puts("extended Mesh57 layout normalizes relocations and preserves metadata and relative offsets");
+    return true;
+}
+
 bool fixed_mesh_create_contract(ID3D12Device* guest)
 {
+    if (!mesh57_descriptor_relocations()) return false;
     const D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const auto root = create_root(guest, root_desc);
     const std::array<UINT, 7> ms{0xbfa00003, 0xbf900009, 0xf80008cf, 0x03020100, 0xf8000941, 0, 0xbf810000};

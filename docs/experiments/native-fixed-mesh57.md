@@ -23,9 +23,15 @@ The `native_fixed_mesh57_waterfall_{warp,hardware}` fixture draws a triangle cov
 
 ## Exact state records
 
-Set `X2W_SHADER_CACHE` to the request cache and `X2W_MESH57_CAPTURE_STATE=1` to retain the fixed creation state when a matching root consumes a mesh pipeline. A `req_<variant>.s57` file contains the little-endian 64-bit stage/root request key, three little-endian 32-bit lengths, and the corresponding byte spans for the normalized descriptor, register block A and register block B. The stand-in clears only the captured root and span pointer fields at DWORD-pair indices 0, 1, 3, 5 and 13. It preserves the lengths and other fields. The variant key extends the existing stage/root key with those three length-prefixed spans. Distinct fixed states can coexist for one stage pair. The fixture overwrites both blocks after creation and checks their archived bytes for accepted and refused variants.
+Set `X2W_SHADER_CACHE` to the request cache and `X2W_MESH57_CAPTURE_STATE=1` to retain the fixed creation state when a matching root consumes a mesh pipeline. A `req_<variant>.s57` file contains the little-endian 64-bit stage/root request key, three little-endian 32-bit lengths, and the corresponding byte spans for the normalized descriptor, register block A and register block B. For the base layout the stand-in clears the captured root and span pointer fields at DWORD-pair indices 0, 1, 3, 5 and 13. It preserves the lengths and other fields. The variant key extends the existing stage/root key with those three length-prefixed spans. Distinct fixed states can coexist for one stage pair. The fixture overwrites both blocks after creation and checks their archived bytes for accepted and refused variants.
 
-Native preparation reads a separately reviewed `<variant>.mesh57-state` profile from the cache. Its versioned Windows x64 header is defined by `Mesh57Profile` in `src/startup_stubs/mesh57_profile.h`. The header supplies the MS entry layout and desktop fixed-function state. The file ends with the exact descriptor, register blocks, serialized root and both guest programs. The stand-in compares every byte before building a PSO. The fixture authors this profile from its own known inputs. A captured register block alone does not establish the desktop rasterizer state or MS entry layout.
+Native preparation reads a separately reviewed `<variant>.mesh57-state` profile from the cache. Its versioned Windows x64 header is defined by `Mesh57Profile` in `src/startup_stubs/mesh57_profile.h`. The header supplies the MS entry layout and desktop fixed-function state. The file ends with the normalized descriptor, register blocks, serialized root and both guest programs. The stand-in compares every byte before building a PSO. The fixture authors this profile from its own known inputs. A captured register block alone does not establish the desktop rasterizer state or MS entry layout.
+
+For the recognized 0x300-byte fixed layout, the variant key ignores relocation
+of the two shader record blocks and retains their relative offsets.
+`startup_indirect_mesh_create_result` checks two source-built relocated
+descriptors, a changed metadata byte, a changed relative offset, and an
+unrecognized extended layout whose section fields remain unchanged.
 
 The source-built `native_fixed_mesh57_constant_{warp,hardware}` tests exercise
 one reviewed MS root-constant block with a deferred guest root. The version 3

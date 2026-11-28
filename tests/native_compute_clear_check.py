@@ -57,6 +57,11 @@ def main(exe, sdk):
         broken=words[:-3]+[mov(37,128)]+words[-3:]
         assert "unsupported" in run(write_request(work,broken,root),"partial.cso",1)
         assert not (work/"partial.cso").exists()
+        # A correctly keyed request whose state block A is short must fail the shape check with its
+        # existing diagnostic. The wave-size bit is read only once 28 bytes are proved (#3241).
+        short=write_request(work,words,root,sa=struct.pack("<6I",0,0,0,32|(8<<16),1|(1<<20),0))
+        assert "compute state block A is not 28 bytes" in run(short,"short.cso",1)
+        assert not (work/"short.cso").exists()
     print("two-table request, register renaming, store order, cache, tamper and partial descriptor passed")
 
 

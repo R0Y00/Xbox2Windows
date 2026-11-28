@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "tools" / "startup"))
 
 import gfx2hlsl as G  # noqa: E402
+from native_direct_container_check import patched_pixel, publish as publish_raw, vertex as container_vertex, words as raw_words  # noqa: E402
 from native_rtv_variant_check import FLOAT32, UINT16, UNORM8, put_variant  # noqa: E402
 from native_startup_request_cache_check import (  # noqa: E402
     COMPUTE_GROUP,
@@ -175,6 +176,33 @@ def main(argv: list[str]) -> int:
         assert not (d_lost / f"{lost_key:016x}.txt").exists()
         assert (d_lost / f"{lost_key:016x}.fail").is_file()
 
+        # A 0-byte <key>.psdep next to a published manifest + valid .psin triggers retranslation and restores .psdep.
+        zero_psdep = d_lost / "zero_psdep"
+        zero_psdep.mkdir()
+        z_key = put_graphics_request(zero_psdep, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        assert run_once(cli, sdk, frontend, zero_psdep, jobs=1).returncode == 0
+        z_psdep = zero_psdep / f"{z_key:016x}.psdep"
+        orig_dep = z_psdep.read_bytes()
+        assert orig_dep
+        z_psdep.write_bytes(b"")
+        r_zero = run_once(cli, sdk, frontend, zero_psdep, jobs=1)
+        assert r_zero.returncode == 0 and f"{z_key:016x}: compiled graphics" in r_zero.stdout, (r_zero.stdout, r_zero.stderr)
+        assert z_psdep.read_bytes() == orig_dep
+
+        # A copied slot-57 sidecar can be older than the published stream manifest.
+        conflict_dir = work / "copied_pixel_sidecar"
+        conflict_dir.mkdir()
+        conflict_key = put_graphics_request(conflict_dir, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        assert run_once(cli, sdk, frontend, conflict_dir, jobs=1).returncode == 0
+        conflict_manifest = conflict_dir / f"{conflict_key:016x}.txt"
+        assert conflict_manifest.is_file()
+        packed = conflict_dir / f"req_{conflict_key:016x}.ps57in"
+        packed.write_bytes(b"PSI1" + bytes(8))
+        touch(packed, mtime=conflict_manifest.stat().st_mtime - 10)
+        conflict = run_once(cli, sdk, frontend, conflict_dir, jobs=1)
+        assert "conflicting stream and slot-57 pixel entry records" in conflict.stdout, conflict.stdout
+        assert not conflict_manifest.exists()
+
         # Parallel --once --jobs 2 matches serial --once --jobs 1.
         d_serial = work / "cmp_serial"
         d_parallel = work / "cmp_parallel"
@@ -218,6 +246,95 @@ def main(argv: list[str]) -> int:
             assert f"{key:016x}: refused:" in r_rtv_recheck.stdout, r_rtv_recheck.stdout
             assert not (d_rtv / f"{key:016x}.txt").exists()
             assert (d_rtv / f"{key:016x}.fail").is_file()
+
+        # Issue #3133: sidecar content changes or contradictory .ps57in with preserved/older mtimes must invalidate.
+        # Contradictory .ps57in appearing with older mtime vs newer mtime must withdraw stale .txt identically.
+        outcomes_ps57 = []
+        for label, offset in (("older", -60.0), ("newer", 10.0)):
+            d_cmp = work / f"ps57_contradict_{label}"
+            d_cmp.mkdir()
+            s_key = put_graphics_request(d_cmp, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+            r_pub = run_once(cli, sdk, frontend, d_cmp, jobs=1)
+            assert r_pub.returncode == 0 and f"{s_key:016x}: compiled graphics" in r_pub.stdout, r_pub.stdout
+            txt_path = d_cmp / f"{s_key:016x}.txt"
+            fail_path = d_cmp / f"{s_key:016x}.fail"
+            assert txt_path.is_file() and (d_cmp / f"{s_key:016x}.psdep").is_file()
+            # Unchanged-input cache-hit control before adding contradictory .ps57in.
+            txt_ns = txt_path.stat().st_mtime_ns
+            r_hit = run_once(cli, sdk, frontend, d_cmp, jobs=1)
+            assert r_hit.returncode == 0 and f"{s_key:016x}:" not in r_hit.stdout and txt_path.stat().st_mtime_ns == txt_ns
+            touch(
+                d_cmp / f"req_{s_key:016x}.ps57in",
+                b"PSI1" + struct.pack("<II", *DECOY_MASKS),
+                mtime=txt_path.stat().st_mtime + offset,
+            )
+            r_bad = run_once(cli, sdk, frontend, d_cmp, jobs=1)
+            assert r_bad.returncode == 0 and not txt_path.exists() and fail_path.is_file(), (label, r_bad.stdout, r_bad.stderr)
+            assert f"{s_key:016x}: refused: conflicting stream and slot-57 pixel entry records" in r_bad.stdout, r_bad.stdout
+            outcomes_ps57.append((r_bad.stdout, fail_path.read_text(encoding="utf-8")))
+        assert outcomes_ps57[0] == outcomes_ps57[1], outcomes_ps57
+
+        # Changed .psin content preserving an older mtime must withdraw stale .txt and report conflict/mismatch.
+        d_psin_mtime = work / "psin_preserved_mtime"
+        d_psin_mtime.mkdir()
+        pm_key = put_graphics_request(d_psin_mtime, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        assert run_once(cli, sdk, frontend, d_psin_mtime, jobs=1).returncode == 0
+        pm_txt = d_psin_mtime / f"{pm_key:016x}.txt"
+        older_t = pm_txt.stat().st_mtime - 60.0
+        touch(
+            d_psin_mtime / f"req_{pm_key:016x}.psin",
+            describe_psin(pm_key, DECOY_MASKS).encode("ascii"),
+            mtime=older_t,
+        )
+        r_pm = run_once(cli, sdk, frontend, d_psin_mtime, jobs=1)
+        assert r_pm.returncode == 0 and not pm_txt.exists() and (d_psin_mtime / f"{pm_key:016x}.fail").is_file()
+        assert f"{pm_key:016x}: refused: stale pixel input description: graphics request key mismatch" in r_pm.stdout, r_pm.stdout
+
+        # Slot-57 .ps57in-only unchanged cache-hit control and changed-content preserved-mtime regression.
+        d_s57 = work / "ps57_preserved_mtime"
+        idx57 = work / "index57"
+        frontend57 = work / "frontend57"
+        idx57.mkdir()
+        vp57 = [0x7E0002F2, 0xF80008CF, 0, 0xF800020F, 0, 0xF800021F, 0, 0xBF810000]
+        (idx57 / "varying.cdxil").write_bytes(container_vertex(program=vp57))
+        interp57 = lambda attr, ch, op, dst, src: 0xC8000000 | dst << 18 | op << 16 | attr << 10 | ch << 8 | src
+        prefix57 = [0xD5800000, 255, 17, 0xD5800000, 255, 23]
+        tmpl57 = prefix57 + [interp57(0, 0, 0, 4, 0), interp57(0, 0, 1, 4, 1)]
+        attrs57 = [(6, row, 15, row, 0, 0, row, 2) for row in range(2)]
+        (idx57 / "smooth.cdxil").write_bytes(patched_pixel(len(tmpl57), tmpl57, input_address=2, attributes=attrs57))
+        subprocess.run([cli, "--index-graphics-interfaces", idx57, frontend57], check=True, capture_output=True)
+        root57 = b"DXBC" + bytes(16) + raw_words(1, 68, 1, 36) + b"RTS0" + raw_words(24, 2, 0, 24, 0, 24, 0)
+        code57 = raw_words(*tmpl57, interp57(0, 1, 2, 5, 2), 0xF800180F, 0x05040504, 0xBF810000)
+        k57 = publish_raw(d_s57, code57, raw_words(*vp57), root57, slot57_inputs=(2, 1))
+        ps57_bytes = b"PSI1" + struct.pack("<II", 2, 1)
+        assert run_once(cli, sdk, frontend57, d_s57, jobs=1).returncode == 0
+        txt57 = d_s57 / f"{k57}.txt"
+        assert txt57.is_file() and (d_s57 / f"{k57}.psdep").read_bytes() == ps57_bytes
+        txt57_ns = txt57.stat().st_mtime_ns
+        r57_hit = run_once(cli, sdk, frontend57, d_s57, jobs=1)
+        assert r57_hit.returncode == 0 and f"{k57}:" not in r57_hit.stdout and txt57.stat().st_mtime_ns == txt57_ns
+        touch(
+            d_s57 / f"req_{k57}.ps57in",
+            b"PSI1" + struct.pack("<II", 2, 2),
+            mtime=txt57.stat().st_mtime - 60.0,
+        )
+        r57_bad = run_once(cli, sdk, frontend57, d_s57, jobs=1)
+        assert r57_bad.returncode == 0 and not txt57.exists() and (d_s57 / f"{k57}.fail").is_file()
+        assert f"{k57}: refused: stale pixel input description: graphics request key mismatch" in r57_bad.stdout, r57_bad.stdout
+
+        # RTV variant must also withdraw when base gains contradictory .ps57in with older mtime.
+        d_rtv57 = work / "rtv_ps57_older"
+        d_rtv57.mkdir()
+        b57 = put_graphics_request(d_rtv57, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        v57, _ = put_variant(d_rtv57, b57, (UINT16, UNORM8))
+        assert run_once(cli, sdk, frontend, d_rtv57, jobs=2).returncode == 0
+        min_txt_mtime = min((d_rtv57 / f"{k:016x}.txt").stat().st_mtime for k in (b57, v57))
+        touch(d_rtv57 / f"req_{b57:016x}.ps57in", b"PSI1" + struct.pack("<II", *DECOY_MASKS), mtime=min_txt_mtime - 60.0)
+        r_rtv57 = run_once(cli, sdk, frontend, d_rtv57, jobs=2)
+        assert r_rtv57.returncode == 0
+        for key in (b57, v57):
+            assert not (d_rtv57 / f"{key:016x}.txt").exists() and (d_rtv57 / f"{key:016x}.fail").is_file()
+            assert f"{key:016x}: refused:" in r_rtv57.stdout and "conflicting stream and slot-57 pixel entry records" in r_rtv57.stdout, r_rtv57.stdout
 
         # Part 2: Live background --watch process retries pre-existing .fail once, skips unchanged .fail,
         # translates newly written graphics/compute requests, and clears .fail when fixed.

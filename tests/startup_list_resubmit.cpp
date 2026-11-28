@@ -41,6 +41,8 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_allocator_pool_size(void* allocator);
+extern "C" __declspec(dllimport) UINT x2w_d3d12_allocator_sampler_snapshots(void* allocator);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_record_sampler_snapshot(void* list);
 
 namespace {
 using Word = std::uint64_t;
@@ -144,6 +146,48 @@ struct Probe {
         return bits;
     }
 };
+
+bool sampler_retirement(void* device, Probe& first, bool untracked)
+{
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    Probe second;
+    second.fence = make_fence(device);
+    void* gate = make_fence(device);
+    void* allocator = nullptr;
+    void* list = nullptr;
+    if (!second.fence || !gate ||
+        !ok(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&second.queue))) ||
+        !ok(invoke(device, 9, list_desc[0], arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator))) ||
+        !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))) ||
+        !ok(invoke(list, 139, arg(allocator))) ||
+        !x2w_d3d12_record_sampler_snapshot(list) ||
+        x2w_d3d12_allocator_sampler_snapshots(allocator) != 1 ||
+        !ok(invoke(list, 9)) || !first.submit(list))
+        return false;
+
+    struct ReleaseGate {
+        void* fence;
+        ~ReleaseGate() { invoke(fence, 10, 1); }
+    } release_gate{gate};
+    if (!ok(invoke(second.queue, 17, arg(gate), 1)) || !second.submit(list, false) ||
+        invoke(list, 2) != 0 || !ok(invoke(allocator, 8)) ||
+        invoke(second.fence, 8) != 0 || x2w_d3d12_allocator_sampler_snapshots(allocator) != 1)
+        return false;
+
+    if (!ok(invoke(gate, 10, 1)) || !second.reached()) return false;
+    void* spare_list = nullptr;
+    if (!ok(invoke(device, 73, arg(list_desc), arg(allocator), 0,
+                   arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&spare_list))) ||
+        !ok(invoke(spare_list, 139, arg(allocator))) || !ok(invoke(spare_list, 9)) ||
+        !ok(invoke(allocator, 8)))
+        return false;
+
+    const UINT held = x2w_d3d12_allocator_sampler_snapshots(allocator);
+    const UINT expected = untracked ? 1 : 0;
+    std::printf("sampler snapshots after both queues completed: %u (expected %u)\n", held, expected);
+    return held == expected;
+}
 
 bool expect(Probe& probe, const char* step, std::uint32_t wanted)
 {
@@ -273,6 +317,7 @@ int main(int argc, char** argv)
     probe.record(list_a, a, blue);
     if (!probe.submit(list_a)) return 64;
     if (!expect(probe, "6 A after the Reset, clear blue", blue_bits)) return 65;
+    if (!sampler_retirement(device, probe, untracked)) return 66;
 
     const HRESULT removed = probe.desktop->GetDeviceRemovedReason();
     const UINT64 errors = probe.debug_errors();

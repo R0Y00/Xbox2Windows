@@ -49,6 +49,8 @@ struct GraphicsRequest {
 };
 // marker: req_<key>.a, or req_<key>.rtv for an RTV variant of a base request in the same directory.
 GraphicsRequest read_graphics_request(const std::filesystem::path &marker);
+// Canonical pixel-input sidecar (.psin or .ps57in) content for req_<key>.a; empty when absent, throws if invalid/conflicting.
+std::string read_pixel_input_description(const std::filesystem::path &base_marker);
 std::string read_shader_container_bytes(const std::filesystem::path &file);
 ComputeContainer read_compute_container(const std::filesystem::path &file);
 // Verify the content key over all six immutable capture parts before exposing any bytes.
