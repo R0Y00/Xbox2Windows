@@ -43,6 +43,15 @@ struct DirectCompute {
     bool uses_exchange = false;
     bool wave64 = false;
     bool narrow_wave64 = false;
+    // Lane pairs: one host wave32 runs a whole guest wave64, and host lane j carries guest lanes j and j + 32.
+    // A vector instruction is emitted once per lane set. high_set selects the VGPR storage of lanes 32..63, and
+    // upper_half is then the constant that picks their EXEC and mask words. pair_emit holds scalar writes until
+    // both sets have read the instruction's operands.
+    bool lane_pairs = false, high_set = false, pair_emit = false;
+    std::map<unsigned, string> held_scalars;
+    // Guest waves of the group and this host wave's index among them (lane pairs only).
+    unsigned guest_waves = 1;
+    string wave_index = "0";
     // The view class a GPU-selected heap slot is read as; see HeapViewContract.
     HeapViewContract heap_view = HeapViewContract::none;
     // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
@@ -88,8 +97,9 @@ struct DirectCompute {
         return value;
     }
     string address(unsigned r) {
-        const auto name = "%r" + to_string(r);
-        if (allocated.insert(r).second)
+        const bool high = high_set && r >= 256 && r < 512;
+        const auto name = "%r" + to_string(r) + (high ? "h" : "");
+        if (allocated.insert(high ? r + 1024 : r).second)
             ir.setup << "  " << name << " = alloca i32, align 4\n";
         return name;
     }
@@ -121,6 +131,13 @@ struct DirectCompute {
         // would let a later v_readlane_b32 return a stale identity.
         if (compute_state && !lane_write && compute_state->has_spill(r))
             refuse(compute_pc, "write to a VGPR holding symbolic lanes: " + reg(r));
+        if (pair_emit && (r < 256 || r >= 512)) {
+            // The other lane set still has to read this instruction's scalar operands. Each set writes its own
+            // mask word; a register written for both sets would keep only the second value.
+            if (!held_scalars.emplace(r, value).second)
+                refuse(compute_pc, "lane-pair layout: one scalar register written for both lane sets");
+            return;
+        }
         if (graphics_input) {
             guarded_ij.erase(r);
             graphics_registers[r] = value;
@@ -211,6 +228,11 @@ struct DirectCompute {
         if (wave64) {
             if ((dst & 1) || (dst > 104 && dst != 106 && dst != 126))
                 throw UnsupportedComputeShader("invalid wave64 mask destination");
+            if (lane_pairs) {
+                // Both lane sets are in this host wave: each emission ballots its own word, without a barrier.
+                write(dst + high_set, mask);
+                return;
+            }
             auto pair = exchange_halves(mask);
             write(dst, pair[0]);
             write(dst + 1, pair[1]);
@@ -232,8 +254,10 @@ struct DirectCompute {
         refuse(i.pc, "unsupported wave64 scalar pair");
     }
     void initialize(unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
-        unsigned threads = x * y * z;
-        complete_compute_quads = threads % 4 == 0;
+        const unsigned guest_threads = x * y * z;
+        // Host threads. With lane pairs each one carries two guest lanes, so a host wave32 is a guest wave64.
+        const unsigned threads = lane_pairs ? guest_threads / 2 : guest_threads;
+        complete_compute_quads = guest_threads % 4 == 0;
         lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
         lane_bit = ir.binary("shl", "1", lane);
         write(126, ballot("true"));
@@ -266,25 +290,36 @@ struct DirectCompute {
                 wave = "%rank";
             }
         }
-        if (wave64) {
+        if (lane_pairs) {
+            guest_waves = guest_threads / 64;
+            wave_index = wave;
+            upper_half = "false";
+            write(127, read(126)); // lanes 32..63 are active on the same host lanes as lanes 0..31
+        } else if (wave64) {
             exchange_words = threads / 32;
             half_index = wave;
             exchange_base = ir.binary("and", wave, "4294967294");
             upper_half = cmp("ne", ir.binary("and", wave, "1"), "0");
             write(127, "4294967295");
         }
-        auto logical = ir.binary("add", ir.binary("mul", wave, "32"), lane);
-        write(256, ir.binary("urem", logical, to_string(x)));
-        if (((flags >> 11) & 3) >= 1)
-            write(257, ir.binary("urem", ir.binary("udiv", logical, to_string(x)), to_string(y)));
-        if (((flags >> 11) & 3) >= 2)
-            write(258, ir.binary("udiv", logical, to_string(x * y)));
+        // The guest thread index of each lane; with lane pairs the second set is lanes 32..63 of the same wave.
+        for (unsigned set = 0; set < (lane_pairs ? 2u : 1u); ++set) {
+            high_set = set;
+            auto logical = ir.binary("add", ir.binary("mul", wave, lane_pairs ? "64" : "32"),
+                                     set ? ir.binary("add", lane, "32") : lane);
+            write(256, ir.binary("urem", logical, to_string(x)));
+            if (((flags >> 11) & 3) >= 1)
+                write(257, ir.binary("urem", ir.binary("udiv", logical, to_string(x)), to_string(y)));
+            if (((flags >> 11) & 3) >= 2)
+                write(258, ir.binary("udiv", logical, to_string(x * y)));
+        }
+        high_set = false;
         for (unsigned j = 0; j < 3; ++j)
             if (flags & (128u << j))
                 write(user++, group_intrinsic("groupId.i32", 94, j));
         if (flags & 1024) {
-            if (wave64) wave = ir.binary("lshr", wave, "1");
-            auto info = ir.binary("or", ir.binary("shl", wave, "20"), to_string(wave64 ? threads / 64 : (threads + 31) / 32));
+            if (wave64 && !lane_pairs) wave = ir.binary("lshr", wave, "1");
+            auto info = ir.binary("or", ir.binary("shl", wave, "20"), to_string(wave64 ? guest_threads / 64 : (threads + 31) / 32));
             write(user, ir.binary("or", info, select(cmp("eq", wave, "0"), "2147483648", "0")));
         }
         initialize_constants();
@@ -1156,10 +1191,17 @@ struct DirectCompute {
         const auto op = decode_local_data(i.a, i.b);
         // The host executes a guest wave64 on two wave32s. Meet before
         // each operation, outside its lane predicate, as in Victory split_lds.
-        if (wave64)
+        if (wave64 && !lane_pairs)
             barrier();
         const auto label = to_string(label_number++);
         auto enabled = active();
+        // Without that barrier (wave32 and narrow wave64, where one host wave is one guest wave, and lane pairs,
+        // where a group barrier cannot stand in guest control flow) a guest lane may still read what another lane
+        // of its wave wrote one instruction earlier, and only a wave operation makes a host bring all lanes of a
+        // wave to the same point. So the predicate comes from a ballot. Without it app-local WARP 1.0.22 reads
+        // words the other lanes have not written yet.
+        if (!wave64 || lane_pairs)
+            enabled = cmp("ne", ir.binary("and", ballot(enabled), lane_bit), "0");
         ir.body << "  br i1 " << enabled << ", label %ds" << label << ", label %dsDone" << label << "\nds" << label
                 << ":\n";
         const auto address = read(256 + op.address);
@@ -3170,11 +3212,24 @@ struct DirectCompute {
             }
             if (reading) {
                 const auto physical = wave64 ? ir.binary("and", selected, "31") : selected;
-                auto value = ir.invoke("i32", "waveReadLaneAt.i32", 117,
-                                       {{"i32", read_storage(vector)}, {"i32", physical}}, "nounwind");
-                if (wave64) {
-                    const auto halves = exchange_halves(value);
-                    value = select(cmp("uge", selected, "32"), halves[1], halves[0]);
+                string value;
+                if (lane_pairs) {
+                    // Lane k >= 32 is the second set of host lane k - 32, in this same host wave.
+                    std::array<string, 2> sets;
+                    for (unsigned set = 0; set < 2; ++set) {
+                        high_set = set;
+                        sets[set] = ir.invoke("i32", "waveReadLaneAt.i32", 117,
+                                              {{"i32", read_storage(vector)}, {"i32", physical}}, "nounwind");
+                    }
+                    high_set = false;
+                    value = select(cmp("uge", selected, "32"), sets[1], sets[0]);
+                } else {
+                    value = ir.invoke("i32", "waveReadLaneAt.i32", 117,
+                                      {{"i32", read_storage(vector)}, {"i32", physical}}, "nounwind");
+                    if (wave64) {
+                        const auto halves = exchange_halves(value);
+                        value = select(cmp("uge", selected, "32"), halves[1], halves[0]);
+                    }
                 }
                 write(i.dst, value);
             } else {
@@ -3191,6 +3246,21 @@ struct DirectCompute {
                 refuse(i.pc, "readfirstlane modifiers");
             // Guest EXEC selects the first lane, even if it is not physical lane zero.
             auto low = read(126);
+            if (lane_pairs) {
+                // The first active lane is in the low set unless that set is empty. Lane 0 answers for an empty EXEC.
+                auto high = read(127);
+                std::array<string, 2> sets;
+                for (unsigned set = 0; set < 2; ++set) {
+                    const auto &word = set ? high : low;
+                    auto first = ir.invoke("i32", "unaryBits.i32", 32, {{"i32", word}}, "nounwind readnone");
+                    first = select(cmp("eq", word, "0"), "0", first);
+                    high_set = set;
+                    sets[set] = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32", val(0)}, {"i32", first}}, "nounwind");
+                }
+                high_set = false;
+                write(i.dst, select(cmp("ne", low, "0"), sets[0], select(cmp("ne", high, "0"), sets[1], sets[0])));
+                return;
+            }
             auto mask = wave64 ? select(upper_half, read(127), low) : low;
             auto first = ir.invoke("i32", "unaryBits.i32", 32, {{"i32", mask}}, "nounwind readnone");
             first = select(cmp("eq", mask, "0"), "0", first);
@@ -4259,13 +4329,68 @@ struct DirectCompute {
                    (i.enc == Encoding::Image && i.op == 8) || is_image_atomic(i);
         });
         std::set<unsigned> labels{entry};
-        ir.body << "  br label %pc" << entry << "\n";
         for (auto &i : p.code)
             if (i.branch()) {
                 labels.insert(i.target());
                 if (i.op != 2)
                     labels.insert(i.next);
             }
+        // Lane pairs: a guest wave may end, or branch around an s_barrier, while the other waves of its group
+        // still reach one. D3D12 defines a group barrier only when every thread of the group arrives at it, so
+        // such a program gets one barrier site in a loop. A wave runs to its next s_barrier or to s_endpgm,
+        // records where to resume and meets the others there. A wave that has ended keeps coming back until
+        // all of them have. Programs whose barriers no wave can skip keep the plain barrier.
+        std::vector<unsigned> stops; // s_barrier pcs; state k + 1 resumes after stops[k]
+        if (lane_pairs && guest_waves > 1) {
+            // True when some path from the entry reaches s_endpgm without passing the instruction at `avoid`.
+            const auto ends_without = [&](unsigned avoid) {
+                std::vector<bool> seen(p.code.size());
+                std::vector<unsigned> work{entry};
+                while (!work.empty()) {
+                    const auto at = p.at.find(work.back());
+                    work.pop_back();
+                    if (at == p.at.end() || seen[at->second] || at->first == avoid)
+                        continue;
+                    seen[at->second] = true;
+                    const auto &c = p.code[at->second];
+                    if (c.name == "s_endpgm")
+                        return true;
+                    if (c.branch())
+                        work.push_back(c.target());
+                    if (!c.branch() || c.op != 2)
+                        work.push_back(c.next);
+                }
+                return false;
+            };
+            bool skipped = false;
+            for (size_t k = 0; k < p.code.size(); ++k) {
+                const auto &stop = p.code[k];
+                if (!p.reached[k] || stop.name != "s_barrier")
+                    continue;
+                // Guest waves may take a loop a different number of times, and resuming inside one would give
+                // it a second entry.
+                for (const auto &b : p.code)
+                    if (b.branch() && b.target() <= stop.pc && stop.pc <= b.pc)
+                        refuse(stop.pc, "lane-pair layout: s_barrier inside a guest loop");
+                stops.push_back(stop.pc);
+                skipped |= ends_without(stop.pc);
+            }
+            if (!skipped)
+                stops.clear();
+        }
+        const bool barrier_loop = !stops.empty();
+        const auto ended = to_string(stops.size() + 1);
+        if (barrier_loop) {
+            ir.setup << "  %resume = alloca i32, align 4\n";
+            ir.globals << "@waveDone = internal addrspace(3) global [" << guest_waves << " x i32] undef, align 4\n";
+            ir.body << "  store i32 0, i32* %resume, align 4\n  br label %dispatch\ndispatch:\n";
+            auto state = ir.value("load i32, i32* %resume, align 4");
+            ir.body << "  switch i32 " << state << ", label %pc" << entry << " [";
+            for (size_t k = 0; k < stops.size(); ++k)
+                ir.body << " i32 " << k + 1 << ", label %resume" << k + 1;
+            ir.body << " i32 " << ended << ", label %sync ]\n";
+        } else
+            ir.body << "  br label %pc" << entry << "\n";
         for (size_t k = 0; k < p.code.size(); ++k) {
             const auto &i = p.code[k];
             compute_pc = i.pc;
@@ -4281,56 +4406,107 @@ struct DirectCompute {
                     ++k;
                 continue;
             }
-            if (i.branch()) {
-                if (i.op == 2)
-                    ir.body << "  br label %pc" << i.target() << "\n";
-                else {
-                    unsigned r = i.op == 4 || i.op == 5 ? 128 : i.op == 6 || i.op == 7 ? 106 : 126;
-                    auto mask = wave64 && r != 128 ? ir.binary("or", read(r), read(r + 1)) : read(r);
-                    auto pred = cmp((i.op & 1) ? "ne" : "eq", mask, "0");
-                    ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
+            // Lane pairs emit a vector instruction once per lane set. Scalar instructions act once, and the
+            // two lane reads combine both sets themselves.
+            const bool scalar = i.enc == Encoding::Sopp || i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 ||
+                                i.enc == Encoding::Sopc || i.enc == Encoding::Sopk || i.enc == Encoding::Smem;
+            pair_emit = lane_pairs && !scalar && i.name != "v_readlane_b32" && i.name != "v_readfirstlane_b32";
+            for (unsigned set = 0; set < (pair_emit ? 2u : 1u); ++set) {
+                if (pair_emit) {
+                    high_set = set;
+                    upper_half = set ? "true" : "false";
                 }
-            } else if (i.dpp_control || i.dpp8_selectors)
-                lower_dpp(i, p.before[k], x*y*z);
-            else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
-                lower_permlane(i, x*y*z);
-            else if (i.name == "s_endpgm")
-                ir.body << "  ret void\n";
-            // Hardware scheduling and register-dependency waits have no SGPR
-            // operands. SSA dependencies carry these constraints into DXIL.
-            else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||
-                     i.name == "s_waitcnt" || i.name == "s_waitcnt_depctr" || i.name == "s_setprio")
-                continue;
-            else if (i.enc == Encoding::Mubuf || i.enc == Encoding::Smem)
-                memory(i, p.before[k]);
-            else if (i.enc == Encoding::Lds)
-                local_memory(i, lds_words);
-            else if (i.name == "s_barrier")
-                barrier(writes_uavs ? 11 : 9); // group rendezvous, LDS and, when used, UAV memory
-            else if (i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt" ||
-                     i.name == "s_waitcnt_lgkmcnt" || i.name == "s_waitcnt_expcnt") {
-                // null,0 drains this wave's counter. Memory-only barriers
-                // preserve ordering without rendezvousing other workgroup waves.
-                if (i.dst != 125 || (i.a & 65535))
-                    refuse(i.pc, "compute counter wait requires null and a zero threshold");
-                if (i.name == "s_waitcnt_lgkmcnt" && uses_lds)
-                    barrier(8);
-                if ((i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt") && writes_uavs)
-                    barrier(2);
+                if (i.branch()) {
+                    if (i.op == 2)
+                        ir.body << "  br label %pc" << i.target() << "\n";
+                    else {
+                        unsigned r = i.op == 4 || i.op == 5 ? 128 : i.op == 6 || i.op == 7 ? 106 : 126;
+                        auto mask = wave64 && r != 128 ? ir.binary("or", read(r), read(r + 1)) : read(r);
+                        auto pred = cmp((i.op & 1) ? "ne" : "eq", mask, "0");
+                        ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
+                    }
+                } else if (i.dpp_control || i.dpp8_selectors)
+                    lower_dpp(i, p.before[k], x*y*z);
+                else if (i.name == "v_permlane16_b32" || i.name == "v_permlanex16_b32")
+                    lower_permlane(i, x*y*z);
+                else if (i.name == "s_endpgm") {
+                    if (barrier_loop)
+                        ir.body << "  store i32 " << ended << ", i32* %resume, align 4\n  br label %sync\n";
+                    else
+                        ir.body << "  ret void\n";
+                }
+                // Hardware scheduling and register-dependency waits have no SGPR
+                // operands. SSA dependencies carry these constraints into DXIL.
+                else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||
+                         i.name == "s_waitcnt" || i.name == "s_waitcnt_depctr" || i.name == "s_setprio")
+                    continue;
+                else if (i.enc == Encoding::Mubuf || i.enc == Encoding::Smem)
+                    memory(i, p.before[k]);
+                else if (i.enc == Encoding::Lds)
+                    local_memory(i, lds_words);
+                else if (i.name == "s_barrier") {
+                    if (barrier_loop) {
+                        const auto state = std::find(stops.begin(), stops.end(), i.pc) - stops.begin() + 1;
+                        ir.body << "  store i32 " << state << ", i32* %resume, align 4\n  br label %sync\nresume"
+                                << state << ":\n";
+                    } else
+                        barrier(writes_uavs ? 11 : 9); // group rendezvous, LDS and, when used, UAV memory
+                }
+                else if (i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt" ||
+                         i.name == "s_waitcnt_lgkmcnt" || i.name == "s_waitcnt_expcnt") {
+                    // null,0 drains this wave's counter. Memory-only barriers
+                    // preserve ordering without rendezvousing other workgroup waves.
+                    if (i.dst != 125 || (i.a & 65535))
+                        refuse(i.pc, "compute counter wait requires null and a zero threshold");
+                    if (i.name == "s_waitcnt_lgkmcnt" && uses_lds)
+                        barrier(8);
+                    if ((i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt") && writes_uavs)
+                        barrier(2);
+                }
+                else if (consume_half_mode(i))
+                    continue;
+                else if (i.enc == Encoding::Sopp)
+                    refuse(i.pc, "unsupported compute control instruction " + string(i.name));
+                else if (i.enc == Encoding::Image)
+                    image_io(i, p.before[k]);
+                else
+                    arithmetic(i, p.before[k], nullptr, true);
             }
-            else if (consume_half_mode(i))
-                continue;
-            else if (i.enc == Encoding::Sopp)
-                refuse(i.pc, "unsupported compute control instruction " + string(i.name));
-            else if (i.enc == Encoding::Image)
-                image_io(i, p.before[k]);
-            else
-                arithmetic(i, p.before[k], nullptr, true);
+            if (pair_emit) {
+                pair_emit = high_set = false;
+                upper_half = "false";
+                for (const auto &[reg, value] : held_scalars)
+                    write(reg, value);
+                held_scalars.clear();
+            }
+        }
+        if (barrier_loop) {
+            // Lane 0 publishes whether this wave has ended. After the barrier every thread reads all waves'
+            // words, so the exit is the same for the whole group; the second barrier ends those reads before
+            // any wave publishes again.
+            ir.body << "sync:\n";
+            const auto done = ir.value("zext i1 " + cmp("eq", ir.value("load i32, i32* %resume, align 4"), ended) + " to i32");
+            const auto slot = shared_address("waveDone", guest_waves, wave_index);
+            const auto leader = cmp("eq", lane, "0");
+            ir.body << "  br i1 " << leader << ", label %syncPublish, label %syncPublished\nsyncPublish:\n"
+                    << "  store i32 " << done << ", i32 addrspace(3)* " << slot
+                    << ", align 4\n  br label %syncPublished\nsyncPublished:\n";
+            barrier(writes_uavs ? 11 : 9);
+            string all = "1";
+            for (unsigned w = 0; w < guest_waves; ++w) {
+                const auto word = shared_address("waveDone", guest_waves, to_string(w));
+                all = ir.binary("and", all, ir.value("load i32, i32 addrspace(3)* " + word + ", align 4"));
+            }
+            barrier();
+            const auto finished = cmp("ne", all, "0");
+            ir.body << "  br i1 " << finished << ", label %syncExit, label %dispatch\nsyncExit:\n  ret void\n";
         }
         auto &r = analysis.result;
         r.instruction_count = unsigned(p.code.size());
-        const unsigned rank_words = x * y * z > 64 ? x * y * z : 0;
-        if ((uses_lds ? lds_words : 0) + rank_words + (uses_exchange ? exchange_words : 0) > 8192)
+        const unsigned host_threads = lane_pairs ? x * y * z / 2 : x * y * z;
+        const unsigned rank_words = host_threads > 64 ? host_threads : 0;
+        if ((uses_lds ? lds_words : 0) + rank_words + (uses_exchange ? exchange_words : 0) +
+            (barrier_loop ? guest_waves : 0) > 8192)
             refuse(entry, "combined shared storage exceeds 32 KiB");
         // SM 6.6 forms consecutive linear quads for 1D groups. In 2D it forms
         // spatial 2x2 quads, which can cross the guest's consecutive lane quads.
@@ -4338,7 +4514,8 @@ struct DirectCompute {
         // The wave64 split occurs at lane 32, a quad boundary.
         if (compute_derivatives)
             ir.validator_minor = 8;
-        r.dxil_ir = compute_derivatives ? ir.finish_compute(x * y * z, 1, 1) : ir.finish_compute(x, y, z);
+        // A lane-pair group is one-dimensional as well: host thread j of a wave carries guest lanes j and j + 32.
+        r.dxil_ir = lane_pairs || compute_derivatives ? ir.finish_compute(host_threads, 1, 1) : ir.finish_compute(x, y, z);
         return std::move(r);
     }
 };

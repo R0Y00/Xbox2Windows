@@ -51,6 +51,8 @@ after:
 - The 46 newly compiled requests are wave64 programs with 64-thread groups.
 - The 42 that no longer compile are wave64 programs that the wave32 model used to accept. They now stop at
   "multi-wave64 exchange requires converged group control flow", a limit of the existing wave64 path.
+  That refusal has since been replaced by the [lane-pair layout](native-wave64-lane-pairs.md); these counts were
+  not measured again.
 
 ## Fixture
 

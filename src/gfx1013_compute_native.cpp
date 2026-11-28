@@ -1825,7 +1825,9 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
                 return i.enc == Encoding::Vopc || i.enc == Encoding::Lds || carry_destination(i) ||
                        i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32" || i.name == "s_barrier";
             });
-            if (branches && synchronizes) refuse(entry, "multi-wave64 exchange requires converged group control flow");
+            // Split halves meet at group barriers, and guest waves that branch apart reach a different number of
+            // them. Such a group runs as lane pairs: each guest wave stays in one host wave32 and meets no one.
+            compiler.lane_pairs = branches && synchronizes;
         }
         auto translated = compiler.lower(entry,user,rsrc2,x,y,z);
         for (auto &binding : translated.bindings) {

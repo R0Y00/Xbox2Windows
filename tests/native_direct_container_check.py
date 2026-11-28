@@ -376,8 +376,9 @@ def main():
         check("split-wave64", cs, compute(mask_program, 64, wave32=False))
         check("two-wave64", cs, compute(mask_program, 128, wave32=False))
         check("multi-wave64-local-branch", cs, compute(words(0xbf880001, end, end), 128, wave32=False))
-        check("multi-wave64-exchange-branch", cs, compute(words(0xbf880001, 0x7c0400f2, end), 128, wave32=False),
-              "converged group control flow")
+        # Guest waves that branch apart around a mask write cannot meet at the exchange barriers. They run as lane
+        # pairs: one host wave32 per guest wave64, so 64 host threads for 128 guest threads, and no exchange.
+        check("multi-wave64-exchange-branch", cs, compute(words(0xbf880001, 0x7c0400f2, end), 128, wave32=False))
         check("partial-wave64", cs, compute(mask_program, 32, wave32=False), "complete guest waves")
         # Wide-carry destination and source are aligned SGPR pairs in a
         # guest wave64. Both host halves must participate in the ballot.
@@ -387,11 +388,17 @@ def main():
               compute(words(carry[0], carry[1] | 0x100, carry[2], end), 64, wave32=False),
               "unsupported carry mask destination")
         check("wave64-divergent-carry", cs,
-              compute(words(carry[0], 0xbf880002, *carry[1:], end), 128, wave32=False),
-              "multi-wave64 exchange requires converged group control flow")
+              compute(words(carry[0], 0xbf880002, *carry[1:], end), 128, wave32=False))
         split_ir = subprocess.run([pathlib.Path(sdk)/"dxc.exe", "-dumpbin", folder/"split-wave64.cso"],
                                   check=True, capture_output=True, text=True).stdout
         assert "waveExchange" in split_ir and "waveReadLaneAt" in split_ir and "waveActiveBallot" in split_ir, split_ir
+        # The converged two-wave group keeps split halves; only the two divergent ones are lane pairs.
+        layouts = {"two-wave64": True, "multi-wave64-exchange-branch": False, "wave64-divergent-carry": False}
+        for name, split in layouts.items():
+            ir = subprocess.run([pathlib.Path(sdk)/"dxc.exe", "-dumpbin", folder/(name+".cso")],
+                                check=True, capture_output=True, text=True).stdout
+            assert "waveActiveBallot" in ir and ("waveExchange" in ir) == split, (name, ir)
+            assert f"NumThreads=({128 if split else 64},1,1)" in ir, (name, ir)
         # A descriptor's stride is symbolic. Its SCC may be discarded
         # only if no path can consume it before a concrete definition.
         stride_field = [0xbe810380, 0xf4080500, 0xfa000000, 0x9391ff15, 0xe0010]
