@@ -1597,6 +1597,34 @@ OperationResult run_startup_flat_param(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+static std::vector<std::uint32_t> parse_hex_words(std::string_view text);
+
+// --startup-raw-buffer <vs.cso> <ps.cso> <constants> <source words> <expected words>: draws one pixel whose
+// pixel stage reads a raw buffer at t0 (a descriptor table) and entry constants at b0. <constants> and
+// <source words> are comma-separated 8-digit hex words. <expected words> is the four words the target must hold.
+OperationResult run_startup_raw_buffer(const OperationContext& ctx)
+{
+    const auto constants = parse_hex_words(ctx.argv[5]);
+    const auto source = parse_hex_words(ctx.argv[6]);
+    const auto expected = parse_hex_words(ctx.argv[7]);
+    if (constants.empty() || constants.size() > 63)
+        return {OutcomeKind::fail, "entry constants are not 1..63 hex words"};
+    if (source.empty() || source.size() > 4096)
+        return {OutcomeKind::fail, "source buffer is not 1..4096 hex words"};
+    if (expected.size() != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_raw_buffer(ctx.device, ctx.argv[3], ctx.argv[4], constants.data(), UINT(constants.size()),
+                             source.data(), UINT(source.size()), words);
+    if (std::memcmp(words, expected.data(), sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_raw_buffer mismatch expected=%08x,%08x,%08x,%08x "
+                             "actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "raw buffer readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
 // Comma-separated 8-digit hex words, in order. An empty list or any other shape returns nothing.
 static std::vector<std::uint32_t> parse_hex_words(std::string_view text)
 {
@@ -1767,6 +1795,7 @@ const OperationSpec kOperations[] = {
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
     {"--startup-flat-param", 6, 7, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-raw-buffer", 8, 8, nullptr, kNoGate, run_startup_raw_buffer},
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},

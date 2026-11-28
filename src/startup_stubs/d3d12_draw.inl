@@ -10,6 +10,8 @@
 // upload ring / a private descriptor heap.
 
 #include "startup_stubs/typed_uav_load.h"
+#include "startup_stubs/udsrc_line.h"
+#include "startup_stubs/indirect_buffer_view.h"
 
 // A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
 // for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
@@ -154,7 +156,11 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
+    enum UdKind {
+        rect = udsrc_rect, base_vertex = udsrc_base_vertex, start_instance = udsrc_start_instance,
+        root_constant = udsrc_root_constant, stride = udsrc_stride, mrt_bits = udsrc_mrt_bits,
+        d16_unorm16 = udsrc_d16_unorm16, desc_word3 = udsrc_desc_word3, num_records = udsrc_num_records
+    };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
 #ifdef X2W_NATIVE_SHADERS
@@ -455,6 +461,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     const bool previously_missing = tr.manifest_retry.pending();
     tr.manifest_retry.found();
     bool matched_rtv = false;
+    UdSrcParsed udsrc;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
         if (end == std::string::npos) end = manifest.size();
@@ -474,17 +481,13 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
             // so a translation whose stores would be silently skipped is never drawn (#1723).
             log("x2w-draw unsupported manifest version for %016llx", tr.key);
             return;
-        } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
-            Translation::Ud ud{-1, x, y};
-            if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
-            else if (!std::strcmp(source, "basevertex")) ud.kind = Translation::base_vertex;
-            else if (!std::strcmp(source, "startinstance")) ud.kind = Translation::start_instance;
-            else if (!std::strcmp(source, "rootconst")) ud.kind = Translation::root_constant;
-            else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
-            else if (!std::strcmp(source, "d16unorm16") && x >= 0 && x < 32) ud.kind = Translation::d16_unorm16;
-            else if (!std::strcmp(source, "descword3")) ud.kind = Translation::desc_word3;
-            else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
-            if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
+        } else if (!accept_udsrc_line(line.c_str(), static_cast<int>(tr.uds.size()), !rtv_request.empty(), &udsrc)) {
+            // An unknown kind or a gap used to be skipped. The shader's constant slot then read 0, and every
+            // udsrc after the gap was skipped too because its index no longer matched the next slot.
+            log("x2w-draw unsupported udsrc for %016llx: %s", tr.key, line.c_str());
+            return;
+        } else if (udsrc.is_udsrc) {
+            tr.uds.push_back({udsrc.kind, udsrc.a, udsrc.b});
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
@@ -2162,6 +2165,8 @@ bool indirect_shader_entry(ID3DBlob* blob, const Translation& translation, bool 
             if (ud.kind == Translation::stride && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
                 (translation.srvs[ud.a].source == 0 || (indexed && translation.srvs[ud.a].source == 1)) &&
                 translation.srvs[ud.a].kind == 0) continue;
+            if (ud.kind == Translation::num_records && ud.a >= 0 && static_cast<std::size_t>(ud.a) < translation.srvs.size() &&
+                translation.srvs[ud.a].source == 0 && translation.srvs[ud.a].kind == 0) continue;
             if (ud.kind != Translation::root_constant && ud.kind != Translation::rect && ud.kind != Translation::d16_unorm16)
                 return false;
         }
@@ -2340,13 +2345,7 @@ ID3D12Resource* validate_indexed_arguments(Wrapper* self, ID3D12GraphicsCommandL
     return scratch.Get();
 }
 
-struct IndirectBufferView {
-    ID3D12Resource* resource = nullptr;
-    u64 offset = 0, bytes = 0;
-    UINT stride = 0;
-    bool upload = false;
-    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
-};
+using IndirectBufferView = IndirectBufferViewOf<ID3D12Resource>;
 
 // X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
 // (a committed default buffer that holds zeros) is read from title memory, snapshotted into its own recycled pool.
@@ -2369,7 +2368,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         return IndirectBufferView{};
     };
     u64 address = 0, offset = 0, bytes = 0;
-    UINT stride = 0;
+    UINT stride = 0, records = 0;
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
@@ -2400,6 +2399,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             offset = view.Buffer.FirstElement * element;
             bytes = u64{view.Buffer.NumElements} * element;
             stride = raw ? 0 : element;
+            records = view.Buffer.NumElements;
             if (const auto base = reinterpret_cast<u64>(owner->own().title_memory)) {
                 // A buffer on a custom heap outside the placement index (the memory view path places it in the title's
                 // own heap) is that memory: the view offset is bound in the token's own desktop resource.
@@ -2418,6 +2418,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     } else {
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
+        records = words[2];
         bytes = u64{stride ? stride : 1} * words[2];
     }
     // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
@@ -2428,7 +2429,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring, true);
         if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
         std::memset(zero_bytes, 0, 16);
-        return {zero_ring, zero_offset, 16, 0, true, 3};
+        return indirect_buffer_view(zero_ring, zero_offset, 16, 0, 0, true, 3);
     }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
     if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
@@ -2440,7 +2441,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
-            if (!owner) return {allocation.resource, allocation.offset, bytes, stride, true};
+            if (!owner) return indirect_buffer_view(allocation.resource, allocation.offset, bytes, stride, records, true, 0);
             return refuse("an input buffer view token names the list's upload memory");
         }
         const auto placed = placed_buffer_range(device, address, bytes);
@@ -2452,7 +2453,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             if (!alias.resource)
                 return refuse(in_upload ? "an input range crosses the end of its upload allocation"
                                         : "an input is in title memory outside any placed buffer");
-            return {alias.resource, alias.offset, bytes, stride};
+            return indirect_buffer_view(alias.resource, alias.offset, bytes, stride, records, false, 0);
         }
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
@@ -2470,7 +2471,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                     return refuse("an input range in title memory is not readable");
                 if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring, true) || !ring)
                     return refuse("an input range could not be copied from title memory");
-                return {ring, ring_offset, bytes, stride, true, 2};
+                return indirect_buffer_view(ring, ring_offset, bytes, stride, records, true, 2);
             } else {
                 return refuse("an input is in a placed buffer that does not alias title memory");
             }
@@ -2498,7 +2499,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload, input_source};
+    return indirect_buffer_view(native, offset, bytes, stride, records, upload, input_source);
 }
 
 struct FormattedBufferDescriptor {
@@ -2772,6 +2773,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(views));
     }
     std::uint32_t strides[32] = {};
+    std::uint32_t record_counts[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
@@ -2992,6 +2994,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (!view.upload)
                 require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             strides[i] = view.stride;
+            record_counts[i] = view.records;
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
@@ -3019,6 +3022,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
                     bytes = std::size_t{view.Buffer.NumElements} * element;
                     strides[i] = typed_view ? element : view.Buffer.StructureByteStride;
+                    record_counts[i] = view.Buffer.NumElements;
                 }
             }
         }
@@ -3026,6 +3030,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A hardware buffer descriptor the title wrote itself: base address, stride and record count.
             address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);
             strides[i] = (words[1] >> 16) & 0x3fff;
+            record_counts[i] = words[2];
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         const std::size_t view_bytes = bytes;  // before the 16 MiB copy cap
@@ -3186,6 +3191,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
+            : ud.kind == Translation::num_records && ud.a >= 0 && ud.a < 32 ? record_counts[ud.a]
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a]
             : ud.kind == Translation::desc_word3 ? formatted_buffers[ud.a].words[3] : 0;
     }

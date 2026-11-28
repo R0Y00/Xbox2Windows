@@ -1008,13 +1008,26 @@ def raw_descriptor_alu(base, syms, constants):
                 return ('descnum', 'stride', word)
         if plain and field == 2 and base == 's_mul_i32':
             if syms[other] in (('descnum', kind, desc_word(word, word[3] - 1)) for kind in ('stride', 'stride_min1')):
-                return word + ('byte_count',)
+                # The clamp (s_max_u32 with 1) makes a stride of 0 count as one byte per record. The extra tag is
+                # how a pixel load bounds the read by that product; stores accept either tag.
+                return word + (('byte_count', 'min1') if syms[other][1] == 'stride_min1' else ('byte_count',))
         if field == 3:
             if plain and base == 's_and_b32' and constants[other] == 0xcfffffff:
                 return word + ('oob0',)
             if (plain or word[loaded:] == ('oob0',)) and base == 's_or_b32' and constants[other] == 0x30000000:
                 return word[:loaded] + ('oob3',)
     return None
+
+
+def raw_conversion_shapes(loaded):
+    """The two four-word forms of one descriptor load after the structured-to-raw conversion.
+
+    Word 1 has its stride cleared, word 2 is the byte count (the plain product, or the product after the stride
+    was clamped to at least 1), and word 3 selects raw out-of-range behavior."""
+    cleared = loaded[1] + ('stride0',)
+    oob = loaded[3] + ('oob3',)
+    return ((loaded[0], cleared, loaded[2] + ('byte_count',), oob),
+            (loaded[0], cleared, loaded[2] + ('byte_count', 'min1'), oob))
 
 
 def smem_offset(tok):
@@ -6054,7 +6067,7 @@ class Stage:
             d = dst[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
-                   if getattr(self, 'kind', None) in ('cs', 'vs') and len(syms) == 2 else None)
+                   if getattr(self, 'kind', None) in ('cs', 'vs', 'ps') and len(syms) == 2 else None)
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
                 if pair:
@@ -7209,7 +7222,7 @@ class Stage:
     def op_s_buffer_load_dwordx16(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 16)
 
-    def buffer_address(self, ops, mods, *, is_formatted=False):
+    def buffer_address(self, ops, mods, *, is_formatted=False, raw_conversion_ok=None):
         # MUBUF and MTBUF share the same address calculation: optional index * stride (idxen),
         # optional byte VGPR offset (offen), scalar byte offset (soffset) and 12-bit immediate
         # offset. Cache-policy flags (glc, slc, dlc) do not change the loaded bytes; lds, tfe
@@ -7224,8 +7237,11 @@ class Stage:
             raise Unsupported('buffer load with %d operands, expected 4' % len(ops))
         idxen, offen = 'idxen' in mods, 'offen' in mods
         what = 'indexed load' if idxen else 'buffer load'
+        # A typed MTBUF load does not use the raw bound (raw_conversion_ok is False there). Leaving the
+        # conversion accepted would read past NUM_RECORDS * stride as an ordinary Load.
+        allow_raw = (not idxen) if raw_conversion_ok is None else bool(raw_conversion_ok) and not idxen
         if not is_formatted:
-            key = self.load_descriptor(ops[2], what, stride0_ok=not idxen, raw_conversion_ok=not idxen)
+            key = self.load_descriptor(ops[2], what, stride0_ok=not idxen, raw_conversion_ok=allow_raw)
         else:
             key = self.descriptor(ops[2])
         if isinstance(key[0], tuple) and key[0][:2] == ('resheap', 'per_lane') and idxen:
@@ -7267,6 +7283,7 @@ class Stage:
         if soffset is not None:
             terms.append(soffset)
         terms.append('%d' % offset)
+        self.address_terms = terms
         return buf, ' + '.join(terms)
 
     def op_buffer_load_dword(self, ops, mods, count=1):
@@ -7277,9 +7294,30 @@ class Stage:
             raise Unsupported('buffer load with 0 operands, expected 4')
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
-        self.emit('a = %s;' % address)
-        for i in range(count):
-            self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i))
+        # A pixel load through the full conversion is a raw byte-address read. The hardware compares the address
+        # against the converted NUM_RECORDS, which is the 32-bit product of the original record count and stride
+        # (at least 1 when the extract was clamped). The entry constants are that view's stride and record count.
+        # Each term of the address is added first: a wrapped sum is out of range even when the truncated value
+        # would have landed inside the buffer.
+        bound = getattr(self, 'raw_load_bound', None) if getattr(self, 'kind', None) == 'ps' else None
+        if bound:
+            index = self.pipe.resources[bound[0]]['index']
+            stride = self.pipe.ud(('stride', index))
+            records = self.pipe.ud(('numrecords', index))
+            factor = 'max(ud%d, 1u)' % stride if bound[1] else 'ud%d' % stride
+            self.emit('{ uint lim = %s * ud%d; uint base = 0; bool ok = true;' % (factor, records))
+            for term in self.address_terms:
+                self.emit('ok = ok && base + (%s) >= base; base += %s;' % (term, term))
+            self.emit('a = base;')
+            for i in range(count):
+                end = 4 * (i + 1)
+                self.set_v(dst[1] + i,
+                           '(ok && a + %du >= a && a + %du <= lim) ? %s.Load(a + %d) : 0u' % (end, end, buf, 4 * i))
+            self.emit('}')
+        else:
+            self.emit('a = %s;' % address)
+            for i in range(count):
+                self.set_v(dst[1] + i, '%s.Load(a + %d)' % (buf, 4 * i))
 
     def op_buffer_load_dwordx2(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 2)
@@ -7412,7 +7450,10 @@ class Stage:
           and word 3 OOB_SELECT set to raw mode (`oob3` via 0x30000000). Permitted when the load
           is non-indexed and the resulting byte range is validated.
         Any other scalar ALU modifications or unproven overwrites raise Unsupported.
+        A pixel-stage load that matches the full conversion records raw_load_bound so the read can be limited
+        to the converted byte count.
         """
+        self.raw_load_bound = None
         key = self.descriptor(tok)
         rsrc = reg_range(tok)
         first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 3 else None
@@ -7424,7 +7465,13 @@ class Stage:
                 cleared = loaded[1] + ('stride0',)
                 valid = valid or actual == (loaded[0], cleared, *loaded[2:])
                 if not valid and raw_conversion_ok:
-                    valid = actual == (loaded[0], cleared, loaded[2] + ('byte_count',), loaded[3] + ('oob3',))
+                    shapes = raw_conversion_shapes(loaded)
+                    if actual == shapes[0]:
+                        valid = True
+                        self.raw_load_bound = (key, False)
+                    elif actual == shapes[1]:
+                        valid = True
+                        self.raw_load_bound = (key, True)
             if (not valid or key in getattr(self.pipe, 'other_modified', ())
                     or (key in getattr(self.pipe, 'modified', ()) and not stride0_ok)):
                 raise Unsupported('%s through a modified descriptor' % what)
@@ -7445,7 +7492,7 @@ class Stage:
             cleared = loaded[1] + ('stride0',)
             valid = valid or actual == (loaded[0], cleared, *loaded[2:])
             if not valid and raw_conversion_ok:
-                valid = actual == (loaded[0], cleared, loaded[2] + ('byte_count',), loaded[3] + ('oob3',))
+                valid = actual in raw_conversion_shapes(loaded)
         if (not valid or key in getattr(self.pipe, 'other_modified', ())
                 or (key in getattr(self.pipe, 'modified', ()) and not stride0_ok)):
             raise Unsupported('%s through a modified descriptor' % what)
@@ -7663,7 +7710,8 @@ class Stage:
         dst = reg_range(ops[0])
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
-        buf, address = self.buffer_address(ops, [m for m in mods if not m.startswith('format:')])
+        buf, address = self.buffer_address(
+            ops, [m for m in mods if not m.startswith('format:')], raw_conversion_ok=False)
         self.emit('a = %s;' % address)
         self.load_format(fmt, buf, dst[1], count)
 
