@@ -16,6 +16,8 @@ the chosen `os`, `console` and `gpu` layers, each overriding the one before. The
     and environment, and
   - prints the allowlisted triage of the run's logs (tools/startup/triage_run.py).
 Runs go to out/startup/runs/<time>-<console>-<os>-<gpu>/ (log/, stage/, storage/, settings.json).
+The child starts from the caller's environment. X2W_* and WINE* values set there that reach the run are
+recorded in settings.json (`inherited_env`); an env value of null removes the variable, also when the caller set it.
 
 --print shows the merged settings and the command without staging or starting anything.
 """
@@ -60,6 +62,8 @@ OPTIONS = {
 }
 # Launcher-only keys: handled here, never passed through as a script switch.
 OWN_KEYS = {"package_drive"}
+# Caller variables that are recorded in settings.json when they reach the run.
+RECORDED_PREFIXES = ("X2W_", "WINE")
 
 
 class PresetError(ValueError):
@@ -95,7 +99,8 @@ def check_layer(where: str, body: dict) -> None:
 
 
 def merge(presets: dict, choice: dict) -> dict:
-    """{"run": {...}, "env": {...}, "layers": [...]}: base, then each chosen layer in LAYERS order."""
+    """{"run": {...}, "env": {...}, "unset": [...], "layers": [...]}: base, then each chosen layer in LAYERS
+    order. `unset` names the env keys whose last value is null; they are removed from the run's environment."""
     run: dict = {}
     env: dict = {}
     layers = ["base"]
@@ -109,8 +114,18 @@ def merge(presets: dict, choice: dict) -> dict:
     for body in bodies:
         run.update(body.get("run", {}))
         env.update(body.get("env", {}))
-    env = {k: v for k, v in env.items() if v is not None}  # null in a later layer unsets an earlier value
-    return {"run": run, "env": env, "layers": layers}
+    unset = sorted(k for k, v in env.items() if v is None)  # null unsets an earlier layer's or the caller's value
+    env = {k: v for k, v in env.items() if v is not None}
+    return {"run": run, "env": env, "unset": unset, "layers": layers}
+
+
+def child_env(settings: dict, environ) -> tuple[dict, dict]:
+    """(the run's environment, the recorded caller values that reach it unchanged)."""
+    env = {k: v for k, v in environ.items() if k not in settings["unset"]}
+    inherited = {k: v for k, v in sorted(env.items())
+                 if k.startswith(RECORDED_PREFIXES) and k not in settings["env"]}
+    env.update(settings["env"])
+    return env, inherited
 
 
 def host_os() -> str:
@@ -258,9 +273,14 @@ def main(argv=None) -> int:
     staged_exe = stage_dir / exe.relative_to(package)
     cmd = build_command("linux" if host == "linux" else "windows", settings, staged_exe, package, log, storage)
 
+    env, inherited = child_env(settings, os.environ)
     print(f"run_preset: {' + '.join(settings['layers'])}")
     for k, v in sorted(settings["env"].items()):
         print(f"  env {k}={v}")
+    for k, v in inherited.items():
+        print(f"  env {k}={v} (from the caller's shell)")
+    for k in settings["unset"]:
+        print(f"  unset {k}")
     if a.print:
         if host != "linux" and settings["run"].get("package_drive"):
             print(f"  mount: subst {settings['run']['package_drive'].rstrip(':').upper()}: {package}")
@@ -274,11 +294,10 @@ def main(argv=None) -> int:
         print(f"run_preset: run.sh has no drive mapping; dosdevices/{settings['run']['package_drive'].lower()}: "
               "in the prefix must point at the package root")
     staged_exe, linked, copied = stage(package, exe, stage_dir)
-    (run_dir / "settings.json").write_text(json.dumps({"choice": choice, **settings, "command": cmd}, indent=2),
-                                           encoding="utf-8")
+    (run_dir / "settings.json").write_text(
+        json.dumps({"choice": choice, **settings, "inherited_env": inherited, "command": cmd}, indent=2),
+        encoding="utf-8")
     print(f"run_preset: staged {linked} linked + {copied} copied PE file(s); run folder {run_dir}")
-    env = dict(os.environ)
-    env.update(settings["env"])
     letter = settings["run"].get("package_drive") if host != "linux" else None
     mounted = False
     try:

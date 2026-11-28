@@ -91,7 +91,12 @@ for os_name in presets["os"]:
 mini = {"base": {"run": {"render": True}, "env": {"X2W_A": "1", "X2W_B": "1"}},
         "os": {"w": {"env": {"X2W_B": None}}}, "console": {"x": {"env": {"X2W_A": "2"}}}, "gpu": {"n": {}}}
 m = rp.merge(mini, {"os": "w", "console": "x", "gpu": "n"})
-check(m["env"] == {"X2W_A": "2"}, "a later layer overrides, null unsets")
+check(m["env"] == {"X2W_A": "2"} and m["unset"] == ["X2W_B"], "a later layer overrides, null unsets")
+caller = {"X2W_A": "caller", "X2W_B": "caller", "X2W_WIN_PYTHON": "py.exe", "WINEPREFIX": "/p", "PATH": "/bin"}
+env, inherited = rp.child_env(m, caller)
+check(env == {"X2W_A": "2", "X2W_WIN_PYTHON": "py.exe", "WINEPREFIX": "/p", "PATH": "/bin"},
+      f"null removes a caller's value, layers override it, the rest is kept: {env}")
+check(inherited == {"WINEPREFIX": "/p", "X2W_WIN_PYTHON": "py.exe"}, f"caller X2W_/WINE values are recorded: {inherited}")
 off = {"run": {"render": False, "translate": True, "seconds": 5}, "env": {}}
 cmd = rp.build_command("windows", off, pkg / "t.exe", pkg, pkg / "log", pkg / "storage")
 check("-Render" not in cmd and "-Translate" in cmd and cmd[cmd.index("-Seconds") + 1] == "5",
@@ -205,12 +210,39 @@ with tempfile.TemporaryDirectory() as tmp:
             (package / "bin" / name).write_bytes(data)
 
     out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        code = rp.main(["--package", str(package), "--console", "s", "--gpu", "amd", "--os", "win11", "--print",
-                        "--runs", str(Path(tmp) / "runs")])
+    rp.os.environ["X2W_PRESET_CHECK_CALLER"] = "1"
+    try:
+        with contextlib.redirect_stdout(out):
+            code = rp.main(["--package", str(package), "--console", "s", "--gpu", "amd", "--os", "win11", "--print",
+                            "--runs", str(Path(tmp) / "runs")])
+    finally:
+        del rp.os.environ["X2W_PRESET_CHECK_CALLER"]
     check(code == 0 and "X2W_DEVICE_TYPE=6" in out.getvalue() and "run.ps1" in out.getvalue()
-          and f"mount: subst G: {package}" in out.getvalue(), "--print output")
+          and f"mount: subst G: {package}" in out.getvalue()
+          and "X2W_PRESET_CHECK_CALLER=1 (from the caller's shell)" in out.getvalue(), "--print output")
     check(not (Path(tmp) / "runs").exists(), "--print creates nothing")
+
+    # A run with the child start replaced: the environment it gets and what settings.json records.
+    mini_path = Path(tmp) / "mini.json"
+    mini_path.write_text(json.dumps(mini), encoding="utf-8")
+    calls = []
+    real_call = rp.subprocess.call
+    rp.subprocess.call = lambda argv, **kw: calls.append((argv, kw.get("env"))) or 0
+    rp.os.environ["X2W_B"] = "caller"
+    rp.os.environ["X2W_PRESET_CHECK_CALLER"] = "1"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = rp.main(["--package", str(package), "--console", "x", "--gpu", "n", "--os", "w",
+                            "--presets", str(mini_path), "--run-dir", str(Path(tmp) / "run4")])
+    finally:
+        rp.subprocess.call = real_call
+        del rp.os.environ["X2W_B"], rp.os.environ["X2W_PRESET_CHECK_CALLER"]
+    recorded = json.loads((Path(tmp) / "run4" / "settings.json").read_text(encoding="utf-8"))
+    child = calls[0][1] if calls else {}
+    check(code == 0 and "X2W_B" not in child and child.get("X2W_A") == "2"
+          and child.get("X2W_PRESET_CHECK_CALLER") == "1", "the run's environment: null removes the caller's value")
+    check(recorded.get("inherited_env", {}).get("X2W_PRESET_CHECK_CALLER") == "1" and recorded.get("unset") == ["X2W_B"]
+          and "X2W_B" not in recorded["inherited_env"], "settings.json records the caller's values and the unset keys")
 
     (package / "MicrosoftGame.config").write_text("<Game/>", encoding="utf-8")
     refused(lambda: rp.package_executable(package), "a config without an Executable")

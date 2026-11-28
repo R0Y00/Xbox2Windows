@@ -937,7 +937,8 @@ instead of a hand-picked set of switches. It takes three choices and the package
 | `--os` | `win11`, `win10`, `linux` | this host |
 
 The settings file has a `base` layer and one layer per choice. They apply in the order base, OS,
-console, GPU. A later layer overrides an earlier one, and an `env` value of `null` unsets it. Each entry
+console, GPU. A later layer overrides an earlier one, and an `env` value of `null` unsets it, also when
+the caller's shell set it. Each entry
 records why it is there. To change what everyone runs with, change the file and cite the run that
 supports the change. Do not add a launcher option for it. `--print` shows the merged switches, the
 environment and the command without staging or starting anything.
@@ -965,7 +966,9 @@ The launcher:
 - starts `run.ps1`, or `run.sh` on Linux, then prints `tools/startup/triage_run.py` for the run's logs.
 
 Runs go to `out/startup/runs/<time>-<console>-<os>-<gpu>/`, which holds `log/`, `stage/`, `storage/`
-and `settings.json`, the merged settings and the exact command. Input comes from the keyboard and
+and `settings.json`: the merged settings, the exact command, and under `inherited_env` the `X2W_*` and
+`WINE*` values from the caller's shell that reach the run (`X2W_WIN_PYTHON`, `X2W_FXC` and
+`X2W_HOST_PYTHON` for `run.sh`, for example); `--print` lists them too. Input comes from the keyboard and
 XInput pad 0 while the output window has focus; `input_script` in the settings file (or
 [Input script](#input-script)) replays a fixed sequence instead. No AMD or NVIDIA entry
 changes a switch today: no stand-in branches on the vendor, and no reported AMD run needed a
