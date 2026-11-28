@@ -7479,8 +7479,10 @@ PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
     PresentedPlanes out;
     std::uint64_t shown[window_planes] = {};
     const unsigned total = planes < window_planes ? planes : window_planes;
+    // If multiple planes are presented, default to compositing them all to avoid black screens 
+    // when plane 0 is empty or black (common in some titles).
     const unsigned only = wanted >= 0 ? (static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u)
-                          : present_composite_enabled() ? ~0u
+                          : (present_composite_enabled() || planes > 1) ? ~0u
                                                         : 0u;
     for (unsigned i = 0; i < total; ++i) {
         if (only != ~0u && i != only) continue;
