@@ -6810,6 +6810,40 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_avx_test PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_test.txt")
+    # cpu_aot_avx_round
+    set(cpu_avx_round_exports
+        "op_vroundps_xmm_rn,op_vroundps_xmm_rd,op_vroundps_xmm_ru,op_vroundps_xmm_rz,"
+        "op_vroundps_xmm_mxcsr,op_vroundps_xmm_suppress,op_vroundps_xmm_mem,"
+        "op_vroundps_ymm_rn,op_vroundps_ymm_rd,op_vroundps_ymm_ru,op_vroundps_ymm_rz,"
+        "op_vroundps_ymm_mxcsr,op_vroundps_ymm_mem,"
+        "op_vroundpd_xmm_rn,op_vroundpd_xmm_rd,op_vroundpd_xmm_ru,op_vroundpd_xmm_rz,"
+        "op_vroundpd_xmm_mxcsr,op_vroundpd_xmm_mem,"
+        "op_vroundpd_ymm_rn,op_vroundpd_ymm_rd,op_vroundpd_ymm_ru,op_vroundpd_ymm_rz,"
+        "op_vroundpd_ymm_mxcsr,op_vroundpd_ymm_mem,"
+        "op_vroundss_rn,op_vroundss_rd,op_vroundss_ru,op_vroundss_rz,"
+        "op_vroundss_mxcsr,op_vroundss_mem,"
+        "op_vroundsd_rn,op_vroundsd_rd,op_vroundsd_ru,op_vroundsd_rz,"
+        "op_vroundsd_mxcsr,op_vroundsd_mem,"
+        "op_vroundps_xmm_zero_upper,op_vroundpd_xmm_zero_upper,"
+        "op_vroundss_zero_upper,op_vroundsd_zero_upper,"
+        "op_vround_r8_reload,op_vround_discarded_read")
+    string(CONCAT cpu_avx_round_exports ${cpu_avx_round_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_round_${variant} avx_round)
+        cpu_translation(cpu_avx_round_${variant} cpu_avx_round_aot "${cpu_avx_round_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_round_altered PRIVATE ALTER_ROUND)
+    add_test(NAME cpu_aot_avx_round COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_round_check.py"
+        "$<TARGET_FILE:cpu_avx_round_original>"
+        "$<TARGET_FILE:cpu_avx_round_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_round_altered>"
+        "$<TARGET_FILE:cpu_avx_round_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_avx_round PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_round.txt")
     set(cpu_sse_mmx_int_exports
         "op_pavgb_mm_reg,op_pavgb_mm_mem,op_pavgb_mm_mem_plus1,op_pavgb_mm_self,"
         "op_pavgw_mm_reg,op_pavgw_mm_mem,op_pavgw_mm_mem_plus1,op_pavgw_mm_self,"
