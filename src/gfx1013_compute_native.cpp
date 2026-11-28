@@ -716,6 +716,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         // Both the saved/written destination and the updated EXEC are numeric mask words.
         set(i.dst, {});
         set(126, {});
+    } else if (!graphics && i.enc == Encoding::Sop1 && i.name.size() >= 13 &&
+               (i.name.substr(i.name.size() - 13) == "_saveexec_b64" ||
+                i.name.substr(i.name.size() - 11) == "_wrexec_b64")) {
+        // These instructions also overwrite both EXEC words implicitly.
+        set(i.dst, {});
+        set(i.dst + 1, {});
+        set(126, {});
+        set(127, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};

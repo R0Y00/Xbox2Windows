@@ -1941,6 +1941,57 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
             return true;
         }
+        if (n == "v_ldexp_f16") {
+            if (graphics_input)
+                return false;
+            if (i.subword || i.dpp_control || permuted || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[2])))
+                refuse(i.pc, "unsupported v_ldexp_f16 operand modifiers");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto inline_s0 = i.src[0] >= 240 && i.src[0] <= 248 ? packed_f16_inline_constant(i.src[0]) : std::nullopt;
+            auto bits = inline_s0 ? to_string(*inline_s0) : ir.binary("and", operand32(i, i.src[0]), "65535");
+            if (i.abs & 1) bits = ir.binary("and", bits, "32767");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
+            auto delta = ir.binary("ashr", ir.binary("shl", operand32(i, i.src[1]), "16"), "16");
+            auto sign = ir.binary("and", bits, "32768");
+            auto exponent = ir.binary("and", ir.binary("lshr", bits, "10"), "31");
+            auto mantissa = ir.binary("and", bits, "1023");
+            auto keep = ir.value("or i1 " + cmp("eq", exponent, "31") + ", " +
+                                 cmp("eq", ir.binary("and", bits, "32767"), "0"));
+            string x = mantissa, steps = "0";
+            for (unsigned k : {8u, 4u, 2u, 1u}) {
+                auto low = cmp("ult", x, to_string(1u << (11 - k)));
+                x = select(low, ir.binary("shl", x, to_string(k)), x);
+                steps = select(low, ir.binary("add", steps, to_string(k)), steps);
+            }
+            auto denormal = cmp("eq", exponent, "0");
+            mantissa = select(denormal, ir.binary("and", x, "1023"), mantissa);
+            auto e = select(denormal, ir.binary("sub", "1", steps), exponent);
+            delta = select(cmp("slt", delta, "-64"), "-64", select(cmp("sgt", delta, "64"), "64", delta));
+            e = ir.binary("add", e, delta);
+            auto normal = ir.binary("or", sign, ir.binary("or", ir.binary("shl", e, "10"), mantissa));
+            auto full = ir.binary("or", mantissa, "1024");
+            auto amount = select(cmp("sgt", e, "0"), "1", select(cmp("slt", e, "-10"), "11", ir.binary("sub", "1", e)));
+            auto half = ir.binary("shl", "1", ir.binary("sub", amount, "1"));
+            auto rest = ir.binary("and", full, ir.binary("sub", ir.binary("shl", half, "1"), "1"));
+            auto q = ir.binary("lshr", full, amount);
+            auto up = ir.value("or i1 " + cmp("ugt", rest, half) + ", " +
+                               ir.value("and i1 " + cmp("eq", rest, half) + ", " +
+                                        cmp("ne", ir.binary("and", q, "1"), "0")));
+            auto subnormal = ir.binary("or", sign, ir.binary("add", q, ir.value("zext i1 " + up + " to i32")));
+            string result = select(cmp("sgt", e, "0"), normal, select(cmp("slt", e, "-10"), sign, subnormal));
+            result = select(cmp("sgt", e, "30"), ir.binary("or", sign, "31744"), result);
+            result = select(keep, bits, result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         if (binary16_alu(n) || binary16_unary(n)) {
             // The graphics frontend shares this ALU. Leave those programs on the
             // existing refusal; this lowering is the direct compute path.
@@ -4180,6 +4231,7 @@ struct DirectCompute {
             op.name == "v_fmamk_f16" ||
             op.name == "v_fmaak_f16" ||
             op.name == "v_fract_f16" ||
+            op.name == "v_ldexp_f16" ||
             op.name == "v_cvt_norm_i16_f16" ||
             op.name == "v_cvt_norm_u16_f16")
                 half_binary = true;
