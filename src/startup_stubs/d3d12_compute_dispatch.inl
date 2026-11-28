@@ -39,7 +39,7 @@ struct ComputeTranslation {
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
-    x2w_startup::ManifestRetry manifest_retry;  // only an absent manifest can become ready later
+    x2w_startup::ManifestRetry manifest_retry;  // absent and stale manifests can become ready later
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
@@ -105,6 +105,21 @@ const char* load_compute_translation(ComputeTranslation& tr)
         tr.manifest_retry.missed(GetTickCount64());
         return nullptr;
     }
+    // A native manifest from another compiler revision, or an unmarked one without the Python translator's
+    // <key>.cs.hlsl, is stale: it is looked for again on the same schedule as an absent one.
+    const auto output = x2w::native_compute_output(manifest);
+    if (output == x2w::NativeComputeOutput::incompatible) {
+        tr.manifest_retry.missed(GetTickCount64());
+        return "native translation from another compiler revision; rebuild it";
+    }
+    if (output == x2w::NativeComputeOutput::unmarked) {
+        const DWORD attributes = cache_path(path, L"", tr.key, L".cs.hlsl")
+            ? GetFileAttributesW(path) : INVALID_FILE_ATTRIBUTES;
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            tr.manifest_retry.missed(GetTickCount64());
+            return "native translation without a revision; rebuild it";
+        }
+    }
     tr.manifest_retry.found();
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
@@ -121,6 +136,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (line != "stage cs") return "not a compute manifest";
             continue;
         }
+        if (line.compare(0, 7, "native ") == 0) continue;
         unsigned i = 0, x = 0, y = 0, z = 0, w = 0;
         int a = 0, b = 0, c = 0, d = 0, used = 0;
         char name[16] = "";
@@ -225,6 +241,16 @@ bool translate_compute_natively(ComputeTranslation& tr)
         for (const auto& block : program.constants)
             for (unsigned word = 0; word < block.count; ++word)
                 tr.uds.push_back({static_cast<int>(block.root_parameter), static_cast<int>(word)});
+        for (unsigned srv : program.stride_srvs) {
+            const bool present = std::any_of(program.bindings.begin(), program.bindings.end(), [srv](const auto& view) {
+                return view.kind == x2w::ComputeViewKind::raw_vector_srv && view.shader_register == srv;
+            });
+            if (!present) throw std::runtime_error("descriptor stride source is not a bound SRV");
+            ComputeTranslation::Slot slot{};
+            slot.a = static_cast<int>(srv);
+            slot.source = ComputeTranslation::input_stride;
+            tr.uds.push_back(slot);
+        }
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {

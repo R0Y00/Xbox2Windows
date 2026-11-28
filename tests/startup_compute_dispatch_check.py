@@ -22,6 +22,8 @@ memory; the output words are read from that memory after the queue's fence. The 
 7. slot 35 selects the correct table at descriptor index 2 instead of the swapped pair at the heap start;
    setting the same heap again preserves the table, but changing the compute root or view heap after binding
    must refuse at the table lookup, not an earlier check.
+8. published output compatibility: the same bytecode is refused with either stale native manifest
+   and runs with the current native marker or with the Python sidecar.
 Exit 77 only if the initial probe cannot use the adapter or required heaps.
 """
 import os
@@ -78,6 +80,7 @@ def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare_case(directory, adapter)
+        env.pop('X2W_NATIVE_SHADERS', None)  # Exercise published translations.
         untouched, expected = [C.SENTINEL] * C.WORDS, C.expected('A')
         assert expected != untouched
 
@@ -97,6 +100,28 @@ def main(consumer, dxc, adapter):
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
         assert f'{key:016x}: ok' in out, out
+
+        manifest = cache / f'{key:016x}.txt'
+        hlsl = cache / f'{key:016x}.cs.hlsl'
+        python_manifest = manifest.read_bytes()
+        python_hlsl = hlsl.read_bytes()
+        assert not any(line.startswith(b'native ') for line in python_manifest.splitlines())
+        hlsl.unlink()
+        for marker, reason in (
+            (b'', 'native translation without a revision; rebuild it'),
+            (b'native 0\n', 'native translation from another compiler revision; rebuild it'),
+        ):
+            manifest.write_bytes(python_manifest + marker)
+            got, result = dispatch(directory, consumer, env, 'dispatch')
+            assert got == untouched, 'a stale native output wrote the output buffer'
+            assert len(lines(result, 'Dispatch(3, 2, 2) refused: ' + reason)) == 1, result.stderr[-3000:]
+
+        # Reuse working bytecode to isolate the manifest gate from native adapter requirements.
+        manifest.write_bytes(python_manifest + b'native 1\n')
+        got, result = dispatch(directory, consumer, env, 'dispatch')
+        assert got == expected and not lines(result, 'refused:'), result.stderr[-3000:]
+        hlsl.write_bytes(python_hlsl)
+        manifest.write_bytes(python_manifest)
 
         got, result = dispatch(directory, consumer, env, 'dispatch')
         wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]

@@ -109,6 +109,8 @@ struct GraphicsLinkage {
 struct NativeComputeShader {
     std::vector<GraphicsLinkage> inputs, outputs;
     std::vector<ComputeConstants> constants;
+    // Additional b0 words, after root constants, read from these bound SRVs.
+    std::vector<unsigned> stride_srvs;
     std::string hlsl, dxil_ir;
     std::vector<ComputeViewBinding> bindings;
     std::vector<ComputeSampler> samplers;
