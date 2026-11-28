@@ -4850,8 +4850,11 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 // Fence slot 10, desktop Signal(value) (also used by the DirectStorage stand-in's EnqueueSignal).
 HRESULT __stdcall fence_signal(Wrapper* self, UINT64 value)
 {
-    const HRESULT hr = static_cast<ID3D12Fence*>(self->own().real)->Signal(value);
-    fence_reached(self, value);
+    auto* fence = static_cast<ID3D12Fence*>(self->own().real);
+    const HRESULT hr = fence->Signal(value);
+    // A CPU Signal is synchronous and may rewind the fence. Publish the desktop observation,
+    // including zero; a failed Signal must not advance the title's completed-value word.
+    if (SUCCEEDED(hr)) InterlockedExchange64(&self->own().completed, static_cast<LONG64>(fence->GetCompletedValue()));
     return hr;
 }
 // Fence slot 8, desktop GetCompletedValue().
