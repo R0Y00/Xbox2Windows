@@ -2025,7 +2025,8 @@ struct DirectCompute {
                     n == "s_bcnt0_i32_b32" || n == "s_bcnt1_i32_b32" ||
                     n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
                     inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
-                    n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
+                    n == "s_or_b32" || n == "s_max_u32" || n == "s_min_u32" || n == "s_min_i32" ||
+                    n == "s_max_i32" || n == "s_absdiff_i32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
                     n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
                     n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
