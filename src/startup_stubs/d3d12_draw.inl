@@ -671,9 +671,6 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
             (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())) &&
             (slot57_entry.empty() || publish_shader_request(key, L".ps57in", slot57_entry.data(), slot57_entry.size())))
             publish_shader_request(key, L".a", a, a_bytes);
-#ifdef X2W_NATIVE_SHADERS
-        if (try_native_graphics(*entry)) return entry;
-#endif
         load_translation(*entry);
     }
     return entry;
@@ -1277,11 +1274,15 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         entry = new Translation;
         entry->key = key;
         entry->rtv_request = request;
-#ifdef X2W_NATIVE_SHADERS
-        if (GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", nullptr, 0) &&
-            publish_shader_request(key, L".rtv", request.data(), request.size()) && try_native_graphics(*entry, true)) return entry;
-#endif
         load_translation(*entry, request);
+#ifdef X2W_NATIVE_SHADERS
+        if (entry->state != 1 && entry->manifest_retry.pending() && !entry->native_graphics_attempted &&
+            GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", nullptr, 0) &&
+            publish_shader_request(key, L".rtv", request.data(), request.size())) {
+            entry->native_graphics_attempted = true;
+            try_native_graphics(*entry, true);
+        }
+#endif
         if (entry->state != 1) {
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
