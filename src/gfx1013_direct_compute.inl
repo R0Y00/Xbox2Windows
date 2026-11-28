@@ -3055,6 +3055,37 @@ struct DirectCompute {
                 write_ballot(sdst, carry);
             return;
         }
+        if (n == "v_cvt_f64_i32" || n == "v_cvt_f64_u32") {
+            // Exact binary64 conversion of a 32-bit signed/unsigned integer (#3363) using pure 32-bit integer ops
+            // and FirstbitHi (dx.op.unaryBits.i32 33); needs neither DoublePrecisionFloatShaderOps nor Int64ShaderOps.
+            if (pixel_stage || graphics_input || i.subword || i.dpp_control || permuted ||
+                i.abs || i.neg || i.clamp || i.scale ||
+                (i.wide && ((i.a & 0x7800) || i.src[1] || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " stage or operand modifiers");
+            if (i.dst < 256 || i.dst >= 511)
+                refuse(i.pc, string(n) + " requires a 64-bit VGPR destination pair");
+            if (i.src[0] >= 240 && i.src[0] <= 248)
+                refuse(i.pc, string(n) + " with an inline float source");
+            const bool is_signed = n == "v_cvt_f64_i32";
+            auto x = operand32(i, i.src[0]);
+            auto is_neg = is_signed ? cmp("slt", x, "0") : string();
+            auto mag = is_signed ? select(is_neg, ir.binary("sub", "0", x), x) : x;
+            auto is_zero = cmp("eq", mag, "0");
+            auto lz = ir.invoke("i32", "unaryBits.i32", 33, {{"i32", mag}}, "nounwind readnone");
+            auto safe_lz = select(is_zero, "0", lz);
+            auto msb = ir.binary("sub", "31", safe_lz);
+            auto exp = ir.binary("add", "1023", msb);
+            auto frac = ir.binary("and", ir.binary("shl", mag, safe_lz), "2147483647");
+            auto hi_nz = ir.binary("or", ir.binary("shl", exp, "20"), ir.binary("lshr", frac, "11"));
+            if (is_signed)
+                hi_nz = ir.binary("or", hi_nz, select(is_neg, "2147483648", "0"));
+            auto lo_nz = ir.binary("shl", frac, "21");
+            auto lo = select(is_zero, "0", lo_nz);
+            auto hi = select(is_zero, "0", hi_nz);
+            vector_write(i.dst, lo);
+            vector_write(i.dst + 1, hi);
+            return;
+        }
         if (auto dst = carry_destination(i)) {
             if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.dpp_control || i.clamp || i.neg || i.scale)
                 refuse(i.pc, "unsupported carry instruction stage or operand modifiers");
