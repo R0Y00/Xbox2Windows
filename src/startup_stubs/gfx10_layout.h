@@ -72,13 +72,14 @@ inline UINT block_log2(UINT mode)
 }
 
 // A three-dimensional texture in the 4 KiB standard mode (0x105), which addrlib lays out in thick blocks
-// (Gfx10Lib::HwlIsThick: a 3D resource in a standard or display mode): one mip of uncompressed texels.
+// (Gfx10Lib::HwlIsThick: a 3D resource in a standard or display mode): uncompressed texels, with a mip
+// chain or without.
 inline bool supports_volume(const D3D12_RESOURCE_DESC& d)
 {
     const Element element = element_of(d.Format);
     return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && swizzle_mode(d) == 5 && element.bytes && element.texels == 1 &&
            d.Width && d.Height && d.DepthOrArraySize && d.Width <= 2048 && d.Height <= 2048 && d.DepthOrArraySize <= 2048 &&
-           d.MipLevels == 1 && d.SampleDesc.Count == 1;
+           d.MipLevels && d.MipLevels <= max_mips && d.SampleDesc.Count == 1;
 }
 
 // A two-dimensional, single-sample texture whose memory this header can address, a one-dimensional
@@ -111,8 +112,9 @@ struct Layout {
     std::array<UINT, max_mips> row_pitch{};               // elements per row of a linear mip
     std::array<UINT, 256> x_bits{}, y_bits{};             // in-block byte offset contributed by a coordinate
     // A volume (supports_volume): its depth, the depth of a thick block, the in-block offset contributed by z,
-    // and the bytes of one layer of blocks. Its one slice holds every depth layer; a 2D texture keeps 1, 1, 0.
-    UINT depth = 1, block_depth = 1, blocks_high = 0;
+    // and the bytes of one layer of blocks, which holds that layer of every mip. Its one slice holds every
+    // depth layer; a 2D texture keeps 1, 1, 0.
+    UINT depth = 1, block_depth = 1;
     std::array<UINT, 256> z_bits{};
     std::uint64_t layer_size = 0;
 
@@ -217,14 +219,22 @@ struct Layout {
         }
     }
 
-    // A volume in the 4 KiB standard mode, one mip (supports_volume). The 12 address bits of a thick block
-    // follow the one-pipe rows of GFX10_SW_4K_S3_PATINFO (nibble01 rows 29-33, nibble2 rows 131-135), by
-    // element size; "0" is a bit inside the element. The block is 2^n texels on each axis, n counting that
-    // axis in the row (addrlib ComputeThickBlockDimension: Block1K_3d scaled to 4 KiB). Blocks follow in x,
-    // then y, then z, a layer of pitch x height blocks at a time (Gfx10Lib::ComputeSurfaceAddrFromCoord-
-    // MacroTiled for a thick, single-mip surface: the slice size times the block depth per layer).
+    // A volume in the 4 KiB standard mode (supports_volume). The 12 address bits of a thick block follow the
+    // one-pipe rows of GFX10_SW_4K_S3_PATINFO (nibble01 rows 29-33, nibble2 rows 131-135), by element size;
+    // "0" is a bit inside the element. The block is 2^n texels on each axis, n counting that axis in the row
+    // (addrlib ComputeThickBlockDimension: Block1K_3d scaled to 4 KiB).
+    //
+    // The volume is stored a layer of blocks (block_depth texels deep) at a time, and each layer holds that
+    // layer of every mip (Gfx10Lib::ComputeSurfaceInfoMacroTiled and ComputeSurfaceAddrFromCoordMacroTiled
+    // for a thick surface): first the shared tail block when the chain has one, then the mips from the
+    // smallest to the largest, each pitch x height blocks in x, then y. Mip sizes round up at every level
+    // (GetMipSize). A mip is in the tail when it is at most a block wide and half a block high
+    // (GetMipTailDim: a 4 KiB block halves its height) and at most five mips remain (GetMaxNumMipsInTail for
+    // a thick 4 KiB block). Tail mip k from the end sits at byte (k << 8) of the tail block; that offset,
+    // read back as 256-byte micro blocks of Block256_3d, is its origin in x and y. Its z is not moved.
     void thick(const D3D12_RESOURCE_DESC& d)
     {
+        static constexpr UINT micro[5][2] = {{8, 4}, {4, 4}, {4, 4}, {4, 2}, {2, 2}}; // Block256_3d width, height
         static constexpr const char* rows4k[5] = {
             "X0X1Z0Y0Z1Y1X2Z2Y2X3Z3Y3", "--X0Z0Y0Z1Y1X1Z2Y2X2Z3Y3", "----X0Y0Z0Y1X1Z1Y2X2Z2Y3",
             "------X0Z0Y0X1Z1Y1X2Z2Y2", "--------Z0Y0X0Z1Y1X1Z2Y2"};
@@ -253,11 +263,36 @@ struct Layout {
                 if (bit < ys) y_bits[v] |= 1u << y_at[bit];
                 if (bit < zs) z_bits[v] |= 1u << z_at[bit];
             }
+        const auto shifted = [](UINT v, UINT mip) { return (std::max)(1u, (v + (1u << mip) - 1) >> mip); };
+        constexpr UINT tail_mips = 5;
         first_tail = mips;
-        blocks_wide[0] = (width + block_width - 1) / block_width;
-        blocks_high = (height + block_height - 1) / block_height;
-        layer_size = std::uint64_t{blocks_wide[0]} * blocks_high * block_bytes;
+        for (UINT mip = 0; mips > 1 && mip < mips; ++mip)
+            if (shifted(width, mip) <= block_width && shifted(height, mip) <= block_height / 2 && mips - mip <= tail_mips) {
+                first_tail = mip;
+                break;
+            }
+        std::array<std::uint64_t, max_mips> size{};
+        for (UINT mip = 0; mip < first_tail; ++mip) {
+            blocks_wide[mip] = (shifted(width, mip) + block_width - 1) / block_width;
+            size[mip] = std::uint64_t{blocks_wide[mip]} * ((shifted(height, mip) + block_height - 1) / block_height) * block_bytes;
+        }
+        std::uint64_t offset = first_tail < mips ? block_bytes : 0;
+        for (UINT mip = first_tail; mip-- > 0;) {
+            start[mip] = offset;
+            offset += size[mip];
+        }
+        layer_size = offset;
         slice_size = layer_size * ((depth + block_depth - 1) / block_depth);
+        for (UINT mip = first_tail; mip < mips; ++mip) {
+            const UINT tail_offset = (tail_mips - 1 - (mip - first_tail)) << 8;
+            UINT x = 0, y = 0;
+            for (UINT bit = 0; bit < 2; ++bit) {
+                y |= ((tail_offset >> (8 + 2 * bit)) & 1) << bit;
+                x |= ((tail_offset >> (9 + 2 * bit)) & 1) << bit;
+            }
+            origin_x[mip] = x * micro[element_log2][0];
+            origin_y[mip] = y * micro[element_log2][1];
+        }
     }
 
     // Elements a mip holds, with the desktop's mip sizes (rounded down, at least one texel).
@@ -270,10 +305,14 @@ struct Layout {
     // layer of a volume.
     std::uint64_t address(UINT mip, UINT x, UINT y, UINT slice, UINT z = 0) const
     {
-        if (block_depth > 1) // a volume (thick)
-            return std::uint64_t{z / block_depth} * layer_size +
-                   (std::uint64_t{y / block_height} * blocks_wide[0] + x / block_width) * block_bytes +
-                   (x_bits[x % block_width] | y_bits[y % block_height] | z_bits[z % block_depth]);
+        if (block_depth > 1) { // a volume (thick)
+            const std::uint64_t layer = std::uint64_t{z / block_depth} * layer_size + start[mip];
+            const UINT in_z = z_bits[z % block_depth];
+            if (mip >= first_tail)
+                return layer + (x_bits[(origin_x[mip] + x) % block_width] | y_bits[(origin_y[mip] + y) % block_height] | in_z);
+            return layer + (std::uint64_t{y / block_height} * blocks_wide[mip] + x / block_width) * block_bytes +
+                   (x_bits[x % block_width] | y_bits[y % block_height] | in_z);
+        }
         const std::uint64_t base = slice * slice_size;
         if (is_linear) return base + start[mip] + (std::uint64_t{y} * row_pitch[mip] + x) * bytes_per_element;
         if (mip >= first_tail) return base + (x_bits[(origin_x[mip] + x) & 255] | y_bits[(origin_y[mip] + y) & 255]);

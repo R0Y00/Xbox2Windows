@@ -1186,7 +1186,7 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     bad_clamp.view.Texture3D.ResourceMinLODClamp = 1.0f;
     invoke(guest, 70, ptr(&desc), ptr(&bad_clamp), cpu);
 
-    // 5. Wrong layout (console layout 0x105)
+    // 5. A console layout (0x105) over the live desktop-layout volume: refused as overlapping_resource
     D3D12_RESOURCE_DESC bad_layout = desc;
     bad_layout.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
     invoke(guest, 70, ptr(&bad_layout), ptr(&v), cpu);
