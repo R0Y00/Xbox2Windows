@@ -53,6 +53,11 @@ def missing_flags(options):
     return out
 
 
+def arg_after(cmd, flag):
+    """The value that follows `flag` in `cmd`, or None when the flag is missing (a FAIL, not a crash)."""
+    return cmd[cmd.index(flag) + 1] if flag in cmd[:-1] else None
+
+
 # --- the shipped presets ---------------------------------------------------------------------
 presets = rp.load_presets()
 check(missing_flags(rp.OPTIONS) == [], f"launcher switches missing from the scripts: {missing_flags(rp.OPTIONS)}")
@@ -76,12 +81,13 @@ for os_name, console, gpu in combos:
     if host == "linux":
         check(cmd[1].endswith("run.sh") and "--render" in cmd, f"{where}: run.sh command")
         check(s["env"].get("X2W_XMEM_SHARED_VIEWS") == "1", f"{where}: shared views on Linux")
+        check(arg_after(cmd, "--suspend-others") == "0", f"{where}: hook thread holding off")
     else:
         check(cmd[5].endswith("run.ps1") and "-Render" in cmd, f"{where}: run.ps1 command")
         check(s["run"].get("package_drive") == "G" and "-MapDrive" not in cmd, f"{where}: package on G through subst, not -MapDrive")
-        check(cmd[cmd.index("-SuspendOthers") + 1] == "0", f"{where}: hook thread holding off")
+        check(arg_after(cmd, "-SuspendOthers") == "0", f"{where}: hook thread holding off")
         check("X2W_XMEM_LAZY_COMMIT" not in s["env"], f"{where}: lazy commit stays off on Windows")
-    check(cmd[cmd.index("--storage" if host == "linux" else "-StoragePath") + 1] == str(pkg / "storage"),
+    check(arg_after(cmd, "--storage" if host == "linux" else "-StoragePath") == str(pkg / "storage"),
           f"{where}: per-run storage")
 
 
@@ -126,7 +132,7 @@ check(env == {"X2W_A": "2", "X2W_WIN_PYTHON": "py.exe", "WINEPREFIX": "/p", "PAT
 check(inherited == {"WINEPREFIX": "/p", "X2W_WIN_PYTHON": "py.exe"}, f"caller X2W_/WINE values are recorded: {inherited}")
 off = {"run": {"render": False, "translate": True, "seconds": 5}, "env": {}}
 cmd = rp.build_command("windows", off, pkg / "t.exe", pkg, pkg / "log", pkg / "storage")
-check("-Render" not in cmd and "-Translate" in cmd and cmd[cmd.index("-Seconds") + 1] == "5",
+check("-Render" not in cmd and "-Translate" in cmd and arg_after(cmd, "-Seconds") == "5",
       "a switch set to false is left out, values are passed")
 refused(lambda: rp.merge(mini, {"os": "w", "console": "z", "gpu": "n"}), "an unknown console")
 with tempfile.TemporaryDirectory() as tmp:
