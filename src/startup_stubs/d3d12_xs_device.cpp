@@ -6662,8 +6662,8 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_written_probe(void* address, uns
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
 // serves pageSize 2 (bits 14-15) from a 64 MiB block, then asserts that the block was used up:
 // the console runtime evidently takes committed-resource memory from XMemAlloc with allocatorId
-// 0x80. Hypothesis used here: attributes = pageSize (2, a 2 MiB page, selected from 4 MiB up; else 1)
-// << 14 | 0x80 << 16 | log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
+// 0x80. Hypothesis used here: attributes = pageSize (2 from 4 MiB up, else 1) << 14 | 0x80 << 16 |
+// log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
 // own memory and does not alias it.
 using XMemAllocHook = void*(__stdcall*)(SIZE_T, ULONGLONG);
 XMemAllocHook title_alloc_hook()
