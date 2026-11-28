@@ -2569,7 +2569,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
-    if (words[0] == view_token_magic) {
+    const bool view_token_input = words[0] == view_token_magic;
+    if (view_token_input) {
         ViewRecord record{};
         AcquireSRWLockShared(&note_lock);
         if (words[1] < view_records().size()) record = view_records()[words[1]];
@@ -2642,7 +2643,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
+        // A view token already names a desktop resource and its range. Reading it does not require the
+        // title-memory alias used for raw guest addresses; the later resource/device/range checks still apply.
+        if (!view_token_input && !placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
             return refuse("an input is in a placed buffer that does not alias title memory");
     } else if (own_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
