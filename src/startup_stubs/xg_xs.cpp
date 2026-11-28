@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/gfx10_texture.h"
 #include "startup_stubs/tile64_plan.h"
 #include "startup_stubs/small_texture_4k.h"
 #include <cstdio>
@@ -500,8 +501,8 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         return slots;
     }();
     const bool bc7_4k = use_bc7_4k_s_layout(desc);
-    // The 4 KiB profile requires UNKNOWN layout and one mip. BC64 requires layout 0x109 and six or nine mips.
-    const auto* slots = bc64::supports(desc) ? bc_table.data() : table.data();
+    // The 4 KiB profile requires UNKNOWN layout and one mip. Gfx10Texture requires explicit 0x100..0x10a layout.
+    const auto* slots = x2w_startup::Gfx10Texture::supports(desc) ? bc_table.data() : table.data();
     if (bc7_4k) slots = bc7_4k_table.data();
     auto* computer = new Computer{slots, desc, 1, bc7_4k};
     *reinterpret_cast<Computer**>(rdx) = computer;

@@ -1739,17 +1739,20 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
         written = found->second;
     ReleaseSRWLockShared(&written_lock);
-    const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
-    // Any other texture slot 70 publishes holds its texels in the console layout its description names
-    // (gfx10_layout.h, address_texture.h).
-    const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
+    const bool tiled_chain = !single && original && x2w_startup::bc64::supports(original->console);
     // Placed sampled BC7 surfaces can carry the same 64 KiB display layout as an address-only SRV.
     // GPU-authored resources have already returned above; only detile the CPU backing on upload.
     const bool placed_display_bc7 = !tiled_address && original && desc.MipLevels == 1 &&
         desc.DepthOrArraySize == 1 && desc.Format == DXGI_FORMAT_BC7_UNORM &&
         x2w_startup::gfx10::swizzle_mode(original->console) == 10 && console_layout_srv(original->console);
     const bool detile_console = console || placed_display_bc7;
-    const bool tiled = tiled_bc7 || tiled_address || tiled_chain || placed_display_bc7;
+    const bool is_gfx10_tiled = !placed_display_bc7 && !tiled_address && !single && original &&
+                                x2w_startup::Gfx10Texture::supports(original->console) &&
+                                (x2w_startup::Gfx10Texture::is_tiled(original->console) || mips > 1 || slices > 1);
+    // Any other texture slot 70 publishes holds its texels in the console layout its description names
+    // (gfx10_layout.h, address_texture.h).
+    const bool tiled_bc7 = !is_gfx10_tiled && !tiled_chain && !tiled_address && !placed_display_bc7 && written.bc7_width != 0;
+    const bool tiled = tiled_bc7 || tiled_address || tiled_chain || is_gfx10_tiled || placed_display_bc7;
     std::optional<x2w_startup::gfx10::Layout> console_layout;
     if (detile_console) console_layout.emplace(original->console);
     const auto generation = written.generation;
@@ -1761,7 +1764,7 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return true;
     }
-    if (tiled && !tiled_chain && !single && !detile_console && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !is_gfx10_tiled && !tiled_chain && !single && !detile_console && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return true;
     if (detile_console) {
         // The desktop footprints must hold exactly the elements the console layout addresses.
@@ -1782,7 +1785,17 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             rows_match = compact.level[i].rows == plan.rows[i] && compact.level[i].row_bytes == plan.row_bytes[i];
         if (!rows_match) return true;
     }
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : detile_console ? console_layout->bytes()
+    const x2w_startup::Gfx10Texture gfx10_tex = is_gfx10_tiled ? x2w_startup::Gfx10Texture(original->console) : x2w_startup::Gfx10Texture{};
+    if (is_gfx10_tiled) {
+        bool rows_match = gfx10_tex.levels == mips && gfx10_tex.slices == slices && plan.count == mips;
+        for (UINT i = 0; rows_match && i < mips; ++i)
+            rows_match = plan.bytes(i) && plan.rows[i] == gfx10_tex.rows(i) &&
+                         plan.row_bytes[i] == u64{gfx10_tex.columns(i)} * gfx10_tex.bpe;
+        if (!rows_match) return true;
+    }
+    const u64 total = is_gfx10_tiled ? gfx10_tex.bytes()
+        : tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes()
+        : detile_console ? console_layout->bytes()
         : tiled && !single ? surface.size() : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
@@ -1850,8 +1863,9 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             state.pending_list = list;
             state.revision = address_upload_revision;
         }
-    } else if (tiled_chain) {
-        const x2w_startup::bc64::Chain chain(original->console);
+    } else if (is_gfx10_tiled || tiled_chain) {
+        std::optional<x2w_startup::bc64::Chain> chain;
+        if (tiled_chain && !is_gfx10_tiled) chain.emplace(original->console);
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
@@ -1863,7 +1877,11 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                     return true;
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
-                chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
+                if (is_gfx10_tiled) {
+                    gfx10_tex.copy_subresource<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
+                } else {
+                    chain->copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
+                }
                 plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
             }
         }

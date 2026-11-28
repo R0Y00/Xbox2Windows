@@ -53,6 +53,7 @@ int main()
 
 #include "addrinterface.h"
 #include "../src/startup_stubs/bc64_chain.h"
+#include "../src/startup_stubs/gfx10_texture.h"
 
 namespace {
 // Mesa ac_fake_hw_db.h "navi21": family_id AMDGPU_FAMILY_NV, chip_external_rev 0x28, gb_addr_config 0x40 with
@@ -542,6 +543,142 @@ int bc64_tiling_reference()
     return failures ? 1 : 0;
 }
 
+int gfx10_tiling_reference()
+{
+    ADDR_HANDLE lib = create_navi21();
+    if (!lib) return 1;
+    struct Gfx10Case {
+        const char* name;
+        DXGI_FORMAT dxgi;
+        AddrFormat addr_fmt;
+        UINT_32 bpp;
+        UINT_32 width, height, mips, slices;
+        UINT layout;
+        AddrSwizzleMode mode;
+    };
+    const Gfx10Case cases[] = {
+        {"BC1 256x256 5m 64KB_S", DXGI_FORMAT_BC1_UNORM, ADDR_FMT_BC1, 64, 256, 256, 5, 1, 0x109, ADDR_SW_64KB_S},
+        {"BC1 128x128 4m 4KB_S",  DXGI_FORMAT_BC1_UNORM, ADDR_FMT_BC1, 64, 128, 128, 4, 1, 0x105, ADDR_SW_4KB_S},
+        {"BC2 128x128 4m 4KB_S",  DXGI_FORMAT_BC2_UNORM, ADDR_FMT_BC2, 128, 128, 128, 4, 1, 0x105, ADDR_SW_4KB_S},
+        {"BC3 128x128 5m 64KB_D", DXGI_FORMAT_BC3_UNORM, ADDR_FMT_BC3, 128, 128, 128, 5, 1, 0x10A, ADDR_SW_64KB_D},
+        {"BC4 256x128 6m 64KB_S", DXGI_FORMAT_BC4_UNORM, ADDR_FMT_BC4, 64, 256, 128, 6, 1, 0x109, ADDR_SW_64KB_S},
+        {"BC5 256x256 4m 64KB_D", DXGI_FORMAT_BC5_UNORM, ADDR_FMT_BC5, 128, 256, 256, 4, 1, 0x10A, ADDR_SW_64KB_D},
+        {"BC6H 256x256 4m 64KB_S", DXGI_FORMAT_BC6H_UF16, ADDR_FMT_BC6, 128, 256, 256, 4, 1, 0x109, ADDR_SW_64KB_S},
+        {"BC7 64x64 7m 4KB_S",    DXGI_FORMAT_BC7_UNORM, ADDR_FMT_BC7, 128, 64, 64, 7, 1, 0x105, ADDR_SW_4KB_S},
+        {"BC7 81x69 1m 4KB_D",    DXGI_FORMAT_BC7_UNORM, ADDR_FMT_BC7, 128, 81, 69, 1, 1, 0x106, ADDR_SW_4KB_D},
+        {"BC7 128x64 8m 4KB_S",   DXGI_FORMAT_BC7_UNORM, ADDR_FMT_BC7, 128, 128, 64, 8, 1, 0x105, ADDR_SW_4KB_S},
+        {"BC7 128x128 3m 2s 64KB_S", DXGI_FORMAT_BC7_UNORM, ADDR_FMT_BC7, 128, 128, 128, 3, 2, 0x109, ADDR_SW_64KB_S},
+        {"R8 64x64 1m 256B_S",    DXGI_FORMAT_R8_UNORM, ADDR_FMT_8, 8, 64, 64, 1, 1, 0x101, ADDR_SW_256B_S},
+        {"R8 64x64 1m 4KB_D",     DXGI_FORMAT_R8_UNORM, ADDR_FMT_8, 8, 64, 64, 1, 1, 0x106, ADDR_SW_4KB_D},
+        {"R8 128x128 4m 64KB_S",  DXGI_FORMAT_R8_UNORM, ADDR_FMT_8, 8, 128, 128, 4, 1, 0x109, ADDR_SW_64KB_S},
+        {"RG8 64x64 3m 4KB_D",    DXGI_FORMAT_R8G8_UNORM, ADDR_FMT_8_8, 16, 64, 64, 3, 1, 0x106, ADDR_SW_4KB_D},
+        {"R16 64x64 3m 4KB_S",    DXGI_FORMAT_R16_FLOAT, ADDR_FMT_16, 16, 64, 64, 3, 1, 0x105, ADDR_SW_4KB_S},
+        {"R32 64x64 1m 256B_D",   DXGI_FORMAT_R32_FLOAT, ADDR_FMT_32, 32, 64, 64, 1, 1, 0x102, ADDR_SW_256B_D},
+        {"RGBA8 128x128 4m 64KB_S", DXGI_FORMAT_R8G8B8A8_UNORM, ADDR_FMT_8_8_8_8, 32, 128, 128, 4, 1, 0x109, ADDR_SW_64KB_S},
+        {"BGRA8 64x64 3m 4KB_S",  DXGI_FORMAT_B8G8R8A8_UNORM, ADDR_FMT_8_8_8_8, 32, 64, 64, 3, 1, 0x105, ADDR_SW_4KB_S},
+        {"RGBA16 64x64 3m 64KB_D", DXGI_FORMAT_R16G16B16A16_FLOAT, ADDR_FMT_16_16_16_16, 64, 64, 64, 3, 1, 0x10A, ADDR_SW_64KB_D},
+        {"RGBA32 32x32 3m 4KB_S", DXGI_FORMAT_R32G32B32A32_FLOAT, ADDR_FMT_32_32_32_32, 128, 32, 32, 3, 1, 0x105, ADDR_SW_4KB_S},
+        {"RGBA8 64x64 3m LINEAR", DXGI_FORMAT_R8G8B8A8_UNORM, ADDR_FMT_8_8_8_8, 32, 64, 64, 3, 1, 0x100, ADDR_SW_LINEAR},
+        {"RGBA16 100x10 3m 2s LINEAR", DXGI_FORMAT_R16G16B16A16_FLOAT, ADDR_FMT_16_16_16_16, 64, 100, 10, 3, 2, 0x100, ADDR_SW_LINEAR},
+    };
+
+    for (const auto& c : cases) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = c.width;
+        desc.Height = c.height;
+        desc.DepthOrArraySize = static_cast<UINT16>(c.slices);
+        desc.MipLevels = static_cast<UINT16>(c.mips);
+        desc.Format = c.dxgi;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(c.layout);
+        if (!x2w_startup::Gfx10Texture::supports(desc)) {
+            std::printf("FAIL %s: Gfx10Texture::supports returned false\n", c.name);
+            ++failures;
+            continue;
+        }
+        const x2w_startup::Gfx10Texture tex(desc);
+
+        ADDR2_COMPUTE_SURFACE_INFO_INPUT in{};
+        ADDR2_COMPUTE_SURFACE_INFO_OUTPUT out{};
+        std::array<ADDR2_MIP_INFO, 16> mip_info{};
+        in.size = sizeof(in);
+        in.flags.texture = 1;
+        in.format = c.addr_fmt;
+        in.swizzleMode = c.mode;
+        in.resourceType = ADDR_RSRC_TEX_2D;
+        in.width = c.width;
+        in.height = c.height;
+        in.numMipLevels = c.mips;
+        in.numSlices = c.slices;
+        in.numSamples = in.numFrags = 1;
+        out.size = sizeof(out);
+        out.pMipInfo = mip_info.data();
+
+        const ADDR_E_RETURNCODE rc = Addr2ComputeSurfaceInfo(lib, &in, &out);
+        const bool is_linear = (c.mode == ADDR_SW_LINEAR);
+        bool ok = rc == ADDR_OK && out.surfSize == tex.bytes() && out.sliceSize == tex.slice_bytes() &&
+                  out.baseAlign == tex.alignment() && (is_linear || out.firstMipIdInTail == tex.first_tail);
+        if (ok) {
+            for (UINT_32 m = 0; m < c.mips; ++m) {
+                const UINT64 expected_off = (is_linear || m < tex.first_tail) ? mip_info[m].macroBlockOffset : mip_info[m].offset;
+                if (expected_off != tex.start(m)) {
+                    std::printf("FAIL %s mip %u offset: addrlib=%llu tex=%llu\n", c.name, m,
+                                static_cast<unsigned long long>(expected_off),
+                                static_cast<unsigned long long>(tex.start(m)));
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            std::printf("FAIL %s info: rc=%d surf=%llu/%llu slice=%llu/%llu align=%u/%llu tail=%u/%u\n", c.name, int(rc),
+                        static_cast<unsigned long long>(out.surfSize), static_cast<unsigned long long>(tex.bytes()),
+                        static_cast<unsigned long long>(out.sliceSize), static_cast<unsigned long long>(tex.slice_bytes()),
+                        out.baseAlign, static_cast<unsigned long long>(tex.alignment()),
+                        out.firstMipIdInTail, tex.first_tail);
+        }
+
+        if (ok) {
+            ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT ain{};
+            ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT aout{};
+            ain.size = sizeof(ain);
+            ain.flags.texture = 1;
+            ain.resourceType = ADDR_RSRC_TEX_2D;
+            ain.swizzleMode = c.mode;
+            ain.bpp = c.bpp;
+            ain.unalignedWidth = (c.width + tex.block_dim - 1) / tex.block_dim;
+            ain.unalignedHeight = (c.height + tex.block_dim - 1) / tex.block_dim;
+            ain.numMipLevels = c.mips;
+            ain.numSlices = c.slices;
+            ain.numSamples = ain.numFrags = 1;
+            aout.size = sizeof(aout);
+            for (ain.slice = 0; ain.slice < c.slices && ok; ++ain.slice) {
+                for (ain.mipId = 0; ain.mipId < c.mips && ok; ++ain.mipId) {
+                    const UINT cols = tex.columns(ain.mipId);
+                    const UINT r = tex.rows(ain.mipId);
+                    for (ain.y = 0; ain.y < r && ok; ++ain.y) {
+                        for (ain.x = 0; ain.x < cols; ++ain.x) {
+                            const UINT64 expected = tex.address(ain.mipId, ain.x, ain.y, ain.slice);
+                            if (Addr2ComputeSurfaceAddrFromCoord(lib, &ain, &aout) != ADDR_OK ||
+                                aout.bitPosition != 0 || aout.addr != expected) {
+                                std::printf("FAIL %s slice %u mip %u (%u,%u): addrlib=%llu tex=%llu\n",
+                                            c.name, ain.slice, ain.mipId, ain.x, ain.y,
+                                            static_cast<unsigned long long>(aout.addr),
+                                            static_cast<unsigned long long>(expected));
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        expect(ok, c.name);
+    }
+
+    AddrDestroy(lib);
+    return failures ? 1 : 0;
+}
+
 int run(bool mutate_linear_fallback)
 {
     std::printf("AddrLib observations from %s\n", addrlib_source);
@@ -660,11 +797,12 @@ int run(bool mutate_linear_fallback)
 int main(int argc, char** argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "--bc64-tiling") == 0) return bc64_tiling_reference();
+    if (argc == 2 && std::strcmp(argv[1], "--gfx10-tiling") == 0) return gfx10_tiling_reference();
     if (argc == 2 && std::strcmp(argv[1], "--factory") == 0) return run_factory(false);
     if (argc == 2 && std::strcmp(argv[1], "--mutate-factory-no-write") == 0) return run_factory(true);
     const bool mutate = argc == 2 && std::strcmp(argv[1], "--mutate-linear-fallback") == 0;
     if (argc > 2 || (argc == 2 && !mutate)) {
-        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback|--factory|--mutate-factory-no-write|--bc64-tiling]");
+        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback|--factory|--mutate-factory-no-write|--bc64-tiling|--gfx10-tiling]");
         return 2;
     }
     const int result = run(mutate);

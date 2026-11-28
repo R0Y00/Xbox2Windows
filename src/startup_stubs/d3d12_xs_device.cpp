@@ -38,6 +38,7 @@
 #include "startup_stubs/compute_builder_gate.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/gfx10_texture.h"
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"

@@ -3200,6 +3200,8 @@ else()
 endif()
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+add_test(NAME xg_gfx10_tiling_reference COMMAND xg_swizzle_select_check --gfx10-tiling)
+set_tests_properties(xg_gfx10_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME tooling_fetch_addrlib_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/fetch_addrlib_cli_check.py")
@@ -4767,6 +4769,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_xg_bc_tiling COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc_tiling_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_bc_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
+    add_test(NAME startup_xg_gfx10_runtime COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_xg_gfx10_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
+    set_tests_properties(startup_xg_gfx10_runtime PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
     add_test(NAME startup_xg_tile64_tiling COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_tile64_tiling_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_tile64_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")

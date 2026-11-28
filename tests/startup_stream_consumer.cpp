@@ -960,13 +960,23 @@ int main(int argc, char** argv)
                static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
                std::strcmp(argv[9], "tiled") == 0};
         bc7.small4k = std::strcmp(argv[9], "small4k") == 0;
-        if (bc7.small4k ? bc7.width != 32 || bc7.height != 32
-                        : (bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69) &&
-                          (bc7.width != 512 || bc7.height != 256)) return 2;
-        if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
-        else if (bc7.small4k) {}
-        else if (std::strcmp(argv[9], "display64k") == 0) bc7.display64k = true;
-        else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
+        bc7.rgba8_4k_s = std::strcmp(argv[9], "rgba8_4k_s") == 0 || std::strcmp(argv[9], "rgba8_4k_s_untiled") == 0;
+        bc7.rgba8_linear_3m = std::strcmp(argv[9], "rgba8_linear_3m") == 0 || std::strcmp(argv[9], "rgba8_linear_3m_desktop") == 0;
+        if (bc7.rgba8_4k_s) {
+            bc7.tiled = std::strcmp(argv[9], "rgba8_4k_s") == 0;
+            if (bc7.width != 64 || bc7.height != 64) return 2;
+        } else if (bc7.rgba8_linear_3m) {
+            bc7.tiled = std::strcmp(argv[9], "rgba8_linear_3m") == 0;
+            if (bc7.width != 64 || bc7.height != 64) return 2;
+        } else if (bc7.small4k) {
+            if (bc7.width != 32 || bc7.height != 32) return 2;
+        } else {
+            if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69) &&
+                (bc7.width != 512 || bc7.height != 256)) return 2;
+            if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
+            else if (std::strcmp(argv[9], "display64k") == 0) bc7.display64k = true;
+            else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
+        }
     }
     ComPtr<IDXGIAdapter> adapter;
     void* device = nullptr;

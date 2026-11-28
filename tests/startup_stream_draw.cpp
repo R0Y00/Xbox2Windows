@@ -368,6 +368,86 @@ bool bind_small4k(ID3D12Device* desktop, void* guest, const StartupBc7Input& inp
     return bind_table(desktop, guest, texture, binding);
 }
 
+bool bind_rgba8_4k_s(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    std::ifstream file(input.blocks, std::ios::binary);
+    const std::vector<unsigned char> texels{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
+    const UINT row_bytes = input.width * 4;
+    if (texels.size() != static_cast<std::size_t>(row_bytes) * input.height) return false;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x105), D3D12_RESOURCE_FLAG_NONE};
+    void** computer = nullptr;
+    if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return false;
+    const auto table = static_cast<void**>(computer[0]);
+    using Query = HRESULT(*)(void*, unsigned char*);
+    using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+    UINT64 span = 0;
+    HRESULT hr = reinterpret_cast<Query>(table[2])(computer, layout.data());
+    if (SUCCEEDED(hr)) std::memcpy(&span, layout.data(), sizeof span);
+    if (span != 16384) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        binding.backing.resize(static_cast<std::size_t>(span), 0xa5);
+        if (input.tiled) {
+            hr = reinterpret_cast<Write>(table[8])(computer, binding.backing.data(), 0, 0, texels.data(),
+                                                    row_bytes, static_cast<UINT>(texels.size()));
+        } else {
+            std::memcpy(binding.backing.data(), texels.data(), (std::min)(binding.backing.size(), texels.size()));
+        }
+    }
+    reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    if (FAILED(hr)) return false;
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
+
+bool bind_rgba8_linear_3m(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    std::ifstream file(input.blocks, std::ios::binary);
+    const std::vector<unsigned char> texels{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>{}};
+    const UINT row_bytes = input.width * 4;
+    if (texels.size() != static_cast<std::size_t>(row_bytes) * input.height) return false;
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 3,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x100), D3D12_RESOURCE_FLAG_NONE};
+    void** computer = nullptr;
+    if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return false;
+    const auto table = static_cast<void**>(computer[0]);
+    using Query = HRESULT(*)(void*, unsigned char*);
+    using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+    std::array<unsigned char, 0x18 + 4 * 0x6c8 + 8> layout{};
+    UINT64 span = 0;
+    HRESULT hr = reinterpret_cast<Query>(table[2])(computer, layout.data());
+    if (SUCCEEDED(hr)) std::memcpy(&span, layout.data(), sizeof span);
+    if (span != 28672) hr = E_FAIL;
+    if (SUCCEEDED(hr)) {
+        binding.backing.resize(static_cast<std::size_t>(span), 0xa5);
+        if (input.tiled) {
+            hr = reinterpret_cast<Write>(table[8])(computer, binding.backing.data(), 0, 0, texels.data(),
+                                                    row_bytes, static_cast<UINT>(texels.size()));
+            if (SUCCEEDED(hr)) {
+                std::vector<unsigned char> mip1(32 * 32 * 4, 0x7f);
+                hr = reinterpret_cast<Write>(table[8])(computer, binding.backing.data(), 0, 1, mip1.data(),
+                                                        32 * 4, static_cast<UINT>(mip1.size()));
+            }
+            if (SUCCEEDED(hr)) {
+                std::vector<unsigned char> mip2(16 * 16 * 4, 0x3f);
+                hr = reinterpret_cast<Write>(table[8])(computer, binding.backing.data(), 0, 2, mip2.data(),
+                                                        16 * 4, static_cast<UINT>(mip2.size()));
+            }
+        } else {
+            std::memcpy(binding.backing.data(), texels.data(), (std::min)(binding.backing.size(), texels.size()));
+        }
+    }
+    reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    if (FAILED(hr)) return false;
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture))))) return false;
+    return bind_table(desktop, guest, texture, binding);
+}
+
 // A shader-visible heap whose first entry is a view of every mip of texture; binding.table is its GPU handle.
 bool bind_table(ID3D12Device* desktop, void* guest, void* texture, Bc7Binding& binding)
 {
@@ -413,6 +493,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
     } else if (bc7 && bc7->small4k) {
         if (!bind_small4k(desktop.Get(), guest, *bc7, binding)) return 35;
+    } else if (bc7 && bc7->rgba8_4k_s) {
+        if (!bind_rgba8_4k_s(desktop.Get(), guest, *bc7, binding)) return 36;
+    } else if (bc7 && bc7->rgba8_linear_3m) {
+        if (!bind_rgba8_linear_3m(desktop.Get(), guest, *bc7, binding)) return 37;
     } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
