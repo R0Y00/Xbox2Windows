@@ -1839,6 +1839,57 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, result));
             return true;
         }
+        if (n == "v_cvt_pknorm_i16_f32" || n == "v_cvt_pknorm_u16_f32") {
+            if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " encoding");
+            if (i.clamp || i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
+            if ((i.a & 0x7800) || ((i.abs | i.neg) & 4) || i.src[2])
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            const bool signed_out = n == "v_cvt_pknorm_i16_f32";
+            const unsigned k = signed_out ? 15u : 16u;
+            const string scale = signed_out ? "32767" : "65535";
+            const string lo_mask = signed_out ? "32767" : "65535";
+            auto cvt_lane = [&](unsigned j) {
+                auto bits = operand32(i, i.src[j]);
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "2147483648");
+                // Exact 32-bit integer RNE of clamp(|x|, 0, 1) * (2^k - 1) via m*(2^k - 1) split at bit k.
+                auto sign = cmp("ne", ir.binary("and", bits, "2147483648"), "0");
+                auto mag = ir.binary("and", bits, "2147483647");
+                auto is_nan = cmp("ugt", mag, "2139095040");
+                auto too_small = cmp("ult", mag, "922746880");
+                auto ge_one = cmp("uge", mag, "1065353216");
+                auto exp = ir.binary("lshr", mag, "23");
+                auto in_range = ir.value("and i1 " + cmp("uge", exp, "110") + ", " + cmp("ule", exp, "126"));
+                auto safe_exp = select(in_range, exp, "126");
+                auto s2 = ir.binary("sub", to_string(150u - k), safe_exp);
+                auto m = ir.binary("or", ir.binary("and", mag, "8388607"), "8388608");
+                auto m_hi = ir.binary("lshr", m, to_string(k));
+                auto m_lo = ir.binary("and", m, lo_mask);
+                auto borrow = select(cmp("ne", m_lo, "0"), "1", "0");
+                auto p_lo = ir.binary("and", ir.binary("sub", "0", m_lo), lo_mask);
+                auto p_hi = ir.binary("sub", ir.binary("sub", m, m_hi), borrow);
+                auto q0 = ir.binary("lshr", p_hi, s2);
+                auto mid_hi = ir.binary("shl", "1", ir.binary("sub", s2, "1"));
+                auto rem_mask = ir.binary("sub", ir.binary("shl", "1", s2), "1");
+                auto rem_hi = ir.binary("and", p_hi, rem_mask);
+                auto tie_or_above = ir.value("or i1 " + cmp("ne", p_lo, "0") + ", " +
+                                             cmp("ne", ir.binary("and", q0, "1"), "0"));
+                auto round_up = ir.value("or i1 " + cmp("ugt", rem_hi, mid_hi) + ", " +
+                                         ir.value("and i1 " + cmp("eq", rem_hi, mid_hi) + ", " + tie_or_above));
+                auto q_frac = ir.binary("add", q0, select(round_up, "1", "0"));
+                auto q_mag = select(too_small, "0", select(ge_one, scale, q_frac));
+                if (signed_out) {
+                    auto neg_q = ir.binary("and", ir.binary("sub", "0", q_mag), "65535");
+                    return select(is_nan, "0", select(sign, neg_q, q_mag));
+                }
+                return select(ir.value("or i1 " + is_nan + ", " + sign), "0", q_mag);
+            };
+            auto low = cvt_lane(0), high = cvt_lane(1);
+            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            return true;
+        }
         if (binary16_alu(n) || binary16_unary(n)) {
             // The graphics frontend shares this ALU. Leave those programs on the
             // existing refusal; this lowering is the direct compute path.
