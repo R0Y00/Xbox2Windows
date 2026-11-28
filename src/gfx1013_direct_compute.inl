@@ -2235,8 +2235,9 @@ struct DirectCompute {
         if (!floating && !signed_int && n != "v_pk_min_u16" && n != "v_pk_max_u16")
             return false;
         // VOP3P NEG_HI/LO occupy the usual ABS/NEG fields. The third
-        // OP_SEL_HI bit is unused here, like the packed add and shift forms.
-        if (i.clamp || i.abs || i.neg || i.src[2] || (i.a & 0x2000))
+        // OP_SEL_HI bit and third-operand modifiers are unused here.
+        const bool bad_mods = floating ? ((i.abs & 4) || (i.neg & 4)) : (i.clamp || i.abs || i.neg);
+        if (bad_mods || i.src[2] || (i.a & 0x2000))
             refuse(i.pc, "unsupported packed 16-bit min/max encoding");
         if (floating && (!half_mode_known || (mode_bits & 0xc0u) != 0xc0u))
             refuse(i.pc, "unsupported packed binary16 min/max denormal mode");
@@ -2269,8 +2270,12 @@ struct DirectCompute {
             }
             return signed_int ? ir.binary("xor", bits, "32768") : bits;
         };
-        auto lane = [&](unsigned selectors) {
+        auto lane = [&](unsigned selectors, unsigned negate) {
             auto x = half(a, selectors & 1), y = half(b, selectors & 2);
+            if (floating && (negate & 1u))
+                x = ir.binary("xor", x, "32768");
+            if (floating && (negate & 2u))
+                y = ir.binary("xor", y, "32768");
             auto result = select(cmp(maximum ? "ugt" : "ult", order_key(x), order_key(y)), x, y);
             if (floating) {
                 // Follow the existing startup contract. One NaN selects
@@ -2278,10 +2283,15 @@ struct DirectCompute {
                 auto x_nan = cmp("ugt", ir.binary("and", x, "32767"), "31744");
                 auto y_nan = cmp("ugt", ir.binary("and", y, "32767"), "31744");
                 result = select(x_nan, select(y_nan, "32256", y), select(y_nan, x, result));
+                if (i.clamp) {
+                    auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                    auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                    result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+                }
             }
             return result;
         };
-        auto low = lane((i.a >> 11) & 3), high = lane((i.b >> 27) & 3);
+        auto low = lane((i.a >> 11) & 3, i.neg), high = lane((i.b >> 27) & 3, i.abs);
         vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
         return true;
     }
