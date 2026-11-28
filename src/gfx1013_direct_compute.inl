@@ -1178,7 +1178,7 @@ struct DirectCompute {
         return ir.binary("or", h, sign);
     }
     static bool packed_f16_arithmetic(Name n) {
-        return n == "v_pk_add_f16" || n == "v_pk_mul_f16" || n == "v_pk_fma_f16";
+        return n == "v_pk_add_f16" || n == "v_pk_mul_f16" || n == "v_pk_fma_f16" || n == "v_pk_fmac_f16";
     }
     string fused_half_rne(const string &a, const string &b, const string &c) {
         auto both = [&](const string &x, const string &y) { return ir.value("and i1 " + x + ", " + y); };
@@ -1271,14 +1271,20 @@ struct DirectCompute {
             return static_cast<uint32_t>(192u - r);
         return std::nullopt;
     }
-    void packed_f16_alu(const Inst &i) {
-        const bool fused = i.name == "v_pk_fma_f16";
-        if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4))))
+    void packed_f16_alu(const Inst &i, const string *permuted = nullptr) {
+        const bool fmac = i.name == "v_pk_fmac_f16";
+        const bool fused = i.name == "v_pk_fma_f16" || fmac;
+        if (fmac) {
+            if (i.enc != Encoding::Vop2 || i.wide || i.subword || i.dpp_control || permuted ||
+                i.abs || i.neg || i.clamp || i.scale)
+                refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
+        } else if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4)))) {
             refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
+        }
         if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
             refuse(i.pc, "unsupported binary16 rounding or denormal mode");
         std::array<string, 3> words;
-        for (unsigned j = 0; j < (fused ? 3u : 2u); ++j) {
+        for (unsigned j = 0; j < (fmac ? 2u : fused ? 3u : 2u); ++j) {
             unsigned r = i.src[j];
             if (auto inline_word = packed_f16_inline_constant(r))
                 words[j] = to_string(*inline_word);
@@ -1287,6 +1293,8 @@ struct DirectCompute {
             else
                 refuse(i.pc, "unsupported packed binary16 arithmetic source");
         }
+        if (fmac)
+            words[2] = read(i.dst);
         auto lane = [&](unsigned selectors, unsigned negate) {
             auto operand = [&](unsigned j) {
                 auto bits = (selectors & (1u << j)) ? ir.binary("lshr", words[j], "16")
@@ -1304,15 +1312,16 @@ struct DirectCompute {
             auto bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
             return select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
         };
-        // In VOP3P, NEG_HI occupies the ABS field. OP_SEL_HI[2] lives in word 0.
-        auto low = lane((i.a >> 11) & 7, i.neg);
-        auto high = lane(((i.b >> 27) & 3) | ((i.a >> 12) & 4), i.abs);
+        // In VOP3P, NEG_HI occupies the ABS field and OP_SEL_HI[2] lives in word 0.
+        // VOP2 v_pk_fmac_f16 runs low halves (pair 0) and high halves (pair 1) with no modifiers.
+        auto low = lane(fmac ? 0u : ((i.a >> 11) & 7u), fmac ? 0u : i.neg);
+        auto high = lane(fmac ? 7u : (((i.b >> 27) & 3u) | ((i.a >> 12) & 4u)), fmac ? 0u : i.abs);
         vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
     }
     bool float_alu(const Inst &i, const string *permuted = nullptr) {
         auto n = i.name;
         if (packed_f16_arithmetic(n)) {
-            packed_f16_alu(i);
+            packed_f16_alu(i, permuted);
             return true;
         }
         if (n == "v_dot2_f32_f16") {
