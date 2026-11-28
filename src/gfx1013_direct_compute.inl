@@ -1903,7 +1903,7 @@ struct DirectCompute {
                 result = unary(24, a);
             else if (n == "v_rsq_f32")
                 result = unary(25, a);
-            else if (n == "v_rcp_f32")
+            else if (n == "v_rcp_f32" || n == "v_rcp_iflag_f32")
                 result = ir.value("fdiv float 1.000000e+00, " + a);
             else
                 return false;

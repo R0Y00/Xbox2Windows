@@ -306,7 +306,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
                 "v_floor_f32", "v_ceil_f32", "v_fract_f32", "v_trunc_f32", "v_rndne_f32",
-                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
+                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
                                   name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
