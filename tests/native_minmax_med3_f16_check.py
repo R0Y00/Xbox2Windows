@@ -118,18 +118,23 @@ def all_cases():
         Case('min3_one_nan', 'min3', (257, 258, 259), (0x7E01, 0x4000, 0x3C00)),
         Case('max3_two_nans', 'max3', (257, 258, 259), (0x7E01, 0xC000, 0x7D00)),
         Case('med3_one_nan_uses_min', 'med3', (257, 258, 259), (0x4200, 0x7E01, 0x3800)),
+        Case('med3_nan_src2', 'med3', (257, 258, 259), (0x4200, 0x3800, 0x7E01)),
+        Case('med3_two_nans', 'med3', (257, 258, 259), (0x7E01, 0x3800, 0x7D02)),
         Case('med3_three_nans', 'med3', (257, 258, 259), (0x7E01, 0x7D02, 0x7F03)),
         # 4. abs and neg modifiers across all three operands.
         Case('min3_abs_neg', 'min3', (257, 258, 259), (0xC000, 0x4200, 0xC400), abs_=0b101, neg=0b110),
         Case('med3_abs_neg', 'med3', (257, 258, 259), (0xC000, 0xBC00, 0x3800), abs_=0b010, neg=0b001),
         # 5. clamp: negative/-0/NaN -> +0.0, subnormal preserved, > 1.0/+Inf -> 1.0.
         Case('min3_clamp_neg_subnormal', 'min3', (257, 258, 259), (0x0001, 0x3800, 0x3C00), clamp=1),
+        Case('min3_clamp_negative', 'min3', (257, 258, 259), (0xBC00, 0x3800, 0x3C00), clamp=1),
         Case('max3_clamp_inf_to_one', 'max3', (257, 258, 259), (0x3800, 0x7C00, 0xC000), clamp=1),
         Case('med3_clamp_nan_to_zero', 'med3', (257, 258, 259), (0x7E01, 0x8000, 0x0000), clamp=1),
+        Case('med3_three_nans_clamp', 'med3', (257, 258, 259), (0x7E01, 0x7D02, 0x7F03), clamp=1),
         # 6. op_sel[2:0] high-half VGPR reads and op_sel[3]=1 destination high half preserving D[15:0].
         Case('max3_opsel_dst_hi', 'max3', (257, 258, 259), (0x4000DEAD, 0x3800CAFE, 0x44001111), op_sel=0b1101),
-        # 7. SGPR, literal (255), inline binary16 float (240/242/243) and inline integer 0 (128).
+        # 7. SGPR, literal (255), inline binary16 float (240/242/243) and inline integer (128, 193).
         Case('min3_sgpr_literal_inline', 'min3', (10, 255, 240), (0x3C00, 0x3400, 0)),
+        Case('min3_inline_neg_int', 'min3', (193, 258, 259), (0, 0x3C00, 0x4000)),
         Case('med3_inline_int_float', 'med3', (128, 242, 243), (0, 0, 0)),
         # 8. Partial EXEC_LO mask: inactive lanes keep DST_INIT.
         Case('max3_partial_exec', 'max3', (257, 258, 259), (0x3C00, 0x4000, 0x4200), exec_mask=0xAAAAAAAA),
