@@ -194,11 +194,11 @@ bool parse_summary(const std::string& text, Counts& counts, int& lines)
 
 void check_counts(const Counts& counts, const char* label)
 {
-    check(counts.type3 == 8, label);
+    check(counts.type3 == 10, label);
     check(counts.packets == 2, label);
     check(counts.completions == 2, label);
-    check(counts.refusals == 7, label);
-    check(counts.invalid_argument == 1, label);
+    check(counts.refusals == 9, label);
+    check(counts.invalid_argument == 3, label);
     check(counts.opus_error == 1, label);
     check(counts.capacity == 1, label);
     check(counts.queue_full == 1, label);
@@ -281,6 +281,13 @@ int main(int argc, char** argv)
                        decode_cmd(1, 44100.0f, 960, packet.data(), static_cast<std::uint32_t>(packet.size()),
                                   out.data(), 3840), out);
     }
+    // An out-of-range slot is classified in the legacy decode path.
+    {
+        auto out = filled(960);
+        expect_refused("legacy slot UINT32_MAX -> E_INVALIDARG", hr_invalid_arg,
+                       decode_cmd((std::numeric_limits<std::uint32_t>::max)(), 48000.0f, 960, packet.data(),
+                                  static_cast<std::uint32_t>(packet.size()), out.data(), 3840), out);
+    }
     // A type 3 header whose decode fields cross a guard page.
     if (auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
         DWORD old = 0;
@@ -322,7 +329,25 @@ int main(int argc, char** argv)
         check(drained && get_count(handle, 0) == 0, "capped queue drains");
     }
 
+    // The typed-stream path rejects an out-of-range slot before decode_packet; keep this connection
+    // open until the legacy connection closes so both refusals reach one summary line.
+    std::array<unsigned char, 0x18> stream_input = input;
+    const std::uint32_t process = 1;
+    std::memcpy(stream_input.data(), &process, sizeof(process));
+    void* stream_handle = nullptr;
+    check(connect(stream_input.data(), output.data(), &stream_handle) == hr_ok && stream_handle,
+          "stream XApuConnect");
+    {
+        auto out = filled(960);
+        const auto cmd = decode_cmd((std::numeric_limits<std::uint32_t>::max)(), 48000.0f, 960,
+                                    packet.data(), static_cast<std::uint32_t>(packet.size()), out.data(), 3840);
+        check(enqueue(stream_handle, cmd.data(), 0, 0) == hr_invalid_arg,
+              "stream slot UINT32_MAX -> E_INVALIDARG");
+        check(get_count(stream_handle, 0) == 0, "stream slot refusal queues nothing");
+        check(untouched(out), "stream slot refusal leaves output untouched");
+    }
     check(disconnect(handle) == hr_ok, "XApuDisconnect succeeds");
+    check(disconnect(stream_handle) == hr_ok, "stream XApuDisconnect succeeds");
 
     Counts counts;
     int lines = 0;

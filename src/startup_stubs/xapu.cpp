@@ -8,6 +8,7 @@
 #include <timeapi.h>
 #include <cstdlib>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #ifdef X2W_HAVE_OPUS
@@ -314,6 +315,7 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
         }
         kept = planar;
     }
+    decoded_packet = true;
     *pcm = kept;
     decoded_packet = true;
     *dest = reinterpret_cast<void*>(out);
@@ -504,6 +506,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
             if (!x2w_local::readable(command, entry.type == 1 ? 28 : 24)) {
                 hr = hr_pointer;
             } else if (entry.slot >= max_slots) {
+                refusal = DecodeRefusal::invalid_argument;
                 hr = hr_invalid_arg;
             } else {
                 entry.stream_command = true;
@@ -511,9 +514,15 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
                 if (entry.type == 1) {
                     std::uint32_t channels = 0;
                     std::memcpy(&channels, command + 24, 4);
-                    if (channels != 1 && channels != 2) hr = hr_invalid_arg;
-                    else if (conn->decoders[entry.slot].channels) hr = hr_invalid_arg;
-                    else conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    if (channels != 1 && channels != 2) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else if (conn->decoders[entry.slot].channels) {
+                        refusal = DecodeRefusal::invalid_argument;
+                        hr = hr_invalid_arg;
+                    } else {
+                        conn->decoders[entry.slot].channels = static_cast<int>(channels);
+                    }
                 }
             }
         }
