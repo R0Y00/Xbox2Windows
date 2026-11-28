@@ -11,6 +11,49 @@
 
 #include "startup_stubs/typed_uav_load.h"
 
+// 'imagedim <index>': the pixel stage reads a GFX10 size field of SRV <index> through GetDimensions(0).
+// That is the view's first mip. It matches the descriptor only when the view starts at resource mip 0.
+struct ImageSizeSrvs {
+    std::uint32_t mask = 0;
+
+    bool read_manifest_line(const std::string& line)
+    {
+        int index = -1, used = 0;
+        if (std::sscanf(line.c_str(), "imagedim %d%n", &index, &used) != 1 || used != static_cast<int>(line.size()))
+            return false;
+        if (index < 0 || index >= 32) return false;
+        const char* digits = line.c_str() + 9;
+        if (digits[0] == '0' && digits[1] != '\0') return false;
+        const auto bit = std::uint32_t{1} << index;
+        if (mask & bit) return false;
+        mask |= bit;
+        return true;
+    }
+
+    bool requires(unsigned index) const
+    {
+        return index < 32 && (mask & (std::uint32_t{1} << index)) != 0;
+    }
+
+    template <class SrvVec>
+    bool valid_for_srvs(const SrvVec& srvs) const
+    {
+        if (!mask) return true;
+        if (srvs.size() < 32 && (mask >> srvs.size()) != 0) return false;
+        for (std::size_t i = 0; i < srvs.size() && i < 32; ++i) {
+            if (requires(static_cast<unsigned>(i)) && (srvs[i].kind < 1 || srvs[i].kind > 5))
+                return false;
+        }
+        return true;
+    }
+};
+
+// MostDetailedMip is the first field of every texture SRV in the union.
+bool image_size_view_starts_at_resource_mip0(const D3D12_SHADER_RESOURCE_VIEW_DESC& desc)
+{
+    return desc.Texture2D.MostDetailedMip == 0;
+}
+
 // A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
 // for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
 // root table P. The native compiler also emits raw table views; a view qualifier or a 'channels' field, as in the compute line, is refused.
@@ -167,6 +210,7 @@ struct Translation {
     x2w_startup::TranslatedSamplers samplers;
     x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     x2w_startup::D16ImageSrvs d16_srvs;         // manifest 'd16srv': texture views that must match proven D16 formats (#2023)
+    ImageSizeSrvs image_size_srvs;              // manifest 'imagedim': size-field reads that need resource mip 0
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -496,6 +540,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
                 log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
                 return;
             }
+        } else if (line.compare(0, 9, "imagedim ") == 0) {
+            if (!tr.image_size_srvs.read_manifest_line(line)) {
+                log("x2w-draw invalid imagedim manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
         } else if (line.compare(0, 7, "d16srv ") == 0) {
             if (!tr.d16_srvs.read_manifest_line(line)) {
                 log("x2w-draw invalid d16srv manifest line for %016llx: %s", tr.key, line.c_str());
@@ -522,7 +571,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
         log("x2w-draw RTV manifest missing for %016llx", tr.key);
         return;
     }
-    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs)) return;
+    if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || !tr.d16_srvs.valid_for_srvs(tr.srvs) ||
+        !tr.image_size_srvs.valid_for_srvs(tr.srvs)) return;
     for (const Translation::Ud& ud : tr.uds) {
         if (ud.kind == Translation::d16_unorm16 &&
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
@@ -2181,6 +2231,7 @@ constexpr const char* indexed_rect_unavailable = "indexed_rect_unavailable";
 constexpr const char* pipeline_unavailable = "pipeline_unavailable";
 constexpr const char* sampler_heap_unavailable = "sampler_heap_unavailable";
 constexpr const char* sampled_texture_mismatch = "sampled_texture_mismatch";
+constexpr const char* image_size_mip = "image_size_mip";
 constexpr const char* sampled_texture_unbindable = "sampled_texture_unbindable";
 constexpr const char* incomplete_vertex_stream = "incomplete_vertex_stream";
 constexpr const char* incomplete_table_buffer = "incomplete_table_buffer";
@@ -2886,6 +2937,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
+                if (tr->image_size_srvs.requires(i) && !image_size_view_starts_at_resource_mip0(desc)) {
+                    static LONG refused;
+                    if (first_calls(refused, 6))
+                        log("x2w-draw %016llx srv %u: image size field refused (view starts at mip %u)",
+                            tr->key, i, desc.Texture2D.MostDetailedMip);
+                    if (indirect)
+                        indirect->set_refusal("translated draw reads an image size from a view that does not start at resource mip 0",
+                                              indirect_refusal_code::image_size_mip);
+                    ReleaseSRWLockExclusive(&draw_lock);
+                    return false;
+                }
             }
             if (texture && x2w_startup::packed_target_format(desc.Format)) {
                 // The view recorded from the title names a packed format: follow a stand-in texture,
