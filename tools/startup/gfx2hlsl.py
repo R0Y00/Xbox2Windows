@@ -979,6 +979,16 @@ def desc_key(sym):
     return sym[1], None if sym[2] is None else sym[2] + 4 * (sym[3] & ~3)
 
 
+def image_desc_key(sym):
+    """Descriptor load an image word belongs to: (source, byte offset of its 8-dword image).
+
+    The dword index is aligned down to the image, so word 2 of a load at byte 32 is that load and not the
+    image a later load placed in the same registers."""
+    if not sym or sym[0] != 'desc' or len(sym) < 4 or not isinstance(sym[2], int) or not isinstance(sym[3], int):
+        return None
+    return (sym[1], sym[2] + 4 * (sym[3] & ~7))
+
+
 def desc_word(sym, dword):
     return sym[:3] + (dword,) + sym[4:]
 
@@ -1015,6 +1025,46 @@ def raw_descriptor_alu(base, syms, constants):
             if (plain or word[loaded:] == ('oob0',)) and base == 's_or_b32' and constants[other] == 0x30000000:
                 return word[:loaded] + ('oob3',)
     return None
+
+
+# GFX10 image resource fields that are the bound view's mip-0 size minus one (Mesa radv_image.c:
+# width = WIDTH_LO + (WIDTH_HI << 2) + 1, height = HEIGHT + 1). WIDTH_LO is word 1 bits 31:30,
+# WIDTH_HI is word 2 bits 11:0, HEIGHT is word 2 bits 27:14. DEPTH is word 4 bits 12:0 and is the
+# view depth only for a 3D image; on 1D and 2D the same bits hold pitch. s_bfe_u32's control is
+# (width << 16) | offset. A shift that keeps bits outside the field is not an entry.
+IMAGE_FIELDS = {
+    (1, 's_bfe_u32', 0x0002001e): ('width', '(({0} - 1u) & 3u)'),
+    (1, 's_lshr_b32', 30): ('width', '(({0} - 1u) & 3u)'),
+    (1, 's_and_b32', 0xc0000000): ('width', '((({0} - 1u) & 3u) << 30)'),
+    (2, 's_and_b32', 0xfff): ('width', '(({0} - 1u) >> 2)'),
+    (2, 's_bfe_u32', 0x000c0000): ('width', '(({0} - 1u) >> 2)'),
+    (2, 's_bfe_u32', 0x000e000e): ('height', '(({0} - 1u) & 0x3fffu)'),
+    (2, 's_and_b32', 0x0fffc000): ('height', '((({0} - 1u) & 0x3fffu) << 14)'),
+    (4, 's_and_b32', 0x1fff): ('depth', '(({0} - 1u) & 0x1fffu)'),
+    (4, 's_bfe_u32', 0x000d0000): ('depth', '(({0} - 1u) & 0x1fffu)'),
+}
+IMAGE_DIM = {
+    'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d',
+    'SQ_RSRC_IMG_2D_ARRAY': 'tex2da', 'SQ_RSRC_IMG_3D': 'tex3d',
+}
+IMAGE_DIM_HAS = {
+    'tex1d': frozenset(('width',)),
+    'tex2d': frozenset(('width', 'height')),
+    'tex2da': frozenset(('width', 'height')),
+    'tex3d': frozenset(('width', 'height', 'depth')),
+}
+IMAGE_DIM_NAME = {'tex1d': '1D', 'tex2d': '2D', 'tex2da': '2D-array', 'tex3d': '3D'}
+IMAGE_DIM_TYPE = {
+    'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>',
+    'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>',
+}
+IMAGE_DIM_READ = {
+    'tex1d': ('uint w, m;', 'tex.GetDimensions(0u, w, m);', {'width': 'w'}),
+    'tex2d': ('uint w, h, m;', 'tex.GetDimensions(0u, w, h, m);', {'width': 'w', 'height': 'h'}),
+    'tex2da': ('uint w, h, e, m;', 'tex.GetDimensions(0u, w, h, e, m);', {'width': 'w', 'height': 'h'}),
+    'tex3d': ('uint w, h, d, m;', 'tex.GetDimensions(0u, w, h, d, m);',
+              {'width': 'w', 'height': 'h', 'depth': 'd'}),
+}
 
 
 def smem_offset(tok):
@@ -2544,6 +2594,7 @@ class Stage:
             self.lines = []           # body statements (per block)
             self.vconst = {}          # VGPR -> literal 32-bit value while the program is straight-line
             self.sym = {}             # scalar register -> symbolic value
+            self.image_span = {}      # SGPR -> (load dword count, index) for an 8- or 16-dword image load
             self.used_s, self.used_v = set(), set()
             self.used_atomic = set()
             self.exec_known = True    # exec still equals the entry mask (the lane is active)
@@ -2653,7 +2704,7 @@ class Stage:
                 return 's%d' % n
             if s[0] == 'tg_size':
                 raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % n)
-            raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
+            raise Unsupported(self.held_message('s%d' % n, s, n))
         self.used_s.add(n)
         return 's%d' % n
 
@@ -2679,7 +2730,7 @@ class Stage:
         if tok == 'm0':
             m = self.sym.get('m0')
             if m:
-                raise Unsupported('numeric use of m0 holding %s' % m[0])
+                raise Unsupported(self.held_message('m0', m, 'm0'))
             return 'm0'
         if tok == 'null':
             return '0x00000000u'
@@ -3050,6 +3101,9 @@ class Stage:
             self.record_scalar_uniformity(n, uniform)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         getattr(self, 'mask_high', set()).discard(n)
+        span = getattr(self, 'image_span', None)
+        if isinstance(span, dict):
+            span.pop(n, None)
         getattr(self, 'float_const_s', {}).pop(n, None)
         if isinstance(self.align4_s, set):
             if sym is not None and sym[0] == 'const':
@@ -4059,6 +4113,7 @@ class Stage:
         every_sgpr = set(range(106)) | {'m0'}
         init_entry = [r for r in set(init_sym) | init_used_s if isinstance(r, int)]
         init_written = set(range(max(init_entry + [-1 if getattr(self, 'kind', None) == 'cs' else 15]) + 1)) | {'m0'}
+        self.note_image_descriptors()
 
         for _ in range(max(4, len(self.ins) + 2)):
             scc_effects = {}
@@ -4068,6 +4123,7 @@ class Stage:
             self.vconst = {}
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
+            self.image_span = {}
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
             self.wqm_count, self.execcopy_epoch = 0, {}
@@ -5898,6 +5954,179 @@ class Stage:
         self.scc_verified = False
         return True
 
+    def note_image_descriptors(self):
+        """Pixel: descriptor load -> image dimension, for the load an image instruction actually reads.
+
+        The key is image_desc_key of the operand's words at that instruction, not the SGPR number. A copy
+        keeps the symbol, so it keeps the key; a later load into the same registers is a different key.
+        Two dimensions on one key are None. A branch leaves the map empty: the load the image reads is
+        then not proved. Other stages leave the map empty."""
+        dims = {}
+        self.image_desc_dim = dims
+        if getattr(self, 'kind', None) != 'ps':
+            return
+        if any(name.startswith(('s_cbranch', 's_branch', 's_setpc')) for _off, _n, name, _asm in self.ins):
+            return
+        sym = dict(self.sym)
+        counts = {'s_load_dword': 1, 's_load_dwordx2': 2, 's_load_dwordx4': 4,
+                  's_load_dwordx8': 8, 's_load_dwordx16': 16}
+        for _off, _n, name, asm in self.ins:
+            _op, operands, mods = parse(asm)
+            if name.startswith('image_') and len(operands) >= 3:
+                reg = reg_range(operands[2])
+                kinds = [IMAGE_DIM[m[4:]] for m in mods if m.startswith('dim:') and m[4:] in IMAGE_DIM]
+                if reg and reg[0] == 's' and reg[2] == reg[1] + 7 and len(kinds) == 1:
+                    first = sym.get(reg[1])
+                    key = image_desc_key(first)
+                    same = key is not None and first[3] % 8 == 0 and all(
+                        sym.get(reg[1] + i) == desc_word(first, first[3] + i)
+                        and 'modified' not in (sym.get(reg[1] + i) or ())[4:]
+                        for i in range(8))
+                    if same:
+                        if key in dims and dims[key] != kinds[0]:
+                            dims[key] = None
+                        elif key not in dims:
+                            dims[key] = kinds[0]
+                continue
+            if name in counts and len(operands) >= 1:
+                dst = reg_range(operands[0])
+                count = counts[name]
+                if dst and dst[0] == 's':
+                    for i in range(dst[1], dst[2] + 1):
+                        sym.pop(i, None)
+                    base = reg_range(operands[1]) if len(operands) >= 3 else None
+                    p = sym.get(base[1]) if base and base[0] == 's' else None
+                    token = operands[2] if len(operands) >= 3 else ''
+                    extra = 0
+                    for mod in mods:
+                        if mod.startswith('offset:') and re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', mod[7:]):
+                            extra = int(mod[7:], 0)
+                    if (p and p[0] == 'ptr' and dst[2] - dst[1] + 1 == count
+                            and re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', token)
+                            and (len(p) == 2 or isinstance(p[2], int))):
+                        off = int(token, 0) + extra + (p[2] if len(p) > 2 else 0)
+                        for i in range(count):
+                            sym[dst[1] + i] = ('desc', p[1], off, i)
+                    continue
+            if name in ('s_mov_b32', 's_mov_b64') and len(operands) >= 2:
+                dst, src = reg_range(operands[0]), reg_range(operands[1])
+                if dst and dst[0] == 's' and src and src[0] == 's' and dst[2] - dst[1] == src[2] - src[1]:
+                    vals = [sym.get(src[1] + i) for i in range(dst[2] - dst[1] + 1)]
+                    for i, val in enumerate(vals):
+                        if val is None:
+                            sym.pop(dst[1] + i, None)
+                        else:
+                            sym[dst[1] + i] = val
+                    continue
+            for dest in scalar_destinations(name, asm):
+                if dest == 'any':
+                    sym.clear()
+                    break
+                sym.pop(dest, None)
+
+    def _copy_image_span(self, src, dest):
+        span = getattr(self, 'image_span', None)
+        if not isinstance(span, dict):
+            return
+        if src and src[0] == 's' and src[1] in span:
+            span[dest] = span[src[1]]
+        else:
+            span.pop(dest, None)
+
+    def image_word(self, reg):
+        """(field 0..7, kind or None, symbol, modified) for a pixel image descriptor word, else None.
+
+        kind is None when that descriptor load is used as two image dimensions. The load has to be one an
+        image instruction reads (image_desc_dim). An 8- or 16-dword load is what marks the word; a 4-dword
+        buffer load is not an image."""
+        if getattr(self, 'kind', None) != 'ps':
+            return None
+        sym = self.sym.get(reg)
+        span = (getattr(self, 'image_span', None) or {}).get(reg)
+        dims = getattr(self, 'image_desc_dim', {})
+        key = image_desc_key(sym)
+        if not sym or sym[0] != 'desc' or not span or key not in dims or len(sym) < 4:
+            return None
+        modified = 'modified' in sym[4:]
+        if len(sym) != 4 and not modified:
+            return None
+        count, index = span
+        if count not in (8, 16) or sym[3] != index:
+            return None
+        return (index % 8, dims[key], sym, modified)
+
+    def image_dim_call(self, sym, kind, component):
+        """GetDimensions(0) of the texture this image descriptor binds, for one component.
+
+        The SRV is marked in the manifest. The draw path refuses that view unless it starts at
+        resource mip 0, because GetDimensions(0) reads the view's first mip."""
+        base, dword = sym[2], sym[3] & ~7
+        key = (sym[1], None if base is None else base + 4 * dword)
+        tex = self.pipe.resource(key, kind)
+        helpers = getattr(self.pipe, 'image_dim_helpers', None)
+        if helpers is None:
+            helpers = self.pipe.image_dim_helpers = set()
+        helpers.add((kind, component))
+        marked = getattr(self.pipe, 'image_size_srvs', None)
+        if marked is None:
+            marked = self.pipe.image_size_srvs = set()
+        entry = self.pipe.resources.get(key)
+        if entry is not None:
+            marked.add(entry['index'])
+        return 'img_%s_%s(%s)' % (component, kind, tex)
+
+    def image_field_expr(self, base, srcs, syms):
+        """A pixel extract of one exact image size field, or ('opaque', word, op, reason).
+
+        None leaves the old descnum path. The value is the bound view's mip-0 size with that field's
+        bits. GetDimensions(0) matches the descriptor when the view starts at resource mip 0."""
+        if getattr(self, 'kind', None) != 'ps' or len(srcs) != 2 or len(syms) != 2:
+            return None
+        constants = [self.const_u32(t) for t in srcs]
+        hits = []
+        for i, _sym in enumerate(syms):
+            reg = reg_range(srcs[i])
+            if not reg or reg[0] != 's' or reg[1] != reg[2]:
+                continue
+            info = self.image_word(reg[1])
+            if not info or info[3]:
+                continue
+            field, kind, sym, _modified = info
+            if kind is None:
+                hits.append(('opaque', field, base, 'word used as two dimensions'))
+                continue
+            # s_bfe_u32 and s_lshr_b32 are not commutative. The descriptor word is the value
+            # (operand 0). A shift whose amount is the descriptor word is a different number.
+            if base in ('s_bfe_u32', 's_lshr_b32') and i != 0:
+                hits.append(('opaque', field, base, ''))
+                continue
+            found = IMAGE_FIELDS.get((field, base, constants[1 - i]))
+            if found is None:
+                hits.append(('opaque', field, base, ''))
+                continue
+            component, template = found
+            if component not in IMAGE_DIM_HAS[kind]:
+                hits.append(('opaque', field, base, '%s of a %s image' % (component, IMAGE_DIM_NAME[kind])))
+                continue
+            hits.append(('value', template.format(self.image_dim_call(sym, kind, component))))
+        if len(hits) != 1:
+            return None
+        return hits[0]
+
+    def held_message(self, name, sym, reg):
+        """Refusal for a numeric read of a symbol. Image words name the word, the op, or the field."""
+        if sym and sym[0] == 'descnum' and len(sym) >= 5 and sym[1] == 'image':
+            if sym[4]:
+                return 'numeric use of %s holding image descriptor %s' % (name, sym[4])
+            return 'numeric use of %s holding %s of image descriptor word %d' % (name, sym[3], sym[2])
+        if sym and sym[0] == 'desc':
+            info = self.image_word(reg)
+            if info:
+                if info[3]:
+                    return 'numeric use of %s holding a modified image descriptor word %d' % (name, info[0])
+                return 'numeric use of %s holding image descriptor word %d' % (name, info[0])
+        return 'numeric use of %s holding %s' % (name, sym[0])
+
     def scalar(self, base, ops, mods=()):
         # Every SALU form in SCA is dst, src (the two templates below use {0} and {1}); a short list would
         # index past the end and leave `translator crash in <op>: IndexError` in the census instead of a
@@ -6011,10 +6240,9 @@ class Stage:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
-            # Every path below writes the destination's symbol directly, not through set_s, or refuses. The
-            # written word is descriptor data, so a lane-mask mark the SGPR held from an earlier write ends here as
-            # set_s ends it. lower() has already classified the sources, so a mask read by this instruction is
-            # still refused.
+            # Paths below either refuse, keep a descriptor symbol, or (an exact pixel image size field) assign
+            # the number through set_s. A lane-mask mark the SGPR held ends here as set_s ends it. lower() has
+            # already classified the sources, so a mask read by this instruction is still refused.
             if dst and dst[0] == 's':
                 for reg in range(dst[1], dst[2] + 1):
                     getattr(self, 'masks', set()).discard(reg)
@@ -6039,10 +6267,19 @@ class Stage:
                             self.resheap_low_add = (dst[1], self.pc + size, heap_mark)
                             self.scc_verified = True
                             return None
+            # After the resource-heap add returns: a pixel size field is not that pointer add.
+            field = self.image_field_expr(base, srcs, syms)
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
-                self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
+                if base == 's_mov_b32':
+                    self.sym['m0'] = syms[0]
+                    src = reg_range(srcs[0]) if srcs else None
+                    self._copy_image_span(src, 'm0')
+                elif field and field[0] == 'opaque':
+                    self.sym['m0'] = ('descnum', 'image', field[1], field[2], field[3])
+                else:
+                    self.sym['m0'] = ('descnum',)
                 return None
             if mask_dest:
                 raise Unsupported('mask from descriptor data')
@@ -6055,13 +6292,19 @@ class Stage:
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
                    if getattr(self, 'kind', None) in ('cs', 'vs') and len(syms) == 2 else None)
+            if field and field[0] == 'value' and not pair and dst[1] == dst[2]:
+                # The field is a number, so SCC is that number's zero flag rather than descriptor data.
+                self.set_s(d, field[1], scc='($) != 0', uniform=True)
+                return None
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
+                self._copy_image_span(reg_range(srcs[0]) if srcs else None, d)
                 if pair:
                     high = reg_range(ops[1])[2]
                     hi = self.sym.get(high)
                     if hi and not run_time_symbol(hi):
                         self.sym[d + 1] = hi  # a descriptor word, a pointer or an unassigned constant: symbol only
+                        self._copy_image_span(('s', high, high), d + 1)
                     else:
                         # A value the high word holds at run time is copied at run time too, so a join that later
                         # reads the register at run time finds it (a constant keeps its symbol for folding).
@@ -6087,7 +6330,13 @@ class Stage:
                 else:
                     self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
-                self.sym[d] = ('descnum',)
+                if field and field[0] == 'opaque':
+                    self.sym[d] = ('descnum', 'image', field[1], field[2], field[3])
+                else:
+                    self.sym[d] = ('descnum',)
+                span = getattr(self, 'image_span', None)
+                if isinstance(span, dict):
+                    span.pop(d, None)
             return None
         # The table templates name their sources as {0}, {1}, ...; a short operand list would make
         # str.format raise IndexError, which the single-shader path records as a translator crash
@@ -6881,6 +7130,10 @@ class Stage:
                 load = (self.pc,)
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], base_off + off, i) + load
+            span = getattr(self, 'image_span', None)
+            if isinstance(span, dict) and count in (8, 16):
+                for i in range(count):
+                    span[dst[1] + i] = (count, i)
             if into_vcc:
                 self.mark_vcc_descriptor()
             return
@@ -11929,6 +12182,8 @@ class Pipeline:
         self.uses_bvh = False
         self.uses_cube_dir = False
         self.uses_gather_2d_lod = False
+        self.image_dim_helpers = set()
+        self.image_size_srvs = set()
         self.uses_store_d16_x = False
         self.uses_dot2 = set()
         self.uses_sad = set()
@@ -12207,6 +12462,10 @@ class Pipeline:
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'bvh': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         if getattr(self, 'resheap_count', 0):
             out.append('ByteAddressBuffer rh[%d] : register(t0, space%d);' % (self.resheap_count, RESHEAP_RANGE_SPACE))
+        for kind, component in sorted(getattr(self, 'image_dim_helpers', ()) or ()):
+            decl, call, names = IMAGE_DIM_READ[kind]
+            out.append('uint img_%s_%s(%s tex) { %s %s return %s; }' % (
+                component, kind, IMAGE_DIM_TYPE[kind], decl, call, names[component]))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             out.append('%s %s%d : register(u%d);' % ({'tex1d': 'RWTexture1D<float4>', 'tex2d': 'RWTexture2D<float4>', 'tex2da': 'RWTexture2DArray<float4>', 'tex3d': 'RWTexture3D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
@@ -12648,6 +12907,8 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
+        for index in sorted(getattr(self, 'image_size_srvs', ()) or ()):
+            lines.append('imagedim %d' % index)
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             source, off = key
             if source[0] != 'table':
