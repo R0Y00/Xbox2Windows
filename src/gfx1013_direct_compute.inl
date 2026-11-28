@@ -2135,9 +2135,14 @@ struct DirectCompute {
                 result = unary(26, a);
             else if (n == "v_floor_f32")
                 result = unary(27, a);
-            else if (round)
+            else if (round) {
                 result = unary(n == "v_fract_f32" ? 22 : n == "v_ceil_f32" ? 28 : 29, a);
-            else if (n == "v_sqrt_f32")
+                // A host Frc can round tiny negative inputs up to 1.0. The guest's
+                // result stays below 1.0; an ordered comparison keeps NaNs intact.
+                if (n == "v_fract_f32")
+                    result = select_float(ir.value("fcmp oge float " + result + ", 1.0"),
+                                          ir.value("bitcast i32 1065353215 to float"), result);
+            } else if (n == "v_sqrt_f32")
                 result = unary(24, a);
             else if (n == "v_rsq_f32")
                 result = unary(25, a);
