@@ -1352,7 +1352,7 @@ struct DirectCompute {
             if (i.enc != Encoding::Vop2 || i.wide || i.subword || i.dpp_control || permuted ||
                 i.abs || i.neg || i.clamp || i.scale)
                 refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
-        } else if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4)))) {
+        } else if (i.enc != Encoding::Mix || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4)))) {
             refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
         }
         if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
@@ -1376,15 +1376,24 @@ struct DirectCompute {
                 return (negate & (1u << j)) ? ir.binary("xor", bits, "32768") : bits;
             };
             auto a = operand(0), b = operand(1);
-            if (fused)
-                return fused_half_rne(a, b, operand(2));
-            auto widen = [&](const string &bits) {
-                return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
-            };
-            const auto op = i.name == "v_pk_mul_f16" ? "fmul" : "fadd";
-            auto result = ir.value(string(op) + " float " + widen(a) + ", " + widen(b));
-            auto bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
-            return select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
+            string bits;
+            if (fused) {
+                bits = fused_half_rne(a, b, operand(2));
+            } else {
+                auto widen = [&](const string &half_bits) {
+                    return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", half_bits}}, "nounwind readnone");
+                };
+                const auto op = i.name == "v_pk_mul_f16" ? "fmul" : "fadd";
+                auto result = ir.value(string(op) + " float " + widen(a) + ", " + widen(b));
+                bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
+                bits = select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
+            }
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", bits, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", bits, "32768"), "0"));
+                bits = select(low, "0", select(cmp("ugt", bits, "15359"), "15360", bits));
+            }
+            return bits;
         };
         // In VOP3P, NEG_HI occupies the ABS field and OP_SEL_HI[2] lives in word 0.
         // VOP2 v_pk_fmac_f16 runs low halves (pair 0) and high halves (pair 1) with no modifiers.
