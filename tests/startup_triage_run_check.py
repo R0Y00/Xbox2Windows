@@ -34,6 +34,9 @@ x2w-runtime 12345678::slot5(0x1, 0x2, 0x3 | 0x4, 0x5) -> 0xffffffff80004005 from
 x2w-runtime 12345678::slot5(0x1, 0x2, 0x3 | 0x4, 0x5) -> 0x80004005 from +0x104
 x2w-runtime 12345678::slot6(0x1, 0x2, 0x3 | 0x4, 0x5) -> 0x0 from +0x108
 x2w-runtime persistent local storage: local object instead of 0x80070005
+x2w-draw compute 8d990b92ca548681 Dispatch(5, 5, 33) refused: an input is in a placed buffer that does not alias title memory
+x2w-draw compute 8d990b92ca548681 Dispatch(5, 5, 33) refused: C:\\Users\\alice\\secret\\key words
+x2w-render compute dispatches: translated 1, refused 2, no translation 3, not modelled 4, builder gate refused 5
 """
 
 
@@ -84,7 +87,10 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 1 | `compute: image_load_mip tfe` |",
             "| 1 | `compute: runtime manifest: UAV kind texture_uav cube` |",
             f"| 1 | `compute: {triage_run.OTHER}` |",
+            "| 1 | `an input is in a placed buffer that does not alias title memory` |",
             f"| 1 | `{triage_run.OTHER}` |",
+            "| translated | refused | no translation | not modelled | builder gate refused |",
+            "| 1 | 2 | 3 | 4 | 5 |",
         ]
         for snippet in expected_snippets:
             if snippet not in report:
@@ -304,6 +310,58 @@ def check_slot133_outcomes(failures: list[str]) -> None:
         triage_run.RE_D3D12_SLOT133, triage_run.RE_D3D12_SLOT133_UNCOMMITTED = saved
     if old.get("Device::slot133") != 5:
         failures.append(f"control did not reproduce the old unhandled noise: {dict(old)}")
+
+
+def check_compute_dispatch_refusals(failures: list[str]) -> None:
+    refused = "x2w-draw compute 8d990b92ca548681 Dispatch(5, 5, 33) refused: "
+    totals = (
+        "x2w-render compute dispatches: translated {}, refused {}, no translation {}, "
+        "not modelled {}, builder gate refused {}\n"
+    )
+    known = "an input is in a placed buffer that does not alias title memory"
+    lines = [
+        refused + known + "\n",
+        refused + known + "\n",
+        refused + "no translation\n",
+        refused + "C:\\Users\\alice\\secret\\game.exe words\n",
+        totals.format(1, 10, 0, 0, 0),
+        totals.format(2, 20, 0, 0, 0),
+        totals.format(0, 5, 0, 0, 0),
+    ]
+    summary = triage_run.summarize_lines(lines)
+    counts = dict(summary["compute_refusals"])
+    if counts != {known: 2, "no translation": 1, triage_run.OTHER: 1}:
+        failures.append(f"compute refusal counts wrong: {counts}")
+    if summary["compute_totals"] != {
+        "translated": 2, "refused": 20, "no translation": 0, "not modelled": 0, "builder gate refused": 0,
+    }:
+        failures.append(f"compute totals did not take per-bucket maxima: {summary['compute_totals']}")
+    with tempfile.TemporaryDirectory() as tmp:
+        logdir = Path(tmp)
+        (logdir / "stderr.txt").write_text("".join(lines), encoding="utf-8")
+        # trap.log mirrors one line already in stderr.txt; the deduplication must not double-count it.
+        (logdir / "trap.log").write_text(refused + known + "\n", encoding="utf-8")
+        report = triage_run.triage_run(logdir)
+    for snippet in (
+        "### Compute Dispatch Refusals",
+        f"| 2 | `{known}` |",
+        "| 1 | `no translation` |",
+        "| 2 | 20 | 0 | 0 | 0 |",
+    ):
+        if snippet not in report:
+            failures.append(f"compute dispatch section missing {snippet!r}:\n{report}")
+    for private in ("alice", "secret", "8d990b92ca548681", "Dispatch(5, 5, 33)"):
+        if private in report:
+            failures.append(f"compute dispatch report copied private text {private!r}:\n{report}")
+    # Negative control: without the rule the refusals and the section both disappear.
+    saved = triage_run.RE_COMPUTE_DISPATCH_REFUSED
+    triage_run.RE_COMPUTE_DISPATCH_REFUSED = re.compile(r"(?!)")
+    try:
+        old = triage_run.summarize_lines(lines)
+        if old["compute_refusals"]:
+            failures.append("control still classified compute refusals")
+    finally:
+        triage_run.RE_COMPUTE_DISPATCH_REFUSED = saved
 
 
 def check_cli_invocation(failures: list[str]) -> None:
@@ -664,6 +722,7 @@ def main() -> int:
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
     check_slot133_outcomes(failures)
+    check_compute_dispatch_refusals(failures)
     check_indirect_outcomes(failures)
     check_gpu_memory_budget(failures)
     check_run_endpoint(failures)

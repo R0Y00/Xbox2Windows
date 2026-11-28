@@ -63,6 +63,73 @@ SLOT70_REASONS = {
     "console_layout_beyond_xg_size",
     "overlapping_resource",
 }
+# Fixed first-refusal reasons of the compute Dispatch path in src/startup_stubs/d3d12_compute_dispatch.inl.
+# Only an exact match is counted under its own name; every other string is "other (text omitted)" and is
+# never copied into the report. The program key, group counts, addresses and descriptor words are dropped.
+COMPUTE_DISPATCH_REASONS = frozenset({
+    "the list type has no Dispatch",
+    "a group count is over the limit",
+    "the compute root set is not the one the pipeline was created with",
+    "no descriptor heap on this device",
+    "no translation",
+    "an entry value was not set since the compute root",
+    "translated indirect Dispatch requires fixed-table raw buffers",
+    "a table descriptor is not bound",
+    "a heap index word is not in the list's upload memory",
+    "a heap index word is outside its table buffer",
+    "a heap record is outside the list's view heap",
+    "an input texture entry is not the token of a shader resource view",
+    "an input texture has no desktop texture to sample",
+    "an input 1D texture has no recorded view description",
+    "an input texture view is not 1D",
+    "an input texture view is not 2D array",
+    "an input texture view does not fit its texture",
+    "an input texture view has a packed format",
+    "an input texture view is not 2D",
+    "an output texture entry is not the token of an unordered access view",
+    "an output texture view or resource is not 3D",
+    "an output texture view was not created on the desktop",
+    "an output texture view is not 1D",
+    "an output 1D texture mip is outside the resource",
+    "an output texture view is not a 2D array",
+    "an output texture array view is outside the resource",
+    "an output texture view is not 2D",
+    "an output texture view has a packed format",
+    "an exact-width image store requires a matching output texture channel count",
+    "an exact-width image store requires typed UAV store support",
+    "an output texture format is not a float or normalized one",
+    "an output texture is also an input of the dispatch",
+    "an input is in title memory outside any placed buffer",
+    "zeros for a null descriptor",
+    "a snapshot of title memory",
+    "an input buffer range is not 16-byte aligned in its resource",
+    "an output token has no original ISA descriptor words for entry constants",
+    "an output buffer is also an input",
+    "an output token has no desktop resource",
+    "a raw buffer writer was bound to a non-buffer backing",
+    "a half buffer store requires matching format, stride and structured bounds",
+    "an output buffer descriptor is a view token",
+    "an output buffer descriptor has zero records",
+    "an output range crosses the end of a placed buffer",
+    "an output is in title memory outside any placed buffer",
+    "an output is in a placed buffer that does not alias title memory",
+    "an input is in a placed buffer that does not alias title memory",
+    "an output half buffer is not element-aligned in its resource",
+    "an output buffer range is not 16-byte aligned in its resource",
+    "an output buffer has no unordered access",
+    "the indirect argument buffer is also a bound shader resource",
+    "a formatted input has no word 3 the program decodes",
+    "formatted D16 write has an incompatible typed buffer UAV",
+    "formatted D16 write needs the original typed buffer view",
+})
+RE_COMPUTE_DISPATCH_REFUSED = re.compile(
+    r"x2w-draw compute [0-9a-fA-F]{16} Dispatch\([^)]*\) refused: (.+)$"
+)
+COMPUTE_TOTAL_NAMES = ("translated", "refused", "no translation", "not modelled", "builder gate refused")
+RE_COMPUTE_TOTALS = re.compile(
+    r"x2w-render compute dispatches: translated (\d{1,19}), refused (\d{1,19}), "
+    r"no translation (\d{1,19}), not modelled (\d{1,19}), builder gate refused (\d{1,19})\s*$"
+)
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",
     "destination capacity exceeded",
@@ -398,6 +465,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
     indirect_peaks: Counter[tuple[str, str]] | None = None
     gpu_budget = GpuBudgetSummary()
     d3d12_debug: Counter[tuple[str, str]] = Counter()
+    compute_refusals: Counter[str] = Counter()
+    compute_totals: dict[str, int] | None = None
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
     runtime_failures: Counter[tuple[str, str]] = Counter()
@@ -421,6 +490,22 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
                     indirect_peaks = Counter()
                 # The runtime emits cumulative snapshots. Counter union takes each bucket's maximum.
                 indirect_peaks |= Counter(snapshot)
+            continue
+
+        # Compute Dispatch refusals and cumulative totals. The runtime emits cumulative snapshots;
+        # keep each bucket's maximum, as for ExecuteIndirect. Keys, addresses and descriptors stay local.
+        m = RE_COMPUTE_DISPATCH_REFUSED.search(line)
+        if m:
+            reason = m.group(1).strip()
+            compute_refusals[reason if reason in COMPUTE_DISPATCH_REASONS else OTHER] += 1
+            continue
+        m = RE_COMPUTE_TOTALS.search(line)
+        if m:
+            snapshot = dict(zip(COMPUTE_TOTAL_NAMES, (int(value) for value in m.groups())))
+            if compute_totals is None:
+                compute_totals = snapshot
+            else:
+                compute_totals = {name: max(compute_totals[name], value) for name, value in snapshot.items()}
             continue
 
         # 1. slot70 memory SRV refusals
@@ -555,6 +640,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Any]:
         "indirect_peaks": indirect_peaks,
         "gpu_budget": gpu_budget,
         "d3d12_debug": d3d12_debug,
+        "compute_refusals": compute_refusals,
+        "compute_totals": compute_totals,
         "dstorage_failures": dstorage_failures,
         "dstorage_hresults": dstorage_hresults,
         "runtime_failures": runtime_failures,
@@ -722,6 +809,26 @@ def format_markdown(
         ])
         rows = [[outcome, *(indirect[outcome, kind] for kind in INDIRECT_KINDS)] for outcome in INDIRECT_OUTCOMES]
         out.extend(_format_table(["Outcome", *INDIRECT_KINDS], rows, len(rows), 0, len(rows)))
+
+    # 2c. Compute Dispatch refusals by allowlisted reason, plus cumulative totals.
+    compute = summary["compute_refusals"]
+    totals = summary["compute_totals"]
+    if compute or totals is not None:
+        out.extend(["### Compute Dispatch Refusals", ""])
+        compute_rows = [[count, f"`{reason}`"] for reason, count in compute.most_common()]
+        out.extend(
+            _format_table(
+                ["Count", "First Refusal Reason"],
+                compute_rows,
+                len(compute),
+                sum(compute.values()),
+                max_items,
+            )
+        )
+        if totals is not None:
+            out.extend(["| " + " | ".join(COMPUTE_TOTAL_NAMES) + " |", "| " + " | ".join(["---"] * len(COMPUTE_TOTAL_NAMES)) + " |"])
+            out.append("| " + " | ".join(str(totals[name]) for name in COMPUTE_TOTAL_NAMES) + " |")
+            out.append("")
 
     gpu_budget = summary["gpu_budget"]
     if gpu_budget.samples:
