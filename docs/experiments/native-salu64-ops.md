@@ -7,7 +7,12 @@ offset, writes both words of an aligned SGPR pair, and preserves SCC.
 `s_not_b64` complements both words and sets SCC when either result word
 is nonzero. Both take aligned SGPR pairs or constants, with sign extension
 for inline negatives and zero extension for other integers. They can
-write VCC as a pair. `s_bfm_b64` and `s_not_b64` may also write EXEC, as both
+write VCC as a pair. `s_bfm_b64` also writes VCC as a pair
+(`tests/native_s_bfm_b64_vcc_check.py`,
+`ctest --preset dev --no-tests=error -R '^native_s_bfm_b64_vcc_'`), covering
+widths 0, 16, 32, 64 and a 32-bit straddle (width 20, offset 24) in wave32
+and wave64, reading back `vcc_lo`/`vcc_hi`, using VCC in `v_cndmask_b32`,
+and checking SCC is unchanged. `s_bfm_b64` and `s_not_b64` may also write EXEC, as both
 words, in wave32 and wave64. `s_cselect_b64` still refuses EXEC destinations.
 `s_not_b64` and `s_cselect_b64` also take VCC and EXEC as 64-bit sources
 (`tests/native_s_not_b64_exec_check.py`, `ctest --preset dev --no-tests=error -R '^native_s_not_b64_exec_'`).
@@ -31,6 +36,7 @@ Hardware without shader model 6.6 and wave32 support returns skip code 77.
 cmake --build --preset dev --target compile_dxil native_store_replay
 ctest --preset dev --no-tests=error -R '^native_salu64_(controls|hardware)$'
 ctest --preset dev --no-tests=error -R '^native_wave64_exec_salu_hardware$'
+ctest --preset dev --no-tests=error -R '^native_s_bfm_b64_vcc_(controls|hardware)$'
 ```
 
 Results: on an NVIDIA GeForce RTX 5080 (Windows 11, DXC from the Windows SDK 10.0.26100) all fifteen cases

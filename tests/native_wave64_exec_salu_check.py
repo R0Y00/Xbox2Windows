@@ -10,7 +10,7 @@ from native_scalar_lds_check import scalar, sop1, vmove
 
 
 BCNT1_B64, BFM_B64 = 0x10, 0x25
-VCC, EXEC, ZERO, NEG_ONE = 106, 126, 128, 193
+VCC, EXEC, ZERO, NEG_ONE, M0 = 106, 126, 128, 193, 124
 COUNT_ERROR = "invalid s_bcnt1_i32_b64 source"
 BFM_ERROR = "invalid s_bfm_b64 destination"
 GROUP_STRIDE_WORDS = 128
@@ -101,7 +101,8 @@ def main(cli, replay, sdk):
 
         for instruction, error in (
             (sop1(BCNT1_B64, 24, VCC), COUNT_ERROR),
-            (scalar(BFM_B64, VCC, ZERO + 16, ZERO), BFM_ERROR),
+            (scalar(BFM_B64, M0, ZERO + 16, ZERO), BFM_ERROR),
+            (scalar(BFM_B64, 23, ZERO + 16, ZERO), BFM_ERROR),
             (sop1(BCNT1_B64, 24, 23), COUNT_ERROR),
         ):
             marker = request(work, root, 64, 64, [instruction, END])
