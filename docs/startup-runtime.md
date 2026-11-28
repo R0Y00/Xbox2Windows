@@ -3921,3 +3921,32 @@ before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On
 list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
 all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
+
+## DirectStorage request cancellation (`CancelRequestsWithTag`)
+
+Queue slot 7 (`IDStorageQueue::CancelRequestsWithTag(mask, value)`, `#1843` slice 3) cancels
+previously enqueued requests whose `UINT64 CancellationTag` at request offset `+0x38`
+(`x2w_startup::StorageRequest::cancellation_tag` in `src/startup_stubs/dstorage_error_record.h`,
+per Microsoft's MIT `Xbox-GDK-Samples` `DirectStorageWin32/dstorage_win32.h`) matches
+`(tag & mask) == value` (`mask = 0, value = 0` matches and cancels every queued request):
+
+- Waiting requests not yet submitted are compacted out of `waiting` in place without allocating
+  (releasing their retained source-file references), leaving non-matching requests, status entries
+  and fences in queue order.
+- Already-submitted requests waiting for the worker (and any OOM-deferred requests) are marked
+  cancelled in place (releasing their retained source-file references) so
+  `submitted_total`/`finished_total` ordering and deferred-completion cutoffs remain intact, and
+  skipped without executing I/O, touching their destination, incrementing `requests_failed`, failing
+  subsequent status entries, recording into `DSTORAGE_ERROR_RECORD`, or signaling `GetErrorEvent`.
+- A request the worker has already dequeued and started running cannot be cancelled, matching the
+  reference boundary.
+- Requests enqueued *after* `CancelRequestsWithTag` with the same tag are not affected.
+- `CancellationTag` is opaque and never sizes the inflate buffer (`IntermediateSize` at `+0x34`
+  remains separate); `startup_storage_cancel` pins identical completion, decoded bytes and bounded
+  commit growth for a source-built zlib payload across distinct nonzero tags alongside its
+  cancellation counterpart, error-record/event isolation and source-file reference release.
+
+Checks:
+
+- `ctest --preset dev --no-tests=error -R '^startup_storage_(cancel(_control)?|worker_start)$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_storage_cancel(_control)?$' -V`

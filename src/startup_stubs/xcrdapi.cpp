@@ -117,7 +117,20 @@ struct Entry {
     u64 id = 0;
     u64 submission_id = 0;
     u64 after = 0;  // failing: entries the worker must have finished before this one completes
+    bool cancelled = false;
 };
+
+u64 request_cancellation_tag(const unsigned char (&bytes)[sizeof(StorageRequest)]) noexcept
+{
+    u64 tag = 0;
+    std::memcpy(&tag, bytes + offsetof(StorageRequest, cancellation_tag), sizeof tag);
+    return tag;
+}
+
+bool tag_matches(u64 tag, u64 mask, u64 value) noexcept
+{
+    return (tag & mask) == value;
+}
 struct CachedStream {
     u64 source = 0;
     u64 base_offset = 0;
@@ -244,6 +257,7 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
             break;
         }
         if (e.type != Entry::request) continue;
+        if (e.cancelled) break;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
         const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         // Skip requests for other files (interleaving across unrelated files within one submission).
@@ -983,6 +997,7 @@ void signal_fence(void* fence, u64 value);
 void run_entry(Object* self, Entry& entry)
 {
     if (entry.type == Entry::request) {
+        if (entry.cancelled) return;
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && entry.token_count) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
@@ -1182,6 +1197,7 @@ struct Unrecorded {
     void* fence;
     u64 value;
     unsigned char bytes[sizeof(StorageRequest)];
+    bool cancelled;
 };
 
 void release_unrecorded(Unrecorded& node) noexcept
@@ -1246,7 +1262,8 @@ void defer_unrecorded(Object* self, Entry& entry)
 {
     auto* node = new (std::nothrow) Unrecorded{};
     if (!node) {
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        if (!(entry.type == Entry::request && entry.cancelled))
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         release_entry(entry);
         return;
     }
@@ -1259,6 +1276,7 @@ void defer_unrecorded(Object* self, Entry& entry)
     node->index = entry.index;
     node->fence = entry.fence;
     node->value = entry.value;
+    node->cancelled = entry.cancelled;
     entry.array = nullptr;
     entry.source = nullptr;  // the node now owns the entry's references
     if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
@@ -1277,7 +1295,8 @@ void fail_unrecorded(Object* self)
     }
     while (node) {
         Unrecorded* const next = node->next;
-        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+        if (!(node->type == Entry::request && node->cancelled))
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
         release_unrecorded(*node);
         delete node;
         node = next;
@@ -1295,7 +1314,8 @@ void fail_waiting(Object* self, QueueWork* work)
             entry = std::move(work->waiting.front());
             work->waiting.pop_front();
         }
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        if (!(entry.type == Entry::request && entry.cancelled))
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         release_entry(entry);
     }
 }
@@ -1424,11 +1444,13 @@ void complete_deferred(Object* self, QueueWork* work)
             }
         }
         if (node) {
-            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+            if (!(node->type == Entry::request && node->cancelled))
+                fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
             release_unrecorded(*node);
             delete node;
         } else {
-            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+            if (!(entry.type == Entry::request && entry.cancelled))
+                fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
             release_entry(entry);
         }
     }
@@ -1600,10 +1622,85 @@ void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
     if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
     submit(self);
 }
-void __stdcall queue_cancel(Object*, u64 mask, u64 value)
+// Queue slot 7, CancelRequestsWithTag(mask, value): cancels previously enqueued requests whose
+// CancellationTag satisfies (tag & mask) == value across waiting, submitted, failing and deferred
+// lists without counting them as failures (#1843).
+void __stdcall queue_cancel(Object* self, u64 mask, u64 value)
 {
+    if (!self) return;
+    std::size_t cancelled_waiting = 0, cancelled_submitted = 0, cancelled_deferred = 0;
+    QueueWork* work = nullptr;
+    {
+        const std::lock_guard setup(setup_mutex());
+        work = self->work;
+        for (Unrecorded* n = self->unrecorded_head; n; n = n->next) {
+            if (n->type == Entry::request && !n->cancelled &&
+                tag_matches(request_cancellation_tag(n->bytes), mask, value)) {
+                n->cancelled = true;
+                release_unrecorded(*n);
+                ++cancelled_deferred;
+            }
+        }
+    }
+    if (work) {
+        const std::lock_guard guard(work->mutex);
+        // Compact `waiting` in place without allocating, preserving order of remaining requests,
+        // status entries and fences.
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < work->waiting.size(); ++read) {
+            Entry& e = work->waiting[read];
+            if (e.type == Entry::request && tag_matches(request_cancellation_tag(e.bytes), mask, value)) {
+                release_entry(e);
+                e.tokens.reset();
+                e.token_count = 0;
+                ++cancelled_waiting;
+                continue;
+            }
+            if (write != read) {
+                work->waiting[write] = std::move(e);
+                e.source = nullptr;
+                e.array = nullptr;
+            }
+            ++write;
+        }
+        while (work->waiting.size() > write) work->waiting.pop_back();
+
+        // Mark matching entries in `submitted` and `failing` cancelled rather than erasing, so
+        // submitted_total / finished_total ordering and deferred-completion cutoffs stay intact.
+        for (Entry& e : work->submitted) {
+            if (e.type == Entry::request && !e.cancelled &&
+                tag_matches(request_cancellation_tag(e.bytes), mask, value)) {
+                e.cancelled = true;
+                release_entry(e);
+                e.tokens.reset();
+                e.token_count = 0;
+                ++cancelled_submitted;
+            }
+        }
+        for (Entry& e : work->failing) {
+            if (e.type == Entry::request && !e.cancelled &&
+                tag_matches(request_cancellation_tag(e.bytes), mask, value)) {
+                e.cancelled = true;
+                release_entry(e);
+                e.tokens.reset();
+                e.token_count = 0;
+                ++cancelled_deferred;
+            }
+        }
+        for (Unrecorded* n = work->deferred_head; n; n = n->next) {
+            if (n->type == Entry::request && !n->cancelled &&
+                tag_matches(request_cancellation_tag(n->bytes), mask, value)) {
+                n->cancelled = true;
+                release_unrecorded(*n);
+                ++cancelled_deferred;
+            }
+        }
+    }
     static LONG calls;
-    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
+    if (x2w_local::first_calls(calls, 4))
+        log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx -> cancelled=%zu (waiting=%zu submitted=%zu deferred=%zu)",
+            mask, value, cancelled_waiting + cancelled_submitted + cancelled_deferred,
+            cancelled_waiting, cancelled_submitted, cancelled_deferred);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
 // Slots 9 and 10 follow Microsoft's Xbox-GDK-Samples dstorage_win32.h. GetErrorEvent's
