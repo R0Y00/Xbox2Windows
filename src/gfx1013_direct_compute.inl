@@ -4,6 +4,30 @@ struct DirectCompute {
     // The nine inline float constants as binary16, which an f16 operand reads instead of the f32 pattern.
     static constexpr Word inline_half_words[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
                                               0xc000, 0x4400, 0xc400, 0x3118};
+    // D3D exp (sm4 asm) has relative error <= 2^-21, or < 8 ULP for normal f32 results.
+    // tests/f16_exp_midpoints.py generates the non-tie cases within that window
+    // using a 90-digit reference. The exact tie at -25 is handled separately.
+    struct ExpF16Midpoint { Word source, result; };
+    static constexpr ExpF16Midpoint exp_f16_midpoints[]{
+        {0x11c3, 0x3c00}, {0x11c4, 0x3c00}, {0x11c5, 0x3c01}, {0x11c6, 0x3c01},
+        {0x11c7, 0x3c01}, {0x1853, 0x3c01}, {0x1b34, 0x3c02}, {0x1b35, 0x3c03},
+        {0x1e7a, 0x3c04}, {0x1fea, 0x3c06}, {0x2164, 0x3c08}, {0x221b, 0x3c08},
+        {0x2389, 0x3c0a}, {0x2bdb, 0x3c2c}, {0x2e7c, 0x3c4a}, {0x2ea7, 0x3c4c},
+        {0x2fe7, 0x3c5b}, {0x36b6, 0x3d5a}, {0x3863, 0x3dd9}, {0x39f8, 0x3eb5},
+        {0x3a8a, 0x3f0c}, {0x3b12, 0x3f62}, {0x3b82, 0x3faa}, {0x3efc, 0x42b5},
+        {0x3f45, 0x430c}, {0x3f89, 0x4362}, {0x3fc1, 0x43aa}, {0x417e, 0x46b5},
+        {0x437e, 0x4ab5}, {0x44bf, 0x4eb5}, {0x45bf, 0x52b5}, {0x46bf, 0x56b5},
+        {0x47bf, 0x5ab5}, {0x8dc3, 0x3c00}, {0x8dc4, 0x3c00}, {0x8dc5, 0x3c00},
+        {0x8dc6, 0x3bff}, {0x8dc7, 0x3bff}, {0x8dc8, 0x3bff}, {0x9454, 0x3bff},
+        {0x9455, 0x3bfe}, {0x9738, 0x3bfd}, {0x990e, 0x3bfc}, {0x9a80, 0x3bfb},
+        {0x9bf2, 0x3bfb}, {0x9e25, 0x3bf7}, {0x9f98, 0x3bf5}, {0xa2b4, 0x3bed},
+        {0xa52d, 0x3be3}, {0xa86d, 0x3bd0}, {0xa8b4, 0x3bcc}, {0xa9d1, 0x3bc0},
+        {0xabe0, 0x3baa}, {0xaf57, 0x3b63}, {0xaf70, 0x3b62}, {0xb1d8, 0x3b0c},
+        {0xb410, 0x3ab5}, {0xb4db, 0x3a7c}, {0xb73a, 0x39d9}, {0xb8a5, 0x395a},
+        {0xbc3f, 0x37aa}, {0xbc77, 0x3762}, {0xbcbb, 0x370c}, {0xbd04, 0x36b5},
+        {0xc082, 0x32b5}, {0xc282, 0x2eb5}, {0xc441, 0x2ab5}, {0xc541, 0x26b5},
+        {0xc641, 0x22b5}, {0xc741, 0x1eb5},
+    };
     static void validate_lane_shape(const Inst &i, unsigned threads, unsigned width) {
         const auto constant = constant32(i, i.src[1]);
         const auto remaining = threads % width;
@@ -24,7 +48,7 @@ struct DirectCompute {
     HeapViewContract heap_view = HeapViewContract::none;
     // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
     bool heap_window = false;
-    // Binary16 add, sub, subrev and mul are lowered only while MODE stays at
+    // Binary16 arithmetic is lowered only while MODE stays at
     // the contract this path implements: round-to-nearest-even, f16 denormals
     // kept on input and output, and FP16_OVFL clear. mode_bits holds the
     // fields this path tracks (round in [3:0], denorm in [7:4], FP16_OVFL in
@@ -600,6 +624,23 @@ struct DirectCompute {
                 return;
             }
             const bool root = low.type == Symbol::Type::root_address;
+            if (low.type == Symbol::Type::heap_offset) {
+                // A resource-heap address formed by s_add_u32 (heap_offset_add): the same slot read as the SGPR-offset
+                // load below, with the byte offset in the low word.
+                if (!heap_offset_address(s, i.src[0]))
+                    refuse(i.pc, "heap descriptor address high word is not the carry of its offset add");
+                if (i.op != 2)
+                    refuse(i.pc, "heap descriptor address must load one descriptor with s_load_dwordx4");
+                refuse_heap_contract(i.pc);
+                if (so != 125)
+                    refuse(i.pc, "heap descriptor address with a second offset register");
+                if (i.b & 0xfffff)
+                    refuse(i.pc, "heap descriptor load with an immediate offset addresses another slot than the captured selection");
+                auto index = ir.binary("lshr", read(i.src[0]), "5");
+                for (unsigned j = 0; j < 4; ++j)
+                    write(i.dst + j, index);
+                return;
+            }
             if (!root && low.type == Symbol::Type::table && low.value == compute_resource_heap) {
                 // Reads from the whole descriptor heap: only the indexed descriptor load of a captured raw buffer slot.
                 if (i.op >= 8)
@@ -1851,7 +1892,7 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, result));
             return true;
         }
-        if (n == "v_add_f16" || n == "v_sub_f16" || n == "v_subrev_f16" || n == "v_mul_f16") {
+        if (binary16_alu(n) || binary16_unary(n)) {
             // The graphics frontend shares this ALU. Leave those programs on the
             // existing refusal; this lowering is the direct compute path.
             if (graphics_input)
@@ -1899,18 +1940,44 @@ struct DirectCompute {
             auto widen = [&](const string &bits) {
                 return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
             };
-            auto a = widen(half_bits(0));
-            auto b = widen(half_bits(1));
-            if (n == "v_subrev_f16")
-                std::swap(a, b);
-            const char *op = n == "v_mul_f16" ? "fmul" : n == "v_add_f16" ? "fadd" : "fsub";
-            auto widened = ir.value(string(op) + " float " + a + ", " + b);
+            const auto source = half_bits(0);
+            auto a = widen(source);
+            const bool rsq = n == "v_rsq_f16", exp = n == "v_exp_f16";
+            string widened;
+            if (n == "v_rcp_f16") {
+                widened = ir.value("fdiv float 1.000000e+00, " + a);
+            } else if (binary16_unary(n)) {
+                const unsigned opcode = rsq ? 25 : exp ? 21 : 24;
+                widened = ir.invoke("float", "unary.f32", opcode, {{"float", a}}, "nounwind readnone");
+            } else {
+                auto b = widen(half_bits(1));
+                if (n == "v_subrev_f16")
+                    std::swap(a, b);
+                const char *op = n == "v_mul_f16" ? "fmul" : n == "v_add_f16" ? "fadd" : "fsub";
+                widened = ir.value(string(op) + " float " + a + ", " + b);
+            }
             auto bits = ir.value("bitcast float " + widened + " to i32");
-            // f32 has a 24-bit significand, which covers a correctly rounded f16
-            // add, sub or mul (2*11+2). Round with the same integer nearest-even
-            // conversion v_cvt_f16_f32 uses.
+            // Round with the same integer nearest-even conversion v_cvt_f16_f32 uses.
             auto rounded = packed_half_rne(bits);
-            // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest lists these four ops with
+            if (rsq) {
+                // Enforce RDNA2's exact special results from the modified half bits.
+                // The D3D Rsqrt contract does not guarantee a negative infinity for -0.
+                // Select the other special results explicitly as well.
+                const auto magnitude = ir.binary("and", source, "32767");
+                // Every encoding above +infinity is negative or a positive NaN.
+                rounded = select(cmp("ugt", source, "31744"), "32256", rounded);
+                rounded = select(cmp("eq", source, "31744"), "0", rounded);
+                const auto zero_result = ir.binary("or", source, "31744");
+                rounded = select(cmp("eq", magnitude, "0"), zero_result, rounded);
+            } else if (exp) {
+                for (const auto &entry : exp_f16_midpoints)
+                    rounded = select(cmp("eq", source, to_string(entry.source)), to_string(entry.result), rounded);
+                // 2^-25 is exactly halfway between zero and the smallest half subnormal.
+                rounded = select(cmp("eq", source, to_string(0xce40)), "0", rounded);
+                const auto magnitude = ir.binary("and", source, "32767");
+                rounded = select(cmp("ugt", magnitude, "31744"), "32256", rounded);
+            }
+            // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest says
             // "On gfx10, all 16-bit instructions preserve the high bits", as v_cvt_f16_f32 above already does.
             vector_write(i.dst, i.subword ? place_subword(i, rounded)
                                           : ir.binary("or", ir.binary("and", read(i.dst), "4294901760"),
@@ -1987,7 +2054,8 @@ struct DirectCompute {
                                 n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
         const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
         const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
-        const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" || n == "v_mac_legacy_f32";
+        const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" ||
+                                 n == "v_mac_legacy_f32" || n == "v_madmk_f32" || n == "v_madak_f32";
         if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && !unfused_mad &&
             n != "v_mul_legacy_f32" &&
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
@@ -2105,10 +2173,18 @@ struct DirectCompute {
                     return ir.value("bitcast i32 " + kept + " to float");
                 };
                 const bool legacy = n == "v_mad_legacy_f32" || n == "v_mac_legacy_f32";
+                const bool literal_k = n == "v_madmk_f32" || n == "v_madak_f32";
+                if (literal_k && (i.wide || i.subword || i.dpp_control || permuted))
+                    refuse(i.pc, "unsupported " + string(n) + " encoding");
                 if (n.substr(0, 5) == "v_mac" && ((i.abs | i.neg) & 4))
                     refuse(i.pc, "unsupported " + string(n) + " accumulator modifier");
-                auto x = ftz(a), y = ftz(fp(1));
-                auto c = n.substr(0, 5) == "v_mac" ? ir.value("bitcast i32 " + read(i.dst) + " to float") : fp(2);
+                auto lit_float = [&]() { return ir.value("bitcast i32 " + to_string(i.literal) + " to float"); };
+                auto x = ftz(a);
+                auto y = ftz(n == "v_madmk_f32" ? lit_float() : fp(1));
+                auto c = n.substr(0, 5) == "v_mac" ? ir.value("bitcast i32 " + read(i.dst) + " to float")
+                       : n == "v_madak_f32"        ? lit_float()
+                       : n == "v_madmk_f32"        ? fp(1)
+                                                   : fp(2);
                 auto product = ir.value("fmul float " + x + ", " + y);
                 if (legacy) {
                     auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + x + ", 0.0") + ", " +
@@ -2494,13 +2570,27 @@ struct DirectCompute {
     }
     void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr, bool compute = false) {
         auto n = i.name;
-        if (compute && (n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
-            // Integer dot products use both packed words as-is. Require the
-            // canonical VOP3P OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
-            if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
+        if (compute) {
+            if (const auto offset = heap_offset_add(i, state)) {
+                // The heap base is slot 0 of ResourceDescriptorHeap: the low word keeps the byte offset, the carry is 0.
+                write(i.dst, operand32(i, i.src[*offset]));
+                write(128, "0");
+                return;
+            }
+        }
+        const bool dot_accumulate = n == "v_dot4c_i32_i8";
+        if (compute && (dot_accumulate || n == "v_dot4_i32_i8" || n == "v_dot4_u32_u8")) {
+            // Integer dots use both packed words as-is. The VOP3P forms
+            // require canonical OP_SEL/OP_SEL_HI and zero NEG_LO/NEG_HI.
+            if (dot_accumulate) {
+                if (i.enc != Encoding::Vop2 || i.wide || i.subword || i.dpp_control || permuted ||
+                    i.abs || i.neg || i.clamp || i.scale)
+                    refuse(i.pc, "unsupported packed byte dot-accumulate operand modifiers");
+            } else if (i.enc != Encoding::Mix || (i.a & 0x7f00) != 0x4000 || (i.b >> 27) != 3)
                 refuse(i.pc, "unsupported packed byte dot operand modifiers");
-            const bool sign = n == "v_dot4_i32_i8";
-            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]), acc = operand32(i, i.src[2]);
+            const bool sign = n != "v_dot4_u32_u8";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            auto acc = operand32(i, dot_accumulate ? i.dst : i.src[2]);
             // The dot alone fits into i32 even for four unsigned 255*255
             // products. Saturate only the final addition to the accumulator.
             auto dot = ir.invoke("i32", "dot4AddPacked.i32", sign ? 163 : 164,
@@ -3083,25 +3173,29 @@ struct DirectCompute {
             return;
         }
         if (compute && (n == "s_cselect_b64" || n == "s_not_b64")) {
-            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106))
+            const bool invert = n == "s_not_b64";
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106 && !(invert && i.dst == 126)))
                 refuse(i.pc, "invalid " + string(n) + " destination");
-            auto high = [&](unsigned src) {
-                if (!wave64 && (src == 106 || src == 126))
+            auto scalar64 = [&](unsigned src) -> std::pair<string, string> {
+                if (!((src <= 104 && !(src & 1)) || src == 106 || src == 126 ||
+                      (src >= 128 && src <= 208) || src == 255))
                     refuse(i.pc, "invalid " + string(n) + " source");
-                return pair_high(i, src);
+                return {operand32(i, src), pair_high(i, src)};
             };
-            auto lo = val(0), hi = high(i.src[0]);
-            if (n == "s_cselect_b64") {
+            auto [lo, hi] = scalar64(i.src[0]);
+            if (!invert) {
+                auto [other_lo, other_hi] = scalar64(i.src[1]);
                 auto condition = cmp("ne", read(128), "0");
-                lo = select(condition, lo, val(1));
-                hi = select(condition, hi, high(i.src[1]));
+                lo = select(condition, lo, other_lo);
+                hi = select(condition, hi, other_hi);
             } else {
                 lo = ir.binary("xor", lo, "4294967295");
                 hi = ir.binary("xor", hi, "4294967295");
-                write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             }
             write(i.dst, lo);
             write(i.dst + 1, hi);
+            if (invert)
+                write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             return;
         }
         if (compute && (n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64")) {
@@ -3344,14 +3438,16 @@ struct DirectCompute {
         }
         if ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) && n.size() > 6 && n.substr(n.size() - 4) == "_b64") {
             bool save = n.find("_saveexec_") != Name::npos;
-            const bool write_exec = compute && n == "s_andn2_wrexec_b64";
+            const bool wrexec = compute && wave64 && n == "s_andn2_wrexec_b64";
             auto op = n.substr(2, n.find('_', 2) - 2);
-            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
-                ((save || write_exec) ? i.enc != Encoding::Sop1 : i.enc != Encoding::Sop2))
+            if (wrexec ? ((i.dst | i.src[0]) & 1) || i.dst > 104 || i.src[0] > 104
+                       : (i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
+                             (save ? i.enc != Encoding::Sop1 : i.enc != Encoding::Sop2))
                 refuse(i.pc, "unsupported wave64 scalar operation");
             auto ah = pair_high(i, i.src[0]);
-            auto bl = save || write_exec ? read(126) : b;
-            auto bh = save || write_exec ? read(127) : pair_high(i, i.src[1]);
+            const bool updates_exec = save || wrexec;
+            auto bl = updates_exec ? read(126) : b;
+            auto bh = updates_exec ? read(127) : pair_high(i, i.src[1]);
             auto combine = [&](const string &left, const string &right) -> string {
                 if (op == "and" || op == "or" || op == "xor") return ir.binary(string(op), left, right);
                 if (op == "andn2" || op == "orn2")
@@ -3360,11 +3456,12 @@ struct DirectCompute {
                     return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right), "4294967295");
                 refuse(i.pc, "unsupported wave64 scalar mask operation");
             };
-            // SAVEEXEC combines its source operand with the old EXEC in ISA operand order.
+            // SAVEEXEC and WREXEC combine the source with old EXEC in ISA operand order.
+            // WREXEC stores the new mask in the destination pair.
             auto lo = combine(a, bl), hi = combine(ah, bh);
             write(i.dst, save ? bl : lo);
             write(i.dst + 1, save ? bh : hi);
-            if (save || write_exec) { write(126, lo); write(127, hi); }
+            if (updates_exec) { write(126, lo); write(127, hi); }
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             return;
         }
@@ -4051,7 +4148,7 @@ struct DirectCompute {
             if (!p.reached[k])
                 continue;
             const auto &op = p.code[k];
-        if (binary16_alu(op.name) ||
+        if (binary16_alu(op.name) || binary16_unary(op.name) ||
             op.name == "v_pk_min_f16" ||
             op.name == "v_pk_max_f16" ||
             op.name == "v_cvt_f16_u16" ||

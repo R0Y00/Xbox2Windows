@@ -7,8 +7,10 @@ offset, writes both words of an aligned SGPR pair, and preserves SCC.
 `s_not_b64` complements both words and sets SCC when either result word
 is nonzero. Both take aligned SGPR pairs or constants, with sign extension
 for inline negatives and zero extension for other integers. They can
-write VCC as a pair. `s_bfm_b64` may also write EXEC, as both words, in wave32
-and wave64. `s_cselect_b64` and `s_not_b64` still refuse EXEC destinations.
+write VCC as a pair. `s_bfm_b64` and `s_not_b64` may also write EXEC, as both
+words, in wave32 and wave64. `s_cselect_b64` still refuses EXEC destinations.
+`s_not_b64` and `s_cselect_b64` also take VCC and EXEC as 64-bit sources
+(`tests/native_s_not_b64_exec_check.py`, `ctest --preset dev --no-tests=error -R '^native_s_not_b64_exec_'`).
 
 Direct compute also accepts `s_bitreplicate_b64_b32 exec, imm`, writing both EXEC words and preserving SCC. Wave32 lane activity uses only `exec_lo`.
 

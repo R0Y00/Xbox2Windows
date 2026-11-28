@@ -53,6 +53,7 @@ struct ComputeTranslation {
     bool logged_token_output = false, logged_bound_token_output = false;
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     const char* first_refusal = nullptr;   // reason of the first refused call
+    bool input_path_logged = false;        // the first time a placed input came from a GPU copy or a title snapshot
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
     ~ComputeTranslation()
@@ -88,6 +89,7 @@ unsigned float_output_channels(DXGI_FORMAT format)
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
+LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
 
 // The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
 // unavailable, or null when it is ready.
@@ -719,20 +721,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            auto view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
-            if (reason && slot.scalar_window && words[0] != view_token_magic &&
-                !std::strcmp(reason, "an input is in title memory outside any placed buffer")) {
-                const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
-                const UINT stride = (words[1] >> 16) & 0x3fff;
-                const u64 extent = u64{stride ? stride : 1} * words[2];
-                const u64 bytes = extent;
-                u64 start{};
-                ID3D12Resource* chunk{};
-                if (bytes >= slot.scalar_window && bytes <= 65536 && bytes % 4 == 0 &&
-                    readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &start, &chunk) && chunk) {
-                    view = {chunk, start, bytes, stride, true};
-                    reason = nullptr;
-                }
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
+            if (view.source == 2) {
+                InterlockedIncrement(&compute_inputs_snapshot);
+                InterlockedExchangeAdd(&compute_inputs_snapshot_kib, static_cast<LONG>((view.bytes + 1023) / 1024));
+            }
+            if (view.source && !tr->input_path_logged) {
+                tr->input_path_logged = true;
+                log("x2w-draw compute %016llx input %zu (%s %d %d) comes from %s (%llu bytes)", key, i, slot.heap ? "heap" : "table", slot.a, slot.b,
+                    view.source == 1 ? "a GPU copy this list made" : view.source == 3 ? "zeros for a null descriptor" : "a snapshot of title memory", view.bytes);
             }
             if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input buffer range is not 16-byte aligned in its resource";
             if (reason && !tr->first_refusal)  // once per key: which input, and where its descriptor was read
