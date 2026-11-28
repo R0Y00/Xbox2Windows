@@ -77,7 +77,7 @@ const char* bind_mesh57_buffers(Wrapper* self, Pass& pass, ID3D12GraphicsCommand
             view.Buffer.Flags != D3D12_BUFFER_SRV_FLAG_NONE || view.Buffer.StructureByteStride ||
             !view.Buffer.NumElements || view.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
             return "selected MS heap SRV requires an R32_UINT buffer";
-        typed = indirect_table_buffer(self, words, false, nullptr, u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP, 4);
+        typed = indirect_table_buffer(self, words, false, nullptr, u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP, false, 4);
         if (!typed.resource || typed.resource == arguments || typed.stride != 4 ||
             typed.bytes != UINT64{view.Buffer.NumElements} * 4)
             return "selected MS heap SRV lacks its complete GPU-backed range";
