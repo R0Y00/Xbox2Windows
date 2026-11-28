@@ -29,6 +29,11 @@ static bool binary16_alu(std::string_view name) {
     return name == "v_add_f16" || name == "v_sub_f16" || name == "v_subrev_f16" || name == "v_mul_f16";
 }
 
+static bool binary16_unary(std::string_view name) {
+    return name == "v_rcp_f16" || name == "v_sqrt_f16" || name == "v_exp_f16" ||
+           name == "v_rsq_f16";
+}
+
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
     std::ostringstream out;
     out << "native compute +0x" << std::hex << pc << ": " << reason;
@@ -59,6 +64,8 @@ struct Inst {
     bool clamp = false, wide = false, subword = false;
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
+    unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
+    std::optional<Word> dpp8_selectors;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -87,7 +94,11 @@ struct Inst {
     }
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
-Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false) {
+unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
+// Direct compute stores both VCC words in scalar registers.
+unsigned smem_sgpr_limit(bool direct_compute) { return direct_compute ? 108 : 106; }
+
+Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=false, bool wave64=false) {
     const auto encoded=gfx1013::instruction(bytes,pc);
     Inst i;
     i.pc = pc;
@@ -159,9 +170,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.dst = (a >> 6) & 127;
         i.src[0] = (a & 63) * 2;
         const unsigned soffset = i.b >> 25;
+        const unsigned limit = smem_sgpr_limit(direct && !graphics);
         if ((i.b & 0x01f00000u) || (a & 0x14000) || (i.op & ~8u) > 4 ||
-            (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset > 105)))
+            (soffset != 125 && ((!direct && i.op < 8 && i.op != 2) || soffset >= limit)))
             refuse(pc, "unsupported scalar memory addressing");
+        if (direct && !graphics && i.dst + memory_count(i) > limit)
+            refuse(pc, "unsupported scalar memory destination range");
         i.name = "smem";
     } else if ((a & 0xfc000000u) == 0xf0000000) {
         i.enc = Encoding::Image;
@@ -197,12 +211,24 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 refuse(pc, "formatted store needs an index-only linear view and supported component count");
             i.name = "buffer_store_format";
         } else if (i.op >= 0x1c && i.op <= 0x1f) {
-            if ((a & 0x3e000u) || (i.b & 0xe00000u))
+            // Direct compute ignores GLC, DLC and SLC cache-policy hints on raw stores.
+            const bool compute = direct && !graphics;
+            if ((a & (compute ? 0x32000u : 0x3e000u)) ||
+                (i.b & (compute ? 0xa00000u : 0xe00000u)))
                 refuse(pc, "raw store needs a linear byte offset");
             i.name = "buffer_store_raw";
         } else if (i.op >= 0x0c && i.op <= 0x0f) {
-            if ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u)
+            if (direct && !graphics) {
+                // GLC, DLC and SLC are cache-policy hints on raw loads.
+                if ((a & 0x02032000u) || (i.b & 0x00a00000u))
+                    refuse(pc, "raw buffer load needs a linear byte offset and no modifiers");
+                // The MUBUF encoding has no trailing literal word.
+                const unsigned soffset = i.b >> 24;
+                if (soffset > 105 && !(soffset >= 128 && soffset <= 208))
+                    refuse(pc, "raw buffer load scalar offset needs an SGPR or inline integer");
+            } else if ((a & 0x0203f000u) != 0x1000u || (i.b & 0xffe00000u) != 0x80000000u) {
                 refuse(pc, "raw buffer load needs offen with zero scalar offset and no modifiers");
+            }
             i.name = "buffer_load_dword";
         } else {
             if (i.op > 3)
@@ -224,16 +250,16 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
     } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
-        // FLAT encoding, segment 2 (GLOBAL). Only the one-dword load with an SGPR-pair base (the saddr form,
-        // ADDR = SADDR + zext(VADDR) + sext(OFFSET)) is lowered, as gfx2hlsl.py op_global_load_dword does.
+        // FLAT encoding, segment 2 (GLOBAL), with an SGPR-pair base:
+        // ADDR = SADDR + zext(VADDR) + sext(OFFSET).
         // SADDR 125 is `off` on gfx10. LDS, the other segments and opcodes stay refused.
         i.b = take();
         i.op = (a >> 18) & 127;
         const unsigned saddr = (i.b >> 16) & 127;
-        if (((a >> 14) & 3) != 2 || i.op != 12 || (a & 0x2000u) || saddr == 125 || saddr == 127)
-            refuse(pc, "direct global memory supports only global_load_dword with a scalar address pair");
+        if (((a >> 14) & 3) != 2 || i.op < 12 || i.op > 15 || (a & 0x2000u) || saddr == 125 || saddr == 127)
+            refuse(pc, "direct global memory supports only DWORD loads with a scalar address pair");
         i.enc = Encoding::Mubuf;
-        i.name = "global_load_dword";
+        i.name = encoded.name;
         i.dst = i.b >> 24;
     } else if ((a & 0xfc000000u) == 0xd8000000) {
         i.enc = Encoding::Lds;
@@ -260,40 +286,50 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.enc = Encoding::Vop1;
             i.op -= 0x180;
         }
+        if (direct && !graphics && i.enc == Encoding::Vop3 && (i.op == 0x377 || i.op == 0x378)) {
+            // The shared extent decoder already counts the trailing literal word.
+            // S1 and S2 may both reference that word.
+            if (i.src[0] == 255)
+                refuse(pc, "permlane S0 cannot be a literal");
+        }
         lit = std::find(i.src.begin(), i.src.end(), 255) != i.src.end();
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
-        const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
-        if (direct && half_alu && i.src[0] == 250)
+        const bool half_alu = !graphics && ((i.enc == Encoding::Vop2 && binary16_alu(encoded.name)) ||
+                                           (i.enc == Encoding::Vop1 && binary16_unary(encoded.name)));
+        const bool dpp8 = i.src[0] == 233 || i.src[0] == 234;
+        if (direct && half_alu && (dpp8 || (i.enc == Encoding::Vop1 && i.src[0] == 250)))
             refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
+        const unsigned sdwa_mask_limit = direct && !graphics && !wave64 ? 107 : 106;
         if (direct && i.src[0] == 249 && (sdwa_compare || i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2)) {
             // Operand profiles from disasm_rdna2's GFX10 VOP1/VOP2 SDWA
             // decoder. Admit only profiles with a direct result placement.
             static const std::set<Name> bits{
                 "v_mov_b32", "v_not_b32", "v_cndmask_b32", "v_bfrev_b32", "v_mul_u32_u24",
-                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32",
-                "v_and_b32", "v_or_b32", "v_xor_b32", "v_min_u32", "v_max_u32",
+                "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_add_co_ci_u32",
+                "v_and_b32", "v_or_b32", "v_xor_b32", "v_xnor_b32", "v_min_u32", "v_max_u32",
                 "v_min_i32", "v_max_i32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"};
             static const std::set<Name> floats{
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
                 "v_floor_f32", "v_ceil_f32", "v_fract_f32", "v_trunc_f32", "v_rndne_f32",
-                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
+                "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32"};
             const auto name = encoded.name;
             const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
-                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" ||
+                                  name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
                                   (sdwa_compare && (name.substr(name.size()-4) == "_f32" || name.substr(name.size()-4) == "_f16"));
             const bool conversion = name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" ||
                                     name.substr(0,15) == "v_cvt_f32_ubyte";
-            if (!(fp_input || conversion || bits.count(name) || sdwa_compare))
+            if (!(fp_input || conversion || bits.count(name) || sdwa_compare) ||
+                (graphics && (name == "v_cvt_pkrtz_f16_f32" || name == "v_add_co_ci_u32")))
                 refuse(pc, "unimplemented direct SDWA operand profile");
             const Word ext = take();
             const unsigned sources = i.enc == Encoding::Vop1 ? 1 : 2;
             if (sdwa_compare) {
-                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > 106))
+                if ((ext & 0x8000) && (name.substr(0,7) == "v_cmpx_" || ((ext >> 8) & 127) > sdwa_mask_limit))
                     refuse(pc, "invalid SDWA compare destination");
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
             } else {
@@ -304,7 +340,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 if (half_alu && ((i.dst_select != 4 && i.dst_select != 5) ||
                                  (i.dst_unused != 0 && i.dst_unused != 2)))
                     refuse(pc, "unsupported SDWA destination modifier");
-                if (i.dst_select == 7 || i.dst_unused == 3 || ((i.clamp || i.scale) && !floats.count(name) && !conversion) ||
+                const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
+                if (i.dst_select == 7 || i.dst_unused == 3 ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }
@@ -312,8 +350,6 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 const unsigned control = (ext >> (16 + 8*j)) & 255;
                 i.src_select[j] = control & 7;
                 i.src_sext[j] = (control & 8) != 0;
-                if (half_alu && (control & 128))
-                    refuse(pc, "SDWA binary16 source must be a VGPR");
                 if (half_alu && i.src_select[j] < 4)
                     refuse(pc, "invalid SDWA source modifier");
                 if (i.src_select[j] == 7 || (control & 64) || (fp_input && i.src_sext[j]) || (!fp_input && (control & 0x30)))
@@ -339,7 +375,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             } else {
                 // VOPC has a scalar mask destination in the same bits that VOP2 uses for placement.
                 i.dst = ext & 0x8000 ? (ext >> 8) & 127 : 106;
-                if ((ext & 0x70480000u) || (i.dst > 105 && i.dst != 106))
+                if ((ext & 0x70480000u) || i.dst > sdwa_mask_limit)
                     refuse(pc, "invalid SDWA class modifiers or mask destination");
                 i.neg = (ext >> 20) & 1;
                 i.abs = (ext >> 21) & 1;
@@ -364,10 +400,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             auto control=take();
             // DPP_CTRL[8] selects patterns outside a quad; bit 17 is
             // reserved. FI and BOUND_CTRL are independent of the pattern.
-            if ((control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
+            if (!half_alu && (control >> 24) != 0xff) refuse(pc,"DPP requires a full-row, full-bank mask");
             if (control & (1u << 17)) refuse(pc,"reserved DPP16 control bit");
             const auto pattern = (control >> 8) & 0x1ff;
             i.dpp_control = pattern;
+            i.dpp_row_mask = control >> 28;
+            i.dpp_bank_mask = (control >> 24) & 15;
             if (pattern > 255 && !i.mirror_mask() && i.dpp_row().op == Inst::DppRowOp::None)
                 refuse(pc,"unsupported DPP lane selection");
             i.dpp_fetch_inactive = (control & (1u << 18)) != 0;
@@ -375,7 +413,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.src[0]=256+(control&255);
             i.neg=((control>>20)&1)|((control>>21)&2);
             i.abs=((control>>21)&1)|((control>>22)&2);
-        } else if (graphics && (i.src[0] == 233 || i.src[0] == 234) && i.enc != Encoding::Vopc && !lit) {
+        } else if (direct && !graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
+            const Word control = take();
+            i.dpp8_selectors = control >> 8;
+            i.dpp_fetch_inactive = i.src[0] == 234;
+            i.src[0] = 256 + (control & 255);
+        } else if (graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
             // pixel_aot.parse_dpp: both halves of an octet must select the
             // same local 2x2 permutation to map to desktop quad operations.
             const Word control = take();
@@ -413,23 +456,103 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     if(i.next-pc!=encoded.size)refuse(pc,"instruction extent mismatch for "+string(encoded.name));
     return i;
 }
-// VOP3B carries a scalar destination in the field used for ABS in VOP3A.
+// VOP2 (including SDWA) writes carry to VCC. VOP3B encodes its own scalar destination.
 static std::optional<unsigned> carry_destination(const Inst &i) {
     if (i.name == "v_add_co_u32" || i.name == "v_sub_co_u32" || i.name == "v_subrev_co_u32" ||
         i.name == "v_add_co_ci_u32" || i.name == "v_sub_co_ci_u32" || i.name == "v_subrev_co_ci_u32")
         return i.wide ? (i.a >> 8) & 127 : 106;
+    if (i.name == "v_mad_u64_u32")  // VOP3B: the carry-out of the 64-bit add (#3000)
+        return (i.a >> 8) & 127;
     return {};
 }
 struct Symbol {
     enum class Type { unknown, constant, masked, table, descriptor, indexed_descriptor, root_address, primitive_mask,
-                      stride, byte_stride, zero_stride_word, byte_count, clear_oob, byte_oob, lane_mask, uniform_mask, unbound } type{};
+                      stride, byte_stride, zero_stride_word, byte_count, clear_oob, byte_oob, lane_mask, uniform_mask,
+                      heap_offset, heap_carry, unbound } type{};
     Word value = 0, offset = 0;
     unsigned index_mask = 0, definition = 0;
     bool numeric() const { return type == Type::unknown || type == Type::constant || type == Type::masked || type == Type::uniform_mask; }
     bool operator==(const Symbol &r) const { return type == r.type && value == r.value && offset == r.offset &&
         index_mask == r.index_mask && definition == r.definition; }
 };
-using State = std::array<Symbol, 128>;
+struct State {
+    std::array<Symbol, 128> scalar{};
+    // Encoded VGPR and guest lane. A join can lose the identity while
+    // retaining the fact that some path omitted the runtime lane write.
+    std::map<std::pair<unsigned, unsigned>, std::optional<Symbol>> lane_spills;
+    // SCC, tracked only as the carry of a heap offset add (see heap_offset_add).
+    Symbol scc{};
+    Symbol &operator[](unsigned n) { return scalar[n]; }
+    const Symbol &operator[](unsigned n) const { return scalar[n]; }
+    const Symbol &at(unsigned n) const { return scalar.at(n); }
+    size_t size() const { return scalar.size(); }
+    auto begin() { return scalar.begin(); }
+    auto end() { return scalar.end(); }
+    auto begin() const { return scalar.begin(); }
+    auto end() const { return scalar.end(); }
+    bool has_spill(unsigned reg) const {
+        const auto it = lane_spills.lower_bound({reg, 0});
+        return it != lane_spills.end() && it->first.first == reg;
+    }
+    void clear_spills(unsigned reg, unsigned count = 1) {
+        lane_spills.erase(lane_spills.lower_bound({reg, 0}), lane_spills.lower_bound({reg + count, 0}));
+    }
+};
+static std::optional<Word> constant32(const Inst &i, unsigned r) {
+    static constexpr Word floats[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
+                                   0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+    if (r >= 128 && r <= 192) return r - 128;
+    if (r >= 193 && r <= 208) return Word(192) - r;
+    if (r >= 240 && r <= 248) return floats[r - 240];
+    if (r == 255) return i.literal;
+    return {};
+}
+static std::optional<unsigned> guest_spill_lane(const Inst &i, bool wave64) {
+    if (auto selector = constant32(i, i.src[1]))
+        return *selector & (wave64 ? 63 : 31);
+    return {};
+}
+static bool identity_spill(const Symbol &s) {
+    // Indexed descriptors and their derived fields still use an SGPR's
+    // runtime index. Erasing a lane operation would lose that payload.
+    // An unbound value stays unbound after a refill, so it is refused at its use.
+    return !s.numeric() &&
+           s.type != Symbol::Type::indexed_descriptor && !s.definition;
+}
+static void clear_vector_spills(const Inst &i, State &s) {
+    if (s.lane_spills.empty()) return;
+    switch (i.enc) {
+    case Encoding::Vop1: case Encoding::Vop2: case Encoding::Vop3: case Encoding::Mix:
+        if (i.dst >= 256 && i.name != "v_nop") {
+            const bool pair = i.name == "v_mad_u64_u32" || i.name == "v_mad_i64_i32" || i.name == "v_lshlrev_b64" ||
+                              i.name == "v_lshrrev_b64" || i.name == "v_ashrrev_i64";
+            s.clear_spills(i.dst, pair ? 2 : 1);
+            if (i.name == "v_swap_b32") s.clear_spills(i.src[0]);
+        }
+        break;
+    case Encoding::Mubuf:
+        if (i.name == "buffer_load_dword") {
+            constexpr unsigned widths[]{1, 2, 4, 3};
+            s.clear_spills(256 + i.dst, widths[i.op & 3]);
+        } else if (i.name == "buffer_load_format" || i.name.substr(0, 8) == "tbuffer_")
+            s.clear_spills(256 + i.dst, (i.op & 3) + 1);
+        else if (i.name == "global_load_dword" ||
+                 (i.name.substr(0, 14) == "buffer_atomic_" && (i.a & 0x4000)))
+            s.clear_spills(256 + i.dst);
+        break;
+    case Encoding::Image:
+        if (i.op != 8) {
+            unsigned count = 0;
+            for (unsigned mask = (i.a >> 8) & 15; mask; mask >>= 1)
+                count += mask & 1;
+            if (i.op == 68) count = 4;
+            if (i.b >> 31) count = (count + 1) / 2;
+            s.clear_spills(256 + i.dst, count);
+        }
+        break;
+    default: break;
+    }
+}
 // FSSM root descriptors carry a guest address in two SGPRs. Preserve the
 // identity of each half through scalar moves and CFG joins (Victory resource.rs).
 void bind_root_address(State &state, const ShaderRootInput &input, unsigned limit) {
@@ -451,7 +574,30 @@ Symbol source(const Inst &i, unsigned code, const State &s) {
         return {Symbol::Type::constant, i.literal};
     return {};
 }
-unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
+// The low word of a resource-heap descriptor address formed by adding a byte offset, as in a waterfall loop over a
+// lane-selected slot: s_add_u32 lo, <resource heap>, <byte offset SGPR>, then the carry into the high word. Returns the
+// operand index of the offset. A constant offset is not matched: the selected slot must come from GPU data.
+static std::optional<unsigned> heap_offset_add(const Inst &i, const State &s) {
+    if (i.name != "s_add_u32" || i.dst > 105) return {};
+    for (unsigned k = 0; k < 2; ++k) {
+        const auto heap = source(i, i.src[k], s), offset = source(i, i.src[1 - k], s);
+        if (heap.type == Symbol::Type::table && heap.value == compute_resource_heap && !heap.offset &&
+            i.src[1 - k] <= 105 && offset.numeric() && offset.type != Symbol::Type::constant)
+            return 1 - k;
+    }
+    return {};
+}
+// The high word of that address: s_add_u32 hi, 0, src_scc or s_addc_u32 hi, 0, 0.
+static bool heap_offset_carry(const Inst &i) {
+    return i.dst <= 105 && ((i.name == "s_add_u32" && ((i.src[0] == 128 && i.src[1] == 253) ||
+                                                       (i.src[0] == 253 && i.src[1] == 128))) ||
+                            (i.name == "s_addc_u32" && i.src[0] == 128 && i.src[1] == 128));
+}
+// s[base:base+1] holds the resource-heap base plus a byte offset with its own carry in the high word.
+static bool heap_offset_address(const State &s, unsigned base) {
+    return base + 1 < s.size() && s[base].type == Symbol::Type::heap_offset &&
+           s[base + 1].type == Symbol::Type::heap_carry && s[base + 1].definition == s[base].definition;
+}
 // Derive the rewritten byte-address V# symbolically. Each field carries its
 // source table/slot identity. Numeric consumption still requires real bits.
 // heap_window: the direct path under HeapViewContract::raw_buffer also rewrites a
@@ -484,12 +630,36 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
         return field(a,T::byte_oob);
     return {};
 }
-State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window = false) {
+State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
         s[n] = v;
     };
+    const Symbol carry = s.scc;
+    if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Sopc || i.enc == Encoding::Sopk)
+        s.scc = {};
+    const auto heap_add = direct && !graphics ? heap_offset_add(i, s) : std::nullopt;
+    if (direct && !graphics) {
+        if (i.name == "v_writelane_b32") {
+            if (auto lane = guest_spill_lane(i, wave64)) {
+                const auto key = std::make_pair(i.dst, *lane);
+                const auto value = source(i, i.src[0], s);
+                if (i.src[0] <= 105 && identity_spill(value))
+                    s.lane_spills[key] = value;
+                else
+                    s.lane_spills.erase(key);
+            }
+            return s;
+        }
+        if (i.name == "v_readlane_b32") {
+            const auto lane = guest_spill_lane(i, wave64);
+            const auto slot = lane ? s.lane_spills.find({i.src[0], *lane}) : s.lane_spills.end();
+            set(i.dst, slot != s.lane_spills.end() && slot->second ? *slot->second : Symbol{});
+            return s;
+        }
+        clear_vector_spills(i, s);
+    }
     auto mask = carry_destination(i);
     const bool compared = graphics && i.enc == Encoding::Vopc && i.dst < 106 && i.name.substr(0,6) == "v_cmp_";
     if (mask || compared) {
@@ -503,6 +673,13 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
                (i.src[0] == 193 || i.src[0] == 128) && (i.src[1] == 193 || i.src[1] == 128)) {
         set(i.dst,{Symbol::Type::uniform_mask,i.pc,0});
         set(i.dst+1,{Symbol::Type::uniform_mask,i.pc,1});
+    } else if (heap_add) {
+        const auto offset = source(i, i.src[*heap_add], s);
+        set(i.dst, {Symbol::Type::heap_offset, compute_resource_heap, 0,
+                    offset.type == Symbol::Type::masked ? offset.value : ~0u, i.pc});
+        s.scc = {Symbol::Type::heap_carry, compute_resource_heap, 0, 0, i.pc};
+    } else if (direct && !graphics && carry.type == Symbol::Type::heap_carry && heap_offset_carry(i)) {
+        set(i.dst, carry);
     } else if (auto field = byte_descriptor_field(i,s,heap_window)) {
         set(i.dst,*field);
     } else if (i.enc == Encoding::FixedSetup) {
@@ -512,11 +689,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.enc == Encoding::Smem) {
         auto base = s[i.src[0]];
         const unsigned offset_reg = i.b >> 25;
-        const Symbol index = offset_reg <= 105 ? s[offset_reg] : Symbol{};
+        const Symbol index = offset_reg < smem_sgpr_limit(direct && !graphics) ? s[offset_reg] : Symbol{};
         unsigned n = memory_count(i);
+        const bool heap_address = i.op == 2 && i.b >> 25 == 125 && heap_offset_address(s, i.src[0]);
         for (unsigned j = 0; j < n; ++j) {
             Symbol v{};
-            if (i.op == 2 && i.b >> 25 != 125 && base.type == Symbol::Type::table) {
+            if (heap_address) {
+                v = {Symbol::Type::indexed_descriptor, compute_resource_heap, (i.b & 0xfffff) + 4 * j, base.index_mask, i.pc};
+            } else if (i.op == 2 && i.b >> 25 != 125 && base.type == Symbol::Type::table) {
                 v = {Symbol::Type::indexed_descriptor, base.value, (i.b & 0xfffff) + 4*j,
                      index.type == Symbol::Type::masked || index.type == Symbol::Type::constant ? index.value : ~0u, i.pc};
             } else if (i.op < 8 && base.type == Symbol::Type::table)
@@ -530,6 +710,10 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
         if (i.name == "s_mov_b64")
             set(i.dst + 1, high);
+    } else if (!graphics && !wave64 && (i.name == "s_and_saveexec_b32" || i.name == "s_or_saveexec_b32")) {
+        // Both the saved EXEC and the updated EXEC are numeric mask words.
+        set(i.dst, {});
+        set(126, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};
@@ -561,13 +745,15 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     } else if (i.name == "s_movk_i32") {
         set(i.dst, {Symbol::Type::constant, Word(int16_t(i.a))});
     } else if (i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2 || i.enc == Encoding::Vopc ||
-               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "v_readfirstlane_b32" ||
-               i.name == "v_readlane_b32")
+               i.name == "s_mulk_i32" || i.name == "s_addk_i32" || i.name == "s_cmovk_i32" ||
+               i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
         if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
-            i.name.size() >= 4 && (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64")) ||
-            i.name == "s_bitreplicate_b64_b32")
+            i.name.size() >= 4 &&
+            (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
+             i.name.substr(i.name.size() - 4) == "_u64") &&
+            i.name.find("_i32_") == Name::npos) || i.name == "s_bitreplicate_b64_b32")
             set(i.dst + 1, {});
     }
     return s;
@@ -660,7 +846,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
             if (pc >= code.size() || (next != instructions.begin() && std::prev(next)->second.next > pc))
                 refuse(pc, "branch outside code or into an instruction");
             const auto fetch = fixed.find(pc);
-            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics);
+            auto instruction = fetch != fixed.end() ? fetch->second : decode(code, pc,true,graphics,wave64);
             if (next != instructions.end() && instruction.next > next->first)
                 refuse(pc, "overlapping instruction boundaries");
             instructions.emplace_hint(next, pc, instruction);
@@ -692,14 +878,14 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
         auto k = work.front();
         work.pop_front();
         auto &i = p.code[k];
-        auto after = transfer(i, p.before[k], wave64, graphics, heap_window);
+        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph);
         auto merge = [&](size_t t) {
             bool changed = !p.reached[t];
             auto &in = p.before[t];
             if (changed) {
                 in = after;
                 p.reached[t] = true;
-            } else
+            } else {
                 for (unsigned n = 0; n < in.size(); ++n)
                     if (!(in[n] == after[n])) {
                         Symbol merged{};
@@ -710,6 +896,20 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
                             changed = true;
                         }
                     }
+                if (!(in.scc == after.scc) && !(in.scc == Symbol{})) {
+                    in.scc = {};
+                    changed = true;
+                }
+                for (auto &[key, value] : in.lane_spills) {
+                    const auto other = after.lane_spills.find(key);
+                    if (value && (other == after.lane_spills.end() || !(other->second == value))) {
+                        value.reset();
+                        changed = true;
+                    }
+                }
+                for (const auto &slot : after.lane_spills)
+                    changed |= in.lane_spills.emplace(slot.first, std::nullopt).second;
+            }
             if (changed)
                 work.push_back(t);
         };
@@ -728,16 +928,10 @@ string reg(unsigned n) { return n >= 256 ? "v" + to_string(n - 256) : "s" + to_s
 string operand(const Inst &i, unsigned n) {
     if ((n <= 105) || n == 106 || n == 126 || n >= 256)
         return reg(n);
-    if (n >= 128 && n <= 208)
-        return hexword(n <= 192 ? n - 128 : 192u - n);
     if (n == 253)
         return "uint(scc)";
-    if (n == 255)
-        return hexword(i.literal);
-    constexpr Word f[] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
-                          0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
-    if (n >= 240 && n <= 248)
-        return hexword(f[n - 240]);
+    if (auto constant = constant32(i, n))
+        return hexword(*constant);
     refuse(i.pc, "unsupported operand " + to_string(n));
 }
 enum class AluType { Bits, Float, ToFloat };
@@ -760,8 +954,13 @@ struct Emit {
         const bool indexed = sym.type == Symbol::Type::indexed_descriptor;
         if ((!indexed && sym.type != Symbol::Type::descriptor) || base + width > state.size())
             refuse(i.pc, "unproven resource descriptor s" + to_string(base));
+        if (sym.value == compute_sampler_heap)
+            refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
-                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 &&
+                                  (i.name == "buffer_store_raw" || i.name == "buffer_load_dword" ||
+                                   i.enc == Encoding::Smem ||
+                                   (i.name.substr(0, 14) == "buffer_atomic_" && !(i.a & 0x2000u))) &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
@@ -840,15 +1039,44 @@ struct Emit {
         it->required_bytes = (std::max)(it->required_bytes, bytes);
         return (write ? "w" : "r") + to_string(it->shader_register);
     }
-    unsigned sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
-                           bool implicit_sample = false, bool comparison = false) {
+    // heap: the sampler is entry `index` of the directly indexed sampler heap. Otherwise `index` is the static sampler register.
+    struct SamplerRef {
+        bool heap;
+        unsigned index;
+    };
+    SamplerRef sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
+                             bool implicit_sample = false, bool comparison = false) {
         const unsigned base = ((i.b >> 21) & 31) * 4;
         ComputeSampler sampler{{}, lod, comparison};
+        unsigned literal = 0, heap = 0;
+        const auto &first = state.at(base);
         for (unsigned j = 0; j < 4; ++j) {
             const auto &s = state.at(base + j);
-            if (s.type != Symbol::Type::constant)
-                refuse(i.pc, "nonconstant sampler");
-            sampler.words[j] = s.value;
+            literal += s.type == Symbol::Type::constant;
+            // The heap content is fixed within a dispatch, so contiguity of the four words of one 16-byte entry is enough.
+            heap += s.type == Symbol::Type::descriptor && s.value == compute_sampler_heap && !s.definition &&
+                    first.offset % 16 == 0 && s.offset == first.offset + 4 * j;
+            if (s.type == Symbol::Type::constant)
+                sampler.words[j] = s.value;
+        }
+        if (literal != 4 && heap != 4)
+            refuse(i.pc, "nonconstant sampler");
+        if (heap == 4) {
+            if (gather_base_level)
+                refuse(i.pc, "gather through the sampler heap is not translated");
+            if (comparison)
+                refuse(i.pc, "comparison sampler from the sampler heap is not translated");
+            if (implicit_sample)
+                refuse(i.pc, "sampler from the sampler heap needs image_sample_l or image_sample_lz");
+            const unsigned entry = first.offset / 16, bytes = 16 * (entry + 1);
+            auto &list = result.bindings;
+            auto found = std::find_if(list.begin(), list.end(),
+                                      [](const auto &b) { return b.kind == ComputeViewKind::heap_sampler; });
+            if (found == list.end())
+                list.push_back({ComputeViewKind::heap_sampler, compute_sampler_heap, 0, 0, bytes});
+            else
+                found->required_bytes = (std::max)(found->required_bytes, bytes);
+            return {true, entry};
         }
         if (comparison) {
             // Field constraints from pixel_aot.comparison_sampler_state. The
@@ -887,12 +1115,12 @@ struct Emit {
             all.push_back(sampler);
             it = std::prev(all.end());
         }
-        return first_sampler+static_cast<unsigned>(it - all.begin());
+        return {false, first_sampler + static_cast<unsigned>(it - all.begin())};
     }
     void image(const Inst &i, const State &state) {
         unsigned mask = (i.a >> 8) & 15, base = ((i.b >> 16) & 31) * 4, addr = i.b & 255;
         const bool half_store = i.op == 8 && (i.b & 0x80000000u);
-        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3e000000u))
+        if (!mask || (i.a & 0x3e0c0u) || (i.b & 0x3c000000u))
             refuse(i.pc, "unsupported image flags");
         bool store = i.op == 8, lod = i.op == 39, gather = i.op == 71;
         if (i.op != 0 && !store && !lod && !gather)
@@ -923,7 +1151,10 @@ struct Emit {
         if (lod || gather) {
             if (gather && mask != 1)
                 refuse(i.pc, "unsupported gather channel");
-            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler_index(i, state, lod)
+            const auto sampler = sampler_index(i, state, lod);
+            if (sampler.heap)
+                refuse(i.pc, "sampler heap reads need the direct DXIL path");
+            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler.index
                  << ",float2(asfloat(" << x << "),asfloat(" << y << "))" << (lod ? ",0);\n" : ");\n");
         } else
             body << "t=" << tex << ".Load(int3(" << x << "," << y << ",0));\n";
@@ -935,9 +1166,9 @@ struct Emit {
                 body << "if(active) " << reg(256 + dst++) << "=asuint(t." << "xyzw"[k] << ");\n";
             }
     }
-    void require_numeric(const Inst &i, unsigned reg) const {
-        if (reg <= 105 && !program.before[program.at.at(i.pc)][reg].numeric())
-            refuse(i.pc, "unbound numeric SGPR s" + to_string(reg));
+    void require_numeric(const Inst &i, unsigned reg, unsigned limit = 106) const {
+        if ((reg < limit || reg == 124) && !program.before[program.at.at(i.pc)][reg].numeric())
+            refuse(i.pc, reg == 124 ? "unbound numeric M0" : "unbound numeric SGPR s" + to_string(reg));
     }
     void scalar(const Inst &i) {
         auto n = i.name;
@@ -1315,6 +1546,8 @@ struct Emit {
             if (i.op < 8) {
                 if (s.at(i.src[0]).type != Symbol::Type::table)
                     refuse(i.pc, "unknown scalar table base");
+                if (s.at(i.src[0]).value == compute_sampler_heap)
+                    refuse(i.pc, "sampler heap reads need the direct DXIL path");
                 if (s.at(i.src[0]).value == compute_resource_heap && i.b >> 25 == 125)
                     refuse(i.pc, "unsupported immediate whole-heap descriptor");
                 if (i.b >> 25 != 125) {
@@ -1460,6 +1693,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     State initial{};
     for (unsigned k = 0; k <= 105; ++k)
         initial[k].type = Symbol::Type::unbound;
+    initial[124].type = Symbol::Type::unbound; // RDNA2 M0 is a separate 32-bit register.
     std::vector<ComputeConstants> constants;
     if (stage) {
         std::array<bool,32> assigned{};
@@ -1521,9 +1755,15 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     }
     // In this compute ABI the two directly indexed heaps follow the user root parameters.
     // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
-    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user)
+    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
         initial[next] = {Symbol::Type::table, compute_resource_heap};
-    const bool wave64 = stage && !stage->wave32;
+        initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
+    }
+    // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
+    // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
+    // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
+    // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
+    const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
@@ -1538,6 +1778,13 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
+        for (size_t i = 0; i < program.code.size(); ++i) {
+            const auto& inst = program.code[i];
+            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
+            if (symbol.type == Symbol::Type::descriptor)
+                compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);
+        }
         if (threads % (wave64 ? 64 : 32))
             for (const auto &i : program.code)
                 if (i.name == "v_readlane_b32" || i.name == "v_writelane_b32")

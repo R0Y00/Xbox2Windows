@@ -59,6 +59,11 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
         # A device slot 67 compute request with the same reason is counted in its own class.
         (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
         (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
+        # A compute runtime manifest reason is a fixed category; text outside its allowlist is not copied.
+        for key, line in ((5, "unsupported startup runtime manifest bindings: UAV kind texture_uav cube"),
+                          (6, "unsupported startup runtime manifest bindings: SRV kind /home/alice/x")):
+            (cache_dir / f"{key:016x}.fail").write_text(line + "\n", encoding="utf-8")
+            (cache_dir / f"req_{key:016x}.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -77,6 +82,8 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
             "| 1 | `compute: image_load_mip tfe` |",
+            "| 1 | `compute: runtime manifest: UAV kind texture_uav cube` |",
+            f"| 1 | `compute: {triage_run.OTHER}` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
@@ -214,6 +221,9 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unavailable acceleration structure at the supplied address", "as_wrong_state"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+        ("unavailable texture at the supplied base and layout", "texture_no_resource"),
+        ("unavailable texture at the supplied base and layout", "texture_unreadable"),
+        ("unavailable texture at the supplied base and layout", "texture_over_64mib"),
         ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
         ("unavailable texture at the supplied base and layout", "partial_tile_beyond_xg_size"),
         ("unavailable texture at the supplied base and layout", "unsupported_desktop_format"),
@@ -500,6 +510,9 @@ def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
         ("native compute +0x14: unsupported instruction v_add3_u32 0xd76d0002u", "v_* instruction"),
         ("native compute +0x8: unsupported opcode 0xdeadbeefu", "unsupported opcode"),
         ("native compute +0x10: unsupported pixel entry VGPR 2", "unsupported pixel entry VGPR"),
+        ("unsupported startup runtime manifest bindings: SRV kind texture_srv 2d array",
+         "runtime manifest: SRV kind texture_srv 2d array"),
+        ("unsupported startup runtime manifest bindings: more than 8 UAVs", "runtime manifest: more than 8 UAVs"),
         ("native compute +0x1c: unproven resource descriptor s12", "unproven resource descriptor"),
         ("native compute +0x20: unbound numeric SGPR s0", "unbound numeric SGPR"),
         ("unknown gfx1013 instruction format at byte 24", "undecodable word"),
@@ -593,11 +606,15 @@ def check_indirect_outcomes(failures: list[str]) -> None:
 
 
 def check_gpu_memory_budget(failures: list[str]) -> None:
-    def sample(local, texture):
+    def sample(local, texture, commit=""):
         return (
             f'x2w-budget local={local} nonlocal=2/8 placed=10000/2+20000/3 texture={texture} '
-            'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0'
+            f'buffer=1/1+0/0 upload=0/0+0/0 readback=0/0+0/0 heap=0/0+0/0 unmeasured=0{commit}'
         )
+
+    # The system commit and pool counters report_budget() appends (known, and unavailable).
+    with_commit = " commit=14335/16100 avail=1765 sections=113609 slabs=3 slots=113000/609 job_peak=14250 job_limit=14336"
+    commit_n_a = " commit=n/a avail=n/a sections=n/a slabs=n/a slots=n/a job_peak=n/a job_limit=none"
 
     high_usage = sample("2500/3000", "100/5+40/2")
     high_ratio = sample("1800/1000", "150/7+50/3")
@@ -606,12 +623,14 @@ def check_gpu_memory_budget(failures: list[str]) -> None:
         sample("4000/1", "500/7+950/4").replace(" unmeasured=0", ""),
         sample("9000/1", "900/1+999/1").replace(" buffer=1/1+0/0", r" buffer=C:\Users\alice"),
         sample("9000/1", "900/1+999/1") + " path=secret.exe",
+        sample("9000/1", "900/1+999/1", " commit=14335/x avail=1765 sections=1 slabs=1 slots=1/1"),
+        sample("9000/1", "900/1+999/1", with_commit + " path=secret.exe"),
     )
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         log = root / "stderr.txt"
-        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4"), high_retained,
-                   sample("5000/0", "300/9+10/3"), sample("1000/1000", "90/6+20/1"), *malformed)
+        samples = (high_usage, high_ratio, sample("2100/1800", "170/8+80/4", with_commit), high_retained,
+                   sample("5000/0", "300/9+10/3", commit_n_a), sample("1000/1000", "90/6+20/1"), *malformed)
         log.write_text("\n".join(samples), encoding="utf-8")
         (root / "trap.log").write_text(high_ratio + "\n", encoding="utf-8")
         report = triage_run.triage_run(root)

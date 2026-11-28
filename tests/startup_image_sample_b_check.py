@@ -50,6 +50,7 @@ import gfx2hlsl as G  # noqa: E402
 import startup_sampler_heap_check as H  # noqa: E402
 from startup_image_2d_array_check import mip_cell  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
+import gpu_case_runner  # noqa: E402
 
 # Sampler words: point filters, wrap, MAX_LOD 2.0 (u4.8 at word 1 bits 23:12), mip filter point (word 2 bits 27:26).
 SAMPLER = ('0', '0x200000', '0x4000000')
@@ -528,7 +529,9 @@ def controls():
     refused('c_b', 'image_sample_c_b')
     refused('offset', 'image_sample_b_o')
     refused('gather', 'image_gather4_b')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    # Since #2943 a cube lowers to TextureCube; the bias dword comes before the face address.
+    cube = stage('cube').hlsl_ps()
+    assert 'TextureCube<float4>' in cube and 'SampleBias(' in cube and 'x2w_cube_dir(F(v1), F(v2), F(v3)), F(v0))' in cube, cube
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     refused('dim1d', 'unverified 1D image b address or modifiers')
     refused('unorm', 'image_sample_b modifier unorm')
@@ -542,7 +545,8 @@ def controls():
         refused(name, 'image_sample_b modifier reserved')
     refused('sampler bias', 'image_sample_b with a sampler LOD bias (word 2 0x4000001)')
     refused('sampler bias sec', 'image_sample_b with a sampler LOD bias (word 2 0x4004000)')
-    print('refused: b_cl, c_b, offset, gather4_b, cube, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
+    print('cube: TextureCube SampleBias with x2w_cube_dir')
+    print('refused: b_cl, c_b, offset, gather4_b, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
           'reserved bits, sampler LOD bias')
 
     # Guest sampler limits: carried over for a constant descriptor, refused where they cannot be shown irrelevant.
@@ -631,8 +635,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     locate()
 
     def draw_once(vs, shader, slice_index, expected, sampler):
-        run = subprocess.run([renderer, adapter, operation, str(vs), str(shader), str(slice_index), expected, sampler],
-                             capture_output=True, text=True)
+        run = gpu_case_runner.run(renderer, adapter, [operation, vs, shader, slice_index, expected, sampler])
         sys.stdout.write(run.stdout)
         if run.returncode == 77:
             print(run.stdout + run.stderr)

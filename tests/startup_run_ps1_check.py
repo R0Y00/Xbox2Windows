@@ -20,6 +20,7 @@ from pathlib import Path
 RUN_PS1 = Path(__file__).resolve().parent.parent / "tools" / "startup" / "run.ps1"
 DLLS = ["xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput"]
 STUB_LINES = [f"stub debugger line {n}" for n in range(1, 8)]
+STUB_ERROR = "synthetic debugger error"
 HEAD_LINES = 5  # run.ps1 prints this many lines of "<LogDir>.out"
 # The stub stands in for tools/startup/debug_launch.py: it records its arguments,
 # prints seven lines and exits with the code under test.
@@ -50,12 +51,16 @@ if {early_exit}:
         time.sleep(0.05)
 for n in range(1, 8):
     print("stub debugger line", n)
+if {emit_stderr}:
+    print("synthetic debugger error", file=sys.stderr)
 sys.exit({code})
 """
 # Stands in for tools/startup/gfx2hlsl.py under -Translate: starts a child process, as the parallel
 # workers are, records the PIDs and arguments, then waits to be stopped. The early-exit case
 # publishes just the watcher's PID and arguments and returns without spawning a child.
 WATCH_STUB = """\
+# The revisions the launcher compares with the cache: fnv(b'x2w-startup-shader-90'), b'x2w-startup-shader-90cs',
+# b'x2w-startup-mesh-57-9' (synthetic, as gfx2hlsl.py spells them).
 import json
 import os
 import subprocess
@@ -77,7 +82,7 @@ STOP = "taskkill.exe /T /F /PID $translator.Id"
 WATCH_CLEANUP = re.compile(
     r"if\s*\(\s*\$translator\s+-and\s+-not\s+\$translator\.HasExited\s*\)\s*\{\s*&\s*\{\s*"
     r"""\$ErrorActionPreference\s*=\s*['"]Continue['"]\s+&\s+taskkill\.exe\b[^|#\n]*\s/T\b""", re.I)
-CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
+CAPTURE = re.compile(r"\$(?:script:)?(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
 # Without -FakeUser, user APIs hit the host runtime; run.ps1 must warn (docs/startup-runtime.md).
@@ -136,8 +141,16 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
+# A shader cache of an older build (#2815): its revision.txt and one request, against the stub's revisions.
+OLDER_CACHE = {"revision.txt": b"graphics x2w-startup-shader-89\ncompute x2w-startup-shader-89cs\n",
+               "req_0123456789abcdef.a": b""}
+REVISION_PHRASES = ("was written by stand-ins of revision graphics x2w-startup-shader-89",
+                    "but the translator", "is revision graphics x2w-startup-shader-90", "Fix: rebuild the stand-ins")
+
+
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, native=False, manifest="absent"):
+             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False, emit_stderr=False,
+             missing_python=False, real_log_error=False, native=False, manifest="absent", cache_files=None):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
@@ -150,8 +163,17 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
-    (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
+    if real_log_error:
+        for name in ("debug_launch.py", "launch.py", "host_cpu.py", "hook_window.py", "window_capture.py"):
+            shutil.copyfile(RUN_PS1.parent / name, startup / name)
+    else:
+        (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit, emit_stderr=emit_stderr), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
+    shutil.copyfile(RUN_PS1.with_name("shader_cache_revision.py"), startup / "shader_cache_revision.py")
+    if cache_files is not None:  # a shader cache left by an earlier run
+        (root / "cache").mkdir()
+        for name, data in cache_files.items():
+            (root / "cache" / name).write_bytes(data)
     build = root / ("build [with spaces]" if absolute_build else "bld")
     build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
@@ -160,6 +182,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     exe.parent.mkdir()
     exe.write_bytes(b"")
     data.mkdir()
+    if real_log_error:
+        (log / "events.txt").mkdir(parents=True)
     if manifest in ("normal", "bracket"):
         (data / "MicrosoftGame.config").write_text("<TitleId>1234</TitleId><SizeMB>42</SizeMB>", encoding="utf-8")
     if manifest.startswith("bracket"):
@@ -182,13 +206,15 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    if missing_python:
+        env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
     build_arg = str(build) if absolute_build else "bld"
     if missing_build:
         build_arg = str(root / "missing build")
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
                "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log),
                "-BuildDir", build_arg,
-               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
+               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", "-AssertSites", "2", *switches]
     sdk = root / "dxc"
     if native:
         sdk.mkdir()
@@ -208,26 +234,45 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         stderr.seek(0)
         printed = [line.strip() for line in stdout if line.strip()]
         error_text = stderr.read().strip()
+    if missing_python:
+        return (["missing Python returned success"] if out.returncode == 0 else []) + (
+            ["missing Python launched debugger"] if (startup / "debugger.json").exists() else [])
+    if real_log_error:
+        summary = Path(str(log) + ".out")
+        text = decode(summary.read_bytes()) if summary.is_file() else ""
+        return ([f"real debugger log error returned {out.returncode}, expected 1"] if out.returncode != 1 else []) + (
+            ["real debugger log error was not captured in the summary"] if "PermissionError" not in text else [])
     found = []
     for dll in DLLS:
         if not (exe.parent / f"{dll}.dll").is_file():
             found.append(f"stand-in {dll}.dll was not copied")
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
-    want_output = STUB_LINES[:HEAD_LINES]
+    summary = Path(str(log) + ".out")
+    summary_lines = [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] if summary.is_file() else []
+    want_output = summary_lines[:HEAD_LINES] if emit_stderr else STUB_LINES[:HEAD_LINES]
+    if cache_files is not None:
+        # One warning with both revisions and the fixes; PowerShell may wrap it, so compare without whitespace.
+        flat = re.sub(r"\s", "", " ".join(printed))
+        missing = [phrase for phrase in REVISION_PHRASES if re.sub(r"\s", "", phrase) not in flat]
+        if missing or flat.count("Fix:rebuildthestand-ins") != 1:
+            found.append(f"stale shader cache: no single revision warning with {missing} (printed {printed})")
+        printed = [line for line in printed if line in STUB_LINES]  # the case runs with -FakeUser: no other warning
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
         printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
                      f"(stderr: {error_text!r})")
-    summary = Path(str(log) + ".out")
     if not summary.is_file():
         found.append(f"stub exit {code}: {summary.name} was not written")
-    elif [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] != STUB_LINES:
+    elif emit_stderr and ([line for line in summary_lines if line in STUB_LINES] != STUB_LINES or
+                          not any(STUB_ERROR in line for line in summary_lines)):
+        found.append(f"stub exit {code}: {summary.name} does not hold stdout and stderr")
+    elif not emit_stderr and summary_lines != STUB_LINES:
         found.append(f"stub exit {code}: {summary.name} does not hold the debugger's output")
     want = [str(exe), str(data), str(log), "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4", *passed]
+            "--trace-files", "1", "--continue-asserts", "4", "--assert-sites", "2", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
     expected = [want, "1" if "-TraceApi" in switches else trace_api_env,
@@ -264,18 +309,27 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, 0, work, manifest=manifest)
     if found and first_only:
         return found
+    for code in (0, 7):
+        found += run_case(shell, script, code, work, emit_stderr=True)
+        if found and first_only:
+            return found
+    found += run_case(shell, script, 7, work, translate=True, emit_stderr=True)
+    if found and first_only:
+        return found
     found += run_case(shell, script, 0, work, switches=["-FakeUser"])
     found += run_case(shell, script, 0, work, fake_user_env=True)
     if found and first_only:
         return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
+    found += run_case(shell, script, 0, work, switches=["-CaptureEvery", "5"], passed=["--capture-every", "5"])
     found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
     found += run_case(shell, script, 0, work, trace_api_env="1")
     found += run_case(shell, script, 0, work, native=True)
     if found and first_only:
         return found
     found += run_case(shell, script, 7, work, translate=True)
+    found += run_case(shell, script, 7, work, translate=True, switches=["-FakeUser"], cache_files=OLDER_CACHE)
     for code in (0, 7):
         found += run_case(shell, script, code, work, translate=True, early_exit=True)
     return found
@@ -357,6 +411,8 @@ def shell_failures(shell, script, tmp):
         if mutant is None or not run_problems(shell, mutant, tmp, True):
             failures.append(f"{name}: mutant '{label}' was not detected")
     if shell:
+        failures += [f"{name}: {item}" for item in run_case(shell, script, 7, tmp, real_log_error=True)]
+        failures += [f"{name}: {item}" for item in run_case(shell, script, 7, tmp, missing_python=True)]
         missing = run_case(shell, script, 7, tmp, missing_build=True)
         if not any("debugger [argv" in item and "was None" in item for item in missing):
             failures.append(f"{name}: missing build directory did not prevent debugger startup")
