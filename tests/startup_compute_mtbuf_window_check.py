@@ -10,8 +10,8 @@ from native_gather_lod_check import render
 from native_mtbuf_check import BYTE_WINDOW
 from native_scalar_lds_check import scalar, sop1, vmove
 from startup_compute_dispatch_check import dispatch, lines, prepare_case
-from startup_compute_translate_check import state_a
-from startup_gfx2hlsl_compute_check import SENTINEL, TGID_X, TGID_Y, TGID_Z, USER7, WORDS
+from startup_compute_translate_check import state_a, write_request
+from startup_gfx2hlsl_compute_check import SENTINEL, TGID_X, TGID_Y, TGID_Z, USER7, WORDS, root_blob
 
 
 INPUT = [0x01234567 + 0x1020304 * i & 0xffffffff for i in range(WORDS)]
@@ -23,11 +23,11 @@ GUARDS = [SENTINEL] * WORDS
 VIEW = 'srv 0 buf table 1 0 identity_dst_sel'
 
 
-def program():
+def program(*, writable=False):
     words = [
         sop1(3, 20, 6), sop1(3, 21, 128),
         0xf408080a, 0xfa000000,                # SRV in s[32:35]
-        0xf408090a, 0xfa000020,                # UAV in s[36:39]
+        0xf408090a, 0xfa000000 if writable else 0xfa000020,  # revisit the same descriptor for UAV in the negative
         *BYTE_WINDOW,
         scalar(0x26, 8, 8, 131),               # y * 3
         scalar(0x26, 9, 9, 134),               # z * 6
@@ -39,6 +39,18 @@ def program():
         0xbf810000,
     ]
     return struct.pack('<%dI' % len(words), *words)
+
+
+def controls(cli, sdk):
+    with TemporaryDirectory() as temp:
+        work = Path(temp)
+        key = write_request(work, program(writable=True), STATE, root=root_blob(table_range=True))
+        result = subprocess.run([cli, sdk, work / 'native', 'gfx1013-direct-cs@0', '--requests', work, work],
+                                capture_output=True, text=True, timeout=30)
+        reason = 'a writable MTBUF byte window has no verified view contract'
+        assert result.returncode != 0 and reason in result.stderr, result.stdout + result.stderr
+        assert not (work / f'{key:016x}.txt').exists() and not (work / f'{key:016x}.cs.cso').exists()
+        print('MTBUF writable byte-window request refused before DXIL publication')
 
 
 def prepare(work, adapter):
@@ -104,9 +116,16 @@ def main(cli, consumer, renderer, sdk, adapter):
         compare(got, GUARDS, result)
         refusal = 'Dispatch(3, 2, 2) refused: an MTBUF byte window requires identity component mapping'
         assert len(lines(result, refusal)) == 1, result.stderr[-3000:]
+        got, result = run(work, consumer, env, IDENTITY, mapping='cbv')
+        compare(got, GUARDS, result)
+        refusal = 'Dispatch(3, 2, 2) refused: an MTBUF byte window requires a buffer SRV'
+        assert len(lines(result, refusal)) == 1, result.stderr[-3000:]
         print(f'{adapter}: identity readback matched five pairs, seven out-of-range pairs and all guards. '
-              'Swapped X/Y refused for both descriptor forms. Cold and warm manifests matched.')
+              'Both swaps and the CBV token refused. Cold and warm manifests matched.')
 
 
 if __name__ == '__main__':
-    main(*sys.argv[1:])
+    if sys.argv[1] == 'controls':
+        controls(*sys.argv[2:])
+    else:
+        main(*sys.argv[1:])
