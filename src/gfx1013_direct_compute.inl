@@ -1048,7 +1048,8 @@ struct DirectCompute {
                 refuse(i.pc, "implicit derivatives with virtual wave64 groups");
             compute_derivatives = true;
         }
-        const bool gather = i.op == 64 || i.op == 71 || compare_gather;
+        const bool gather_offset = i.op == 0x57; // image_gather4_lz_o
+        const bool gather = i.op == 64 || i.op == 71 || compare_gather || gather_offset;
         const bool gather_lod = i.op == 68;
         const bool sample = (!gather && implicit) || (compare && !gather) || gradient || i.op == 39 || i.op == 36,
                    store = i.op == 8,
@@ -1069,6 +1070,8 @@ struct DirectCompute {
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
             (compare_gather && dim == 3) ||
+            (gather_offset && (graphics_input || dim != 1 || (i.a & 0x1004u) ||
+                               (i.b & 0xc0000000u) || i.dst > 252 || (!(i.a & 6) && addr > 253))) ||
             ((sample || gather) && (i.a & 0x1000u) && gradient) ||
             (dimensions && (dim == 4 || dim >= 6 || (i.b & 0x40000000u))) ||
             (store && !half && mask != 15 && !exact_store) || (half && mask != 1 && mask != 3 && mask != 15) ||
@@ -1148,7 +1151,7 @@ struct DirectCompute {
             c[1] = ir.binary("lshr", packed, "16");
         } else {
             for (unsigned j = 0; j < coords; ++j)
-                c[j] = coordinate(j + unsigned(bias || compare) + (gradient ? 2 * spatial : 0));
+                c[j] = coordinate(j + unsigned(bias || compare || gather_offset) + (gradient ? 2 * spatial : 0));
             if (bias || compare)
                 level = coordinate(0);
             if (lod || dim >= 6)
@@ -1169,7 +1172,7 @@ struct DirectCompute {
                     analysis.result.sampler_heap = true;
                     sampler = ir.handle({3, 0, 14, 0, 0, 0, 2048, false, 1}, read(sampler_base));
                 } else {
-                    const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather,
+                    const auto sampler_ref = analysis.sampler_index(i, s, sample || implicit, i.op == 71 || compare_gather || gather_offset,
                                                                     implicit || gradient, compare);
                     if (i.op == 64 && !sampler_ref.heap &&
                         (analysis.result.samplers.at(sampler_ref.index - analysis.first_sampler).words[1] & 0xffffff))
@@ -1221,8 +1224,17 @@ struct DirectCompute {
                 for (unsigned j = 0; j < 4; ++j)
                     args.emplace_back("float", c[j]);
                 const unsigned offsets = dim == 3 ? 0 : spatial;
-                for (unsigned j = 0; j < (sample ? 3u : 2u); ++j)
-                    args.emplace_back("i32", j < offsets ? "0" : "undef");
+                if (gather_offset) {
+                    // Shift each signed six-bit field into the high bits before sign extension.
+                    const auto packed = coordinate(0);
+                    for (const char *shift : {"26", "18"}) {
+                        auto field = ir.binary("shl", packed, shift);
+                        args.emplace_back("i32", ir.binary("ashr", field, "26"));
+                    }
+                } else {
+                    for (unsigned j = 0; j < (sample ? 3u : 2u); ++j)
+                        args.emplace_back("i32", j < offsets ? "0" : "undef");
+                }
                 if (gather) {
                     unsigned channel = 0;
                     while (!(mask & (1u << channel))) ++channel;
