@@ -809,6 +809,10 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
+                       (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8)) {
+                uav_lines << "uav " << b.shader_register << " bufhalf table " << b.root_parameter << ' '
+                          << b.byte_offset << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";

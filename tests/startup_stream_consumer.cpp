@@ -242,6 +242,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool long_run = keep_closed || mode == "dispatch-input-snapshot-long";
     constexpr UINT long_records = 2u << 20, long_frames = 48;
     const bool shared_uav = mode == "dispatch-read-write-uav";
+    const bool typed_output_offset = mode == "dispatch-records32-output-offset";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
     const bool write_zero = mode == "dispatch-indirect-pixel-zero";
@@ -322,6 +323,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else if (mode == "dispatch-output-unaligned") {
         descriptors[1][0] += 8;  // still inside the buffer: 318 records
         descriptors[1][2] = words - 2;
+    } else if (typed_output_offset) {
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[1]) + 8;
+        descriptors[1][0] = static_cast<UINT>(address);
+        descriptors[1][1] = static_cast<UINT>(address >> 32) | fields[1][0] << 16;
     }
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -359,7 +364,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     }
-    if (mode == "dispatch-records32" || shared_uav) {  // the output's descriptor at table byte 32, none at byte 16
+    if (mode == "dispatch-records32" || typed_output_offset || shared_uav) {  // output at byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
