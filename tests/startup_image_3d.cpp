@@ -26,21 +26,21 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
-// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
-constexpr UINT mip_base = 4;
 constexpr UINT max_levels = 3;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
 // alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
-void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, UINT base, float out[4])
 {
     if (levels == 1) {
         const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
         std::memcpy(out, one, sizeof(one));
         return;
     }
-    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    const UINT area = base * base;
+    const float red = float(1 + x + base * y + area * (s + 2 * m)) / float(8 * area);
+    const float many[4] = {red, float(x), float(y), float(s + 2 * m)};
     std::memcpy(out, many, sizeof(many));
 }
 
@@ -68,7 +68,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, UINT mip_base)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
@@ -146,7 +146,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
-                    texel_value(tx, ty, tz, level, levels, texel);
+                    texel_value(tx, ty, tz, level, levels, base, texel);
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
                     const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
