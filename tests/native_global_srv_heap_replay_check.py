@@ -40,7 +40,7 @@ def pack(body, extra=()):
     return b"DXBC" + bytes(16) + words(1, 32 + 4 * len(chunks) + len(data), len(chunks), *table) + data
 
 
-def compute_two_inputs(code, threads=64):
+def compute_two_inputs(code, threads=64, *, vgprs=4, sa4=0):
     """compute() of native_direct_container_check.py with both root inputs in one list: an SRV/UAV descriptor table
     in s[0:1] (type 3) and the descriptor heap in s[2:3] (type 5). Four user SGPRs: rsrc2 0x8400 | 0x1008."""
     body = bytearray(256)
@@ -54,8 +54,9 @@ def compute_two_inputs(code, threads=64):
     body.extend(struct.pack("<IIIIBBH", 3, 0, 1, 0, 0, 0, 0))  # A: table of root parameter 0 at user SGPR 0
     body.extend(struct.pack("<IIIIBBH", 5, 0, 1, 0, 2, 0, 0))  # B: descriptor heap at user SGPR 2
     struct.pack_into("<QQ", body, record, len(body), len(code))
+    struct.pack_into("<I", body, record + 16, sa4)
     struct.pack_into("<I", body, record + 20, 32)
-    struct.pack_into("<II", body, record + 76, 512, 4)
+    struct.pack_into("<II", body, record + 76, 512, vgprs)
     struct.pack_into("<IIII", body, record + 120, 0x8400 | 0x1008, threads, 1, 1)
     body.extend(code)
     return pack(body)
@@ -292,10 +293,10 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     # 9. The byte-address rewrite of the selected heap descriptor (stride, max 1, byte count, stride cleared, raw
     #    out-of-bounds mode) reads the selected raw slot: recorded, compiled offline and replayed like PROGRAM. A stride
     #    read that nothing uses compiles too. The descriptor words stay symbolic, so a stride > 1 is not exercised.
-    def window_request(name, program):
+    def shader_request(name, program, **stage):
         directory = base / name
         directory.mkdir()
-        cdx_bytes = compute_two_inputs(words(*program))
+        cdx_bytes = compute_two_inputs(words(*program), **stage)
         window_stem = "req_%016x" % key_of(root, cdx_bytes)
         (directory / (window_stem + ".cdx")).write_bytes(cdx_bytes)
         (directory / (window_stem + ".root")).write_bytes(root)
@@ -310,7 +311,7 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
                                    "a loop after the heap load does not refuse the window, a .cso is published"),
     }
     for name, (program, message) in compiled_shapes.items():
-        directory, window_stem = window_request(name, program)
+        directory, window_stem = shader_request(name, program)
         (directory / (window_stem + ".views")).write_text(good, newline="\n")
         out_dir = base / (name + "_out")
         code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
@@ -318,7 +319,7 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
                 (out_dir / (window_stem[len("req_"):] + ".cs.cso")).exists(), "compile_dxil: " + message)
     window_outputs = {}
     for n in (0, 1):
-        directory, window_stem = window_request(f"window{n}", WINDOW)
+        directory, window_stem = shader_request(f"window{n}", WINDOW)
         code, out, err = run([fixture, "record", sdk, cache, directory / (window_stem + ".cdx"), adapter, n, "ok"])
         require(code == 0 and "output matches slot %d data" % n in out,
                 f"record window select {n}: u0 equals the slot {n} data read through the rewritten descriptor")
@@ -340,5 +341,56 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     code, out, err = replay(selections[0], outputs[0], missing, "refused", 0)
     require(code == 0 and "global SRV view metadata file missing: " + str(missing) in out and "sentinels intact" in out,
             "replay with a missing .views path refuses with the file diagnostic, u0 sentinels intact")
+
+    # 10. Raw load address forms. Eight active lanes each write one 16-byte output slot.
+    def raw_load_request(name, width=1, *, offen=False, soffset=18, imm=0, flags=0, flags2=0):
+        opcode_delta = {1: 0, 2: 1, 3: 3, 4: 2}[width] << 18
+        program = words_list[:load - 1] + [
+            0x34020084,              # v_lshlrev_b32_e32 v1, 4, v0
+            0xbe92038c,              # s_mov_b32 s18, 12
+            0xbefe03ff, 0x000000ff,  # s_mov_b32 exec_lo, 0xff
+            0xe0300000 | opcode_delta | (int(offen) << 12) | imm | flags,
+            (soffset << 24) | 0x00050201 | flags2,  # s[20:23], vdata at v2, VADDR field v1
+            0xbf8c3f70,              # s_waitcnt vmcnt(0)
+            0xe0701000 | opcode_delta, 0x80030201,  # buffer_store_dword[xN] v2..., v1, s[12:15], 0 offen
+            0xbf810000,              # s_endpgm
+        ]
+        directory, key = shader_request(name, program, threads=32, vgprs=6, sa4=1 << 20)
+        views = directory / (key + ".views")
+        views.write_text(good, newline="\n")
+        out_dir = base / (name + "_out")
+        result = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
+        return result, directory, key, views, out_dir / (key[len("req_"):] + ".cs.cso")
+
+    cases = [(f"off_sgpr_x{width}", width, 12, {}) for width in (1, 2, 3, 4)]
+    cases += [
+        ("off_sgpr_imm", 1, 12, {"imm": 8}),
+        ("offen_sgpr", 1, 12, {"offen": True}),
+        ("off_inline", 1, 20, {"soffset": 128 + 20}),
+        ("off_inline_zero", 1, 0, {"soffset": 128}),
+    ]
+    for name, width, scalar_bytes, addressing in cases:
+        (code, out, err), directory, key, views, cso = raw_load_request(name, width, **addressing)
+        require(code == 0 and "requests=1 compiled=1 refused=0" in out and cso.exists(), f"{name}: compiled")
+        expected = [0x69696969] * 72
+        for lane in range(8):
+            addr = scalar_bytes + addressing.get("imm", 0) + (16 * lane if addressing.get("offen") else 0)
+            expected[4 * lane:4 * lane + width] = [0xA0000000 + addr // 4 + k for k in range(width)]
+        reference = directory / "expected.bin"
+        reference.write_bytes(words(*expected))
+        code, out, err = run([fixture, "replay", sdk, cache, directory / (key + ".cdx"), cso,
+                              views, adapter, "ok", 0, reference])
+        require(code == 0 and "output matches CPU reference (72 words)" in out, f"{name}: CPU reference")
+
+    modifiers = "raw buffer load needs a linear byte offset and no modifiers"
+    for name, diagnostic, addressing in (
+        ("raw_glc", modifiers, {"flags": 1 << 14}),
+        ("raw_slc", modifiers, {"flags2": 1 << 22}),
+        ("raw_idxen", modifiers, {"flags": 1 << 13}),
+        ("raw_descriptor_soffset", "unbound numeric SGPR s20", {"soffset": 20}),
+        ("raw_literal_soffset", "raw buffer load scalar offset needs an SGPR or inline integer", {"soffset": 255}),
+    ):
+        (code, out, err), _, _, _, cso = raw_load_request(name, **addressing)
+        require(code == 1 and diagnostic in err and not cso.exists(), f"{name}: refused with '{diagnostic}'")
 
 print("native_global_srv_heap_replay: all checks passed")

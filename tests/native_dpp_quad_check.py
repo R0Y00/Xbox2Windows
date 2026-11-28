@@ -65,14 +65,14 @@ def reference(op, selection, active, fi, bound_zero):
 
 
 def request(work, root, program, threads=32):
-    sa = struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1, 0, 0x8A)
+    sa = struct.pack("<7I", 0, 0, 0, threads | 1 << 16, 1 | (1 << 20), 0, 0x8A)
     return write_request(work, program, root, sa)
 
 
 def controls(cli, sdk, work, root):
     for pattern, threads, error in (
             (0xB1, 32, None),
-            (0x101, 32, "unsupported DPP lane selection"),  # row_shl:1
+            (0x150, 32, "unsupported DPP lane selection"),  # row_share:0
             (0xB1, 30, "DPP quad_perm needs a thread count divisible by four")):
         marker = request(work, root, compute_program(OR, pattern), threads)
         output = marker.with_suffix(".cso")
