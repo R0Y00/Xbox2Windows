@@ -3023,6 +3023,51 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
             return;
         }
+        if (n == "v_mqsad_u32_u8") {
+            // RDNA 2 ISA V_MQSAD_U32_U8 (#3361): 4 uint32 masked SAD lanes over 8-byte S0, 4-byte reference S1,
+            // and 4 uint32 accumulators in VGPR quad S2; skips bytes where ref byte == 0.
+            if (pixel_stage || graphics_input || !i.wide || i.subword || i.dpp_control ||
+                i.abs || i.neg || i.scale || (i.a & 0x7800))
+                refuse(i.pc, "unsupported v_mqsad_u32_u8 stage or operand modifiers");
+            const bool s0_pair = (i.src[0] >= 256 && i.src[0] < 511) || (i.src[0] <= 104 && !(i.src[0] & 1));
+            const bool s2_quad = i.src[2] >= 256 && i.src[2] <= 508;
+            if (i.dst < 256 || i.dst > 508 || !s0_pair || !s2_quad)
+                refuse(i.pc, "v_mqsad_u32_u8 requires 64-bit S0 pair and 128-bit VGPR quad S2/D");
+            if (i.src[1] >= 240 && i.src[1] <= 248)
+                refuse(i.pc, "v_mqsad_u32_u8 with an inline float reference");
+            auto s0_lo = operand32(i, i.src[0]), s0_hi = operand32(i, i.src[0] + 1);
+            auto s1 = operand32(i, i.src[1]);
+            string acc[4];
+            for (unsigned lane_i = 0; lane_i < 4; ++lane_i)
+                acc[lane_i] = operand32(i, i.src[2] + lane_i);
+            auto byte_of = [&](const string &w, unsigned idx) {
+                return ir.binary("and", idx ? ir.binary("lshr", w, to_string(8 * idx)) : w, "255");
+            };
+            auto absdiff = [&](const string &x, const string &y) {
+                return select(cmp("ult", x, y), ir.binary("sub", y, x), ir.binary("sub", x, y));
+            };
+            string src_bytes[8], ref_bytes[4];
+            for (unsigned k = 0; k < 4; ++k) {
+                src_bytes[k] = byte_of(s0_lo, k);
+                src_bytes[k + 4] = byte_of(s0_hi, k);
+                ref_bytes[k] = byte_of(s1, k);
+            }
+            string out[4];
+            for (unsigned lane_i = 0; lane_i < 4; ++lane_i) {
+                string sad;
+                for (unsigned k = 0; k < 4; ++k) {
+                    auto term = select(cmp("eq", ref_bytes[k], "0"), "0", absdiff(src_bytes[lane_i + k], ref_bytes[k]));
+                    sad = sad.empty() ? term : ir.binary("add", sad, term);
+                }
+                auto sum = ir.binary("add", acc[lane_i], sad);
+                if (i.clamp)
+                    sum = select(cmp("ult", sum, acc[lane_i]), "4294967295", sum);
+                out[lane_i] = sum;
+            }
+            for (unsigned lane_i = 0; lane_i < 4; ++lane_i)
+                vector_write(i.dst + lane_i, out[lane_i]);
+            return;
+        }
         if (n == "v_mad_u64_u32" || n == "v_mad_i64_i32") {
             // D = S0 * S1 + S2 modulo 2^64 with 32-bit factors and a 64-bit S2 (#3000, gfx2hlsl.py mad64). The
             // unsigned form writes the carry-out of the 64-bit add as a lane mask; the signed carry-out is not
