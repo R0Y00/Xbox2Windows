@@ -7571,9 +7571,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         // by default, every plane with X2W_PRESENT_COMPOSITE=1. The compositor draws the steps in order.
         if (render_mode()) {
             const PresentedPlanes presented = presented_planes(planes, plane_parameters);
-            if (presented.count)
+            static LONG shown_log;
+            if (!presented.count && first_calls(shown_log, 4))
+                log("x2w-present render mode: no drawable planes resolved (count=%u)", presented.count);
+            else if (presented.count) {
+                if (first_calls(shown_log, 4))
+                    log("x2w-present render mode: %u drawable planes", presented.count);
                 shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
                                                     presented.drawable, present_composite_enabled() ? window_planes : 1);
+            }
             if (present_composite_enabled() && presented.top && presented.top_plane > 0) {
                 raw_surface = presented.top;
                 raw_plane = presented.top_plane;

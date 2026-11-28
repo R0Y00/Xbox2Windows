@@ -121,15 +121,19 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window, UINT plane_
         if (SUCCEEDED(hr)) factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     }
     if (SUCCEEDED(hr)) hr = chain1->QueryInterface(IID_PPV_ARGS(&p.chain));
+    else log("x2w-present swap chain QueryInterface failed 0x%08lx", static_cast<unsigned long>(hr));
     if (chain1) chain1->Release();
-    if (factory) factory->Release();
     const D3D12_DESCRIPTOR_HEAP_DESC target_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&target_heap, IID_PPV_ARGS(&p.targets));
+    else log("x2w-present CreateDescriptorHeap(RTV) failed 0x%08lx", static_cast<unsigned long>(hr));
     const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (UINT i = 0; SUCCEEDED(hr) && i < 2; ++i) {
         hr = p.chain->GetBuffer(i, IID_PPV_ARGS(&p.buffers[i]));
-        if (SUCCEEDED(hr))
+        if (FAILED(hr)) log("x2w-present GetBuffer(%u) failed 0x%08lx", i, static_cast<unsigned long>(hr));
+        else {
             device->CreateRenderTargetView(p.buffers[i], nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{p.targets->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * step});
+            if (FAILED(hr)) log("x2w-present CreateRenderTargetView(%u) failed 0x%08lx", i, static_cast<unsigned long>(hr));
+        }
     }
     if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocator));
     if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocator, nullptr, IID_PPV_ARGS(&p.list));
@@ -163,7 +167,13 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
 {
     X2W_ZONE("window present (blit + fence wait)");
     WindowPresenter& p = window_presenter;
-    if (p.failed || !queue || !steps || !count || !plane_surfaces) return false;
+    if (p.failed || !queue || !steps || !count || !plane_surfaces) {
+        static LONG fail_log;
+        if (first_calls(fail_log, 4))
+            log("x2w-present present_to_window refused: failed=%d queue=%p steps=%p count=%u surfaces=%p",
+                p.failed ? 1 : 0, static_cast<void*>(queue), static_cast<const void*>(steps), count, static_cast<const void*>(plane_surfaces));
+        return false;
+    }
     HWND window = output_window();
     if (!window) return false;
     if (!p.chain && !create_window_presenter(queue, window, plane_capacity)) {
