@@ -9,8 +9,12 @@ The logs are produced outside the repository. No GDK header, LIB or DLL enters
 the tree. The parser is tested on a synthetic log with a base class, vftable,
 bitfield, array and alignment member, so the Python check runs on Linux.
 
+The commands below expect `$gdk` to point at your local out-of-repo GDK
+extraction. Keep that directory outside the repository.
+
     python -B tests/gdk_layouts_check.py
-    python -B tools/gdk_layouts.py parse D:\gdk-oracle\fixtures\layout-xg-one.log --json out\xg.json --module xg_xs_gen8 --platform Gaming.Xbox.XboxOne.x64 --msvc 19.44.35207
+    $gdk = '<out-of-repo GDK root>'
+    python -B tools/gdk_layouts.py parse "$gdk\gdk-oracle\fixtures\layout-xg-one.log" --json out\xg.json --module xg_xs_gen8 --platform Gaming.Xbox.XboxOne.x64 --msvc 19.44.35207
     python -B tools/gdk_abi_probe.py generate --layouts out\xg.json --out out\xg-probe.cpp --include windows.h --include xg.h --prefix XG_ --print
 
 Measured on 28 November 2026 with MSVC 19.44.35207 and the 261000 headers:
