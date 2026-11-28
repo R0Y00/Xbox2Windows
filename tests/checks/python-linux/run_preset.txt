@@ -1,0 +1,2 @@
+# Shared run presets: every console x OS x GPU choice against run.ps1/run.sh, staging on a synthetic package.
+tests/startup_run_preset_check.py

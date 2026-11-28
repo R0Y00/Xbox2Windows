@@ -291,6 +291,39 @@ python3 -m venv out/pe-env
 and the local `llvm-mc`, `llvm-objcopy` and `libLLVM` paths. CI uses LLVM 15;
 newer versions may print a different `exp` spelling.
 
+## Run settings for packages
+
+Start runs of a local package with the shared presets rather than a
+hand-written `run.ps1` or `run.sh` line:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools\startup\run_preset.py --package <package root> --console x --gpu nvidia
+```
+
+The launcher asks only for the console (`x` or `s`), the GPU (`nvidia` or `amd`)
+and the OS (`win11`, `win10` or `linux`; the host by default). All other
+settings come from `tools/startup/run_presets.json`, applied in layers: base,
+then OS, console and GPU. `--print` shows the merged settings and the command
+without starting anything. See
+[Run with the shared presets](docs/startup-runtime.md#run-with-the-shared-presets).
+
+Keep the presets current. They are only useful while they hold the best
+settings on main:
+
+- When a pull request adds an opt-in switch or setting that helps package runs,
+  add it to the right layer in the same pull request or in a follow-up.
+- When a measured run shows that a preset setting is better, worse or no longer
+  needed, change it.
+- Give each change its evidence in the layer's `why`: commit, host, GPU,
+  duration, and the counters before and after.
+- When a host needs a setting that no layer covers, such as a GPU generation, a
+  driver or an OS, put it in that host's layer with the run that showed it, and
+  name the switch in that layer's `why` (the check refuses a GPU difference it
+  does not name). Do not add a launcher option.
+- Leave out switches that main does not read yet, such as one from an open pull
+  request.
+- After editing, run `tests/startup_run_preset_check.py`.
+
 ## Repository map
 
 | Path | Purpose |

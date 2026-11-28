@@ -1,0 +1,70 @@
+{
+  "about": "Shared settings for tools/startup/run_preset.py. Layers apply in order base, os, console, gpu; a later layer overrides an earlier one, and an env value of null unsets it, also when the caller's shell set it. 'run' keys are run.ps1/run.sh switches (see OPTIONS in run_preset.py); 'env' keys are exported before the script starts. Every entry says why it is there. Change a value here, with the measured run that supports it, rather than adding a launcher option.",
+  "base": {
+    "why": "The settings shared by the furthest real-title runs reported in #870 (-Render -Translate -FakeUser -GpuMirror -StartupBelow40, a large assert budget, more than the default 14 GiB, the package on its console drive letter, an empty storage folder per run). package_drive is mapped with subst for the run, not run.ps1 -MapDrive: with -MapDrive a real-title run stayed on its first screens (11 pipelines translated in 420 s) where the same settings on a subst drive went on loading (76). suspend_others 0 turns off #1408's thread holding (run.ps1 -SuspendOthers, #3332): with it on, real-title runs on main stop before the first input poll (bisected to #1408 on 2026-11-28), and #3331 measured a 3-4x slower load. RING_RELEASE_AT_SUBMIT (#2949), ROOT_SRV_AT_DRAW (#3028), TABLE_ALIAS (#2977) and RUNTIME_LOCAL were measured together against the previous shared set (RELEASE_RETIRED_VIEWS and XAPU_TYPED_COMPLETIONS instead): 420 s on the same input, 163,846 vs 75,028 translated draws, 76 vs 62 pipelines, 2,079 vs 1,925 textures, NVIDIA, Windows 11, ec71c290. X2W_PROBE_PRECHECK=0 (#3313) skips the VirtualQuery pre-check that the stand-ins run before each probe and copy while a debugger is attached, which title runs always are: 420 s on the same input, 1,142,089 vs 162,303 translated draws, 80,175 vs 15,001 executes, 5,372 vs 2,134 textures, NVIDIA, Windows 11, ec71c290. X2W_HIDE_TITLE_WINDOW=1 hides the title's own window, which nothing presents to, once presents reach the output window; dialogs stay visible, and the window is shown again if a present misses the output window. The output window belongs to the same process, so the input stand-in's focus check still sees the process in front.",
+    "run": {
+      "seconds": 3600,
+      "memory_gib": 40,
+      "continue_asserts": 1000,
+      "assert_sites": 8,
+      "render": true,
+      "translate": true,
+      "fake_user": true,
+      "gpu_mirror": true,
+      "host_cpu": true,
+      "startup_below_40": true,
+      "suspend_others": "0",
+      "package_drive": "G"
+    },
+    "env": {
+      "X2W_D3D12_RELEASE_RETIRED": "1",
+      "X2W_D3D12_RING_RELEASE_AT_SUBMIT": "1",
+      "X2W_D3D12_ROOT_SRV_AT_DRAW": "1",
+      "X2W_D3D12_TABLE_ALIAS": "1",
+      "X2W_PROBE_PRECHECK": "0",
+      "X2W_PRESENT_COMPOSITE": "1",
+      "X2W_RUNTIME_LOCAL": "1",
+      "X2W_D3D12_BUDGET": "1",
+      "X2W_HIDE_TITLE_WINDOW": "1"
+    }
+  },
+  "os": {
+    "win11": {
+      "why": "Windows 11: the base settings as they are."
+    },
+    "win10": {
+      "why": "Windows 10 runs with the base settings too. The in-box D3D12 has no shader model 6.6; X2W_D3D12_PERMISSIVE (always set by run.ps1) re-serializes root signatures for it (#1277). X2W_RUNTIME_LOCAL in base covers hosts without Gaming Services."
+    },
+    "linux": {
+      "why": "Linux runs tools/startup/run.sh under Wine or Proton with vkd3d-proton (docs/wine.md); WINEPREFIX and X2W_WIN_PYTHON must be set. run.sh already turns on shared views and joined calls; they are listed here so the settings file shows them. The lazy commit pair is what the one reported Linux real-title run used (#1198, #2911). run.sh has no drive mapping: link dosdevices/g: in the prefix to the package root. The title's own window can cover the output window under Wine; base hides it on every host.",
+      "env": {
+        "X2W_XMEM_SHARED_VIEWS": "1",
+        "X2W_XMEM_JOIN_CALLS": "1",
+        "X2W_XMEM_LAZY_COMMIT": "1",
+        "X2W_XMEM_LAZY_STARTUP": "1"
+      }
+    }
+  },
+  "console": {
+    "x": {
+      "why": "Series X: the OEM ConsoleMode registry reads answer 0x64 (docs/startup-runtime.md, Console profile).",
+      "env": {
+        "X2W_DEVICE_TYPE": "7"
+      }
+    },
+    "s": {
+      "why": "Series S: ConsoleMode answers 0x60. A title may present on a plane above plane 0 on this profile, which is why X2W_PRESENT_COMPOSITE is in base; it may also load modules the Series X profile does not.",
+      "env": {
+        "X2W_DEVICE_TYPE": "6"
+      }
+    }
+  },
+  "gpu": {
+    "nvidia": {
+      "why": "No stand-in branches on the GPU vendor; the base settings are the ones measured on NVIDIA adapters."
+    },
+    "amd": {
+      "why": "No stand-in branches on the GPU vendor, and no AMD real-title run needed a different switch (#870). Native compute declares 32-lane waves, which RDNA adapters support. X2W_SPLIT_INDIRECT_DISPATCH is needed only on RDNA 1 with some drivers (#2626), so it is not set here."
+    }
+  }
+}
