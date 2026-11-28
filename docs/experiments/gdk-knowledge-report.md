@@ -79,11 +79,11 @@ missing categories and conflicts are only reported.
 
 ## Measured run
 
-On 2026-11-28, the local knowledge root produced 44 modules, 11,145 unique
-types, 4,714 unique exports from 8,035 export rows, 12 runtime facts, no shader
-corpus and 3 platform profiles. The 9,677 ABI sizeof facts matched their layout
-sizes, so the conflict list was empty. All 70 GDK-facing shim exports matched
-an export fact. The shader category was absent and reported as missing.
+On 2026-11-28, the local knowledge root produced 45 modules, 11,145 unique
+types, 4,714 unique exports from 8,035 export rows, 12 runtime facts, 6 shader
+cases and 3 platform profiles. The 9,677 ABI sizeof facts matched their layout
+sizes, so the conflict list was empty. All six categories were present. All 70
+GDK-facing shim exports matched an export fact.
 
 ## Limits
 
