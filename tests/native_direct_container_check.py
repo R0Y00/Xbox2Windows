@@ -13,7 +13,7 @@ def words(*values):
     return struct.pack(f"<{len(values)}I", *values)
 
 
-def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=(), *, group=None):
+def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, uses=(), *, group=None, lds_blocks=1):
     body = bytearray(256)
     struct.pack_into("<Q", body, 0, 6)
     for offset in (8, 16, 24, 32, 40, 48, 72):
@@ -31,10 +31,10 @@ def compute(code, threads=32, table=False, root_descriptor=False, wave32=True, u
             body.extend(words(*use))
     struct.pack_into("<QQ", body, record, len(body), len(code))
     struct.pack_into("<I", body, record+20, 32 if wave32 else 0)
-    struct.pack_into("<II", body, record+76, 512, 4)
+    struct.pack_into("<II", body, record+76, lds_blocks * 512, 4)
     user_flags = 4 if root_descriptor else (0x1002 if table else 0)
     group = (threads, 1, 1) if group is None else group
-    struct.pack_into("<IIII", body, record+120, 0x8400 | user_flags, *group)
+    struct.pack_into("<IIII", body, record+120, (lds_blocks << 15) | 0x400 | user_flags, *group)
     body.extend(code)
     return pack(body)
 

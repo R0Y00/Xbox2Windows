@@ -4045,6 +4045,29 @@ struct DirectCompute {
         } else
             vector_write(i.dst, place_subword(i, z));
     }
+    void lower_ds_bpermute(const Inst &i, unsigned threads) {
+        auto byte_address = ir.binary("add", read(256 + (i.b & 255)), to_string(i.a & 65535));
+        auto source_lane = ir.binary("and", ir.binary("lshr", byte_address, "2"), "31");
+        auto source_bit = ir.binary("shl", "1", source_lane);
+        auto enabled = cmp("ne", ir.binary("and", read(126), source_bit), "0");
+        if (threads < 32) {
+            // Guest EXEC can name lanes with no corresponding host thread.
+            auto present = cmp("ne", ir.binary("and", ballot("true"), source_bit), "0");
+            enabled = ir.value("and i1 " + present + ", " + enabled);
+            source_lane = select(present, source_lane, lane);
+        }
+        auto data = read(256 + ((i.b >> 8) & 255));
+        // A per-lane WaveReadLaneAt index read the wrong lane on WARP. Read every
+        // present lane with a constant index and select the one each lane names.
+        string value = "0";
+        for (unsigned l = 0; l < (std::min)(threads, 32u); ++l) {
+            auto lane_value = ir.invoke("i32", "waveReadLaneAt.i32", 117,
+                                        {{"i32", data}, {"i32", to_string(l)}}, "nounwind");
+            value = select(cmp("eq", source_lane, to_string(l)), lane_value, value);
+        }
+        // Model an inactive source as zero, as in the direct DPP8 lowering.
+        vector_write(256 + (i.b >> 24), select(enabled, value, "0"));
+    }
     void lower_permlane(const Inst &i, unsigned threads) {
         const bool cross_row = i.name == "v_permlanex16_b32";
         if (threads % (cross_row ? 32 : 16))
@@ -4217,7 +4240,7 @@ struct DirectCompute {
     NativeComputeShader lower(unsigned entry, unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
         const unsigned lds_words = ((flags >> 15) & 511) * 128;
         const bool uses_lds = std::any_of(analysis.program.code.begin(), analysis.program.code.end(),
-                                          [](const Inst &i) { return i.enc == Encoding::Lds; });
+                                          [](const Inst &i) { return i.enc == Encoding::Lds && !is_ds_bpermute(i); });
         if (uses_lds)
             ir.globals << "@lds = internal addrspace(3) global [" << lds_words << " x i32] undef, align 4\n";
         prepare_descriptor_strides();
@@ -4303,6 +4326,8 @@ struct DirectCompute {
                 continue;
             else if (i.enc == Encoding::Mubuf || i.enc == Encoding::Smem)
                 memory(i, p.before[k]);
+            else if (is_ds_bpermute(i))
+                lower_ds_bpermute(i, x*y*z);
             else if (i.enc == Encoding::Lds)
                 local_memory(i, lds_words);
             else if (i.name == "s_barrier")

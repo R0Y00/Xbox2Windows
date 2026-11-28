@@ -94,6 +94,10 @@ struct Inst {
     }
     unsigned target() const { return next + 4 * static_cast<int16_t>(a & 65535); }
 };
+bool is_ds_bpermute(const Inst &i) {
+    // DS opcode 0xb3, with GDS and the reserved bit clear.
+    return i.enc == Encoding::Lds && (i.a >> 16) == 0xdacc;
+}
 unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
 // Direct compute stores both VCC words in scalar registers.
 unsigned smem_sgpr_limit(bool direct_compute) { return direct_compute ? 108 : 106; }
@@ -1785,10 +1789,14 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     emit.result.constants = constants;
     if (!lds)
         for (const auto &inst : program.code)
-            if (inst.enc == Encoding::Lds)
+            if (inst.enc == Encoding::Lds && !(direct_dxil && is_ds_bpermute(inst)))
                 refuse(inst.pc, "LDS instruction without allocation");
     if (direct_dxil) {
         const bool guest_wave32 = stage ? stage->wave32 : request.wave32;
+        if (!guest_wave32)
+            for (const auto &inst : program.code)
+                if (is_ds_bpermute(inst))
+                    refuse(inst.pc, "ds_bpermute_b32 requires guest wave32");
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
         compiler.narrow_wave64 = narrow_wave64;
