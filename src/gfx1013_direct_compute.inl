@@ -842,7 +842,10 @@ struct DirectCompute {
         const unsigned coords = coord_count[dim];
         const bool exact_store = store && !half && !graphics_input && (dim == 1 || dim == 2 || dim == 5) &&
                                  (mask == 1 || mask == 3 || mask == 7);
-        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+        // Read-only image ops ignore GLC (bit 13, 0x2000) and DLC (bit 7, 0x0080) cache hints;
+        // LWE (0x20000), TFE (0x10000), R128 (0x8000), reserved bits (0x4040), and store GLC/DLC stay refused.
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !gather_lod && !dimensions) || !mask ||
+            (i.a & (store ? 0x3e0c0u : 0x3c040u)) ||
             (i.b & 0x3c000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
             (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
             (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
