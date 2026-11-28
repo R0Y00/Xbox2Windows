@@ -31,7 +31,7 @@ static bool binary16_alu(std::string_view name) {
 
 static bool binary16_unary(std::string_view name) {
     return name == "v_rcp_f16" || name == "v_sqrt_f16" || name == "v_exp_f16" ||
-           name == "v_rsq_f16";
+           name == "v_rsq_f16" || name == "v_sin_f16" || name == "v_cos_f16";
 }
 
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
