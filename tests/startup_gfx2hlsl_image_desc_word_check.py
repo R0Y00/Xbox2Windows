@@ -90,6 +90,10 @@ OPS = {
     'v_mov_b32_e32 v4, m0': vop1(0x01, 4, 124),
 }
 OPS.update({'v_mov_b32_e32 v4, s%d' % n: vop1(0x01, 4, n) for n in range(16, 24)})
+OPS['s_and_b32 s10, s26, 0xfff'] = sop2(AND, 10, 26, LIT, 0xfff)
+OPS['s_and_b32 s10, s42, 0xfff'] = sop2(AND, 10, 42, LIT, 0xfff)
+OPS.update({'s_mov_b32 s%d, s%d' % (40 + i, 24 + i): sop1(0x03, 40 + i, 24 + i)
+            for i in range(8)})
 for text, code in OPS.items():
     (_off, _n, _name, decoded), = G.decode(code + bytes.fromhex('000081bf'))[:1]
     assert decoded == text, (text, decoded)
@@ -213,6 +217,28 @@ def controls():
             'numeric use of s17 holding a modified image descriptor word 1')
     refused(splice(WORDS['lz'], ('s_cselect_b32 s10, 0, s17',), 'image'),
             'numeric use of s17 holding image descriptor word 1')
+    overwritten = splice(WORDS['lz'], (
+        's_add_u32 s17, s17, 1',
+        's_bfe_u32 s10, s17, 0x2001e',
+        'v_mov_b32_e32 v4, s10',
+    ), 'image')
+    refused(overwritten, 'numeric use of s10 holding descnum')
+
+    # The upper image in an x16 load is a distinct descriptor even though it shares the load's table address.
+    x16 = WORDS['lz'].replace(smem(0x03, 16, 8), smem(0x04, 16, 8), 1)
+    assert x16 != WORDS['lz']
+    load_end = x16.index(smem(0x04, 16, 8)) + len(smem(0x04, 16, 8))
+    copies = b''.join(OPS['s_mov_b32 s%d, s%d' % (40 + i, 24 + i)] for i in range(8))
+    x16 = x16[:load_end] + copies + x16[load_end:]
+    x16 = splice(x16, ('s_and_b32 s10, s42, 0xfff', 'v_mov_b32_e32 v4, s10'), 'after-image')
+    refused(x16, 'numeric use of s10 holding descnum')
+
+    # The conservative pre-scan refuses a branched program even when the branch is after the sample.
+    branched = use('lz', 's_bfe_u32 s10, s17, 0x2001e')
+    end_at = next(off for off, _n, name, _asm in G.decode(branched) if name == 's_endpgm')
+    branched = branched[:end_at] + bytes.fromhex('000084bf') + branched[end_at:]
+    refused(branched, 'numeric use of s10 holding descnum')
+
     image3d = next(WORDS['three'][off:off + n]
                    for off, n, name, _asm in G.decode(WORDS['three']) if name.startswith('image_'))
     both = splice(WORDS['lz'], ('s_bfe_u32 s10, s17, 0x2001e', 'v_mov_b32_e32 v4, s10'), 'image')
