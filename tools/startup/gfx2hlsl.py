@@ -944,6 +944,16 @@ def desc_key(sym):
     return sym[1], None if sym[2] is None else sym[2] + 4 * (sym[3] & ~3)
 
 
+def image_desc_key(sym):
+    """Descriptor load an image word belongs to: (source, byte offset of its 8-dword image).
+
+    The dword index is aligned down to the image, so word 2 of a load at byte 32 is that load and not the
+    image a later load placed in the same registers."""
+    if not sym or sym[0] != 'desc' or len(sym) < 4 or not isinstance(sym[2], int) or not isinstance(sym[3], int):
+        return None
+    return (sym[1], sym[2] + 4 * (sym[3] & ~7))
+
+
 def desc_word(sym, dword):
     return sym[:3] + (dword,) + sym[4:]
 
@@ -3852,8 +3862,6 @@ class Stage:
             self.blocks = []          # (offset, [lines], terminator)
             self.sym = dict(init_sym)
             self.image_span = {}
-            if isinstance(getattr(self, 'image_reg_dim', None), dict):
-                self.image_reg_dim.pop('m0', None)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
             self.wqm_count, self.execcopy_epoch = 0, {}
@@ -5653,50 +5661,74 @@ class Stage:
         return None
 
     def note_image_descriptors(self):
-        """Pixel SGPRs that are an 8-dword image descriptor, including copies through s_mov.
+        """Pixel: descriptor load -> image dimension, for the load an image instruction actually reads.
 
-        The kind is the image instruction's dimension. Two dimensions on one register are recorded as None
-        so a numeric use refuses instead of picking one. Other stages leave the map empty."""
-        dim, copies, conflict = {}, [], set()
+        The key is image_desc_key of the operand's words at that instruction, not the SGPR number. A copy
+        keeps the symbol, so it keeps the key; a later load into the same registers is a different key.
+        Two dimensions on one key are None. A branch leaves the map empty: the load the image reads is
+        then not proved. Other stages leave the map empty."""
+        dims = {}
+        self.image_desc_dim = dims
         if getattr(self, 'kind', None) != 'ps':
-            self.image_reg_dim = dim
             return
+        if any(name.startswith(('s_cbranch', 's_branch', 's_setpc')) for _off, _n, name, _asm in self.ins):
+            return
+        sym = dict(self.sym)
+        counts = {'s_load_dword': 1, 's_load_dwordx2': 2, 's_load_dwordx4': 4,
+                  's_load_dwordx8': 8, 's_load_dwordx16': 16}
         for _off, _n, name, asm in self.ins:
             _op, operands, mods = parse(asm)
             if name.startswith('image_') and len(operands) >= 3:
                 reg = reg_range(operands[2])
                 kinds = [IMAGE_DIM[m[4:]] for m in mods if m.startswith('dim:') and m[4:] in IMAGE_DIM]
                 if reg and reg[0] == 's' and reg[2] == reg[1] + 7 and len(kinds) == 1:
-                    for n in range(reg[1], reg[2] + 1):
-                        if n in dim and dim[n] != kinds[0]:
-                            conflict.add(n)
-                        dim[n] = kinds[0]
+                    first = sym.get(reg[1])
+                    key = image_desc_key(first)
+                    same = key is not None and first[3] % 8 == 0 and all(
+                        sym.get(reg[1] + i) == desc_word(first, first[3] + i)
+                        and 'modified' not in (sym.get(reg[1] + i) or ())[4:]
+                        for i in range(8))
+                    if same:
+                        if key in dims and dims[key] != kinds[0]:
+                            dims[key] = None
+                        elif key not in dims:
+                            dims[key] = kinds[0]
+                continue
+            if name in counts and len(operands) >= 1:
+                dst = reg_range(operands[0])
+                count = counts[name]
+                if dst and dst[0] == 's':
+                    for i in range(dst[1], dst[2] + 1):
+                        sym.pop(i, None)
+                    base = reg_range(operands[1]) if len(operands) >= 3 else None
+                    p = sym.get(base[1]) if base and base[0] == 's' else None
+                    token = operands[2] if len(operands) >= 3 else ''
+                    extra = 0
+                    for mod in mods:
+                        if mod.startswith('offset:') and re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', mod[7:]):
+                            extra = int(mod[7:], 0)
+                    if (p and p[0] == 'ptr' and dst[2] - dst[1] + 1 == count
+                            and re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|\d+)', token)
+                            and (len(p) == 2 or isinstance(p[2], int))):
+                        off = int(token, 0) + extra + (p[2] if len(p) > 2 else 0)
+                        for i in range(count):
+                            sym[dst[1] + i] = ('desc', p[1], off, i)
+                    continue
             if name in ('s_mov_b32', 's_mov_b64') and len(operands) >= 2:
                 dst, src = reg_range(operands[0]), reg_range(operands[1])
-                if (dst and src and dst[0] == 's' and src[0] == 's'
-                        and dst[2] - dst[1] == src[2] - src[1] and dst[2] - dst[1] in (0, 1)):
-                    for i in range(dst[2] - dst[1] + 1):
-                        copies.append((dst[1] + i, src[1] + i))
-        changed = True
-        while changed:
-            changed = False
-            for dst, src in copies:
-                if src in dim and dst not in dim:
-                    dim[dst] = dim[src]
-                    if src in conflict:
-                        conflict.add(dst)
-                    changed = True
-                elif dst in dim and src not in dim:
-                    dim[src] = dim[dst]
-                    if dst in conflict:
-                        conflict.add(src)
-                    changed = True
-                elif src in dim and dst in dim and dim[src] != dim[dst]:
-                    conflict.add(src)
-                    conflict.add(dst)
-        for n in conflict:
-            dim[n] = None
-        self.image_reg_dim = dim
+                if dst and dst[0] == 's' and src and src[0] == 's' and dst[2] - dst[1] == src[2] - src[1]:
+                    vals = [sym.get(src[1] + i) for i in range(dst[2] - dst[1] + 1)]
+                    for i, val in enumerate(vals):
+                        if val is None:
+                            sym.pop(dst[1] + i, None)
+                        else:
+                            sym[dst[1] + i] = val
+                    continue
+            for dest in scalar_destinations(name, asm):
+                if dest == 'any':
+                    sym.clear()
+                    break
+                sym.pop(dest, None)
 
     def _copy_image_span(self, src, dest):
         span = getattr(self, 'image_span', None)
@@ -5710,14 +5742,16 @@ class Stage:
     def image_word(self, reg):
         """(field 0..7, kind or None, symbol, modified) for a pixel image descriptor word, else None.
 
-        kind is None when the register is used as two image dimensions. An 8- or 16-dword load is what
-        marks the word; a 4-dword buffer load is not an image."""
+        kind is None when that descriptor load is used as two image dimensions. The load has to be one an
+        image instruction reads (image_desc_dim). An 8- or 16-dword load is what marks the word; a 4-dword
+        buffer load is not an image."""
         if getattr(self, 'kind', None) != 'ps':
             return None
         sym = self.sym.get(reg)
         span = (getattr(self, 'image_span', None) or {}).get(reg)
-        dims = getattr(self, 'image_reg_dim', {})
-        if not sym or sym[0] != 'desc' or not span or reg not in dims or len(sym) < 4:
+        dims = getattr(self, 'image_desc_dim', {})
+        key = image_desc_key(sym)
+        if not sym or sym[0] != 'desc' or not span or key not in dims or len(sym) < 4:
             return None
         modified = 'modified' in sym[4:]
         if len(sym) != 4 and not modified:
@@ -5725,7 +5759,7 @@ class Stage:
         count, index = span
         if count not in (8, 16) or sym[3] != index:
             return None
-        return (index % 8, dims[reg], sym, modified)
+        return (index % 8, dims[key], sym, modified)
 
     def image_dim_call(self, sym, kind, component):
         """GetDimensions(0) of the texture this image descriptor binds, for one component."""
@@ -5915,12 +5949,6 @@ class Stage:
                     self.sym['m0'] = syms[0]
                     src = reg_range(srcs[0]) if srcs else None
                     self._copy_image_span(src, 'm0')
-                    dims = getattr(self, 'image_reg_dim', None)
-                    if isinstance(dims, dict):
-                        if src and src[0] == 's' and src[1] in dims:
-                            dims['m0'] = dims[src[1]]
-                        else:
-                            dims.pop('m0', None)
                 elif field and field[0] == 'opaque':
                     self.sym['m0'] = ('descnum', 'image', field[1], field[2], field[3])
                 else:

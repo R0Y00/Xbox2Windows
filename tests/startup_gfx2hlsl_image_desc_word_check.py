@@ -7,7 +7,10 @@ word 2 bits 11:0. HEIGHT minus one is word 2 bits 27:14. DEPTH minus one is word
 
 Everything else stays refused: a whole word, any other word or field, a shift of word 2 that keeps the
 resource-level bit, depth of a 1D, 2D or 2D-array image, height of a 1D image, a modified word, m0, a
-4-dword buffer descriptor, a load with no image instruction, and the vertex stage.
+4-dword buffer descriptor, a load with no image instruction, and the vertex stage. A size field is
+the descriptor load the image instruction reads: an earlier load at table offset 32 into the same
+registers does not borrow the sampled dimension, and a reload of those registers after the sample does
+not either. A copy of the sampled word taken before the reload still does.
 
 The pixel prologue is the source-built image_sample fixture. The scalar ops are encoded from the SOP1/SOP2
 layouts and the decoder must print each one back. With image_field_expr removed, every accepted case is
@@ -76,6 +79,8 @@ OPS = {
     's_lshl_b32 s11, s11, 2': sop2(LSHL, 11, 11, TWO),
     's_or_b32 s12, s10, s11': sop2(OR, 12, 10, 11),
     's_add_u32 s12, s12, 1': sop2(ADD, 12, 12, ONE),
+    's_load_dwordx8 s[16:23], s[8:9], 0x20': smem(0x03, 16, 8, 0x20),
+    's_waitcnt lgkmcnt(0)': bytes.fromhex('7fc08cbf'),
     'v_mov_b32_e32 v4, s10': VMOV,
     'v_mov_b32_e32 v4, s12': vop1(0x01, 4, 12),
     'v_mov_b32_e32 v4, s17': vop1(0x01, 4, 17),
@@ -216,6 +221,36 @@ def controls():
     refused(bare_buf, 'numeric use of s10 holding descnum')
     vertex = smem(0x03, 16, 8) + OPS['s_bfe_u32 s10, s17, 0x2001e'] + VMOV + VS_WORDS
     refused(WORDS['lz'], 'numeric use of s10 holding descnum', vs=vertex)
+
+    # The offset-32 load is read before the fixture's own offset-0 load. The sample uses offset 0, so
+    # the earlier word must not borrow that dimension. The v_mov is after the image instruction.
+    early = (OPS['s_load_dwordx8 s[16:23], s[8:9], 0x20'] + OPS['s_waitcnt lgkmcnt(0)']
+             + OPS['s_and_b32 s10, s18, 0xfff'] + WORDS['lz'])
+    early = splice(early, ('v_mov_b32_e32 v4, s10',), 'after-image')
+    refused(early, 'numeric use of s10 holding descnum')
+
+    # s18 is copied before the sample. After it, s[16:23] is loaded again from offset 32.
+    # The copy is still the sampled descriptor. The reloaded s18 is not.
+    kept = splice(WORDS['lz'], ('s_mov_b32 s28, s18',), 'image')
+    kept = splice(kept, (
+        's_load_dwordx8 s[16:23], s[8:9], 0x20',
+        's_waitcnt lgkmcnt(0)',
+        's_and_b32 s10, s28, 0xfff',
+        'v_mov_b32_e32 v4, s10',
+    ), 'after-image')
+    text, manifest = ps(kept)
+    assert W_HI in text, text
+    assert manifest.count('\nsrv ') == 1 and 'srv 0 tex2d table 0 0' in manifest, manifest
+    assert 'table 0 32' not in manifest, manifest
+    without_field(kept)
+    reloaded = splice(WORDS['lz'], ('s_mov_b32 s28, s18',), 'image')
+    reloaded = splice(reloaded, (
+        's_load_dwordx8 s[16:23], s[8:9], 0x20',
+        's_waitcnt lgkmcnt(0)',
+        's_and_b32 s10, s18, 0xfff',
+        'v_mov_b32_e32 v4, s10',
+    ), 'after-image')
+    refused(reloaded, 'numeric use of s10 holding descnum')
     print('pixel image descriptor size fields: width, height and 3D depth lowered; other words refused')
 
 
