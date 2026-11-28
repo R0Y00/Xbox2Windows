@@ -356,7 +356,7 @@ HANDLE section_for(ULONG_PTR page, bool need_commit = true)
         return first_slot_committed;
     };
     if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
-    if (!defer && !first_slot_committed && !commit_slot(slot.slab, slot.offset, false)) {
+    if (!defer && !commit_slot(slot.slab, slot.offset, false)) {
         const DWORD error = GetLastError();
         memory.slots.unwind_fresh(slot);
         SetLastError(error);
