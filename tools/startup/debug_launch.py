@@ -1,6 +1,7 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
 usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+                      [--suspend-others 0] [--capture-every S]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -15,15 +16,21 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.SuspendThread.restype = wt.DWORD
+nt_dll = ctypes.WinDLL("ntdll")
+nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
-from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
+from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
+from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -128,6 +135,13 @@ def main():
         print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
         return 2
     stop_first = opts.get("--stop-first-chance") == "1"
+    try:
+        capture_every = float(opts.get("--capture-every", 0))  # seconds between window pictures; 0 = off
+    except ValueError:
+        capture_every = -1
+    if not (capture_every == 0 or 1 <= capture_every < float("inf")):
+        print("expected --capture-every of 0 (off) or a finite number of seconds that is at least 1")
+        return 2
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
@@ -188,8 +202,12 @@ def main():
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     pi = PROCESS_INFORMATION()
     flags = 0x2 | 0x4 | 0x400  # DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+    startup, extra_flags, startup_keep, startup_note = startup_for_create(si, env)
+    if startup_note:
+        print(startup_note)
+    flags |= extra_flags
     if not k32.CreateProcessW(exe, ctypes.create_unicode_buffer(f'"{exe}"'), None, None, True, flags,
-                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(si), ctypes.byref(pi)):
+                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(startup), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
@@ -383,6 +401,9 @@ def main():
     redirects = {}
     # Offline by default (--offline 0 turns it off): no sockets, NetBIOS name devices or DNS resolver.
     offline = opts.get("--offline", "1") == "1"
+    # Keep the same offline entry checks. An allowed file operation only
+    # needs a return breakpoint when collecting its completion status.
+    offline_entry_only = offline and os.environ.get("X2W_OFFLINE_ENTRY_ONLY") == "1"
     OFFLINE_DENY = ("\\device\\afd", "\\device\\netbt", "dnsresolver", "\\device\\tcp", "\\device\\udp",
                     "\\device\\rawip", "\\device\\ws2ifsl")
     denied = {}
@@ -444,9 +465,62 @@ def main():
     breakpoints = {}  # addr -> original byte
     retired = set()  # X2W_LOG_AT breakpoints removed at their hit limit
     late_hits = {}  # retired addr -> INT3 events that arrived after the removal
-    returns = {}  # addr -> list of (tid, rsp after return, description)
+    returns = ReturnBook()
     stepping = {}  # tid -> addr to re-arm
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
+    hook_entries = [0]
+    held_threads = {}  # tid -> handle of a thread held for the current step window
+    os_handles = {}  # tid -> hThread of CREATE_*_DEBUG_EVENT: valid until its EXIT_THREAD is continued; never closed here
+    sync_raw = (ctypes.c_ubyte * (1232 + 16))()
+    sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
+
+    def hold_thread(tid):
+        handle = os_handles.get(tid)
+        owned = handle is None
+        if owned:  # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
+            handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
+            if not handle:
+                return classify_hold(None, ctypes.get_last_error())
+
+        def drop():
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+        # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
+        struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
+        previous = wt.ULONG()
+        status = nt_dll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
+        suspended = status == 0
+        if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
+            held_threads[tid] = (handle, owned)
+            return HELD
+        if suspended:
+            k32.ResumeThread(wt.HANDLE(handle))
+        # A thread already exiting (waiting for its EXIT_THREAD event) refuses suspension with
+        # STATUS_THREAD_IS_TERMINATING while GetExitCodeThread still says STILL_ACTIVE: it runs no code.
+        if not suspended and classify_status(status) == GONE:
+            drop()
+            return GONE
+        # Classify after the failure: a thread that has called ExitThread is GONE (no code left to race
+        # with); a live thread that cannot be suspended stays FAILED and the window reports it.
+        code = wt.DWORD()
+        exit_code = code.value if k32.GetExitCodeThread(wt.HANDLE(handle), ctypes.byref(code)) else None
+        # A thread that is terminating may not have its exit code yet: its handle is signaled in moments.
+        signaled = k32.WaitForSingleObject(wt.HANDLE(handle), 20) == 0
+        drop()
+        return classify_hold(exit_code, signaled=signaled)
+
+    def release_thread(tid):
+        held = held_threads.pop(tid, None)
+        if held:
+            handle, owned = held
+            k32.ResumeThread(wt.HANDLE(handle))
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+    # A hook step-over restores the original byte for one instruction. Every other thread is held
+    # for that step (--suspend-others 0 turns this off to measure what the window costs).
+    window = StepWindow(hold_thread, release_thread, protect=opts.get("--suspend-others", "1") != "0")
 
     def arm(addr, *, skip_int3=False):
         if addr not in breakpoints:
@@ -459,6 +533,12 @@ def main():
         thread, ctx = get_ctx(tid)
         if not thread:
             return False
+        if window.defer(tid):
+            # This thread trapped before it was held. Back to the hook address: it traps again, and
+            # is traced, once the window is closed and the byte is patched again.
+            struct.pack_into("<Q", ctx, 0xF8, addr)
+            set_ctx(thread)
+            return True
         regs = dict(zip(REGS, struct.unpack_from("<16Q", ctx, 0x78) + struct.unpack_from("<Q", ctx, 0xF8)))
         rva = addr - main_base if log_at else None
         point = log_at.get(rva)
@@ -474,6 +554,7 @@ def main():
             file_log.flush()
         rsp = regs["Rsp"]
         if addr in hooks:
+            hook_entries[0] += 1
             name, arg = hooks[addr]
             ret = read_qword(read, rsp) or 0
             if arg == "valloc":
@@ -537,6 +618,8 @@ def main():
                     struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
                     set_ctx(thread)
                     return True
+                if offline_entry_only:
+                    desc = None
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -544,24 +627,23 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc))
+                returns.add(ret, tid, rsp + 8, desc, addr)
                 arm(ret)
-        for item in list(returns.get(addr, [])):
-            if item[0] == tid and item[1] == rsp:
-                returns[addr].remove(item)
-                file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
-                file_log.flush()
+        for description in returns.take(addr, tid, rsp):
+            file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
+            file_log.flush()
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
-        if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.get(addr)
+        if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.pending(addr)
                 and write(addr, breakpoints[addr])):
             del breakpoints[addr]
             retired.add(addr)
             set_ctx(thread)
             return True
-        # Step over the original instruction, then re-arm.
+        # Hold other threads while stepping over the original instruction.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])
@@ -631,6 +713,80 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
+    def grab_window():
+        """The title's window as (width, height, BGRA bytes, title text length), or the reason there is none.
+
+        Runs on the capture thread as well as at the end of the run; every GDI object is released."""
+        user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+        found = []
+        proto = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+        def visit(hwnd, _):
+            owner = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(proto(visit), 0)
+        if not found:
+            return "no visible window"
+        hwnd = found[0]
+        rect = wt.RECT()
+        user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
+        width, height = min(rect.right, 1920), min(rect.bottom, 1080)
+        if width <= 0 or height <= 0:
+            return "empty client area"
+        user32.GetDC.restype = wt.HDC
+        gdi32.CreateCompatibleDC.restype = wt.HDC
+        gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+        source = user32.GetDC(wt.HWND(hwnd))
+        memory = gdi32.CreateCompatibleDC(wt.HDC(source))
+        bitmap = gdi32.CreateCompatibleBitmap(wt.HDC(source), width, height)
+        try:
+            gdi32.SelectObject(wt.HDC(memory), wt.HBITMAP(bitmap))
+            gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
+            header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+            pixels = (ctypes.c_ubyte * (width * height * 4))()
+            gdi32.GetDIBits(wt.HDC(memory), wt.HBITMAP(bitmap), 0, height, pixels, header, 0)
+            raw = bytes(pixels)
+        finally:
+            gdi32.DeleteObject(wt.HGDIOBJ(bitmap))
+            gdi32.DeleteDC(wt.HDC(memory))
+            user32.ReleaseDC(wt.HWND(hwnd), wt.HDC(source))
+        title = ctypes.create_unicode_buffer(128)
+        user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
+        return width, height, raw, len(title.value)
+
+    def capture_window():
+        """Saves what the title's window currently shows on screen (client area) as window.png."""
+        frame = grab_window()
+        if isinstance(frame, str):
+            print(f"  window capture: {frame}")
+            return
+        width, height, raw, title_length = frame
+        with open(os.path.join(logdir, "window.png"), "wb") as handle:
+            handle.write(png_bytes(width, height, raw))
+        print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {title_length})")
+
+    # --capture-every: a thread of its own grabs the window, so a slow capture never delays the debug events.
+    series = Series(logdir) if capture_every else None
+    capture_done = threading.Event()
+
+    def capture_loop():
+        while not capture_done.wait(capture_every):
+            try:
+                frame = grab_window()
+                if isinstance(frame, str):
+                    series.miss()
+                else:
+                    series.offer(time.time() - start, frame[0], frame[1], frame[2])
+            except Exception:  # diagnostics only: the run goes on, the tick is counted
+                series.miss()
+
+    capture_thread = threading.Thread(target=capture_loop, name="window-capture", daemon=True) if series else None
+    if capture_thread:
+        capture_thread.start()
     stop_requested = False
     stop_next = 0.0
     while not timeout or time.time() - start < timeout:
@@ -645,13 +801,17 @@ def main():
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
+        if window.expire(time.monotonic()):
+            log(f"{time.time() - start:7.3f} hook step window expired, held threads resumed")
         if not k32.WaitForDebugEvent(event, 200):
             continue
         code, pid, tid = struct.unpack_from("<III", event, 0)
         status = DBG_CONTINUE
         if code == CREATE_PROCESS:
             live_threads.add(tid)
-            h_file, _, _, base = struct.unpack_from("<QQQQ", event, 16)
+            h_file, _, h_thread, base = struct.unpack_from("<QQQQ", event, 16)
+            if h_thread:
+                os_handles[tid] = h_thread
             main_base = base
             for item in filter(None, os.environ.get("X2W_COUNT", "").split(",")):
                 hooks[base + int(item, 16)] = (f"+{item}", "count")
@@ -696,8 +856,14 @@ def main():
         elif code == CREATE_THREAD:
             log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            h_thread = struct.unpack_from("<Q", event, 16)[0]
+            if h_thread:
+                os_handles[tid] = h_thread
+            window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            window.finish(tid)
+            os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")
@@ -733,6 +899,7 @@ def main():
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
                     write(addr, b"\xcc")
+                window.finish(tid)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
@@ -787,6 +954,7 @@ def main():
                 status = DBG_EXCEPTION_NOT_HANDLED
         k32.ContinueDebugEvent(pid, tid, status)
 
+    window.abandon()
     elapsed = time.time() - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
@@ -897,6 +1065,11 @@ def main():
         if late_hits:
             print("  LOG_AT late hits resumed after the limit: " +
                   ", ".join(f"+{addr - main_base:x} x{n}" for addr, n in sorted(late_hits.items())))
+    report = window.summary(hook_entries[0])
+    print("  " + report)
+    if file_log:
+        file_log.write(report + "\n")
+        file_log.flush()
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
@@ -907,61 +1080,10 @@ def main():
     else:
         print("  call tracing: off (runtime and movie-player call hooks; --trace-calls 1)")
 
-    def capture_window():
-        """Saves what the title's window currently shows on screen (client area) as window.png."""
-        import zlib
-        user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
-        found = []
-        proto = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-
-        def visit(hwnd, _):
-            owner = wt.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-            return True
-
-        user32.EnumWindows(proto(visit), 0)
-        if not found:
-            print("  window capture: no visible window")
-            return
-        hwnd = found[0]
-        rect = wt.RECT()
-        user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
-        width, height = min(rect.right, 1920), min(rect.bottom, 1080)
-        if width <= 0 or height <= 0:
-            print("  window capture: empty client area")
-            return
-        user32.GetDC.restype = wt.HDC
-        gdi32.CreateCompatibleDC.restype = wt.HDC
-        gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
-        source = user32.GetDC(wt.HWND(hwnd))
-        memory = gdi32.CreateCompatibleDC(wt.HDC(source))
-        bitmap = gdi32.CreateCompatibleBitmap(wt.HDC(source), width, height)
-        gdi32.SelectObject(wt.HDC(memory), wt.HBITMAP(bitmap))
-        gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
-        header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
-        pixels = (ctypes.c_ubyte * (width * height * 4))()
-        gdi32.GetDIBits(wt.HDC(memory), wt.HBITMAP(bitmap), 0, height, pixels, header, 0)
-        raw = bytes(pixels)
-        rows = []
-        for y in range(height):
-            line = raw[y * width * 4:(y + 1) * width * 4]
-            rows.append(bytes(1) + bytes(b for i in range(0, len(line), 4) for b in (line[i + 2], line[i + 1], line[i])))
-
-        def chunk(kind, payload):
-            body = kind + payload
-            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-
-        png = (bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) +
-               chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
-               chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
-        with open(os.path.join(logdir, "window.png"), "wb") as handle:
-            handle.write(png)
-        title = ctypes.create_unicode_buffer(128)
-        user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
-        print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {len(title.value)})")
-
+    if capture_thread:
+        capture_done.set()
+        capture_thread.join(30)
+        print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
     if exit_code is None:
         try:
             capture_window()
