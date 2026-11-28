@@ -47,15 +47,13 @@ controls for other barrier types, flagged barriers, invalid resources and arrays
 
 ## Occlusion queries
 
-Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
-(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
-the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
-implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
-`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
-diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
-no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
-end at Close, not the numbering.
+The GXDK 261000 `ID3D12GraphicsCommandList8` table confirms `BeginQuery`, `EndQuery` and
+`ResolveQueryData` at command-list slots 28 to 30, and `SetPredication` at 31. Slots 32 to 55
+are the desktop slots 28 to 51 plus four; slots 56 to 58 are `SetMarker`, `BeginEvent` and
+`EndEvent`, and `ExecuteIndirect` is 61. The query bindings stay a diagnostic opt-in: only with
+`X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay no-ops
+as before. The fixture below calls those slots directly, so it checks the forwarding, the
+refusals and the end at Close, not the numbering.
 
 The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
 binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
@@ -76,7 +74,7 @@ the console `Map`. It then checks that the refused calls, among them resolves ov
 with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
 error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
-`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
+Slots 56 to 58 are the desktop marker methods, not query methods.
 
 ## Depth target on translated draws
 
@@ -1645,7 +1643,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
 | `X2W_D3D12_ROOT_SRV_AT_DRAW=1` | opt-in, render mode: a graphics root SRV (slot 44) without an upload mapping is not copied into the upload ring, since no draw reads that desktop binding (default: a 64 KiB copy at every slot 44 call). Translated draws copy the SRV themselves and are unaffected (`startup_root_srv_draw_*`). See [the experiment note](experiments/startup-root-srv-at-draw.md) |
 | `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1` | opt-in, render mode: a closed command list releases its upload ring chunks once its submit is fenced instead of holding them until Reset, and the ring grows in 16 MiB chunks up to 512 MiB (default: doubling chunks up to 256 MiB, holds until Reset). The larger ring can add up to about 1 GiB of process commit at peak (startup runs in the experiment note). A later submit of the same list before its Reset fences its unchanged chunks again; if one was reused in between, that list is refused before the execute and logged (`startup_address_console_gate_ring_keep_*`, `upload_reservation`). See [the experiment note](experiments/startup-upload-ring-release-at-submit.md) |
-| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
+| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the confirmed `BeginQuery`, `EndQuery` and `ResolveQueryData` methods (see [Occlusion queries](#occlusion-queries)). The bindings remain diagnostic because the forwarding behavior is not a console runtime oracle. Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
