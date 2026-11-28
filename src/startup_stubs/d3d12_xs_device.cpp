@@ -3426,7 +3426,7 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
     return TRUE;
 }
 
-// Query slots 28 to 30, confirmed by the GXDK 261000 ID3D12GraphicsCommandList6 function table
+// Query slots 28 to 30, confirmed by the GXDK 261000 ID3D12GraphicsCommandList8 function table
 // (command_list_slot_names.h): they are bound only with X2W_D3D12_QUERY_SLOTS=1 because the behavior is
 // diagnostic. The heap reaches device slot 39 with the desktop desc. Only occlusion queries are
 // forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
