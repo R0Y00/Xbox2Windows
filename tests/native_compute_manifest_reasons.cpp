@@ -67,6 +67,19 @@ int main() {
              p.bindings[0].kind = K::texture_srv;
              p.bindings[0].array_count = 4;
          }},
+        {"SRV kind cube_comparison_srv cube", [](auto &p) {
+             p.bindings[0].kind = K::cube_comparison_srv;
+             p.bindings[0].image_dimension = 3;
+         }},
+        {"SRV kind cube_sample_srv cube array", [](auto &p) {
+             p.bindings[0].kind = K::cube_sample_srv;
+             p.bindings[0].image_dimension = 3;
+             p.bindings[0].array_count = 2;
+         }},
+        {"SRV kind cube_sample_srv 2d", [](auto &p) {
+             p.bindings[0].kind = K::cube_sample_srv;
+             p.bindings[0].image_dimension = 1;
+         }},
         {"UAV kind typed_buffer_uav", [](auto &p) { p.bindings[1].kind = K::typed_buffer_uav; }},
         {"UAV kind texture_uav cube", [](auto &p) {
              p.bindings[1].kind = K::texture_uav;
@@ -93,19 +106,22 @@ int main() {
                     ok ? "" : manifest ? "a manifest" : reason.c_str());
         failures += !ok;
     }
-    // A texture SRV is published under the name of its dimension: the line the runtime's reader takes.
+    // A texture SRV is published under the name of its dimension: the line the runtime's reader takes. A cube sample
+    // names `texcubearr`: the program declares a TextureCubeArray (`texcube` stays the draw route's TextureCube).
     const struct {
+        K kind;
         unsigned image_dimension;
         const char *line;
     } published[] = {
-        {0, "srv 0 tex1d table 1 64\n"},
-        {1, "srv 0 tex2d table 1 64\n"},
-        {2, "srv 0 tex3d table 1 64\n"},
-        {5, "srv 0 tex2da table 1 64\n"},
+        {K::texture_srv, 0, "srv 0 tex1d table 1 64\n"},
+        {K::texture_srv, 1, "srv 0 tex2d table 1 64\n"},
+        {K::texture_srv, 2, "srv 0 tex3d table 1 64\n"},
+        {K::texture_srv, 5, "srv 0 tex2da table 1 64\n"},
+        {K::cube_sample_srv, 3, "srv 0 texcubearr table 1 64\n"},
     };
     for (const auto &c : published) {
         auto program = base();
-        program.bindings[0].kind = K::texture_srv;
+        program.bindings[0].kind = c.kind;
         program.bindings[0].image_dimension = c.image_dimension;
         reason = "unset";
         const auto manifest = format_compute_runtime_manifest(program, &reason);

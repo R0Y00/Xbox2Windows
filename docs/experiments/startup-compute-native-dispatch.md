@@ -86,7 +86,22 @@ ctest --preset dev --no-tests=error -V -R '^(startup_compute_dispatch(_.*)?|star
   and 3D the title's view must be described, have the manifest's dimension and fit its texture, otherwise the
   Dispatch is refused (on a dimension mismatch the draw path binds a null view instead). "Fits" is
   `address_view_fits`: the view format is the storage format or a member of its typeless family, the mip and
-  slice range lie inside the texture, and ResourceMinLODClamp is 0. Cube texture SRVs are not published.
+  slice range lie inside the texture, and ResourceMinLODClamp is 0.
+- A cube sample or gather (`image_sample*` or `image_gather4*` with the cube dimension) is published as
+  `srv N texcubearr table R B`, because the translator declares a TextureCubeArray (DXIL resource kind 9; the layer is `face >> 3`). The title's view must be a
+  described TEXTURECUBE of a six-slice 2D texture: a view of another dimension (a TEXTURECUBEARRAY or TEXTURE2DARRAY
+  view included) is refused as "an input texture view is not cube", a missing description as "an input cube texture
+  has no recorded view description", and a view that does not fit as for the other dimensions. The Dispatch then
+  creates the view as a TEXTURECUBEARRAY of one cube (First2DArrayFace 0, NumCubes 1, the title's mips and format).
+  A face id of 8 or more addresses layer `face >> 3` of that one-cube view, which is not tested here; cube arrays
+  in the program, `image_load` on a cube (a plain `texture_srv` of the cube dimension), cube comparison samples and
+  descriptor arrays stay refused by name at publication. `gfx2hlsl.py` still refuses a cube in a compute program.
+  The fixture is `startup_compute_dispatch_cube_check.py`: 24 texels (6 faces of 2x2) sampled at face coordinates
+  (+-0.5, +-0.5) against a D3D face mapping written in the test. On hardware the translator's DXIL runs; WARP cannot
+  create its `[WaveSize(32)]` shader, so on WARP the test substitutes an HLSL equivalent for the compiled shader and
+  covers the manifest and the reader only. Gather on a cube is published the same way but not run by the fixture.
+  The TEXTURECUBEARRAY rewrite follows the declared resource kind; with it removed, WARP and hardware gave the same
+  words and no debug-layer message, so no run here tells the two apart.
 - One descriptor shape was dispatched: stride 4 and 320 records, for the input and for the output.
 - An indirect Dispatch of a natively translated program was not run.
 - A captured request starts with a 36-byte prefix of `v_nop` words before `s_inst_prefetch`. The route passes

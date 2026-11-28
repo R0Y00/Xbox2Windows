@@ -1010,7 +1010,9 @@ and raw table buffers stored to, with their descriptors in 32-byte table records
 scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
 not lower) is refused. Programs published as `<key>.txt` also bind 1D, 2D, 2D-array and 3D texture SRVs
 (`srv N tex1d|tex2d|tex2da|tex3d table R B`) from the title's described view of that dimension, or are
-refused by name; cube texture SRVs are not published. The first 16 refusals of a process are logged as
+refused by name. A cube sample is published as `srv N texcubearr table R B` (the program declares a
+TextureCubeArray) and bound from the title's described TEXTURECUBE view of a six-slice texture, created as a
+one-cube TEXTURECUBEARRAY; `image_load` on a cube, cube comparison and cube arrays are not published. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process

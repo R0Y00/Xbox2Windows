@@ -4,7 +4,7 @@
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
+// (`srv <i> tex1d|tex2d|tex2da|tex3d|texcubearr table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -182,6 +182,8 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (!std::strcmp(name, "tex2d")) return D3D12_SRV_DIMENSION_TEXTURE2D;
             if (!std::strcmp(name, "tex2da")) return D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             if (!std::strcmp(name, "tex3d")) return D3D12_SRV_DIMENSION_TEXTURE3D;
+            // The program declares a TextureCubeArray; the title's TEXTURECUBE view is bound as a one-cube array.
+            if (!std::strcmp(name, "texcubearr")) return D3D12_SRV_DIMENSION_TEXTURECUBE;
             return D3D12_SRV_DIMENSION_UNKNOWN;
         };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
@@ -245,7 +247,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpc %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"
+        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D/cube texture"
                   : line.rfind("uav", 0) == 0 ? "an unsupported compute output view"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
@@ -554,19 +556,35 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
                 else if (slot.srv_dimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
-                    // 1D, 2D array and 3D: only the title's own described view of that dimension, inside its texture.
+                    // 1D, 2D array, 3D and cube: only the title's own described view of that dimension, inside its texture.
                     const bool one = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D;
                     const bool array = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    const bool cube = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURECUBE;
                     if (!described)
                         reason = one ? "an input 1D texture has no recorded view description"
                             : array ? "an input 2D array texture has no recorded view description"
+                            : cube ? "an input cube texture has no recorded view description"
                             : "an input 3D texture has no recorded view description";
                     else if (desc.ViewDimension != slot.srv_dimension)
                         reason = one ? "an input texture view is not 1D" : array ? "an input texture view is not 2D array"
-                            : "an input texture view is not 3D";
+                            : cube ? "an input texture view is not cube" : "an input texture view is not 3D";
                     else if (!x2w_startup::address_view_fits(resource, desc))
                         reason = "an input texture view does not fit its texture";
                     else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                    else if (cube) {
+                        // The program declares a TextureCubeArray (manifest `texcubearr`), and a view must match the declared
+                        // dimension: the title's cube becomes a one-cube array of the same mips and format. The fit check
+                        // above ran on the title's view, which only a TEXTURECUBE of exactly six slices passes.
+                        // The two views share a union: the mips are read before the rewrite, and First2DArrayFace takes the
+                        // place of TextureCube.ResourceMinLODClamp, which the fit check already required to be 0.
+                        const UINT most_detailed = desc.TextureCube.MostDetailedMip, levels = desc.TextureCube.MipLevels;
+                        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+                        desc.TextureCubeArray.MostDetailedMip = most_detailed;
+                        desc.TextureCubeArray.MipLevels = levels;
+                        desc.TextureCubeArray.First2DArrayFace = 0;
+                        desc.TextureCubeArray.NumCubes = 1;
+                        desc.TextureCubeArray.ResourceMinLODClamp = 0.0f;
+                    }
                 }
                 else if (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
                                    : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)

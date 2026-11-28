@@ -383,7 +383,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     }
-    if (mode == "dispatch-records32" || typed_output_offset || shared_uav) {  // output at byte 32, none at byte 16
+    if (mode == "dispatch-records32" || typed_output_offset || shared_uav || mode.rfind("dispatch-cube", 0) == 0) {  // output at byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
@@ -539,6 +539,48 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             view.Texture3D = {0, 1, clamp};
         }
         invoke(device, 18, word(texture), control == "undescribed" ? 0 : word(&view), cpu + 64);
+    }
+    if (mode.rfind("dispatch-cube", 0) == 0) {
+        // dispatch-cube[-array|-undescribed|-twelve]: records of 32 bytes (the output at byte 32, as dispatch-records32); the
+        // sampled input is a described R32_FLOAT cube texture in the SRV at table byte 64: 2x2 texels, six slices (the cube faces, +X -X +Y -Y +Z -Z), texel (x + 2 y) of slice f holding
+        // 100 + 4 f + x + 2 y. Each slice is uploaded by its own copy. The view is a TEXTURECUBE of mip 0. -array views the
+        // same six slices as a TEXTURE2DARRAY, -undescribed creates the view without a description, -twelve makes the
+        // texture twelve slices deep (slices 6 to 11 hold 100 + 4 slice + x + 2 y too) under a TEXTURECUBE view.
+        const std::string control = mode.substr(13);
+        if (!control.empty() && control != "-array" && control != "-undescribed" && control != "-twelve") return 2;
+        constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT;
+        const UINT slices = control == "-twelve" ? 12 : 6;
+        const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 2, static_cast<UINT16>(slices), 1, format, {1, 0}};
+        constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, slice_bytes = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 8192, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
+        void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* texel = nullptr;
+        if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&texel)))) || !texel) return 80;
+        std::memset(texel, 0, 8192);
+        for (UINT slice = 0; slice < slices; ++slice)
+            for (UINT y = 0; y < 2; ++y)
+                for (UINT x = 0; x < 2; ++x) {
+                    const float value = static_cast<float>(100 + 4 * slice + x + 2 * y);
+                    std::memcpy(static_cast<char*>(texel) + slice * slice_bytes + y * pitch + x * 4, &value, sizeof(value));
+                }
+        invoke(upload, 9, 0, 0);
+        for (UINT slice = 0; slice < slices; ++slice) {
+            D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            image.SubresourceIndex = slice;
+            D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            source.PlacedFootprint = {UINT64{slice} * slice_bytes, {format, 2, 2, 1, pitch}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{format, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        if (control == "-array") {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 1, 0, 6, 0, 0.0f};
+        } else {
+            view.TextureCube = {0, 1, 0.0f};
+        }
+        invoke(device, 18, word(texture), control == "-undescribed" ? 0 : word(&view), cpu + 64);
     }
     if (mode == "dispatch-input-memory-view") {
         // The input is a buffer view (device slot 70) of memory no buffer is placed over, 16 bytes in; its token
