@@ -90,6 +90,87 @@ std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
 
+// X2W_D3D12_VIEW_CONTENT_TOKENS=1 (opt-in, #1199, view_content_token.h): a view that fits a content token is named in
+// title memory by its content, so its record is only named by shadow slots. Such a record (freeable) is parked when
+// the last shadow slot stops naming it: it keeps its contents and its view_ids entry, so the same view created again
+// finds it (revived), and it waits in a queue, oldest first. A new record takes the oldest parked one once more than
+// view_parked_keep records are parked; only then does its view_ids entry go. Off under
+// X2W_D3D12_CAPTURE, whose VIEW chunks are written once per id. Every field: note_lock held.
+bool view_content_tokens()
+{
+    static const bool on = x2w_local::env_on("X2W_D3D12_VIEW_CONTENT_TOKENS") &&
+                           !GetEnvironmentVariableA("X2W_D3D12_CAPTURE", nullptr, 0);
+    return on;
+}
+// Parked records kept findable before the oldest is reused: about 10 MB of records and map nodes. Only the fixture
+// export x2w_d3d12_set_view_parked_keep changes it.
+std::uint32_t view_parked_keep = 65536;
+struct ViewLife {
+    u64 hash;                    // the record's view_ids key
+    std::uint32_t shadow_refs;   // shadow slots that name the record
+    std::uint32_t prev, next;    // parked queue links: id + 1, 0 at either end
+    std::uint8_t freeable, parked;
+};
+std::vector<ViewLife>& view_life() { static std::vector<ViewLife> v; return v; }  // per record, only when switched on
+std::uint32_t view_parked_head, view_parked_tail, view_parked_count;  // head: oldest; id + 1, 0: empty
+LONG64 views_freed, views_reused, views_revived, content_tokens_written;
+
+void unlink_parked(std::uint32_t id)
+{
+    ViewLife& life = view_life()[id];
+    (life.prev ? view_life()[life.prev - 1].next : view_parked_head) = life.next;
+    (life.next ? view_life()[life.next - 1].prev : view_parked_tail) = life.prev;
+    life.prev = life.next = 0;
+    life.parked = 0;
+    --view_parked_count;
+}
+// A record no shadow slot names any more joins the back of the parked queue, contents and view_ids entry kept.
+// Allocates nothing.
+void park_view_record(std::uint32_t id)
+{
+    ViewLife& life = view_life()[id];
+    life.parked = 1;
+    life.prev = view_parked_tail;
+    life.next = 0;
+    (view_parked_tail ? view_life()[view_parked_tail - 1].next : view_parked_head) = id + 1;
+    view_parked_tail = id + 1;
+    ++view_parked_count;
+    ++views_freed;
+}
+// The same view was created again while its record was parked.
+void revive_view_record(std::uint32_t id)
+{
+    unlink_parked(id);
+    ++views_revived;
+}
+// The oldest parked record, out of the queue and out of view_ids, with its contents cleared, once more than
+// view_parked_keep are parked; otherwise 0. Returns id + 1. Allocates nothing.
+std::uint32_t take_parked_record()
+{
+    if (!view_content_tokens() || view_parked_count <= view_parked_keep || !view_parked_head) return 0;
+    const std::uint32_t id = view_parked_head - 1;
+    unlink_parked(id);
+    ViewLife& life = view_life()[id];
+    const auto found = view_ids().find(life.hash);
+    if (found != view_ids().end() && found->second == id) view_ids().erase(found);
+    view_records()[id] = ViewRecord{};
+    view_materialized()[id] = 0;
+    life = ViewLife{};
+    return id + 1;
+}
+void shadow_ref_add(std::uint32_t id_plus_one)
+{
+    if (!view_content_tokens() || !id_plus_one || id_plus_one - 1 >= view_life().size()) return;
+    ++view_life()[id_plus_one - 1].shadow_refs;
+}
+void shadow_ref_drop(std::uint32_t id_plus_one)
+{
+    if (!view_content_tokens() || !id_plus_one || id_plus_one - 1 >= view_life().size()) return;
+    ViewLife& life = view_life()[id_plus_one - 1];
+    if (life.shadow_refs) --life.shadow_refs;
+    if (!life.shadow_refs && life.freeable && !life.parked) park_view_record(id_plus_one - 1);
+}
+
 // X2W_D3D12_VIEW_CENSUS=1 (diagnostic only, docs/startup-runtime.md): new distinct view records by slot, and one line
 // before an insertion that is expected to grow view_records or the view_ids buckets. All fields: note_lock held.
 bool view_census_enabled()
@@ -183,6 +264,32 @@ void view_refs_leave_class(std::uint32_t slot, u64 resource, u64 counter, Retire
 
 constexpr std::uint32_t view_token_magic = 0x56573258;  // "X2WV"
 
+// The view a token in title descriptor memory names (words[0] == view_token_magic): decoded from a content token, or
+// copied from the record its id names (takes note_lock shared). False when neither names a view.
+bool token_view(const std::uint32_t* words, ViewRecord& record, bool* materialized = nullptr)
+{
+    if (x2w_startup::is_view_content(words)) {
+        x2w_startup::ContentView view;
+        if (!x2w_startup::decode_view_content(words, view)) return false;
+        record = ViewRecord{};
+        record.id = ~0u;
+        record.slot = view.slot;
+        record.resource = view.resource;
+        record.desc_bytes = view.desc_bytes;
+        std::memcpy(record.desc, view.desc, view.desc_bytes);
+        if (materialized) *materialized = view.created;
+        return true;
+    }
+    AcquireSRWLockShared(&note_lock);
+    const bool known = words[1] < view_records().size();
+    if (known) {
+        record = view_records()[words[1]];
+        if (materialized) *materialized = view_materialized()[words[1]] != 0;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return known;
+}
+
 bool title_backed(u64 title_handle, u64 bytes)
 {
     bool inside = false;
@@ -207,10 +314,8 @@ bool descriptor_has_live_view(u64 desktop_handle, u64 title_handle)
     std::uint32_t words[8];
     std::memcpy(words, reinterpret_cast<const void*>(title_handle), sizeof(words));
     if (words[0] != view_token_magic) return false;
-    AcquireSRWLockShared(&note_lock);
-    live = words[1] < view_records().size() && view_materialized()[words[1]];
-    ReleaseSRWLockShared(&note_lock);
-    return live;
+    ViewRecord record;
+    return token_view(words, record, &live) && live;
 }
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
@@ -429,21 +534,35 @@ void reserve_one_view_entry(std::vector<T>& v, ViewAllocation site)
 // Adds a new record to the three view containers, or to none of them (note_lock held). Everything that can allocate
 // comes first: the two reservations change no size, and a failed try_emplace leaves the map unchanged. The two
 // push_back calls then have room and cannot fail. Returns the name of the container that could not allocate, or null.
-const char* store_view(const ViewRecord& record, std::uint8_t created, u64 hash)
+// With view_content_tokens(), a record.id below the container size reuses a record take_parked_record() emptied
+// (only the map node allocates), and view_life gets the record's hash and freeable flag.
+const char* store_view(const ViewRecord& record, std::uint8_t created, u64 hash, bool freeable = false)
 {
+    const bool reuse = record.id < view_records().size();
     const char* growing = "view_records";
     try {
-        reserve_one_view_entry(view_records(), view_records_site);
-        growing = "view_materialized";
-        reserve_one_view_entry(view_materialized(), view_materialized_site);
+        if (!reuse) {
+            reserve_one_view_entry(view_records(), view_records_site);
+            if (view_content_tokens()) reserve_one_view_entry(view_life(), view_records_site);
+            growing = "view_materialized";
+            reserve_one_view_entry(view_materialized(), view_materialized_site);
+        }
         growing = "view_ids";
         view_allocation_gate(view_ids_site);
         view_ids().try_emplace(hash, record.id);
     } catch (const std::bad_alloc&) {
         return growing;
     }
+    if (reuse) {
+        view_records()[record.id] = record;
+        view_materialized()[record.id] = created;
+        view_life()[record.id] = ViewLife{hash, 0, 0, 0, static_cast<std::uint8_t>(freeable), 0};
+        ++views_reused;
+        return nullptr;
+    }
     view_records().push_back(record);
     view_materialized().push_back(created);
+    if (view_content_tokens()) view_life().push_back(ViewLife{hash, 0, 0, 0, static_cast<std::uint8_t>(freeable), 0});
     return nullptr;
 }
 
@@ -459,6 +578,7 @@ void drop_unrecorded_view(const ViewRecord& record, bool materialized, const cha
         if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
             view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
                               view_records()[prev - 1].counter);
+        shadow_ref_drop(prev);
     }
     if (materialized) view_refs_leave_class(record.slot, record.resource, record.counter, RetireLeft::view);
     ReleaseSRWLockExclusive(&note_lock);
@@ -494,13 +614,20 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
     };
     mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
+    std::uint32_t content[8] = {};
+    const bool freeable = view_content_tokens() &&
+        x2w_startup::encode_view_content(view_token_magic, record.slot, resource, counter, record.desc, record.desc_bytes,
+                                         materialized, content);
     AcquireSRWLockExclusive(&note_lock);
     ++views_noted;
     const auto found = view_ids().find(hash);
     if (found != view_ids().end()) {
         record.id = found->second;
+        if (view_content_tokens() && record.id < view_life().size() && view_life()[record.id].parked)
+            revive_view_record(record.id);
     } else {
-        record.id = static_cast<std::uint32_t>(view_records().size());
+        const std::uint32_t taken = take_parked_record();
+        record.id = taken ? taken - 1 : static_cast<std::uint32_t>(view_records().size());
         const bool census = view_census_enabled();
         std::size_t capacity_before = 0, buckets_before = 0;
         bool records_full = false, ids_full = false;
@@ -523,7 +650,8 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
                 log("%s (new slot %u)", line, record.slot);
             }
         }
-        if (const char* container = store_view(record, created, hash)) {
+        if (const char* container = store_view(record, created, hash, freeable)) {
+            if (taken) park_view_record(record.id);  // emptied, not in view_ids: never found, taken again later
             drop_unrecorded_view(record, materialized, container);
             return;
         }
@@ -540,21 +668,29 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         // The same view written to the same slot again keeps its id and changes no reference count. A different view
         // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
         if (prev != record.id + 1) {
+            shadow_ref_add(record.id + 1);
             if (materialized) view_refs_add(static_cast<std::uint32_t>(slot), resource, counter);
             if (prev && prev - 1 < view_records().size() && view_materialized()[prev - 1])
                 view_refs_release(view_records()[prev - 1].slot, view_records()[prev - 1].resource,
                                   view_records()[prev - 1].counter);
+            shadow_ref_drop(prev);
         }
     } else if (view_slot_names_resource(static_cast<std::uint32_t>(slot)) && resource) {
         // A descriptor no shadow slot tracks cannot hold the view: the use takes the resource out of the class.
         view_refs_leave_class(static_cast<std::uint32_t>(slot), resource, counter, RetireLeft::view);
     }
+    // A freeable record no shadow slot names (an untracked destination): its content token is all that names it.
+    if (view_content_tokens() && record.id < view_life().size() && view_life()[record.id].freeable &&
+        !view_life()[record.id].shadow_refs && !view_life()[record.id].parked)
+        park_view_record(record.id);
+    if (freeable) ++content_tokens_written;
     ReleaseSRWLockExclusive(&note_lock);
     const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
     if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
         x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {
         std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), 0,
                                   static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32), 0, 0};
+        if (freeable) std::memcpy(token, content, sizeof(token));
         std::memcpy(reinterpret_cast<void*>(dest_title), token, token_bytes);
     }
 }
@@ -574,12 +710,14 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
                 if (src_id && src_id - 1 < view_records().size() && view_materialized()[src_id - 1])
                     view_refs_add(view_records()[src_id - 1].slot, view_records()[src_id - 1].resource,
                                   view_records()[src_id - 1].counter);
+                shadow_ref_add(src_id);
             }
             for (UINT i = 0; i < count; ++i) {
                 const std::uint32_t old_id = to[i];
                 if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
                     view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
                                       view_records()[old_id - 1].counter);
+                shadow_ref_drop(old_id);
             }
             std::memmove(to, from, u64{count} * 4);
         } else {
@@ -588,6 +726,7 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
                 if (old_id && old_id - 1 < view_records().size() && view_materialized()[old_id - 1])
                     view_refs_release(view_records()[old_id - 1].slot, view_records()[old_id - 1].resource,
                                       view_records()[old_id - 1].counter);
+                shadow_ref_drop(old_id);
             }
             std::memset(to, 0, u64{count} * 4);
         }
