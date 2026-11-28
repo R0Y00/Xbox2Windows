@@ -11,6 +11,7 @@
 //   - CommandList slot 14: Dispatch(x, y, z)
 //   - Correct execution on GPU, subrange write to offset 256 and sentinel preserved at offset 0.
 //   - Restoring the compute root after a same-layout root wrote its own constants and UAV through it.
+//   - Refusal logs for unset root arguments and dropped logs for unplaced, misaligned, and rejected UAV addresses.
 //   - Negative controls: Dispatch with 0 threads or without a compute pipeline.
 //   - Zero debug layer errors and healthy desktop device.
 //
@@ -26,6 +27,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -117,6 +120,10 @@ int main(int argc, char** argv)
 {
     if (argc < 2) return 2;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
+    char trap_log_path[MAX_PATH]{};
+    const DWORD trap_log_path_size = GetEnvironmentVariableA("X2W_TRAP_LOG", trap_log_path, MAX_PATH);
+    if (!trap_log_path_size || trap_log_path_size >= MAX_PATH) return 2;
+    DeleteFileA(trap_log_path);
 
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -459,9 +466,29 @@ int main(int argc, char** argv)
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
                 static_cast<unsigned long long>(errors));
 
+    std::ifstream trap_log(trap_log_path, std::ios::binary);
+    if (!trap_log) {
+        std::fprintf(stderr, "could not read dispatch log: %s\n", trap_log_path);
+        return 22;
+    }
+    unsigned unbound_dispatch_refusals = 0;
+    unsigned dropped_uav_addresses = 0;
+    std::string line;
+    while (std::getline(trap_log, line)) {
+        if (line.find("Dispatch(1, 1, 1) refused: a compute root argument is not bound") != std::string::npos)
+            ++unbound_dispatch_refusals;
+        if (line.find("compute root UAV 0: title ") != std::string::npos &&
+            line.find("is not an upload or placed buffer range") != std::string::npos)
+            ++dropped_uav_addresses;
+    }
+    std::printf("unbound-root Dispatch refusals: %u (expected 5)\n", unbound_dispatch_refusals);
+    std::printf("unplaced, misaligned, or rejected UAV binds dropped: %u (expected 3)\n", dropped_uav_addresses);
+    trap_log.close();
+
     // Release wrappers and free memory
     placed_wrapper.Reset();
     VirtualFree(guest_mem, 0, MEM_RELEASE);
+    DeleteFileA(trap_log_path);
 
-    return removed == S_OK && errors == 0 ? 0 : 70;
+    return removed == S_OK && errors == 0 && unbound_dispatch_refusals == 5 && dropped_uav_addresses == 3 ? 0 : 70;
 }
