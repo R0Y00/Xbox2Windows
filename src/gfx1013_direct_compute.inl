@@ -1315,9 +1315,15 @@ struct DirectCompute {
             packed_f16_alu(i);
             return true;
         }
-        if (n == "v_dot2_f32_f16") {
-            if (i.enc != Encoding::Mix || i.dpp_control || permuted || (i.a & 0x2400))
+        const bool dot2c = n == "v_dot2c_f32_f16";
+        if (n == "v_dot2_f32_f16" || dot2c) {
+            if (dot2c) {
+                if (i.enc != Encoding::Vop2 || i.wide || i.subword || i.dpp_control || permuted ||
+                    i.abs || i.neg || i.clamp || i.scale)
+                    refuse(i.pc, "unsupported v_dot2c_f32_f16 encoding");
+            } else if (i.enc != Encoding::Mix || i.dpp_control || permuted || (i.a & 0x2400)) {
                 refuse(i.pc, "unsupported v_dot2_f32_f16 encoding");
+            }
             if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ffu))
                 refuse(i.pc, "unsupported binary16 rounding or denormal mode");
             auto half_pair = [&](unsigned j) {
@@ -1326,15 +1332,20 @@ struct DirectCompute {
                     return to_string(*inline_word);
                 if (r <= 105 || r == 255 || (r >= 256 && r < 512))
                     return operand32(i, r);
-                refuse(i.pc, "unsupported v_dot2_f32_f16 source");
+                refuse(i.pc, dot2c ? "unsupported v_dot2c_f32_f16 source" : "unsupported v_dot2_f32_f16 source");
             };
             const auto s0 = half_pair(0), s1 = half_pair(1);
-            const unsigned r2 = i.src[2];
-            if ((r2 > 105 && r2 < 128) || (r2 > 208 && r2 < 240) || (r2 > 248 && r2 < 255) || r2 >= 512)
-                refuse(i.pc, "unsupported v_dot2_f32_f16 source");
-            auto cbits = operand32(i, r2);
-            if (i.neg & 4u)
-                cbits = ir.binary("xor", cbits, "2147483648");
+            string cbits;
+            if (dot2c) {
+                cbits = read(i.dst);
+            } else {
+                const unsigned r2 = i.src[2];
+                if ((r2 > 105 && r2 < 128) || (r2 > 208 && r2 < 240) || (r2 > 248 && r2 < 255) || r2 >= 512)
+                    refuse(i.pc, "unsupported v_dot2_f32_f16 source");
+                cbits = operand32(i, r2);
+                if (i.neg & 4u)
+                    cbits = ir.binary("xor", cbits, "2147483648");
+            }
             const auto c = ir.value("bitcast i32 " + cbits + " to float");
             auto term = [&](const string &word, unsigned selector, bool negate) {
                 auto bits = selector ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
@@ -1342,8 +1353,10 @@ struct DirectCompute {
                     bits = ir.binary("xor", bits, "32768");
                 return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
             };
-            // Pair 0 uses OP_SEL[1:0] and NEG_LO[1:0]; pair 1 uses OP_SEL_HI[1:0] and NEG_HI[1:0] (in ABS).
-            const unsigned op_sel = (i.a >> 11) & 3u, op_sel_hi = (i.b >> 27) & 3u;
+            // VOP3P pair 0 uses OP_SEL[1:0]/NEG_LO[1:0] and pair 1 uses OP_SEL_HI[1:0]/NEG_HI[1:0] (in ABS).
+            // VOP2 v_dot2c_f32_f16 always dots low halves (pair 0 = 0) and high halves (pair 1 = 3) with no modifiers.
+            const unsigned op_sel = dot2c ? 0u : ((i.a >> 11) & 3u);
+            const unsigned op_sel_hi = dot2c ? 3u : ((i.b >> 27) & 3u);
             auto a0 = term(s0, op_sel & 1u, (i.neg & 1u) != 0);
             auto b0 = term(s1, (op_sel >> 1) & 1u, (i.neg & 2u) != 0);
             auto a1 = term(s0, op_sel_hi & 1u, (i.abs & 1u) != 0);
@@ -3794,7 +3807,7 @@ struct DirectCompute {
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
                 mode_write = true;
-            if (packed_f16_arithmetic(op.name) || op.name == "v_dot2_f32_f16")
+            if (packed_f16_arithmetic(op.name) || op.name == "v_dot2_f32_f16" || op.name == "v_dot2c_f32_f16")
                 half_binary = true;
             if (op.branch() && op.op != 2)
                 conditional = true;
