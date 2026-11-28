@@ -71,12 +71,14 @@ def check_parse():
         source.write_text(DLL_TEXT, encoding="utf-8")
         output = directory / "exports.json"
         code = exports.main([
-            "parse-dumpbin", str(source), "--json", str(output), "--kind", "dll"
+            "parse-dumpbin", str(source), "--json", str(output), "--kind", "dll", "--sdk", "999"
         ])
         check(code == 0, f"parse-dumpbin exit {code}")
         document = json.loads(output.read_text(encoding="utf-8"))
         check(document["count"] == 3, f"count {document['count']}")
+        check(document["sdk"] == "999", f"sdk {document['sdk']}")
         check(document["modules"][0]["module"] == "xg_xs", f"module {document['modules'][0]['module']}")
+        check(document["modules"][0]["sdk"] == "999", f"module sdk {document['modules'][0]['sdk']}")
         check(len(document["modules"][0]["sha256"]) == 64, "sha256")
     print("exports: DLL, LIB, ordinal and CLI parsing passed")
 

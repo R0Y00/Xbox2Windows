@@ -87,7 +87,7 @@ def module_name(path, kind):
     return name
 
 
-def collect_dumpbin(path, kind):
+def collect_dumpbin(path, kind, sdk="261000"):
     path = Path(path)
     if path.is_dir():
         entries = sorted(
@@ -100,7 +100,7 @@ def collect_dumpbin(path, kind):
         text = entry.read_text(encoding="utf-8", errors="replace")
         parsed, unparsed = parse_dumpbin_report(text)
         module = {
-            "sdk": "261000",
+            "sdk": sdk,
             "module": module_name(entry, kind),
             "file": str(entry),
             "kind": kind,
@@ -117,7 +117,7 @@ def collect_dumpbin(path, kind):
     return modules
 
 
-def scan_pe(path):
+def scan_pe(path, sdk="261000"):
     import pefile  # Imported here so parse-dumpbin needs only the standard library.
 
     pe = pefile.PE(str(path), fast_load=True)
@@ -136,7 +136,7 @@ def scan_pe(path):
                 }
             )
     module = {
-        "sdk": "261000",
+        "sdk": sdk,
         "module": module_name(path, "dll"),
         "file": str(path),
         "kind": "dll",
@@ -148,9 +148,9 @@ def scan_pe(path):
     return module
 
 
-def write_document(path, modules):
+def write_document(path, modules, sdk="261000"):
     document = {
-        "sdk": "261000",
+        "sdk": sdk,
         "count": sum(len(module["exports"]) for module in modules),
         "modules": modules,
     }
@@ -168,17 +168,24 @@ def main(argv=None):
     dumpbin.add_argument("inputs", nargs="+")
     dumpbin.add_argument("--json", required=True)
     dumpbin.add_argument("--kind", choices=("lib", "dll"), default="lib")
+    dumpbin.add_argument("--sdk", default="261000")
     dumpbin.set_defaults(
         func=lambda args: write_document(
             args.json,
-            [module for path in args.inputs for module in collect_dumpbin(path, args.kind)],
+            [module for path in args.inputs for module in collect_dumpbin(path, args.kind, args.sdk)],
+            args.sdk,
         )
     )
 
     pe = sub.add_parser("scan-pe", help="read exports from a PE DLL")
     pe.add_argument("dlls", nargs="+")
     pe.add_argument("--json", required=True)
-    pe.set_defaults(func=lambda args: write_document(args.json, [scan_pe(path) for path in args.dlls]))
+    pe.add_argument("--sdk", default="261000")
+    pe.set_defaults(
+        func=lambda args: write_document(
+            args.json, [scan_pe(path, args.sdk) for path in args.dlls], args.sdk
+        )
+    )
 
     args = parser.parse_args(argv)
     return args.func(args)
