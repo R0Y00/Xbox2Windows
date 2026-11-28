@@ -43,7 +43,9 @@ enum class ComputeViewKind {
     uint_texture_uav,
     float_texture_uav,
     float2_texture_uav,
-    float3_texture_uav
+    float3_texture_uav,
+    // A raw buffer bound as a root UAV. The guest address is the root pointer plus a VGPR offset.
+    root_buffer_uav
 };
 inline unsigned exact_texture_uav_channels(ComputeViewKind kind) {
     switch (kind) {
@@ -68,7 +70,8 @@ struct IndexedAtomicView {
 inline bool compute_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::texture_uav || kind == ComputeViewKind::half_scalar_uav ||
            kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav ||
-           kind == ComputeViewKind::uint_texture_uav || exact_texture_uav_channels(kind) || compute_buffer_uav(kind);
+           kind == ComputeViewKind::uint_texture_uav || kind == ComputeViewKind::root_buffer_uav ||
+           exact_texture_uav_channels(kind) || compute_buffer_uav(kind);
 }
 struct ComputeViewBinding {
     ComputeViewKind kind;
