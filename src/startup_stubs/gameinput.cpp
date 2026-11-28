@@ -257,9 +257,11 @@ void trace_state(const GamepadState& state, bool scripted, double script_time, b
         std::snprintf(present_text, sizeof(present_text), "%llu", static_cast<unsigned long long>(present_number));
     else
         std::snprintf(present_text, sizeof(present_text), "none");
-    x2w_local::logf("x2w-input-trace state buttons=0x%08x lt=%.3f rt=%.3f lx=%.3f ly=%.3f rx=%.3f ry=%.3f script=%s present=%s",
+    // time: seconds since process start on the input clock, the base of an X2W_INPUT_SCRIPT with base=start.
+    x2w_local::logf("x2w-input-trace state buttons=0x%08x lt=%.3f rt=%.3f lx=%.3f ly=%.3f rx=%.3f ry=%.3f script=%s present=%s "
+                    "time=%.3f",
                     static_cast<unsigned>(state.buttons), state.left_trigger, state.right_trigger, state.left_x, state.left_y,
-                    state.right_x, state.right_y, script, present_text);
+                    state.right_x, state.right_y, script, present_text, static_cast<double>(now) / 1000.0);
 }
 
 void trace_event(const x2w_input_script::Event& e)

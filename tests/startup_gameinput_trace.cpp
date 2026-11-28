@@ -215,13 +215,13 @@ int run_child(const char* dll, bool trace)
     if (trace) {
         const char* const state_line =
             "x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=0.000 ly=0.000 rx=0.000 ry=0.000 "
-            "script=2.000 present=11";
+            "script=2.000 present=11 time=2.000";
         const char* const stick_line =
             "x2w-input-trace state buttons=0x00000000 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 "
-            "script=2.500 present=11";
+            "script=2.500 present=11 time=2.500";
         const char* const b_line =
             "x2w-input-trace state buttons=0x00000008 lt=0.000 rt=0.000 lx=0.000 ly=0.000 rx=0.000 ry=0.000 "
-            "script=3.600 present=11";
+            "script=3.600 present=11 time=3.600";
         check(count(log, state_line) == 1, "trace: A press line with script time 2.000 and present 11");
         check(count(log, stick_line) == 1, "trace: left stick and Y axis line at script time 2.500");
         check(count(log, b_line) == 1, "trace: off-grid B press line at script time 3.600");

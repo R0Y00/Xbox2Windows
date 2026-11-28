@@ -2090,10 +2090,11 @@ merged. Every line starts with `x2w-input-trace` and goes to stderr and `X2W_TRA
 stand-in's other lines. A state line has the form
 
 ```text
-x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
+x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11 time=4.250
 ```
 
-where `script` is the script time in seconds or `off`, and `present` is the latest present number
+where `script` is the script time in seconds or `off`, `time` is the input clock in seconds since
+process start (the time base of a `base=start` script), and `present` is the latest present number
 from the picture signature or `none` without a presenter sample. One state line is written per
 change and, while the state is unchanged, at most once every 250 ms. Waits, marks and skipped
 groups add one `x2w-input-trace wait`, `mark` or `group` line each, with the script item and shifted

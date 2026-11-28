@@ -32,7 +32,7 @@ Every line starts with `x2w-input-trace`. A state line is written when the resol
 changes and, while it is unchanged, at most once every 250 ms:
 
 ```text
-x2w-input-trace state buttons=0x00000000 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
+x2w-input-trace state buttons=0x00000000 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11 time=4.250
 ```
 
 `buttons` is the GameInput button mask in hexadecimal. `lt`, `rt`, `lx`, `ly`, `rx` and `ry` use
@@ -41,6 +41,10 @@ the script's time base in seconds, or `off` when no timed entry or wait/mark is 
 is the latest present number published by the picture signature, or `none` when no presenter
 sample is available. The state line does not depend on the title having called
 `GetGamepadState`; it is sampled when the stand-in captures a reading.
+
+`time` is the input clock in seconds since process start, the time base of an `X2W_INPUT_SCRIPT`
+with `base=start`, so a recorded session can be replayed from it. The 250 ms repeat alone does not
+give a steady cadence, because a line is only written when a reading is captured.
 
 Script marks and waits add one event line each:
 
