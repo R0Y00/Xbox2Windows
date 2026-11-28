@@ -228,6 +228,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// dispatch-uav-token-* writes the token of a slot-19 view of the output buffer at table byte 32. X2W_TEST_DISPATCH_UAV
+// names a D3D12_UNORDERED_ACCESS_VIEW_DESC that replaces the view; dispatch-uav-token-large views a committed buffer.
 // (The long case puts its input at 0x28000, not at a 64 KiB multiple like 0x20000: there the placed buffer would alias title memory
 // and the input would be read in place, never snapshotted, which is how an earlier version of this case passed without a snapshot.)
 // dispatch-input-snapshot-long: dispatch-input-snapshot with an 8 MiB input range (the descriptor declares 2M records; the program
@@ -424,7 +426,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
             view.Format = DXGI_FORMAT_R32_UINT;
             view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
         }
+        if (!from_file("X2W_TEST_DISPATCH_UAV", &view, sizeof(view))) return 2;
         void* output = placed[1];
+        if (mode == "dispatch-uav-token-large") {  // a committed buffer 64 KiB over 16 MiB, with no title memory
+            const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, (16u << 20) + 0x10000, 1, 1, 1,
+                DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+            if (!(output = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, desc, D3D12_RESOURCE_STATE_COMMON))) return 71;
+        }
         if (mode == "dispatch-uav-token-copied") {
             const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1,
                 DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
@@ -432,7 +440,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
                     word(&__uuidof(ID3D12Resource)), word(&output))))) return 71;
         }
         if (mode == "dispatch-uav-token-copied") copied_token_output = output;
-        invoke(device, 19, word(output), 0, word(&view), cpu + 32);
+        // Byte 32 is not a descriptor of the heap on every adapter (WARP): the view is created at byte 64 and its
+        // token copied to byte 32, as a title copies descriptors.
+        invoke(device, 19, word(output), 0, word(&view), cpu + 64);
+        std::memcpy(reinterpret_cast<void*>(cpu + 32), reinterpret_cast<const void*>(cpu + 64), 16);
         if (mode == "dispatch-uav-token-wrong-slot")
             reinterpret_cast<UINT*>(cpu + 32)[2] = 18;
     }

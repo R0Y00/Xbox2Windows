@@ -514,10 +514,13 @@ const char* compute_token_output(Wrapper* list, const std::uint32_t* words, Comp
         return "an output UAV has no supported byte interval";
     output.offset = view.FirstElement * element;
     output.bytes = u64{view.NumElements} * element;
-    if (!output.bytes || output.bytes % 4 || output.bytes > (16u << 20) ||
-        output.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT || output.offset > output.backing.Width ||
-        output.bytes > output.backing.Width - output.offset)
-        return "an output UAV interval is unaligned, oversized or outside its buffer";
+    // Each refused interval has its own reason. The width test comes first: the end test subtracts the offset.
+    if (!output.bytes) return "an output UAV interval is empty";
+    if (output.bytes % 4) return "an output UAV interval is not whole dwords";
+    if (output.bytes > (16u << 20)) return "an output UAV interval is over 16 MiB";
+    if (output.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return "an output UAV interval is not 16-byte aligned in its buffer";
+    if (output.offset > output.backing.Width) return "an output UAV interval starts past its buffer";
+    if (output.bytes > output.backing.Width - output.offset) return "an output UAV interval crosses the end of its buffer";
     const auto base = reinterpret_cast<u64>(owner->own().title_memory);
     if (base) {
         if (output.offset > UINT64_MAX - base) return "an output UAV placement address overflows";

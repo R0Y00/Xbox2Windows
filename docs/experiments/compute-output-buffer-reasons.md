@@ -68,6 +68,42 @@ the 12 translated keys, and the first refused dispatch of each of the other 11, 
 of a desktop resource. That run made 2,453,727 compute dispatches, so dispatch counts compare only within one run.
 Whether the 12 translated keys write the right values was not checked.
 
+## Slot-19 output view intervals
+
+A slot-19 output token (#3094) names a buffer UAV. The byte interval of that view was refused with one message,
+`an output UAV interval is unaligned, oversized or outside its buffer`. It is now split into the condition that
+failed, checked in this order:
+
+1. `an output UAV interval is empty`
+2. `an output UAV interval is not whole dwords`
+3. `an output UAV interval is over 16 MiB`
+4. `an output UAV interval is not 16-byte aligned in its buffer`
+5. `an output UAV interval starts past its buffer`
+6. `an output UAV interval crosses the end of its buffer`
+
+Only the reason changes. The once-per-key `x2w-draw compute UAV` line already logs the view's format, first
+element, element count, stride, flags, backing width, byte offset and byte count.
+
+`tests/startup_compute_token_interval_check.py` publishes case A with 32-byte table records through
+`gfx2hlsl.py --pending` and binds a raw slot-19 view at byte 16 of the placed output buffer. Words 4-315 match.
+Conditions 2, 3 and 4 then each come from one replaced view description (an R16_UINT view of one element, a raw
+view of 16 MiB + 16 bytes of a committed buffer 64 KiB over 16 MiB, an R32_UINT view at byte 4), and each dispatch
+refuses with its own reason in the log and the census and leaves every word at its sentinel. Conditions 1, 5 and 6
+need a view that D3D12 rejects when it is created: with the debug layer on, the device is removed at
+`CreateUnorderedAccessView`, so no fixture creates one.
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_compute_token_interval_(warp|hardware)$" -V
+```
+
+Both tests pass on WARP (10.0.26100.9818) and on an RTX 4090 (driver 32.0.16.1088), Windows 11 build 26300,
+debug layer on. With only the split reverted, the bound view still matches and the three cases are still refused,
+each with the old reason, so all three expectations fail.
+
+On WARP, byte 32 of the consumer's four-descriptor heap is not a descriptor: a view created there ends the
+consumer with exit 2173. The `dispatch-uav-token-*` modes therefore create the view at byte 64 and copy its token to
+byte 32, as a title copies descriptors.
+
 ## Published half-width buffer stores
 
 A native slot 67 request with a `half_buffer_uav` now publishes
