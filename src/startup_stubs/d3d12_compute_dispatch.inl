@@ -731,7 +731,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             views[i] = {token.resource, token.offset, token.bytes, true};
             if (!reason && slot.half_typed_bytes) {
                 views[i].described = true;
-                std::memcpy(views[i].desc, &token.view, sizeof(token.view));
+                views[i].desc.uav = token.view;
             }
             continue;
         }
