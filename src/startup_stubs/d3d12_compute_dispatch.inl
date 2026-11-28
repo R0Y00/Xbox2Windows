@@ -721,7 +721,22 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            auto view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            // Native scalar loads may name a small CPU window outside every placed buffer.
+            // Resolve GPU-backed ranges first; never replace their contents with a CPU snapshot.
+            if (reason && slot.scalar_window && words[0] != view_token_magic &&
+                !std::strcmp(reason, "an input is in title memory outside any placed buffer")) {
+                const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
+                const UINT stride = (words[1] >> 16) & 0x3fff;
+                const u64 bytes = u64{stride ? stride : 1} * words[2];
+                u64 start{};
+                ID3D12Resource* chunk{};
+                if (bytes >= slot.scalar_window && bytes <= 65536 && bytes % 4 == 0 &&
+                    readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &start, &chunk) && chunk) {
+                    view = {chunk, start, bytes, stride, true, 2};
+                    reason = nullptr;
+                }
+            }
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
             if (view.source == 2) {
                 InterlockedIncrement(&compute_inputs_snapshot);
