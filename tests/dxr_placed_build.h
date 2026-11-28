@@ -85,7 +85,8 @@ public:
             return (std::max)(sizes.ScratchDataSizeInBytes, sizes.UpdateScratchDataSizeInBytes);
         };
         const auto blas = place(0, dest_offset + bottom_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
-        const auto tlas = place(1, dest_offset + top_size.ResultDataMaxSizeInBytes, dest_state) + dest_offset;
+        const auto overlap_test_bytes = (std::max)(top_size.ResultDataMaxSizeInBytes, UINT64{512});
+        const auto tlas = place(1, dest_offset + overlap_test_bytes + 256, dest_state) + dest_offset;
         // The controls also name a scratch buffer as a destination (a buffer that is not an acceleration structure) and
         // read a 256-byte view at it, so a scratch buffer must cover the result size and that view as well. The sizes
         // come from the device: a GPU with a larger result than scratch size must still see a placed buffer here, so the
@@ -119,6 +120,15 @@ public:
         must_reject(tlas, unmapped, Cause::not_placed, "scratch outside the placed buffers");
         must_reject(tlas, ts + 16, Cause::unaligned, "unaligned scratch");
         must_reject(tlas, big_as_, Cause::wrong_state, "scratch in an acceleration-structure buffer");
+        auto no_build_scratch = top_size;
+        no_build_scratch.ScratchDataSizeInBytes = 0;
+        auto no_build_scratch_build = top;
+        Cause no_build_scratch_cause = Cause::ok;
+        const HRESULT no_build_scratch_hr = x2w_startup::resolve_placed_build(
+            guest_.Get(), tlas, ts, no_build_scratch, no_build_scratch_build, &no_build_scratch_cause);
+        if (no_build_scratch_hr != E_INVALIDARG || no_build_scratch_cause != Cause::not_placed ||
+            no_build_scratch_build.DestAccelerationStructureData || no_build_scratch_build.ScratchAccelerationStructureData)
+            throw std::runtime_error("A full build with zero scratch size was not refused as not_placed");
         check(x2w_startup::resolve_placed_build(guest_.Get(), blas, bs, bottom_size, bottom), "Resolve placed BLAS");
         check(x2w_startup::resolve_placed_build(guest_.Get(), tlas, ts, top_size, top), "Resolve placed TLAS");
         tlas_title_ = tlas;
@@ -183,14 +193,12 @@ public:
         must_reject(tlas, unmapped, scratch, sizes, true, Cause::source_not_placed, "source outside the placed buffers");
         must_reject(tlas, scratch, scratch, sizes, true, Cause::source_wrong_state,
                     "source in a buffer that is not an acceleration structure");
-        // An aligned source one stride (256 bytes) past the destination: where the structure is longer than that the two
-        // partly overlap (the shape rule, checked by value in placed_build_causes names it); on a device that sizes it
-        // shorter, the source lies past the end of the destination's buffer.
-        const Cause stride_cause = x2w_startup::check_update_shape(true, tlas + 256, tlas, sizes.ResultDataMaxSizeInBytes);
-        must_reject(tlas, tlas + 256, scratch, sizes, true,
-                    stride_cause != Cause::ok ? stride_cause : Cause::source_not_placed, "source one stride past the destination");
-        if (stride_cause != Cause::ok && stride_cause != Cause::source_dest_partial_overlap)
-            throw std::runtime_error("The shape rule named an unexpected cause for a source one stride past the destination");
+        // Make the source range fit even on devices with small structures, so this control specifically exercises the
+        // partial-overlap rule rather than a placement boundary.
+        auto overlap_sizes = sizes;
+        overlap_sizes.ResultDataMaxSizeInBytes = (std::max)(sizes.ResultDataMaxSizeInBytes, UINT64{512});
+        must_reject(tlas, tlas + 256, scratch, overlap_sizes, true, Cause::source_dest_partial_overlap,
+                    "source one stride past the destination");
         // The scratch rule applies to an update as to a build.
         must_reject(tlas, tlas, big_as_, sizes, true, Cause::wrong_state, "update with a scratch in an acceleration-structure buffer");
 
@@ -250,7 +258,7 @@ public:
 
     // Re-resolve one placed structure (0 = BLAS, 1 = TLAS) as an in-place PERFORM_UPDATE of itself. The source is the
     // title address the structure was built at, so the update runs through the same slot-133 placement lookup as the
-    // build. The caller keeps ALLOW_UPDATE from the initial build; the resolver cannot see it.
+    // build. The resolver also verifies that the initial build used ALLOW_UPDATE.
     void resolve_update(unsigned which, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build) {
         const auto& placed = titles_.at(which);
         build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
