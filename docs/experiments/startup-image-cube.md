@@ -24,7 +24,9 @@ The translator emits a helper `x2w_cube_dir(s, t, face)` that rebuilds a directi
 
 - `image_load` and `image_load_mip` on a cube (`Load is not defined on a TextureCube`), `image_sample_d`
   (cube derivatives are not converted), `image_get_lod`, `a16` and `d16`.
-- A cube in a compute program: the compute dispatch has no `texcube` view binding.
+- A cube in a compute program through `gfx2hlsl.py`: the compute dispatch has no `texcube` view binding. The
+  published native route (`compile_dxil --requests`) names a cube sample `srv N texcubearr table R B` and binds the
+  title's TEXTURECUBE view as a one-cube TEXTURECUBEARRAY (docs/experiments/startup-compute-native-dispatch.md).
 - A constant sampler with `DISABLE_CUBE_WRAP` (`SQ_IMG_SAMP_WORD0` bit 28, Mesa
   `src/amd/registers/gfx10-rsrc.json`): the guest then filters without crossing face edges, while a D3D12 cube
   always filters across them. With the bit clear both cross.
