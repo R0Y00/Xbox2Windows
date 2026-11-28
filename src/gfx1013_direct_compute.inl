@@ -3238,6 +3238,55 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", lo, ir.binary("shl", hi, "16")));
             return;
         }
+        if (n == "v_qsad_pk_u16_u8" || n == "v_mqsad_pk_u16_u8") {
+            // RDNA 2 ISA V_QSAD_PK_U16_U8 / V_MQSAD_PK_U16_U8 (#3359): 4 packed uint16 SAD lanes over 8-byte S0,
+            // 4-byte reference S1, and 4 packed uint16 accumulators in S2; v_mqsad_pk_u16_u8 skips zero ref bytes.
+            if (pixel_stage || graphics_input || !i.wide || i.subword || i.dpp_control ||
+                i.abs || i.neg || i.scale || (i.a & 0x7800))
+                refuse(i.pc, "unsupported " + string(n) + " stage or operand modifiers");
+            auto is_pair = [](unsigned r) { return (r >= 256 && r < 511) || (r <= 104 && !(r & 1)); };
+            if (i.dst < 256 || i.dst >= 511 || !is_pair(i.src[0]) || !is_pair(i.src[2]))
+                refuse(i.pc, string(n) + " requires 64-bit register pair operands");
+            if (i.src[1] >= 240 && i.src[1] <= 248)
+                refuse(i.pc, string(n) + " with an inline float reference");
+            const bool masked = n == "v_mqsad_pk_u16_u8";
+            auto s0_lo = operand32(i, i.src[0]), s0_hi = operand32(i, i.src[0] + 1);
+            auto s1 = operand32(i, i.src[1]);
+            auto s2_lo = operand32(i, i.src[2]), s2_hi = operand32(i, i.src[2] + 1);
+            auto byte_of = [&](const string &w, unsigned idx) {
+                return ir.binary("and", idx ? ir.binary("lshr", w, to_string(8 * idx)) : w, "255");
+            };
+            auto absdiff = [&](const string &x, const string &y) {
+                return select(cmp("ult", x, y), ir.binary("sub", y, x), ir.binary("sub", x, y));
+            };
+            string src_bytes[8], ref_bytes[4];
+            for (unsigned k = 0; k < 4; ++k) {
+                src_bytes[k] = byte_of(s0_lo, k);
+                src_bytes[k + 4] = byte_of(s0_hi, k);
+                ref_bytes[k] = byte_of(s1, k);
+            }
+            string lane_out[4];
+            for (unsigned lane_i = 0; lane_i < 4; ++lane_i) {
+                const string &acc_word = lane_i < 2 ? s2_lo : s2_hi;
+                auto sum = (lane_i & 1) ? ir.binary("lshr", acc_word, "16") : ir.binary("and", acc_word, "65535");
+                for (unsigned k = 0; k < 4; ++k) {
+                    auto term = absdiff(src_bytes[lane_i + k], ref_bytes[k]);
+                    if (masked)
+                        term = select(cmp("eq", ref_bytes[k], "0"), "0", term);
+                    sum = ir.binary("add", sum, term);
+                }
+                if (i.clamp)
+                    sum = select(cmp("ugt", sum, "65535"), "65535", sum);
+                else
+                    sum = ir.binary("and", sum, "65535");
+                lane_out[lane_i] = sum;
+            }
+            auto d_lo = ir.binary("or", lane_out[0], ir.binary("shl", lane_out[1], "16"));
+            auto d_hi = ir.binary("or", lane_out[2], ir.binary("shl", lane_out[3], "16"));
+            vector_write(i.dst, d_lo);
+            vector_write(i.dst + 1, d_hi);
+            return;
+        }
         const bool select_mods = n == "v_cndmask_b32" && i.wide && !((i.abs | i.neg) & 4);
         if ((i.subword && i.enc != Encoding::Vop1 && i.enc != Encoding::Vop2) || ((i.abs || i.neg) && !select_mods) || i.clamp || i.scale)
             refuse(i.pc, "direct ALU operand modifiers");
