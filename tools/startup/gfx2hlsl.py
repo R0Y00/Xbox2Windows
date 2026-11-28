@@ -790,6 +790,41 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+EXEC_SUBSET = frozenset({('exec', 0), ('exec_hi', 1)})
+
+
+def subset_after(name, asm, may, clear):
+    """Forward step before an s_cbranch_execz: scalar words known to have bit 0 wherever current EXEC has bit 0.
+
+    When EXEC is unchanged, bitwise mask instructions propagate those subset facts via clear_after and non-mask
+    writes drop them. When EXEC is written, facts on the written wave half are dropped unless a move assigns EXEC
+    from a scalar mask word (so that word equals the new EXEC) or an OR widens EXEC with an existing bitmask.
+    Indirect scalar writes (s_movrel*) drop all non-EXEC facts."""
+    base = re.sub(r'_e(32|64)$', '', name)
+    if base.startswith('s_movrel'):
+        return EXEC_SUBSET
+    if not (may & EXEC_KEYS):
+        return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+    kept = ({0} if 'exec' not in may else set()) | ({1} if 'exec_hi' not in may else set())
+    shape = clear_shape(name, asm)
+    if shape and shape != 'cmpx':
+        op, saving, count, words = shape
+        if op == 'or' and (saving == '_saveexec' or any(
+                all(src[p] == ('exec', 'exec_hi')[p] for p in range(count)) for src in words[1:])):
+            return frozenset(clear_after(name, asm, may, clear)) | EXEC_SUBSET
+        out = {fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS}
+        if op == 'mov' and saving is None:
+            dest, src = words
+            for p, dw in enumerate(dest):
+                if dw in EXEC_KEYS:
+                    h = 0 if dw == 'exec' else 1
+                    sw = src[p]
+                    if re.fullmatch(r's\d+|vcc(_hi)?', sw):
+                        out.add((sw, h))
+            return frozenset(out) | EXEC_SUBSET
+    return frozenset(fact for fact in clear if fact[1] in kept and fact[0] not in may - EXEC_KEYS) | EXEC_SUBSET
+
+
 def mask_lanes(name, asm):
     """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
     every operand holds the same lanes: wave half p of a 64-bit form."""
@@ -3171,6 +3206,18 @@ class Stage:
                     and self.ins[head][2] == 'v_readfirstlane_b32'
                     and self.ins[close - 1][2] == 's_andn2_wrexec_b32'):
                 self.waterfall_reads[target] = self.waterfall_refusal(head, close, effects, live_in, jumps)
+        pre_sub = [EXEC_SUBSET] + [None] * (len(self.ins) - 1)
+        changed = bool(self.ins)
+        while changed:
+            changed = False
+            for i in range(len(self.ins)):
+                if pre_sub[i] is None:
+                    continue
+                after = subset_after(*self.ins[i][2:], effects[i][2], pre_sub[i])
+                for s in succ[i]:
+                    if pre_sub[s] is None or not pre_sub[s] <= after:
+                        pre_sub[s] = after if pre_sub[s] is None else (pre_sub[s] & after)
+                        changed = True
         refused, into = {}, {}
         for k, target in jumps:
             into.setdefault(index.get(target), []).append(k)
@@ -3183,7 +3230,7 @@ class Stage:
                 continue
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
             # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
-            entry = frozenset({('exec', 0), ('exec_hi', 1)})
+            entry = pre_sub[b] or EXEC_SUBSET
             before = {b + 1: entry} if b + 1 < t else {}
             entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
             changed = not entered
@@ -3191,7 +3238,7 @@ class Stage:
                 changed = False
                 for i in range(b + 1, t):
                     if i in before:
-                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | entry
+                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | EXEC_SUBSET
                         for s in succ[i]:
                             if b < s < t and before.get(s, after) & after != before.get(s):
                                 before[s], changed = before.get(s, after) & after, True
@@ -3231,7 +3278,7 @@ class Stage:
                               self.execz_scalar_exit(b, i, t, exit_index, effects, live_in, into)):
                         reason = 'branch out of the block'
                 elif may & EXEC_KEYS and (entered or i in before and
-                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
+                                          not EXEC_SUBSET <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
                                if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
@@ -7958,13 +8005,33 @@ class Stage:
             raise Unsupported('image instruction without %s' % ('dim:' if not dims else 'dmask:'))
         dim = dims[0][4:]
         dmask = int(dmasks[0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da',
+                 'SQ_RSRC_IMG_CUBE': 'texcube'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
+        # A cube sample addresses the face coordinates s and t and then the face id (#2943). The face coordinates
+        # are sc/|ma| + 1.5 and tc/|ma| + 1.5 with ma the v_cubema value, twice the major coordinate (Mesa
+        # ac_nir_lower_tex.c prepare_cube_coords; LLVM ConstantFoldAMDGCNCubeIntrinsic), so both lie in [1, 2].
+        # The lowering rebuilds a direction for TextureCube (x2w_cube_dir). Loads, derivative and LOD queries,
+        # packed addresses and compute stages have no TextureCube equivalent here and are refused by name.
+        cube = dim == 'SQ_RSRC_IMG_CUBE'
+        if cube:
+            if how in ('load', 'load_mip'):
+                raise Unsupported('image dimension SQ_RSRC_IMG_CUBE: Load is not defined on a TextureCube')
+            if how == 'd':
+                raise Unsupported('image_sample_d on SQ_RSRC_IMG_CUBE: cube derivatives are not converted')
+            if how == 'get_lod':
+                raise Unsupported('image_get_lod on SQ_RSRC_IMG_CUBE')
+            for flag in ('a16', 'd16'):
+                if flag in mods:
+                    raise Unsupported('image_sample%s on SQ_RSRC_IMG_CUBE with %s'
+                                      % ('' if how == 'sample' else '_' + how, flag))
+            if getattr(self, 'kind', None) == 'cs':
+                raise Unsupported('cube image in a compute program (no texcube SRV binding)')
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
         # Load on a Texture2DArray take it in the same place, so only the declared type differs.
         one = dim == 'SQ_RSRC_IMG_1D'
-        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY')
+        three = dim in ('SQ_RSRC_IMG_3D', 'SQ_RSRC_IMG_2D_ARRAY', 'SQ_RSRC_IMG_CUBE')
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -8108,6 +8175,11 @@ class Stage:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             name = 'image_sample' + ('' if how == 'sample' else '_' + how)
+            if cube and words and (words[0] >> 28) & 1:
+                # SQ_IMG_SAMP_WORD0 bit 28 DISABLE_CUBE_WRAP (Mesa src/amd/registers/gfx10-rsrc.json): filtering then
+                # stops at a face edge, while a D3D12 TextureCube always filters across faces. With the bit clear both
+                # wrap across faces. A heap or register sampler is not read here, so its bit is not validated.
+                raise Unsupported('%s on SQ_RSRC_IMG_CUBE with DISABLE_CUBE_WRAP' % name)
             sjoin = None
             if dim == 'SQ_RSRC_IMG_2D' and how in ('l', 'lz') and not packed_2d and not heap and words is None:
                 r = reg_range(ops[3])
@@ -8145,6 +8217,9 @@ class Stage:
                 uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
             elif one:
                 uv = self.f(cs[0])
+            elif cube:
+                self.pipe.uses_cube_dir = True
+                uv = 'x2w_cube_dir(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             elif three and how != 'get_lod':
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
@@ -11705,6 +11780,7 @@ class Pipeline:
     vertex_kind = 'vs'
     uses_pack16_rne = False
     uses_bvh = False
+    uses_cube_dir = False
     uses_gather_2d_lod = False
     uses_store_d16_x = False
     uses_sad = ()
@@ -11749,6 +11825,7 @@ class Pipeline:
         self.uses_sampler_heap = False
         self.uses_pack16_rne = False
         self.uses_bvh = False
+        self.uses_cube_dir = False
         self.uses_gather_2d_lod = False
         self.image_dim_helpers = set()
         self.uses_store_d16_x = False
@@ -12016,7 +12093,7 @@ class Pipeline:
         if self.uses_bvh:
             out.extend(BVH_HELPERS)
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'bvh': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'bvh': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>', 'texcube': 'TextureCube<float4>'}[r['kind']], r['index'], r['index']))
         for kind, component in sorted(getattr(self, 'image_dim_helpers', ()) or ()):
             decl, call, names = IMAGE_DIM_READ[kind]
             out.append('uint img_%s_%s(%s tex) { %s %s return %s; }' % (
@@ -12029,6 +12106,27 @@ class Pipeline:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
                        % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
+        if self.uses_cube_dir:
+            # A direction for TextureCube from a gfx10 cube address (#2943): s and t are the face coordinates
+            # sc/|ma| + 1.5 and tc/|ma| + 1.5 and f the face id, with the per-face sc and tc of v_cubesc and
+            # v_cubetc (cube() above). A major component of +-1 reproduces u = sc/|major| and v = tc/|major|.
+            # A cube-array id (8 * layer + face) keeps only its face, so layer 0 is sampled; faces 6 and 7, a
+            # negative or NaN id become faces 5 and 0. Coordinates outside [1, 2] are assumed to clamp to face edges
+            # (untested outside [1, 2]).
+            out.extend((
+                'float3 x2w_cube_dir(float s, float t, float f) {',
+                '    float u = clamp(2.0 * (s - 1.5), -1.0, 1.0);',
+                '    float v = clamp(2.0 * (t - 1.5), -1.0, 1.0);',
+                '    int k = (f >= 0.0 && f < 2147483648.0) ? ((int)f & 7) : 0;',
+                '    k = min(k, 5);',
+                '    if (k == 0) return float3(1.0, -v, -u);',
+                '    if (k == 1) return float3(-1.0, -v, u);',
+                '    if (k == 2) return float3(u, 1.0, v);',
+                '    if (k == 3) return float3(u, -1.0, -v);',
+                '    if (k == 4) return float3(u, -v, 1.0);',
+                '    return float3(-u, -v, -1.0);',
+                '}',
+            ))
         if self.uses_pack16_rne:
             # IEEE binary32 to binary16 round-to-nearest-even (quieting NaN while preserving its sign,
             # matching RDNA 2 hardware on binary32 inputs), plus exact UNORM16 ratio-to-half conversion

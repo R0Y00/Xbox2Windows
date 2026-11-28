@@ -53,6 +53,16 @@ inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
     return false;
 }
 
+// Seconds since this process was created: one time base for lines from different stand-in DLLs.
+inline double process_seconds() noexcept
+{
+    FILETIME created{}, exited{}, kernel{}, user{}, now{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime; };
+    return ticks(now) > ticks(created) ? static_cast<double>(ticks(now) - ticks(created)) / 1e7 : 0.0;
+}
+
 // First-chance exceptions stop the whole process while a debugger is attached, so a probe or a copy that is
 // refused before it touches an unmapped address is worth a query. faults_avoided counts those refusals; the
 // totals line of the render heartbeat prints it.

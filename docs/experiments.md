@@ -2,6 +2,28 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## First native graphics draw through the stand-in
+
+Set `X2W_NATIVE_SHADERS` to the desktop DXC directory and `X2W_SHADER_CACHE` to a writable cache.
+The stand-in reads the published graphics request, links the pair, and uses the compiler's persistent
+frontend and bytecode caches. The runtime consumes the same supported binding manifest as the offline
+compiler. The source-built triangle fixture uses one RGBA8 target and checks all 32 pixels in each
+of two processes. A third process supplies an unsupported pixel stage and checks the untouched clear.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer d3d12_xs_shim compile_dxil
+ctest --preset dev --no-tests=error -V -R '^startup_native_graphics_draw_(hardware|warp)$'
+```
+
+## Implicit derivatives in direct compute
+
+[Group shapes, lane mapping and readback fixtures](experiments/native-compute-implicit-derivatives.md)
+
+## Slot 67 wave size in direct compute
+
+State block A bit 20 of dword 4 selects the guest wave size.
+[Capture inference and hardware fixture](experiments/native-slot67-wave-size.md)
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
@@ -69,6 +91,8 @@ permutation. The compute shader exchanges the first operand before applying the
 local second operand. A sparse EXEC mask distinguishes fetching an inactive
 source, supplying zero and retaining the destination. The test checks both
 workgroups and the surrounding buffer guards.
+
+Wave32 direct compute lowers `s_or_saveexec_b32`. As with `s_mov_b32 exec_lo`, EXEC keeps bits past the group; a lane runs only if its own bit is set.
 
 The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
 lane writes and reads back lanes in each half of a guest wave64. The compiler
@@ -295,6 +319,16 @@ validated GPU copy in the current recording completely supplied the requested vi
 The source is a same-device desktop resource with no title shadow, a unique alias,
 or an already covered range. Later overlapping copies invalidate earlier coverage.
 The recording discards this proof at Close, so another recording needs its own writer.
+
+`X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1` lets a translated compute Dispatch read an input that lies in a placed buffer which does
+not alias title memory. That buffer's desktop copy is a committed default buffer that holds zeros, so the bytes the title wrote
+exist only in title memory. The input resolves in this order: a validated GPU copy of the current recording (the proof above,
+which needs `X2W_TRANSLATED_INDIRECT_COPY_RANGES=1`), else a snapshot of the range (at most 16 MiB) taken from title memory
+into the snapshot pool when the Dispatch is recorded, else the refusal `an input is in a placed buffer that does not alias title
+memory`. A guest write after the recording is not seen, and data a GPU pass wrote into such a buffer is not either. The first
+use per pipeline key logs `x2w-draw compute <key> input <n> (...) comes from a GPU copy this list made|a snapshot of title
+memory`, and the render totals line counts both paths. Off by default. To turn it on for a run, set `$env:X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT = "1"` in the PowerShell session before
+starting `tools/startup/run.ps1`, which passes the session's environment on to the run. The snapshots have a pool of their own (128 MiB, chunks of 16 MiB, built like the shared upload ring: a chunk is reused once no recording can submit its bytes and every queue that used it has finished), so draw and texture uploads cannot starve them and a long run is not stopped by a full pool; a reservation it cannot serve logs `x2w-draw snapshot pool reservation refused: no unused capacity`. `startup_compute_dispatch_input` covers it with the `dispatch-input-snapshot` case and, for the recycling, `dispatch-input-snapshot-long` (48 frames of an 8 MiB snapshot, 384 MiB in all).
 
 The source-built fixture reproduces a 68-byte request shape with source offset `0xbfffa0`.
 Its compute writer fills the source with contrasting colours. The consumer reads red
@@ -631,7 +665,7 @@ python3 -B tests/startup_buffer_address_check.py controls
 
 ## Startup translator: SMEM combined register and immediate offsets
 
-Direct C++ wave32 compute accepts numeric `vcc_lo` and `vcc_hi` as SMEM offsets and scalar load destinations through s107.
+Direct C++ compute, in wave32 and wave64, accepts numeric `vcc_lo` and `vcc_hi` as SMEM offsets and scalar load destinations through s107.
 
 In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and the signed immediate in `mods` (`offset:0x...` or `offset:-0x...`). Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
 
@@ -12048,10 +12082,24 @@ On success the caller exits with `0x8AC`, also with `CPU_CRC_TEST_LIVE_WORKER=1`
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_acphal_hal$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
+```
 
 ### ApuFree in the AcpHal stand-in
 
 The desktop `AcpHal.dll` stand-in (not the fixture provider above) now returns `ApuAlloc` blocks on `ApuFree` through a first-fit free list with coalescing, so repeated allocate and free cycles no longer exhaust the heap. It is a stand-in contract only: the console's error codes, alignment limits and zero-size behaviour are not public, and the codes chosen are listed in [startup-runtime.md](startup-runtime.md#apu-heap-stand-in). The source-built check is `ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V`.
+
+### XMA context activity in the AcpHal stand-in
+
+With `X2W_AUDIO_PERMISSIVE=1` and `X2W_AUDIO_ACTIVITY=1`, the desktop `AcpHal.dll` and `xapu.dll` stand-ins count what a caller does with the audio processor. This is a first measurement for [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145), before any decoding. AcpHal compares the XMA context array it allocated with a copy inside the calls that count, at most once per 10 ms, and counts contexts filled (all zero to nonzero), changed and cleared, plus HAL slot2 submits by type. xapu counts `XApuEnqueueCommand` calls by command class with no cap. Neither DLL starts a thread; each logs at most a line per second, from a counted call at least a second after its previous line, when a count moved (later counts wait for a later call); the experimental exports `x2w_acphal_xma_activity` and `x2w_xapu_command_counts` return the totals. Line formats and limits are in [startup-runtime.md](startup-runtime.md#activity-counter).
+
+`startup_acphal_xma_activity` runs one source-built caller script in three child processes, plus an unload case. With the counter on, the caller fills 5 contexts, changes 3 and clears 2, submits 4 HAL commands of types 1, 1, 3 and 12, and enqueues 6 XApu commands of classes 1, 2 and 0x20, one null command, one command on an unknown handle and one type 3 command whose 8-byte header ends where free address space begins, sent with `X2W_XAPU_TYPED_COMPLETIONS=1` (every case sets `X2W_PROBE_PRECHECK=1`, so the free tail is refused without a fault). An `X2W_WITH_OPUS` build refuses that one with `E_POINTER` as too short to decode, and it must still count as class 3; only that build tells a counted refusal from an uncounted one. The exports and the summed log lines must give exactly those counts, and an array freed and allocated again must not be counted. The zero-write control writes only the 64 bytes after the last context and sends nothing: every count must be 0 and no line may be logged. With the counter off, the exports report nothing and no line is logged. Every result, output, last error and the final context bytes must match between the on and off runs. The unload case allocates the contexts a second time without `ApuFree`, then frees both DLLs, checks that they are unmapped, waits 1.5 s and must exit 0.
+
+```powershell
+cmake --build --preset release --target startup_acphal_xma_activity
+ctest --preset release --no-tests=error -R '^startup_acphal_xma_activity$' -V
+```
+
+The 64-byte context stride and the command class (the first `UINT32` of a command) are stand-in conventions, not console contracts. The counter identifies no field inside a context, such as an enable flag, decodes nothing, and does not establish which counted event starts playback.
 
 ### XApu command-queue caller and recorder
 
@@ -15190,7 +15238,7 @@ For binary32 arithmetic and compare sources, the translator reads the inline int
 
 ## Startup translator: explicit-LOD image sampling
 
-`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array and multisample dimensions (a cube lowers since #2943, see [startup-image-cube](experiments/startup-image-cube.md)), an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
 
 ## Startup translator: binary32 arithmetic
 
@@ -15211,7 +15259,7 @@ Not covered: inexact products. The translation writes both `v_fma_f32`, which ro
 
 ## Startup translator: biased image sampling
 
-`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_b` form in a pixel stage to `tex.SampleBias(smp, uv, bias)` for 2D, 2D-array and 3D textures. The RDNA 2 ISA (section 8.2.4, Table 43: "_B LOD BIAS, 1: lod bias, Add this BIAS to the LOD computed"; section 8.2.5: the address is `{ offset } { bias } { z-compare } { derivative } { body }` and the bias is "One Dword float") puts the bias in the FIRST address register, so `v[0:2]` is bias, u, v and the NSA list `[v3, v1, v2]` takes the bias from `v3`. LLVM 15 agrees: `IntrinsicsAMDGPU.td` gives `AMDGPUSample_b` the extra argument `llvm_anyfloat_ty "bias"` and `MIMGInstructions.td` the gfx10 opcode `0x25`. `llvm-mc` (LLVM 15, gfx1013) assembles the contiguous 2D, 2D-array, 3D and NSA forms, and the check compares every fixture against it. HLSL `SampleBias` adds the bias to the implicit mip level and documents the range -16.0 to 15.99; the ISA text states no hardware clamp, so a bias outside that range is an unverified difference. The form needs a pixel stage whose EXEC is still the entry mask with wave-uniform control flow (implicit derivatives); a uniform (scc) join or later loop does not drop that proof, while divergent EXEC or a vcc/exec-conditioned branch before the sample does (there the plain sample is lowered to level 0, which would drop the bias). It is also refused outside a pixel stage, and so are `image_sample_b_cl`, `image_sample_c_b*`, `image_sample_b_o`, `image_gather4_b`, 1D, cube and multisample dimensions, an empty `dmask`, the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers, set reserved MIMG bits, and a constant sampler whose LOD bias fields (word 2 bits 19:0, s6.8 and s2.4, scaled by `T#.perf_modulation` in the ISA) are not zero or whose mip filter is 0 (mipmapping disabled), or whose MIN_LOD is above its MAX_LOD. The guest clamp is kept: MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 `src/amd/registers/gfx10-rsrc.json`, `SQ_IMG_SAMP_WORD1`; `radeonsi/si_state.c` lines 5169-5170 encode them with `S_FIXED(x, 8)`), and the sampler of an `image_sample_b` is written as an `smpl` manifest line that the runtime decodes to `MinLOD = MIN_LOD / 256` and `MaxLOD = MAX_LOD / 256` (`src/startup_stubs/translated_sampler_bindings.h`); `smp` and `smpc` lines still leave MinLOD at 0 and MaxLOD unbounded (the next section moves `image_sample`, `_l` and `_lz` with a constant sampler to `smpl`). A sampler read from the sampler heap, including the default-sampler shortcut for a run-time heap load, or built from a register is refused for `image_sample_b`, because its LOD limits and bias cannot be shown to be irrelevant.
+`tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_b` form in a pixel stage to `tex.SampleBias(smp, uv, bias)` for 2D, 2D-array and 3D textures. The RDNA 2 ISA (section 8.2.4, Table 43: "_B LOD BIAS, 1: lod bias, Add this BIAS to the LOD computed"; section 8.2.5: the address is `{ offset } { bias } { z-compare } { derivative } { body }` and the bias is "One Dword float") puts the bias in the FIRST address register, so `v[0:2]` is bias, u, v and the NSA list `[v3, v1, v2]` takes the bias from `v3`. LLVM 15 agrees: `IntrinsicsAMDGPU.td` gives `AMDGPUSample_b` the extra argument `llvm_anyfloat_ty "bias"` and `MIMGInstructions.td` the gfx10 opcode `0x25`. `llvm-mc` (LLVM 15, gfx1013) assembles the contiguous 2D, 2D-array, 3D and NSA forms, and the check compares every fixture against it. HLSL `SampleBias` adds the bias to the implicit mip level and documents the range -16.0 to 15.99; the ISA text states no hardware clamp, so a bias outside that range is an unverified difference. The form needs a pixel stage whose EXEC is still the entry mask with wave-uniform control flow (implicit derivatives); a uniform (scc) join or later loop does not drop that proof, while divergent EXEC or a vcc/exec-conditioned branch before the sample does (there the plain sample is lowered to level 0, which would drop the bias). It is also refused outside a pixel stage, and so are `image_sample_b_cl`, `image_sample_c_b*`, `image_sample_b_o`, `image_gather4_b`, 1D and multisample dimensions (a cube lowers since #2943, see [startup-image-cube](experiments/startup-image-cube.md)), an empty `dmask`, the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers, set reserved MIMG bits, and a constant sampler whose LOD bias fields (word 2 bits 19:0, s6.8 and s2.4, scaled by `T#.perf_modulation` in the ISA) are not zero or whose mip filter is 0 (mipmapping disabled), or whose MIN_LOD is above its MAX_LOD. The guest clamp is kept: MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) are unsigned 4.8 fixed point (Mesa 24.0.0 `src/amd/registers/gfx10-rsrc.json`, `SQ_IMG_SAMP_WORD1`; `radeonsi/si_state.c` lines 5169-5170 encode them with `S_FIXED(x, 8)`), and the sampler of an `image_sample_b` is written as an `smpl` manifest line that the runtime decodes to `MinLOD = MIN_LOD / 256` and `MaxLOD = MAX_LOD / 256` (`src/startup_stubs/translated_sampler_bindings.h`); `smp` and `smpc` lines still leave MinLOD at 0 and MaxLOD unbounded (the next section moves `image_sample`, `_l` and `_lz` with a constant sampler to `smpl`). A sampler read from the sampler heap, including the default-sampler shortcut for a run-time heap load, or built from a register is refused for `image_sample_b`, because its LOD limits and bias cannot be shown to be irrelevant.
 
 `tests/startup_image_sample_b_check.py` translates source-built fixtures and, with `draw`, draws the 2D array through `offscreen_check --startup-image-2d-array-mips` (4x4, two slices, three mips whose cells all differ, point sampler with mip filter point; MAX_LOD 2 for the bias cases). Constant coordinates have no derivatives, so the draw rewrites only the `u` initialiser of the translated HLSL to `0.75 + 0.5 * (SV_Position.x - 0.5)`, an implicit LOD of 1 at the sampled pixel; the `SampleBias` call is untouched. Bias -1, 0 and +1 read mip 0, 1 and 2 on WARP with DXC and FXC. A uniform (scc) join before the sample is accepted and drawn (same mip as the plain bias -1 case); divergent EXEC or a vcc/exec-conditioned branch before the sample is refused. Negative controls: the same program with `image_sample` reads mip 1 for every case, and edited calls (bias replaced by 0, bias negated, bias and `u` exchanged, `Sample` for `SampleBias`) each read another cell. The sampler limits are discriminated by cases whose limit lies below a mip that exists: MAX_LOD 1 with bias +1 stays on mip 1 (unclamped: mip 2), MAX_LOD 0 with bias +1 stays on mip 0, MIN_LOD 2 with bias -1 reads mip 2 (unclamped: mip 0) and MIN_LOD 1 = MAX_LOD 1 with bias -1 reads mip 1; the MAX_LOD 2 bias cases cannot tell, because mip 2 is the last level. Each limit case is drawn again with an `smp` line instead of `smpl` (limits not carried) and must read the unclamped mip. `startup_sampler_comparison` checks the decoded MinLOD and MaxLOD. Replacing the bias by 0 or exchanging the bias with the first coordinate in `gfx2hlsl.py`, dropping the MaxLOD assignment in the runtime decoder, accepting a heap sampler, and the previous `gfx2hlsl.py`, each make a check fail. Not covered: a physical-adapter run (`startup_image_sample_b_hardware` is registered), a plain 2D or 3D draw (those forms are checked on the generated HLSL), fractional bias with a linear mip filter, bias outside -16 to 15.99, a fractional MIN_LOD or MAX_LOD (only whole mips are drawn; the 4.8 decode is checked without a device), a non-zero descriptor LOD bias (refused, not carried) and the limits of the other sample forms (see the next section).
 
@@ -15986,6 +16034,8 @@ guarded block and take the latch until the counter reaches 4. The translator rep
 `loop exit crosses a backward s_cbranch_scc0` for the early exit in both variants.
 Run `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
+
+`subset_after` tracks pre-branch mask-subset facts (`sM <= EXEC`) across instructions and joins into `Stage.execz_refusals`, so saving `s22 <= EXEC` (or `s_mov_b32 exec_lo, s22` before `s_cbranch_execz`) proves `s_mov_b32 exec_lo, s22` inside the skipped block (#2645 T1). On the no-exit variant (`O-loop-subset`) DXC `cs_6_0` produces `[9, 1, 2, 9, 9, 9, 9, 9]` while `LOOP_BREAK_WORDS` still refuses `+0x30` with `loop exit crosses a backward s_cbranch_scc0`, and pre-branch narrowing (`s_and_saveexec_b32`, `v_cmpx_gt_u32`), mask overwrites, and unproven joins remain refused as `exec write`.
 
 ### Scalar run before the EXEC restore at a compute exit target (#2645 T3)
 
