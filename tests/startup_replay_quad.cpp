@@ -254,6 +254,8 @@ int create_scene(void* device, Scene& s)
             FAILED(static_cast<HRESULT>(invoke(device, 73, arg(list_desc), arg(allocator), 0,
                                                arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&s.static_list)))))
             return 23;
+        // The stand-in's lists record only after a Reset (slot 139), as the title's do.
+        if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 139, arg(allocator))))) return 30;
         invoke(s.static_list, 52, s.rtv, arg(green), 1, arg(&corner));
         if (FAILED(static_cast<HRESULT>(invoke(s.static_list, 9)))) return 31;
         s.release_static = GetEnvironmentVariableA("X2W_TEST_REPLAY_STATIC_RELEASE", nullptr, 0) != 0;
