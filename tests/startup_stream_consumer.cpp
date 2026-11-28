@@ -397,7 +397,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         std::memcpy(reinterpret_cast<void*>(cpu + 64), window, sizeof(window));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
-    if (mode == "dispatch-records32" || typed_output_offset || shared_uav) {  // output at byte 32, none at byte 16
+    if (mode == "dispatch-records32" || typed_output_offset || shared_uav ||
+        mode == "dispatch-srv-token-typed") {  // output at byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
@@ -435,6 +436,14 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         invoke(device, 19, word(output), 0, word(&view), cpu + 32);
         if (mode == "dispatch-uav-token-wrong-slot")
             reinterpret_cast<UINT*>(cpu + 32)[2] = 18;
+    }
+    if (mode == "dispatch-srv-token-typed") {
+        // dispatch-srv-token-typed: the input descriptor is the token of a typed buffer view (device slot 18) of the
+        // input buffer; for this mode the input's word 3 field is the view's DXGI format, its records field the elements.
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{static_cast<DXGI_FORMAT>(fields[0][2]), D3D12_SRV_DIMENSION_BUFFER,
+                                             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        view.Buffer.NumElements = fields[0][1];
+        invoke(device, 18, word(placed[0]), word(&view), cpu);
     }
     const bool heap_record = mode.rfind("dispatch-heap", 0) == 0 && !heap_waterfall;
     if (heap_record)

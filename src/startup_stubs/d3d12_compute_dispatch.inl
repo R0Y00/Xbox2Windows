@@ -2,7 +2,8 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
-// outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
+// outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores; `srv <i> typed table
+// <param> <byte> bytes <n>` inputs are read through a UINT view of 32-bit components)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
 // (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
@@ -44,6 +45,7 @@ struct ComputeTranslation {
         unsigned channels = 4;
         D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
         unsigned half_buffer_bytes = 0;
+        unsigned typed_bytes = 0;  // `srv <i> typed`: the widest formatted load, 4 bytes per component
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -101,6 +103,65 @@ bool half_buffer_descriptor_matches(const std::uint32_t* words, unsigned bytes)
     return (words[1] >> 16) == bytes && (words[3] & (0xfffff000u | selectors)) ==
         (0x01000000u | (format << 12) | (0xfacu & selectors));
 }
+// Channels of a gfx10 unified buffer FORMAT with 32-bit components (UINT, SINT or FLOAT; tools/startup/gfx2hlsl.py
+// names the codes): a UINT view of that width reads the bits buffer_load_format returns. 0 for any other FORMAT.
+unsigned typed_dword_format_channels(std::uint32_t code)
+{
+    switch (code) {
+    case 20: case 21: case 22: return 1;
+    case 62: case 63: case 64: return 2;
+    case 72: case 73: case 74: return 3;
+    case 75: case 76: case 77: return 4;
+    default: return 0;
+    }
+}
+
+// The view a translated buffer_load_format_* reads (`srv <i> typed`, a Buffer<uint4>): the title's descriptor
+// resolved as a buffer range, retyped to the UINT format of its 32-bit components. Returns the refusal or null.
+const char* typed_dword_input_view(Wrapper* self, const std::uint32_t* words, unsigned typed_bytes,
+                                   IndirectBufferView& range, D3D12_SHADER_RESOURCE_VIEW_DESC& view)
+{
+    UINT channels = 0;
+    if (words[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        const bool known = words[1] < view_records().size();
+        if (known) record = view_records()[words[1]];
+        ReleaseSRWLockShared(&note_lock);
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+        if (known && record.slot == 18 && record.desc_bytes >= ViewRecord::srv_desc_bytes)
+            std::memcpy(&desc, record.desc, ViewRecord::srv_desc_bytes);
+        if (desc.Format) desc.Format = desktop_format(desc.Format);
+        channels = x2w_startup::typed_dword_channels(desc);
+        if (!channels) return "a typed input token is not a typed buffer view with 32-bit channels";
+    } else if (words[0] || words[1] || words[2] || words[3]) {
+        // An all-zero descriptor is a null buffer: indirect_table_buffer gives it zeros, read as the program's width.
+        channels = typed_dword_format_channels(x2w_startup::formatted_buffer_code(words[3]));
+        if (!channels) return "a typed input FORMAT is not 32 bits per channel";
+        if (((words[1] >> 16) & 0x3fff) != channels * 4) return "a typed input stride is not its element size";
+        for (unsigned c = 0; c < typed_bytes / 4; ++c)
+            if (((words[3] >> (3 * c)) & 7) != 4 + c) return "a typed input DST_SEL is not the identity";
+        // Unified FORMAT (RESOURCE_LEVEL 1), structured bounds (OOB_SELECT 0), no swizzle, index stride or ADD_TID.
+        if ((words[1] >> 30) || (words[3] & 0xfff80000u) != 0x01000000u)
+            return "a typed input descriptor is swizzled or not bounds-checked by record";
+    } else {
+        channels = 4;  // the 16 zero bytes indirect_table_buffer gives a null buffer, one element
+    }
+    if (channels * 4 < typed_bytes) return "a typed input has fewer channels than the program reads";
+    const char* reason = nullptr;
+    range = indirect_table_buffer(self, words, false, &reason, 16u << 20, 4, true);
+    if (reason) return reason;
+    const UINT element = channels * 4;
+    if (range.offset % element || range.bytes < element) return "a typed input range does not start at a whole element";
+    view = {};
+    view.Format = x2w_startup::typed_dword_uint_format(channels);
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Buffer.FirstElement = range.offset / element;
+    view.Buffer.NumElements = static_cast<UINT>(range.bytes / element);
+    return nullptr;
+}
+
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
@@ -202,6 +263,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "srv %u typed table %d %d bytes %u%n", &i, &a, &b, &x, &used) == 4 && whole() &&
+                 i == tr.srvs.size() && x && x <= 16 && x % 4 == 0) {
+            tr.srvs.push_back({a, b});
+            tr.srvs.back().typed_bytes = x;
+        }
         else if (std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 && whole() && a >= 0 &&
                  i == tr.srvs.size()) {
             tr.srvs.push_back({a, 0});
@@ -605,7 +671,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        if (dispatch.signature && (slot.heap || slot.texture || slot.root)) {
+        if (dispatch.signature && (slot.heap || slot.texture || slot.root || slot.typed_bytes)) {
             reason = "translated indirect Dispatch requires fixed-table raw buffers";
             break;
         }
@@ -770,6 +836,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             views[i] = {texture, 0, 0, true, true, described};
             views[i].desc.uav = desc;
             views[i].wrapper = wrapper;
+            continue;
+        }
+        if (!output && slot.typed_bytes) {
+            IndirectBufferView range{};
+            D3D12_SHADER_RESOURCE_VIEW_DESC typed{};
+            reason = typed_dword_input_view(self, words, slot.typed_bytes, range, typed);
+            views[i] = {range.resource, range.offset, range.bytes, !range.upload, false, true};
+            views[i].desc.srv = typed;
+            views[i].stride = range.stride;
+            std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
         if (!output) {
@@ -990,6 +1066,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? &view.desc.srv : nullptr, dest);
+            continue;
+        }
+        if (i < inputs && view.described) {  // a typed buffer input
+            if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            device_of(the_device)->CreateShaderResourceView(view.resource, &view.desc.srv, dest);
             continue;
         }
         if (i < inputs || i >= count) {

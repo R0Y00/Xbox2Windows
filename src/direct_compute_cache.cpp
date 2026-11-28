@@ -957,6 +957,11 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 b.kind == ComputeViewKind::byte_window_srv) {
                 srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if (b.kind == ComputeViewKind::typed_buffer_srv && b.array_count == 1 && b.required_bytes &&
+                       b.required_bytes <= 16 && b.required_bytes % 4 == 0) {
+                // buffer_load_format_*: read as Buffer<uint4>; bytes is the widest load (4 per component).
+                srv_lines << "srv " << b.shader_register << " typed table " << b.root_parameter << ' ' << b.byte_offset
+                          << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::texture_srv && b.array_count == 1 &&
                        (b.image_dimension == 0 || b.image_dimension == 1 || b.image_dimension == 2 ||
                         b.image_dimension == 5)) {
