@@ -675,13 +675,16 @@ int main(int argc, char** argv)
             const D3D12_SHADER_RESOURCE_VIEW_DESC* srv = nullptr;
             UINT64 overwrite_dest = 0;
             GuestHeap* doomed = nullptr;
+            UINT64 copy_dest = 0, copy_source = 0;
             bool fired = false;
-        } race{guest.Get(), tex_rep.Get(), &srv_desc, vis_heap.cpu + std::uint64_t{3} * c.increment, &doomed_heap};
+        } race{guest.Get(), tex_rep.Get(), &srv_desc, vis_heap.cpu + std::uint64_t{3} * c.increment, &doomed_heap,
+               vis_heap.cpu + std::uint64_t{6} * c.increment, cpu_heap.cpu + std::uint64_t{tex_count} * c.increment};
 
         x2w_d3d12_set_lazy_refresh_hook([](void* ctx) {
             auto* st = static_cast<RaceState*>(ctx);
             if (st->fired) return;
             st->fired = true;
+            invoke<void>(st->guest, 24, 1u, st->copy_dest, st->copy_source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             invoke<void>(st->guest, 18, st->tex_rep, st->srv, st->overwrite_dest);
             st->doomed->guest.Reset();
             st->doomed->real.Reset();
@@ -690,6 +693,13 @@ int main(int argc, char** argv)
         x2w_d3d12_set_lazy_refresh_hook(nullptr, nullptr);
         if (!copied || !race.fired) {
             std::puts("FAIL: prepare/overwrite/resume race hook did not complete");
+            VirtualFree(race_mem, 0, MEM_RELEASE);
+            VirtualFree(rep_mem, 0, MEM_RELEASE);
+            free_title_mem();
+            return 5;
+        }
+        float got_copy[4]{};
+        if (!c.read_slot(vis_heap, 6, got_copy) || !verify_texel00(got_copy, 12, "vis_heap[6] copied mid-publication")) {
             VirtualFree(race_mem, 0, MEM_RELEASE);
             VirtualFree(rep_mem, 0, MEM_RELEASE);
             free_title_mem();
@@ -706,6 +716,8 @@ int main(int argc, char** argv)
                      cpu_heap.cpu + std::uint64_t{tex_count} * c.increment);
         invoke<void>(guest.Get(), 18, static_cast<IUnknown*>(nullptr), &srv_desc,
                      vis_heap.cpu + std::uint64_t{3} * c.increment);
+        invoke<void>(guest.Get(), 18, static_cast<IUnknown*>(nullptr), &srv_desc,
+                     vis_heap.cpu + std::uint64_t{6} * c.increment);
         tex_race.Reset();
         tex_rep.Reset();
         if (!c.reset_copy_list() || !c.guest_sync()) {
