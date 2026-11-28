@@ -640,6 +640,13 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Presenter allocator reuse: pure decisions and a real queue held beyond two seconds.
+add_executable(startup_presenter_fence tests/startup_presenter_fence.cpp)
+target_include_directories(startup_presenter_fence PRIVATE src)
+target_compile_features(startup_presenter_fence PRIVATE cxx_std_17)
+target_link_libraries(startup_presenter_fence PRIVATE d3d12 dxgi)
+# Registrations: tests/cmake/startup_presenter_fence.cmake
+
 # Device slot 15 (GetDescriptorHandleIncrementSize, #870) next to a desktop device on the same adapter.
 add_executable(startup_descriptor_increment tests/startup_descriptor_increment.cpp)
 target_compile_features(startup_descriptor_increment PRIVATE cxx_std_17)

@@ -65,6 +65,7 @@
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
+#include "startup_stubs/presenter_fence_win.h"
 #include "startup_stubs/present_planes.h"
 #include "startup_stubs/plane_compositor.h"
 
