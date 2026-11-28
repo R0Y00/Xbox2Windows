@@ -8,11 +8,14 @@ rounding while preserving `D[31:16]`.
 
 ## Scope
 
-- Covers `-0.0h`, `±min_sub`, `0.5h`, `1.5h`, `2.5h`, `-1.5h`, and `1023.5h`
-  (mantissa-to-exponent carry) across VOP1 and VOP3A with pre-seeded `D[31:16]`.
+- Covers `-0.0h`, `±min_sub`, `0.5h`, `1.5h`, `2.5h`, `-1.5h`, `1023.5h`
+  (mantissa-to-exponent carry), and inline binary16 float constants `240..248`
+  (`0.5`, `-0.5`, `1.0`, `-1.0`, `2.0`, `-2.0`, `4.0`, `1/(2*pi)`) across VOP1
+  and VOP3A with pre-seeded `D[31:16]`.
 - Refuses unsupported modifiers (`omod`, `op_sel`, unused VOP3 sources).
-- Negative controls: round-half-away-from-zero, losing `-0.0h`, and zeroing
-  `D[31:16]` each differ from the reference.
+- Negative controls: round-half-away-from-zero, losing `-0.0h`, reading inline
+  float constants as `0x0000`, and zeroing `D[31:16]` each differ from the
+  reference.
 - Does not establish full-game execution.
 
 ## Reproduction

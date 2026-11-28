@@ -2883,6 +2883,7 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
+    UINT title_view_heap_entries = 0;        // logical descriptor count of title_view_heap (indices 0..count-1)
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};

@@ -1,4 +1,4 @@
-if(X2W_HAVE_DXCAPI AND EXISTS "${INTAKE_PYTHON}")
+if(TARGET compile_dxil AND TARGET native_store_replay AND EXISTS "${INTAKE_PYTHON}")
     add_test(NAME native_round_f16_controls
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_round_f16_check.py"
             controls "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")

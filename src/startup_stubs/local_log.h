@@ -86,14 +86,17 @@ inline thread_local MappedCache mapped_cache;
 inline void forget_mapped_spans() noexcept { mapped_cache = MappedCache{}; }
 
 // The pre-check is a debugging aid: it only pays off while a debugger would stop on every first-chance fault.
-// It runs when a debugger is attached or X2W_PROBE_PRECHECK is set to anything but 0 (read once, cached);
-// otherwise probes and copies keep the plain touch / __try path at no extra cost.
+// X2W_PROBE_PRECHECK decides when it is set (0 off, anything else on); unset, the pre-check runs when a debugger is
+// attached. Read once, cached. Title runs always start under debug_launch.py, where a VirtualQuery per probe can
+// cost far more than the faults it avoids, so X2W_PROBE_PRECHECK=0 turns it off there. Off, probes and copies keep
+// the plain touch / __try path at no extra cost.
 inline bool precheck_enabled() noexcept
 {
     static const bool enabled = [] {
         char value[8] = {};
         const DWORD n = GetEnvironmentVariableA("X2W_PROBE_PRECHECK", value, sizeof(value));
-        return IsDebuggerPresent() != FALSE || (n != 0 && n < sizeof(value) && value[0] != '0');
+        if (n != 0 && n < sizeof(value)) return value[0] != '0';
+        return IsDebuggerPresent() != FALSE;
     }();
     return enabled;
 }
