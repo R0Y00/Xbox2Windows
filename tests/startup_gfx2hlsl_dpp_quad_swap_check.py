@@ -419,6 +419,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                 wrong['unsigned maximum instead of minimum'] = mutate(text, r'\bmin\(', 'max(')
             if name == 'cmp':
                 wrong['reversed compare (own < exchanged)'] = mutate(text, r'\(v256 < v0\)', '(v256 > v0)')
+            if name == 'cmp':
+                # Positions order by y first, so the Y neighbour and the diagonal one compare alike: not a mutant.
+                del wrong['Y reads the diagonal neighbour']
             for label, source in wrong.items():
                 bad = compile_hlsl(dxc, 'dxc', source, 'bad_%s_%d' % (name, abs(hash(label))), 'ps_6_0', directory)
                 run = draw(renderer, adapter, vs, bad, good)
