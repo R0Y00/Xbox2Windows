@@ -5,11 +5,21 @@ The native frontend lowers gfx1013 VOP3 `v_cvt_pknorm_i16_f32` (`0x368`) and
 and Pixel shaders, packing `cvt_norm(S0.f32)` into `D[15:0]` and
 `cvt_norm(S1.f32)` into `D[31:16]`.
 
-## Exact 32-bit integer RNE lowering and semantics
+## Exact 32-bit integer RNE lowering and model status
 
-Both lanes compute exact `round_rne(clamp(x, -1, 1) * 32767)` (`i16`) and
-`round_rne(clamp(x, 0, 1) * 65535)` (`u16`) in 32-bit unsigned integer
-arithmetic without floating-point intermediaries or 64-bit integers:
+Both lanes compute single-rounding `round_rne(clamp(x, -1, 1) * 32767)` (`i16`)
+and `round_rne(clamp(x, 0, 1) * 65535)` (`u16`) in 32-bit unsigned integer
+arithmetic without floating-point intermediaries or 64-bit integers.
+
+- **Model status:** Unlike `v_cvt_pk_u8_f32` (`tools/rdna_cvt_pk_u8.py`),
+  `v_cvt_pknorm_i16_f32` and `v_cvt_pknorm_u16_f32` have not yet been measured
+  with a silicon probe on physical RDNA 2 hardware, and the AMD RDNA 2 ISA
+  reference leaves rounding/bounds/NaN details of the `float32_to_snorm16` /
+  `float32_to_unorm16` helpers implicit. This direct DXIL lowering implements a
+  single RNE rounding of the exact scaled product (`clamp(x) * 32767` or `*
+  65535`) with `NaN -> 0`; the fixture explicitly includes the four inputs
+  (`0x3F000400`, `0x38400180`, `0x3F000200`, `0x37C000C0`) that separate
+  single-rounding exact multiplication from a binary32 multiply followed by RNE.
 
 - For normal binary32 inputs with `mag in [2^-17, 1.0)` (`exp in [110, 126]`),
   the 24-bit significand `m` is multiplied by `2^k - 1` (`k = 15` for `i16`,
@@ -39,9 +49,10 @@ any of the following hold:
 ## Fixture coverage and reproduction
 
 [native_cvt_pknorm_f32_check.py](../../tests/native_cvt_pknorm_f32_check.py)
-checks 26 Compute cases (`<= 32` words/lane in `native_store_replay`), 8
-refusal controls, and lossless 16-bit Pixel readback across 13 draws (25
-full-`EXEC` cases padded to 26) on WARP and D3D12 hardware:
+checks 28 Compute cases (`<= 32` words/lane in `native_store_replay`), 8
+refusal controls, single-rounding vs binary32-multiply-then-RNE separation, and
+lossless 16-bit Pixel readback across 14 draws (27 full-`EXEC` cases padded to
+28) on WARP and D3D12 hardware:
 
 ```powershell
 cmake --build --preset dev --target compile_dxil native_compute_ir_dump native_store_replay offscreen_check

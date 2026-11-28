@@ -125,7 +125,10 @@ def all_cases():
         Case('u16_half_and_quarter', 'u16', (257, 258), (0x3F000000, 0x3E800000)),  # 0.5 -> 32768, 0.25 -> 16384
         Case('i16_neg_quarter', 'i16', (257, 258), (0xBE800000, 0x3E800000)),     # -0.25 -> -8192, 0.25 -> 8192
         Case('u16_p_lo_tie_witness', 'u16', (257, 258), (0x3F000101, 0xBF000101)),  # 32768.50389 -> 32769 (kills drop p_lo)
-        Case('i16_p_lo_tie_witness', 'i16', (257, 258), (0x3F000201, 0xBF000201)),  # +-16384.50389 -> +-16385
+        Case('i16_p_lo_tie_witness', 'i16', (257, 258), (0x3F000201, 0xBF000201)),  # +-16384.50192 -> +-16385
+        # Single-rounding exact product vs binary32-multiply-then-RNE witnesses:
+        Case('i16_single_round_sep', 'i16', (257, 258), (0x3F000400, 0x38400180)),  # 16385 vs 16386, 1 vs 2
+        Case('u16_single_round_sep', 'u16', (257, 258), (0x3F000200, 0x37C000C0)),  # 32769 vs 32770, 1 vs 2
         # 3. VOP3 abs[1:0] and neg[1:0] across both operands.
         Case('i16_abs_both', 'i16', (257, 258), (0xBF000000, 0xBE800000), abs_=0b11),
         Case('i16_neg_both', 'i16', (257, 258), (0x3F000000, 0x3F800000), neg=0b11),
@@ -181,7 +184,44 @@ def refusal_programs():
     ]
 
 
+def cvt_norm_f32_half_mul_f32_oracle(kind, bits):
+    """Alternative binary32-multiply-then-RNE oracle (separated by *_single_round_sep)."""
+    bits &= 0xFFFFFFFF
+    if (bits & 0x7FFFFFFF) > 0x7F800000:
+        return 0
+    val = struct.unpack('<f', struct.pack('<I', bits))[0]
+    if kind == 'u16':
+        if math.isnan(val) or val <= 0.0:
+            return 0
+        if val >= 1.0:
+            return 0xFFFF
+        scaled = Fraction(struct.unpack('<f', struct.pack('<f', val * 65535.0))[0])
+    else:
+        if val == 0.0:
+            return 0
+        if val >= 1.0:
+            return 32767
+        if val <= -1.0:
+            return (-32767) & 0xFFFF
+        scaled = Fraction(struct.unpack('<f', struct.pack('<f', val * 32767.0))[0])
+    neg_sign = scaled < 0
+    mag = abs(scaled)
+    q = int(mag)
+    rem = mag - q
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and (q & 1)):
+        q += 1
+    return ((-q) & 0xFFFF) if neg_sign else (q & 0xFFFF)
+
+
+def check_oracle_separation():
+    assert cvt_norm_f32_half('i16', 0x3F000400) == 16385 and cvt_norm_f32_half_mul_f32_oracle('i16', 0x3F000400) == 16386
+    assert cvt_norm_f32_half('i16', 0x38400180) == 1 and cvt_norm_f32_half_mul_f32_oracle('i16', 0x38400180) == 2
+    assert cvt_norm_f32_half('u16', 0x3F000200) == 32769 and cvt_norm_f32_half_mul_f32_oracle('u16', 0x3F000200) == 32770
+    assert cvt_norm_f32_half('u16', 0x37C000C0) == 1 and cvt_norm_f32_half_mul_f32_oracle('u16', 0x37C000C0) == 2
+
+
 def ir(dumper):
+    check_oracle_separation()
     items = all_cases()
     code = compute_program(items)
     want = [c.expected(lane=0) for c in items]
@@ -203,6 +243,7 @@ def ir(dumper):
 
 
 def controls(cli, sdk, work, root):
+    check_oracle_separation()
     items = all_cases()
     code = compute_program(items)
     marker = request(work, root, code)
