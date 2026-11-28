@@ -1,6 +1,7 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--suspend-others 0]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+                      [--suspend-others 0] [--capture-every S]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -15,6 +16,7 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -25,9 +27,10 @@ k32.SuspendThread.restype = wt.DWORD
 nt_dll = ctypes.WinDLL("ntdll")
 nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
-from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
+from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file, startup_for_create  # noqa: E402
 import host_cpu  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
+from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -132,6 +135,13 @@ def main():
         print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
         return 2
     stop_first = opts.get("--stop-first-chance") == "1"
+    try:
+        capture_every = float(opts.get("--capture-every", 0))  # seconds between window pictures; 0 = off
+    except ValueError:
+        capture_every = -1
+    if not (capture_every == 0 or 1 <= capture_every < float("inf")):
+        print("expected --capture-every of 0 (off) or a finite number of seconds that is at least 1")
+        return 2
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
@@ -192,8 +202,12 @@ def main():
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     pi = PROCESS_INFORMATION()
     flags = 0x2 | 0x4 | 0x400  # DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
+    startup, extra_flags, startup_keep, startup_note = startup_for_create(si, env)
+    if startup_note:
+        print(startup_note)
+    flags |= extra_flags
     if not k32.CreateProcessW(exe, ctypes.create_unicode_buffer(f'"{exe}"'), None, None, True, flags,
-                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(si), ctypes.byref(pi)):
+                              ctypes.create_unicode_buffer(block), cwd, ctypes.byref(startup), ctypes.byref(pi)):
         print("CreateProcess failed", ctypes.get_last_error())
         return 2
     k32.AssignProcessToJobObject(wt.HANDLE(job), wt.HANDLE(pi.hProcess))
@@ -478,6 +492,9 @@ def main():
     redirects = {}
     # Offline by default (--offline 0 turns it off): no sockets, NetBIOS name devices or DNS resolver.
     offline = opts.get("--offline", "1") == "1"
+    # Keep the same offline entry checks. An allowed file operation only
+    # needs a return breakpoint when collecting its completion status.
+    offline_entry_only = offline and os.environ.get("X2W_OFFLINE_ENTRY_ONLY") == "1"
     OFFLINE_DENY = ("\\device\\afd", "\\device\\netbt", "dnsresolver", "\\device\\tcp", "\\device\\udp",
                     "\\device\\rawip", "\\device\\ws2ifsl")
     denied = {}
@@ -715,6 +732,8 @@ def main():
                     struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
                     set_ctx(thread)
                     return True
+                if offline_entry_only:
+                    desc = None
             if desc and ("memory:" in desc or "CALLERS" in os.environ.get("X2W_TRACE", "")):
                 # Title-level callers: module addresses on the stack outside the system DLLs.
                 words = struct.unpack_from("<160Q", (read(rsp, 8 * 160) or b"").ljust(8 * 160, b"\0"))
@@ -729,8 +748,6 @@ def main():
         for description in returns.take(addr, tid, rsp):
             file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
             file_log.flush()
-        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
-        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         # After the final logged hit, let the restored instruction run at full speed unless
         # another hook still owns this breakpoint.
@@ -740,8 +757,9 @@ def main():
             retired.add(addr)
             set_ctx(thread)
             return True
-        # Step over the original instruction, then re-arm.
+        # Hold other threads while stepping over the original instruction.
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
         set_ctx(thread)
         write(addr, breakpoints[addr])
@@ -811,6 +829,80 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
+    def grab_window():
+        """The title's window as (width, height, BGRA bytes, title text length), or the reason there is none.
+
+        Runs on the capture thread as well as at the end of the run; every GDI object is released."""
+        user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+        found = []
+        proto = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+        def visit(hwnd, _):
+            owner = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(proto(visit), 0)
+        if not found:
+            return "no visible window"
+        hwnd = found[0]
+        rect = wt.RECT()
+        user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
+        width, height = min(rect.right, 1920), min(rect.bottom, 1080)
+        if width <= 0 or height <= 0:
+            return "empty client area"
+        user32.GetDC.restype = wt.HDC
+        gdi32.CreateCompatibleDC.restype = wt.HDC
+        gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+        source = user32.GetDC(wt.HWND(hwnd))
+        memory = gdi32.CreateCompatibleDC(wt.HDC(source))
+        bitmap = gdi32.CreateCompatibleBitmap(wt.HDC(source), width, height)
+        try:
+            gdi32.SelectObject(wt.HDC(memory), wt.HBITMAP(bitmap))
+            gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
+            header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+            pixels = (ctypes.c_ubyte * (width * height * 4))()
+            gdi32.GetDIBits(wt.HDC(memory), wt.HBITMAP(bitmap), 0, height, pixels, header, 0)
+            raw = bytes(pixels)
+        finally:
+            gdi32.DeleteObject(wt.HGDIOBJ(bitmap))
+            gdi32.DeleteDC(wt.HDC(memory))
+            user32.ReleaseDC(wt.HWND(hwnd), wt.HDC(source))
+        title = ctypes.create_unicode_buffer(128)
+        user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
+        return width, height, raw, len(title.value)
+
+    def capture_window():
+        """Saves what the title's window currently shows on screen (client area) as window.png."""
+        frame = grab_window()
+        if isinstance(frame, str):
+            print(f"  window capture: {frame}")
+            return
+        width, height, raw, title_length = frame
+        with open(os.path.join(logdir, "window.png"), "wb") as handle:
+            handle.write(png_bytes(width, height, raw))
+        print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {title_length})")
+
+    # --capture-every: a thread of its own grabs the window, so a slow capture never delays the debug events.
+    series = Series(logdir) if capture_every else None
+    capture_done = threading.Event()
+
+    def capture_loop():
+        while not capture_done.wait(capture_every):
+            try:
+                frame = grab_window()
+                if isinstance(frame, str):
+                    series.miss()
+                else:
+                    series.offer(time.time() - start, frame[0], frame[1], frame[2])
+            except Exception:  # diagnostics only: the run goes on, the tick is counted
+                series.miss()
+
+    capture_thread = threading.Thread(target=capture_loop, name="window-capture", daemon=True) if series else None
+    if capture_thread:
+        capture_thread.start()
     stop_requested = False
     stop_next = 0.0
     while not timeout or time.time() - start < timeout:
@@ -1104,61 +1196,10 @@ def main():
     else:
         print("  call tracing: off (runtime and movie-player call hooks; --trace-calls 1)")
 
-    def capture_window():
-        """Saves what the title's window currently shows on screen (client area) as window.png."""
-        import zlib
-        user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
-        found = []
-        proto = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-
-        def visit(hwnd, _):
-            owner = wt.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value == pi.dwProcessId and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-            return True
-
-        user32.EnumWindows(proto(visit), 0)
-        if not found:
-            print("  window capture: no visible window")
-            return
-        hwnd = found[0]
-        rect = wt.RECT()
-        user32.GetClientRect(wt.HWND(hwnd), ctypes.byref(rect))
-        width, height = min(rect.right, 1920), min(rect.bottom, 1080)
-        if width <= 0 or height <= 0:
-            print("  window capture: empty client area")
-            return
-        user32.GetDC.restype = wt.HDC
-        gdi32.CreateCompatibleDC.restype = wt.HDC
-        gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
-        source = user32.GetDC(wt.HWND(hwnd))
-        memory = gdi32.CreateCompatibleDC(wt.HDC(source))
-        bitmap = gdi32.CreateCompatibleBitmap(wt.HDC(source), width, height)
-        gdi32.SelectObject(wt.HDC(memory), wt.HBITMAP(bitmap))
-        gdi32.BitBlt(wt.HDC(memory), 0, 0, width, height, wt.HDC(source), 0, 0, 0x00CC0020)
-        header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
-        pixels = (ctypes.c_ubyte * (width * height * 4))()
-        gdi32.GetDIBits(wt.HDC(memory), wt.HBITMAP(bitmap), 0, height, pixels, header, 0)
-        raw = bytes(pixels)
-        rows = []
-        for y in range(height):
-            line = raw[y * width * 4:(y + 1) * width * 4]
-            rows.append(bytes(1) + bytes(b for i in range(0, len(line), 4) for b in (line[i + 2], line[i + 1], line[i])))
-
-        def chunk(kind, payload):
-            body = kind + payload
-            return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-
-        png = (bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) +
-               chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
-               chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
-        with open(os.path.join(logdir, "window.png"), "wb") as handle:
-            handle.write(png)
-        title = ctypes.create_unicode_buffer(128)
-        user32.GetWindowTextW(wt.HWND(hwnd), title, 128)
-        print(f"  window capture: {width}x{height} -> window.png (client area as on screen; title text length {len(title.value)})")
-
+    if capture_thread:
+        capture_done.set()
+        capture_thread.join(30)
+        print("  " + series.summary() + f" (every {capture_every:g} s, window_<sss>s.png, at most {FILE_CAP} files)")
     if exit_code is None:
         try:
             capture_window()
