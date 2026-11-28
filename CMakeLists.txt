@@ -5287,6 +5287,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME runtime_startup_triage_run_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_triage_run_cli_check.py")
     set_tests_properties(runtime_startup_triage_run_cli_check PROPERTIES TIMEOUT 60)
+    # Sanitized decoder of the MSVC C++ exception record (0xE06D7363) from synthetic memory (#1758).
+    add_test(NAME startup_msvc_throw_info COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_msvc_throw_info_check.py")
     add_test(NAME startup_run_ps1 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_run_ps1_check.py")
     # The Linux launcher's check exits 77 on Windows; the Ubuntu job runs it.
