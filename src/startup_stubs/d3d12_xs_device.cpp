@@ -180,6 +180,7 @@ struct alignas(16) WrapperOwn {
     // Fence: the completed value the title polls through the address from slot 12 (monitorx/mwaitx).
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
+    SRWLOCK fence_lock; // Serializes CPU/native fence observations and publication to the title address.
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
@@ -230,12 +231,14 @@ struct Wrapper {
 
 void fence_reached(Wrapper* fence, std::uint64_t value) noexcept
 {
+    AcquireSRWLockExclusive(&fence->own().fence_lock);
     LONG64 seen = fence->own().completed;
     while (static_cast<std::uint64_t>(seen) < value || seen == -1) {
         const LONG64 previous = InterlockedCompareExchange64(&fence->own().completed, static_cast<LONG64>(value), seen);
         if (previous == seen) break;
         seen = previous;
     }
+    ReleaseSRWLockExclusive(&fence->own().fence_lock);
 }
 
 // Descriptor heaps created over title memory: title CPU handles in [title, title + bytes) map to
@@ -4675,14 +4678,23 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 HRESULT __stdcall fence_signal(Wrapper* self, UINT64 value)
 {
     auto* fence = static_cast<ID3D12Fence*>(self->own().real);
+    AcquireSRWLockExclusive(&self->own().fence_lock);
     const HRESULT hr = fence->Signal(value);
-    // A CPU Signal is synchronous and may rewind the fence. Publish the desktop observation,
-    // including zero; a failed Signal must not advance the title's completed-value word.
-    if (SUCCEEDED(hr)) InterlockedExchange64(&self->own().completed, static_cast<LONG64>(fence->GetCompletedValue()));
+    // A CPU Signal is synchronous and may rewind the fence. Publish the desktop observation
+    // atomically with the native call, including zero; a failed Signal leaves it unchanged.
+    if (SUCCEEDED(hr))
+        InterlockedExchange64(&self->own().completed, static_cast<LONG64>(fence->GetCompletedValue()));
+    ReleaseSRWLockExclusive(&self->own().fence_lock);
     return hr;
 }
 // Fence slot 8, desktop GetCompletedValue().
-UINT64 __stdcall fence_completed_value(Wrapper* self) { return static_cast<UINT64>(self->own().completed); }
+UINT64 __stdcall fence_completed_value(Wrapper* self)
+{
+    AcquireSRWLockShared(&self->own().fence_lock);
+    const UINT64 value = static_cast<UINT64>(self->own().completed);
+    ReleaseSRWLockShared(&self->own().fence_lock);
+    return value;
+}
 // Fence slot 12 (Xbox order): (value, ptr, flag) -> address of the completed value, which the title
 // reads and waits on directly; all ones there means device removed.
 volatile LONG64* __stdcall fence_completed_address(Wrapper* self, u64 value, u64 r8, u64 r9)

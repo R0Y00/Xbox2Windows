@@ -5,9 +5,11 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -101,6 +103,36 @@ int main(int argc, char** argv)
     if (!shadow) return 4;
 
     unsigned failures = 0;
+
+    // Two callers cross a barrier, then each Signal its own value. The fixture repeats this
+    // so a stale post-call observation cannot disagree with the native fence or method.
+    unsigned concurrent_failures = 0;
+    for (unsigned pair = 0; pair < 128; ++pair) {
+        std::atomic<unsigned> ready{};
+        std::atomic<bool> go{};
+        auto caller = [&](UINT64 value) {
+            ++ready;
+            while (!go.load()) std::this_thread::yield();
+            if (FAILED(invoke(fence.Get(), 10, value))) ++concurrent_failures;
+        };
+        std::thread one(caller, UINT64{1});
+        std::thread two(caller, UINT64{2});
+        while (ready.load() != 2) std::this_thread::yield();
+        go.store(true);
+        one.join();
+        two.join();
+
+        const UINT64 native = real->GetCompletedValue();
+        const UINT64 direct = static_cast<UINT64>(*shadow);
+        const UINT64 observed = invoke<UINT64>(fence.Get(), 8);
+        if (native != direct || native != observed) ++concurrent_failures;
+    }
+    const UINT64 concurrent_native = real->GetCompletedValue();
+    std::printf("concurrent CPU signals: native=%llu method=%llu address=%llu %s\n",
+                concurrent_native, invoke<UINT64>(fence.Get(), 8),
+                static_cast<UINT64>(*shadow), concurrent_failures ? "FAIL" : "PASS");
+    failures += concurrent_failures ? 1 : 0;
+
     for (const UINT64 value : {UINT64{9}, UINT64{2}, UINT64{0}, UINT64{7}}) {
         if (FAILED(invoke(fence.Get(), 10, value))) return 5;
         const UINT64 native = real->GetCompletedValue();

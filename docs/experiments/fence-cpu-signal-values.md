@@ -14,6 +14,9 @@ also explicitly permits rewinding a fence. The shim previously applied an
 atomic maximum and published the requested value even if the desktop call
 failed. It now updates the cached word from the desktop observation after a
 successful CPU signal; a failed call leaves the word unchanged.
+Each fence serializes the native CPU signal, desktop observation and cached
+publication with a fence-local SRW lock. A later or equal callback retains the
+existing value through the same publication path.
 
 ## Reproduction
 
@@ -47,8 +50,8 @@ debug layer reported enabled in every run.
 On the unmodified base, WARP reported native values `9, 2, 0, 7`, but the shim
 method and cached word remained `9, 9, 9, 9`. With the fix, both registered fence
 tests passed. The existing `startup_queue_wait_warp` test also passed. These
-results cover the CPU signal contract, not full startup or concurrent signals
-from multiple producers. A failed desktop signal was not induced in this run.
+results cover the CPU signal contract and a two-caller barrier regression, not
+full startup or queued signals. A failed desktop signal was not induced in this run.
 
 ## Separate queued rewind limitation
 
@@ -82,5 +85,6 @@ can retain an earlier larger target, run after a successful CPU rewind, then
 publish that old target over the CPU value through `fence_reached`. This
 interleaving was identified from the callback path and was not induced in this
 run. The passing CPU tests create no queue and make no claim about pending
-callbacks or concurrent producers. The shim completion method still reads the
-cached word; this patch adds no live desktop read or lock to that method.
+callbacks or concurrent CPU and queue producers. The shim completion method
+reads the lock-protected cached word; direct address reads remain atomically
+published by the same fence-local lock on success.
