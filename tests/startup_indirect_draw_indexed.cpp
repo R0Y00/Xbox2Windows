@@ -1763,6 +1763,8 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
 #include "startup_indirect_mesh_lease.inl"
 }  // namespace
 
+#include "startup_mesh_argument_provenance.inl"
+
 int main(int argc, char** argv) try
 {
     DrawKind kind = DrawKind::indexed;
@@ -1807,7 +1809,8 @@ int main(int argc, char** argv) try
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
-    else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
+    else if (lease_arguments || console_mesh || desktop_as || (argc == 3 &&
+        (std::strcmp(argv[2], "mesh") == 0 || std::strcmp(argv[2], "mesh-provenance") == 0)))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
     else if (argc != 2 && !count_control && !translated_indexed && !lease_writer) return 2;
@@ -2439,6 +2442,9 @@ int main(int argc, char** argv) try
     const D3D12_COMMAND_SIGNATURE_DESC signature_desc{command_stride(kind), 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
     check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest draw signature");
+
+    if (argc == 3 && std::strcmp(argv[2], "mesh-provenance") == 0)
+        return check_mesh_argument_provenance(device.Get(), guest.Get(), graphics.Get(), pso.Get(), signature.Get()) ? 0 : 1;
 
     if (lease_arguments) {
         if (!lease_fixture) return 2;
