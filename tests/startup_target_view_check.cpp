@@ -56,5 +56,18 @@ int main() {
     expect(check_uav(&u,&b,&b,repair)==Refusal::counter, "unstructured counter");
     expect(check_uav(&u,nullptr,&b,repair)==Refusal::counter, "counter without resource");
     expect(check<D3D12_DEPTH_STENCIL_VIEW_DESC>(nullptr,&r,repair)==Refusal::format, "default depth format");
+    // Plane views of planar video resources keep the plane's own format; any other format is repaired.
+    D3D12_RESOURCE_DESC video = r; video.Format = DXGI_FORMAT_NV12; video.DepthOrArraySize = 1;
+    D3D12_RENDER_TARGET_VIEW_DESC pv{}; pv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    pv.Format = DXGI_FORMAT_R8_UNORM; pv.Texture2D = {0, 0}; auto pv_saved = pv;
+    expect(check(&pv, &video, repair) == Refusal::none && !std::memcmp(&pv, &pv_saved, sizeof(pv)), "NV12 plane 0 view");
+    pv.Format = DXGI_FORMAT_R8G8_UNORM; pv.Texture2D.PlaneSlice = 1; pv_saved = pv;
+    expect(check(&pv, &video, repair) == Refusal::none && !std::memcmp(&pv, &pv_saved, sizeof(pv)), "NV12 plane 1 view");
+    pv.Format = DXGI_FORMAT_R8_UNORM;
+    expect(check(&pv, &video, repair) == Refusal::none && pv.Format == DXGI_FORMAT_NV12, "NV12 plane 1 with the plane 0 format");
+    video.Format = DXGI_FORMAT_P010; pv.Format = DXGI_FORMAT_R16G16_UNORM; pv_saved = pv;
+    expect(check(&pv, &video, repair) == Refusal::none && !std::memcmp(&pv, &pv_saved, sizeof(pv)), "P010 plane 1 view");
+    pv.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    expect(check(&pv, &video, repair) == Refusal::none && pv.Format == DXGI_FORMAT_P010, "P010 unrelated format repaired");
     return failures ? 1 : 0;
 }

@@ -55,6 +55,17 @@ inline bool format_cast_fits(DXGI_FORMAT resource, DXGI_FORMAT view, bool fully_
     return !((from == NumericFormat::snorm && to == NumericFormat::unorm) ||
              (from == NumericFormat::unorm && to == NumericFormat::snorm));
 }
+// Plane views of a planar video resource name the plane's own format, not the resource format (NV12 plane 0
+// R8_UNORM, plane 1 R8G8_UNORM; P010/P016 plane 0 R16_UNORM, plane 1 R16G16_UNORM), which is outside the resource's
+// typeless family and must pass through unchanged.
+inline bool planar_view_fits(DXGI_FORMAT resource, DXGI_FORMAT view, UINT plane)
+{
+    if (resource == DXGI_FORMAT_NV12)
+        return plane == 0 ? view == DXGI_FORMAT_R8_UNORM : plane == 1 && view == DXGI_FORMAT_R8G8_UNORM;
+    if (resource == DXGI_FORMAT_P010 || resource == DXGI_FORMAT_P016)
+        return plane == 0 ? view == DXGI_FORMAT_R16_UNORM : plane == 1 && view == DXGI_FORMAT_R16G16_UNORM;
+    return false;
+}
 enum class Refusal { none, null_desc, dimension, mip, array, format, counter, plane };
 inline const char* reason(Refusal r) {
     switch (r) {
@@ -126,7 +137,8 @@ Refusal check(Desc* v, const D3D12_RESOURCE_DESC* r, Repair repair, bool typed_c
     // the view is refused; a typeless depth family member (R32_TYPELESS) is cast by format_cast_fits.
     bool special_buffer = false;
     if constexpr (uav) special_buffer = p.buffer && (v->Buffer.StructureByteStride || v->Buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW);
-    if ((!allowed(v->Format) && !special_buffer) || (r && !p.buffer && !format_cast_fits(r->Format, v->Format, typed_cast))) {
+    if ((!allowed(v->Format) && !special_buffer) || (r && !p.buffer && !format_cast_fits(r->Format, v->Format, typed_cast) &&
+                       !planar_view_fits(r->Format, v->Format, p.plane ? *p.plane : 0))) {
         if (!r || !allowed(r->Format)) return Refusal::format;
         repair("Format", static_cast<UINT64>(v->Format), static_cast<UINT64>(r->Format)); v->Format = r->Format;
     }

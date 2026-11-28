@@ -120,6 +120,14 @@ def store(directory, consumer, dxc, env):
     assert not wrong, 'occupied slot: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
     assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
 
+    # A view format outside the texture's family is repaired at creation; the Dispatch recreates the view from the
+    # repaired description, so the texture is written and the debug layer stays silent.
+    got, result = run(directory, consumer, env, 'texture-store-viewfmt', layout)
+    wrong = [i for i in range(halves) if got[i] != expected[i]]
+    assert not wrong, 'repaired view: half=%d (%d halves differ)\n%s' % (wrong[0], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr[-3000:]
+    clean(result)
+
     # The same when the live token reached the slot by a memory copy in title memory instead of a creation there.
     got, result = run(directory, consumer, env, 'texture-store-copied', layout)
     wrong = [i for i in range(halves) if got[i] != expected[i]]

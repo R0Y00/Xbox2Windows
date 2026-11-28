@@ -580,6 +580,9 @@ static int texture_slot67(void* device, const std::string& mode)
     } else {
         view.Texture2D.MipSlice = swapped ? 1 : 0;
     }
+    // texture-store-viewfmt names a format outside the texture's family: the stand-in repairs it, and its dispatch
+    // must recreate the view with the repaired description.
+    if (mode == "texture-store-viewfmt") view.Format = DXGI_FORMAT_R32_FLOAT;
     if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
     if (mode == "texture-store-copied") {
         // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a

@@ -5044,11 +5044,14 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         if constexpr (N == 18) retire_leave_class(reinterpret_cast<const void*>(a), RetireLeft::view);
         return 0;
     }
-    const auto record_view = [&](bool materialized) {
+    const auto record_view = [&](bool materialized, const void* checked = nullptr) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
         const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
-        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
+        // A repaired description is what the desktop device saw: the record keeps it, so a later recreation
+        // (translated dispatch) does not forward the original, invalid one again.
+        note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0,
+                  checked ? checked : reinterpret_cast<const void*>(raw[described]),
                   described_bytes, title_dest, args[D], materialized);
     };
     const char* skip = nullptr;
@@ -5139,6 +5142,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     // The view descriptions of slots 18-21 start with a DXGI_FORMAT.
     alignas(D3D12_SHADER_RESOURCE_VIEW_DESC) unsigned char desc_copy[64];
     const int desc_index = N == 19 ? 2 : 1;
+    const void* checked_desc = nullptr;  // the repaired UAV/RTV/DSV description the record must keep
     constexpr std::size_t view_bytes = N == 18 ? sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) :
         N == 19 ? sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) :
         N == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC) : sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC);
@@ -5235,6 +5239,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         if (view) {
             std::memcpy(desc_copy, view, sizeof(*view));
             args[desc_index] = reinterpret_cast<u64>(desc_copy);
+            checked_desc = desc_copy;
         }
     }
     const LONG removed_before = removal_reported;
@@ -5244,7 +5249,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     // reference and adds none.
     const HRESULT removed = removal_device ? removal_device->GetDeviceRemovedReason() : S_OK;
     const bool created = SUCCEEDED(removed);
-    record_view(created);
+    record_view(created, checked_desc);
     if (!created) {
         static LONG failed;
         if (first_calls(failed, 6))
