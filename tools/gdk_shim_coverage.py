@@ -6,12 +6,13 @@ signature and not a test: this matrix prioritizes work, it does not claim full
 coverage.
 
 Commands:
-  report --exports <json> --repo <Xbox2Windows> [--json <out>] [--markdown <out>]
-  report --exports <json> --def xmem=src/xmem_shim.def ... [--json <out>]
+  --exports <json> --repo <Xbox2Windows> [--json <out>] [--markdown <out>]
+  --exports <json> --def xmem=src/xmem_shim.def ... [--json <out>]
 """
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -42,14 +43,21 @@ def read_def(path):
             continue
         if text.upper() == "EXPORTS":
             continue
-        name = text.split("=", 1)[0].split()[0]
+        fields = text.split("=", 1)[0].split()
+        if not fields:
+            continue
+        name = fields[0]
         ordinal = None
-        if "@" in name:
-            name, _, ordinal_text = name.partition("@")
-            try:
-                ordinal = int(ordinal_text)
-            except ValueError:
-                ordinal = None
+        match = re.fullmatch(r"(.+)@(\d+)", name)
+        if match:
+            name, ordinal_text = match.groups()
+            ordinal = int(ordinal_text)
+        else:
+            for token in text.split():
+                match = re.fullmatch(r"@(\d+)", token)
+                if match:
+                    ordinal = int(match.group(1))
+                    break
         if not name or name == "PRIVATE":
             continue
         if "DATA" in text.split():
@@ -60,6 +68,14 @@ def read_def(path):
     return {"names": names, "ordinals": ordinals, "data": data}
 
 
+def normalize_module(name):
+    name = Path(name).stem.lower()
+    for suffix in (".lib", ".dll"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
 def load_exports(document):
     if isinstance(document, list):
         modules = document
@@ -67,17 +83,19 @@ def load_exports(document):
         modules = document.get("modules") or [document]
     result = {}
     for module in modules:
-        stem = Path(module["file"]).stem.lower()
+        stem = normalize_module(module.get("module") or Path(module["file"]).stem)
         entry = result.get(stem)
         if entry is None:
-            entry = {"file": module["file"], "exports": []}
+            entry = {"file": module["file"], "exports": [], "errors": []}
             result[stem] = entry
+        if module.get("error"):
+            entry["errors"].append(module["error"])
         entry["exports"].extend(module.get("exports", []))
     return result
 
 
 def find_module(modules, name):
-    return modules.get(name.lower())
+    return modules.get(normalize_module(name))
 
 
 def rows_for(args):
@@ -99,6 +117,29 @@ def rows_for(args):
         shim = read_def(def_path)
         gdk = find_module(modules, module)
         if gdk is None:
+            rows.append(
+                {
+                    "module": module,
+                    "gdk_lib": None,
+                    "def": str(def_path),
+                    "gdk_exports": 0,
+                    "gdk_functions": 0,
+                    "gdk_data": 0,
+                    "shim_exports": len(shim["names"]),
+                    "shim_functions": len(shim["names"]),
+                    "shim_data": len(shim["data"]),
+                    "covered_functions": 0,
+                    "covered_data": 0,
+                    "missing_functions": [],
+                    "missing_data": [],
+                    "extra": [],
+                    "ordinals": {},
+                    "def_ordinals": {
+                        name: shim["ordinals"][name] for name in sorted(shim["ordinals"])
+                    },
+                    "unmeasured": "no inventory entry",
+                }
+            )
             continue
         gdk_names = {item["name"] for item in gdk["exports"] if item.get("name")}
         gdk_functions = {name for name in gdk_names if not is_data(name)}
@@ -112,28 +153,29 @@ def rows_for(args):
             for item in gdk["exports"]
             if item.get("name") and item.get("ordinal") is not None
         }
-        rows.append(
-            {
-                "module": module,
-                "gdk_lib": gdk["file"],
-                "def": str(def_path),
-                "gdk_exports": len(gdk_names),
-                "gdk_functions": len(gdk_functions),
-                "gdk_data": len(gdk_data),
-                "shim_exports": len(shim["names"]),
-                "shim_functions": len(shim_functions),
-                "shim_data": len(shim_data),
-                "covered_functions": len(gdk_functions & shim_functions),
-                "covered_data": len(gdk_data & shim_data),
-                "missing_functions": missing_functions,
-                "missing_data": missing_data,
-                "extra": sorted(shim["names"] - gdk_names),
-                "ordinals": {name: ordinals[name] for name in sorted(ordinals)},
-                "def_ordinals": {
-                    name: shim["ordinals"][name] for name in sorted(shim["ordinals"])
-                },
-            }
-        )
+        row = {
+            "module": module,
+            "gdk_lib": gdk["file"],
+            "def": str(def_path),
+            "gdk_exports": len(gdk_names),
+            "gdk_functions": len(gdk_functions),
+            "gdk_data": len(gdk_data),
+            "shim_exports": len(shim["names"]),
+            "shim_functions": len(shim_functions),
+            "shim_data": len(shim_data),
+            "covered_functions": len(gdk_functions & shim_functions),
+            "covered_data": len(gdk_data & shim_data),
+            "missing_functions": missing_functions,
+            "missing_data": missing_data,
+            "extra": sorted(shim["names"] - gdk_names),
+            "ordinals": {name: ordinals[name] for name in sorted(ordinals)},
+            "def_ordinals": {
+                name: shim["ordinals"][name] for name in sorted(shim["ordinals"])
+            },
+        }
+        if gdk["errors"]:
+            row["unmeasured"] = "; ".join(gdk["errors"])
+        rows.append(row)
     return rows
 
 
@@ -141,14 +183,20 @@ def render_markdown(rows):
     lines = [
         "# GDK export coverage of the Xbox2Windows shims",
         "",
-        "| Module | GDK functions | Shim functions | Covered | Missing |",
-        "|---|---:|---:|---:|---:|",
+        "| Module | GDK functions | Shim functions | Covered | Missing | Status |",
+        "|---|---:|---:|---:|---:|---|",
     ]
     for row in rows:
+        unmeasured = row.get("unmeasured")
+        data = dict(row)
+        data.update(
+            missing="?" if unmeasured else len(row["missing_functions"]),
+            gdk_functions="?" if unmeasured else row["gdk_functions"],
+            covered_functions="?" if unmeasured else row["covered_functions"],
+            status=unmeasured or "ok",
+        )
         lines.append(
-            "| {module} | {gdk_functions} | {shim_functions} | {covered_functions} | {missing} |".format(
-                missing=len(row["missing_functions"]), **row
-            )
+            "| {module} | {gdk_functions} | {shim_functions} | {covered_functions} | {missing} | {status} |".format(**data)
         )
     lines += [
         "",
@@ -160,6 +208,10 @@ def render_markdown(rows):
     for row in rows:
         lines.append("## " + row["module"])
         lines.append("")
+        if row.get("unmeasured"):
+            lines.append("Unmeasured: " + row["unmeasured"])
+            lines.append("")
+            continue
         lines.append(
             "Missing functions: "
             + (", ".join(row["missing_functions"]) if row["missing_functions"] else "none")
@@ -196,7 +248,8 @@ def main(argv=None):
         Path(args.markdown).write_text(markdown + "\n", encoding="utf-8")
     print(markdown)
     missing = sum(len(row["missing_functions"]) for row in rows)
-    return 1 if args.fail_on_missing and missing else 0
+    unmeasured = sum(1 for row in rows if row.get("unmeasured"))
+    return 1 if args.fail_on_missing and (missing or unmeasured) else 0
 
 
 if __name__ == "__main__":

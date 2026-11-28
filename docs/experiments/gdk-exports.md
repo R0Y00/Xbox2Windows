@@ -5,6 +5,11 @@ an inventory with module, file, SHA-256, export name, ordinal and RVA.
 tools/gdk_shim_coverage.py compares that inventory with the Xbox2Windows .def
 files and writes a JSON matrix plus a Markdown table.
 
+The SHA-256 identifies the captured .txt when parse-dumpbin is used, and the
+DLL when scan-pe is used. A module with no inventory entry, a capture with zero
+exports, or a partially parsed capture is reported as unmeasured;
+--fail-on-missing fails on those rows as well as on missing names.
+
 The GDK libraries and the full inventory stay outside the repository. The
 inventory used for the 261000 edition has 89 modules and 8,035 export names.
 When a module has both a .lib and a .dll, the coverage tool merges their exports
@@ -16,15 +21,15 @@ and deduplicates the names, so d3d12_xs reports the union of the two files.
 
 Measured on 28 November 2026 with the 261000 LIB/DLL set:
 
-| Module | GDK functions | Shim functions | Covered | Missing |
-|---|---:|---:|---:|---:|
-| xmem | 36 | 27 | 13 | 23 |
-| d3d12_xs | 28 | 5 | 4 | 24 |
-| acphal | 10 | 10 | 9 | 1 |
-| xapu | 6 | 6 | 5 | 1 |
-| chad | 7 | 5 | 5 | 2 |
-| xg_xs | 27 | 2 | 2 | 25 |
-| xcrdapi | 1 | 3 | 1 | 0 |
+| Module | GDK functions | Shim functions | Covered | Missing | Status |
+|---|---:|---:|---:|---:|---|
+| xmem | 36 | 27 | 13 | 23 | ok |
+| d3d12_xs | 28 | 5 | 4 | 24 | ok |
+| acphal | 10 | 10 | 9 | 1 | ok |
+| xapu | 6 | 6 | 5 | 1 | ok |
+| chad | 7 | 5 | 5 | 2 | ok |
+| xg_xs | 27 | 2 | 2 | 25 | ok |
+| xcrdapi | 1 | 3 | 1 | 0 | ok |
 
 The xg_xs gap remains the largest: layout computation, DCC, tile shapes,
 hardware-version setup and descriptor validation are not exported by the shim.
