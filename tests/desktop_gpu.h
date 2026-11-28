@@ -26,11 +26,14 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false,
-                            UINT first_mip = 0, UINT view_levels = 0);
+                            UINT first_mip = 0, UINT view_levels = 0, UINT mip_base = 4, bool cube = false);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                   bool depth16, std::uint32_t words[64], bool array = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4]);
+                              const std::uint32_t expected[4], unsigned coverage = 1);
+// Queries colour formats and returns "typed_uav_load_refused" when one has no typed UAV load, before any draw.
+// Returns nullptr only when the refusal helper itself accepts a cleared UAV_TYPED_LOAD bit.
+const char* check_startup_image_store_typed_load(ID3D12Device* device);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
@@ -46,6 +49,7 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
                         bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
+int check_compute_waterfall_oracle(ID3D12Device* device, const char* shader_path);
 struct ComputeReadbackProgram {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;

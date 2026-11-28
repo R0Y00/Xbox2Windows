@@ -1041,6 +1041,12 @@ OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_waterfall_oracle(const OperationContext& ctx)
+{
+    check_compute_waterfall_oracle(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_bvh_differential(const OperationContext& ctx)
 {
     return skip_if_false(check_bvh_differential(ctx.device, false));
@@ -1329,7 +1335,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
 // third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
-// mip levels whose cells all differ (tests/startup_image_3d.cpp).
+// mip levels whose cells all differ (tests/startup_image_3d.cpp). --startup-image-cube binds six 4x4 faces as a
+// TextureCube whose 96 texels all differ (#2943); z is passed through as for the other modes.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
@@ -1337,6 +1344,7 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     const bool array = array_mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
     const bool one_dimensional = one_dimensional_mips || std::strcmp(ctx.argv[2], "--startup-image-1d") == 0;
     const bool two_dimensional = std::strcmp(ctx.argv[2], "--startup-image-2d") == 0;
+    const bool cube = std::strcmp(ctx.argv[2], "--startup-image-cube") == 0;
     float z = 0.0f;
     if (two_dimensional && ctx.argv[5][0] == '0' && (ctx.argv[5][1] == 'x' || ctx.argv[5][1] == 'X')) {
         char* end = nullptr;
@@ -1353,7 +1361,7 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     float color[4]{};
     const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
     check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array,
-                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional);
+                           array_mips || one_dimensional_mips ? 3 : 1, one_dimensional, two_dimensional, 0, 0, 4, cube);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1364,16 +1372,32 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest line> <first/count> prints one RGBA32F pixel.
+// --startup-image-2d-view <vs.cso> <ps.cso> <sampler manifest> <first/count> [0|1] [8] prints one RGBA32F pixel.
+// The optional selector is forwarded as the second root constant. The final 8 requests an 8x8 mip base.
+// --startup-image-2d-array-view uses the two-slice renderer with the default 4x4 base.
 OperationResult run_startup_image_2d_view(const OperationContext& ctx)
 {
     const std::string_view window = ctx.argv[6];
     if (window.size() != 3 || window[1] != '/' || window[0] < '0' || window[0] > '2' ||
         window[2] < '1' || window[2] > '3')
         return {OutcomeKind::fail, "expected a first/count mip window on a three-mip texture"};
+    const bool array = std::strcmp(ctx.argv[2], "--startup-image-2d-array-view") == 0;
+    float selector = 0.0f;
+    if (ctx.argc >= 8) {
+        if (std::strcmp(ctx.argv[7], "1") == 0)
+            selector = 1.0f;
+        else if (std::strcmp(ctx.argv[7], "0") != 0)
+            return {OutcomeKind::fail, "view selector must be 0 or 1"};
+    }
+    UINT mip_base = 4;
+    if (ctx.argc == 9) {
+        if (std::strcmp(ctx.argv[8], "8") != 0)
+            return {OutcomeKind::fail, "2D mip base must be 8"};
+        mip_base = 8;
+    }
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], 0, color, ctx.argv[5], false, 3, false, true,
-                           UINT(window[0] - '0'), UINT(window[2] - '0'));
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], selector, color, ctx.argv[5], array, 3, false, !array,
+                           UINT(window[0] - '0'), UINT(window[2] - '0'), mip_base);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     std::printf("view_rgba=%08x,%08x,%08x,%08x\n", bits[0], bits[1], bits[2], bits[3]);
@@ -1416,18 +1440,29 @@ OperationResult run_startup_image_load_d16(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits>: the translated pixel stage stores to
-// u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and every other texel -1.0.
+// --startup-image-store <vs.cso> <ps.cso> <x,y> <expected rgba bits> [coverage]: the translated pixel
+// stage stores to u0 (tests/startup_image_store.cpp); texel (x, y) must hold the four hex words and
+// every other texel -1.0. Coverage is 1 (one pixel) or 2 (two pixels in one draw).
 OperationResult run_startup_image_store(const OperationContext& ctx)
 {
-    unsigned x = 0, y = 0;
+    unsigned x = 0, y = 0, coverage = 1;
     std::uint32_t expected[4]{};
     if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
-    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+    if (ctx.argc == 8 && (std::sscanf(ctx.argv[7], "%u", &coverage) != 1 || (coverage != 1 && coverage != 2)))
+        return {OutcomeKind::fail, "coverage is not 1 or 2"};
+    if (check_startup_image_store(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected, coverage))
         return {OutcomeKind::fail, "image store readback differs"};
     return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-store-reject-load: a colour format without typed UAV load is refused before any draw.
+OperationResult run_startup_image_store_reject_load(const OperationContext& ctx)
+{
+    if (const char* reason = check_startup_image_store_typed_load(ctx.device))
+        return {OutcomeKind::fail, reason};
+    return {OutcomeKind::fail, "typed UAV load negative control found no refusal"};
 }
 
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
@@ -1518,6 +1553,23 @@ OperationResult run_startup_pixel_words(const OperationContext& ctx)
         return {OutcomeKind::fail, "pixel readback differs"};
     }
     std::printf("all %lu pixels matched\n", width * height);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-pixel-dump <vs.cso> <ps.cso> <width> <height> <out.bin>: the draw of --startup-pixel-words, but the
+// readback is written to the file (width * height * 4 little-endian words, row by row) for the caller to check.
+// Gated on wave operations: the caller's pixel stage reads its own lane and wave (tests that need a reference
+// per desktop wave, which only the readback can tell).
+OperationResult run_startup_pixel_dump(const OperationContext& ctx)
+{
+    const unsigned long width = pixel_extent(ctx.argv[5]), height = pixel_extent(ctx.argv[6]);
+    std::vector<std::uint32_t> pixels(size_t(width) * height * 4);
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    std::ofstream file(ctx.argv[7], std::ios::binary);
+    file.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(std::uint32_t)));
+    if (!file)
+        return {OutcomeKind::fail, "cannot write the readback file"};
+    std::printf("wrote %lu pixels\n", width * height);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1674,7 +1726,10 @@ constexpr CapabilityGate kGateSm66MinLod{
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
 // remain inside the handlers and report OutcomeKind::skip.
+OperationResult run_serve(const OperationContext& ctx);
+
 const OperationSpec kOperations[] = {
+    {"--serve", 3, 3, nullptr, kNoGate, run_serve},
     {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
     {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_batch},
     {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
@@ -1700,11 +1755,14 @@ const OperationSpec kOperations[] = {
     {"--startup-image-1d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-1d-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-view", 7, 9, nullptr, kNoGate, run_startup_image_2d_view},
+    {"--startup-image-2d-array-view", 7, 8, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
-    {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store", 7, 8, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-store-reject-load", 3, 3, nullptr, kNoGate, run_startup_image_store_reject_load},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-cube", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-sharedexp-target", 3, 3, nullptr, kNoGate, run_startup_sharedexp_target},
@@ -1712,6 +1770,7 @@ const OperationSpec kOperations[] = {
     {"--startup-entry-words", 7, 7, nullptr, kNoGate, run_startup_entry_words},
     {"--startup-pixel-words", 8, 8, validate_pixel_words_args, kNoGate, run_startup_pixel_words},
     {"--raster-reference", 10, 10, validate_raster_args, kNoGate, run_startup_pixel_words},
+    {"--startup-pixel-dump", 8, 8, validate_pixel_words_args, kGateShaderWave, run_startup_pixel_dump},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1783,6 +1842,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
+    {"--compute-waterfall-oracle", 4, 4, nullptr, kNoGate, run_compute_waterfall_oracle},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
     {"--bvh-hits", 3, 3, nullptr, kGateSm65, run_bvh_hits},
@@ -1954,6 +2014,60 @@ int run_operation_spec(const OperationSpec& spec, const OperationContext& ctx, D
         return 1;
     }
     return 1;
+}
+
+// --serve: any other operation, case after case, on this one device. A test that checks hundreds of shader pairs starts one
+// process and creates the D3D12 device once instead of once per case. After the banner it prints the marker pair for case -1 (the banner text), then
+// reads one case per stdin line: the operation and its operands separated by tabs, exactly the arguments that follow the
+// adapter name in a one-shot call. Each case runs through the same argument validation, capability gate, debug-layer check
+// and exit-code mapping as a one-shot call (0 pass, 1 failure, 77 skip, 2 bad arguments); its stdout and stderr text is
+// whatever the one-shot call prints. Both streams end the case with a marker line ("X2WEND <index>" on stderr, then
+// "X2WCASE <index> <exit code>" on stdout) so the client can split the text per case. The line "--end" or closing stdin ends the loop; a removed
+// device ends it with exit code 1 after answering, and the client starts a new process.
+OperationResult run_serve(const OperationContext& ctx)
+{
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "X2WEND -1\n");           // the banner printed so far; the client repeats it in front of every case, as a one-shot call prints it
+    std::printf("X2WCASE -1 0\n");
+    std::fflush(stdout);
+    std::vector<char> buffer(65536);
+    for (int index = 0; std::fgets(buffer.data(), int(buffer.size()), stdin); ++index) {
+        std::string line(buffer.data());
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line == "--end") break;                 // an explicit end: not every launcher (a Wine wrapper) passes the end of stdin on
+        std::vector<std::string> field{ctx.argv[0], std::string(ctx.mode)};
+        for (std::size_t start = 0;;) {
+            const auto tab = line.find('\t', start);
+            field.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+            if (tab == std::string::npos) break;
+            start = tab + 1;
+        }
+        std::vector<char*> argv;
+        for (auto& f : field) argv.push_back(f.data());
+        int code = 2;
+        const bool nested = field.size() >= 3 && field[2] != "--serve";
+        if (nested) {
+            const CliResolution cli = resolve_cli(int(argv.size()), argv.data());
+            if (cli.action == CliAction::operation) {
+                const OperationContext inner{ctx.device, ctx.messages, ctx.caps, ctx.mode, int(argv.size()), argv.data(), nullptr};
+                code = run_operation_spec(*cli.spec, inner);
+            }
+        } else {
+            std::fprintf(stderr, "--serve takes an operation and its operands, one case per line\n");
+        }
+        if (ctx.messages) ctx.messages->ClearStoredMessages();
+        const bool removed = FAILED(ctx.device->GetDeviceRemovedReason());
+        if (removed) {
+            std::fprintf(stderr, "device removed during case %d\n", index);
+            code = 1;
+        }
+        std::fflush(stdout);
+        std::fprintf(stderr, "X2WEND %d\n", index);
+        std::printf("X2WCASE %d %d\n", index, code);
+        std::fflush(stdout);
+        if (removed) return {OutcomeKind::fail, "device removed"};
+    }
+    return {OutcomeKind::pass, nullptr};
 }
 
 int run_self_test()

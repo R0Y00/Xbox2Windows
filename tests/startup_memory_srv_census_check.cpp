@@ -5,6 +5,7 @@
 #include "startup_stubs/memory_srv_as.h"
 #include "startup_stubs/memory_srv_census.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -35,6 +36,26 @@ template <class Census> std::vector<std::string> lines(Census& census, bool only
 int main()
 {
     using namespace x2w_startup;
+    {
+        // The cause texture_unavailable names (d3d12_memory_srv.inl, texture_unavailable_reason). A lookup that never tried to
+        // publish is a missing resource whatever the size; a layout over the 64 MiB single-copy limit is named by size and
+        // never touches its pages; within the limit unreadable texels and an unexplained failure stay apart.
+        bool touched = false;
+        const auto readable = [&](bool value) { return [&touched, value] { touched = true; return value; }; };
+        const std::uint64_t limit = max_published_texture_bytes;
+        check("limit is 64 MiB", limit == 64ull << 20);
+        check("no publication: no resource", !std::strcmp(texture_unavailable_cause(false, 0, readable(true)), "texture_no_resource"));
+        check("no publication, huge layout: still no resource", !std::strcmp(texture_unavailable_cause(false, limit + 1, readable(false)), "texture_no_resource"));
+        touched = false;
+        check("over the limit: named by size", !std::strcmp(texture_unavailable_cause(true, limit + 1, readable(true)), "texture_over_64mib"));
+        check("over the limit: the pages are not touched", !touched);
+        check("over the limit and unreadable: still size", !std::strcmp(texture_unavailable_cause(true, limit + 1, readable(false)), "texture_over_64mib"));
+        check("exactly the limit is within it", !std::strcmp(texture_unavailable_cause(true, limit, readable(false)), "texture_unreadable"));
+        check("within the limit, readable: other failure", !std::strcmp(texture_unavailable_cause(true, 4096, readable(true)), "texture_unavailable"));
+        check("within the limit, unreadable texels", !std::strcmp(texture_unavailable_cause(true, 4096, readable(false)), "texture_unreadable"));
+        for (const char* name : {"texture_no_resource", "texture_unreadable", "texture_over_64mib"})
+            check("each cause has its own census reason", memory_srv_reason_index(name) < memory_srv_reason_count);
+    }
     MemorySrvCensus srv;
     const auto a = texture(64, DXGI_FORMAT_BC1_UNORM, 7);
     check("first shape is detailed", srv.note("unsupported_description", &a));
@@ -80,7 +101,7 @@ int main()
     check("summary", !report.empty() && report[0] ==
           "x2w-d3d12 memory SRV refusals (slot 70): total 138; null_destination 1, unreadable_resource 0, unreadable_view 0, "
           "null_address 1, unsupported_description 133, destination_outside_view_heaps 0, gpu_written_resource 0, "
-          "as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 1, texture_unavailable 1, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
+          "as_unaligned 0, as_not_placed 0, as_wrong_state 0, buffer_unavailable 1, texture_unavailable 1, texture_no_resource 0, texture_unreadable 0, texture_over_64mib 0, partial_tile_xg_rows 0, partial_tile_beyond_xg_size 0, unsupported_desktop_format 0, "
           "console_layout_xg_rows 0, console_layout_without_footprints 0, console_layout_beyond_xg_size 0, overlapping_resource 0, "
           "other 1; distinct shapes 128 (calls past the shape table 5)");
     check("first shape line", report.size() > 1 && report[1] ==
