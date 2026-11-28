@@ -4,6 +4,8 @@ The pixel stage loads an 8-dword image descriptor and an image instruction uses 
 size fields lower to GetDimensions(0) on that texture. WIDTH minus one is split into word 1 bits 31:30 and
 word 2 bits 11:0. HEIGHT minus one is word 2 bits 27:14. DEPTH minus one is word 4 bits 12:0 and only for a
 3D image. s_bfe_u32, s_and_b32 and s_lshr_b32 qualify only with that field's control or mask.
+s_lshr_b32 also requires the descriptor word to be the value, not the shift amount. A translation
+that reads a size field marks that SRV with imagedim. A sample that does not read one does not.
 
 Everything else stays refused: a whole word, any other word or field, a shift of word 2 that keeps the
 resource-level bit, depth of a 1D, 2D or 2D-array image, height of a 1D image, a modified word, m0, a
@@ -56,6 +58,7 @@ VMOV = vop1(0x01, 4, 10)
 OPS = {
     's_bfe_u32 s10, s17, 0x2001e': sop2(BFE, 10, 17, LIT, 0x2001e),
     's_lshr_b32 s10, s17, 0x1e': sop2(LSHR, 10, 17, LIT, 30),
+    's_lshr_b32 s10, 0x1e, s17': sop2(LSHR, 10, LIT, 17, 30),
     's_and_b32 s10, s17, 0xc0000000': sop2(AND, 10, 17, LIT, 0xc0000000),
     's_and_b32 s10, s18, 0xfff': sop2(AND, 10, 18, LIT, 0xfff),
     's_and_b32 s11, s18, 0xfff': sop2(AND, 11, 18, LIT, 0xfff),
@@ -175,6 +178,7 @@ def controls():
         assert expr in text, (label, text)
         assert HELPERS[helper] in text, (label, text)
         assert 'srv 0 ' in manifest, (label, manifest)
+        assert '\nimagedim 0\n' in manifest, (label, manifest)
         without_field(code)
     composed = splice(WORDS['lz'], (
         's_bfe_u32 s10, s17, 0x2001e',
@@ -193,6 +197,7 @@ def controls():
         refused(splice(WORDS['lz'], ('v_mov_b32_e32 v4, s%d' % (16 + word),), 'image'),
                 'numeric use of s%d holding image descriptor word %d' % (16 + word, word))
     refused(use('lz', 's_lshr_b32 s10, s18, 0xe'), 's_lshr_b32 of image descriptor word 2')
+    refused(use('lz', 's_lshr_b32 s10, 0x1e, s17'), 's_lshr_b32 of image descriptor word 1')
     refused(use('lz', 's_bfe_u32 s10, s18, 0xe000f'), 's_bfe_u32 of image descriptor word 2')
     refused(use('lz', 's_bfe_u32 s10, s19, 0x4000c'), 's_bfe_u32 of image descriptor word 3')
     refused(use('lz', 's_bfe_u32 s10, s21, 0x40004'), 's_bfe_u32 of image descriptor word 5')
@@ -221,6 +226,8 @@ def controls():
     refused(bare_buf, 'numeric use of s10 holding descnum')
     vertex = smem(0x03, 16, 8) + OPS['s_bfe_u32 s10, s17, 0x2001e'] + VMOV + VS_WORDS
     refused(WORDS['lz'], 'numeric use of s10 holding descnum', vs=vertex)
+    _sample, sample_manifest = ps(WORDS['lz'])
+    assert 'imagedim' not in sample_manifest, sample_manifest
 
     # The offset-32 load is read before the fixture's own offset-0 load. The sample uses offset 0, so
     # the earlier word must not borrow that dimension. The v_mov is after the image instruction.
@@ -241,6 +248,7 @@ def controls():
     text, manifest = ps(kept)
     assert W_HI in text, text
     assert manifest.count('\nsrv ') == 1 and 'srv 0 tex2d table 0 0' in manifest, manifest
+    assert '\nimagedim 0\n' in manifest and 'imagedim 1' not in manifest, manifest
     assert 'table 0 32' not in manifest, manifest
     without_field(kept)
     reloaded = splice(WORDS['lz'], ('s_mov_b32 s28, s18',), 'image')

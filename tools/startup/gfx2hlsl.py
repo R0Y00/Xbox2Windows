@@ -6056,13 +6056,23 @@ class Stage:
         return (index % 8, dims[key], sym, modified)
 
     def image_dim_call(self, sym, kind, component):
-        """GetDimensions(0) of the texture this image descriptor binds, for one component."""
+        """GetDimensions(0) of the texture this image descriptor binds, for one component.
+
+        The SRV is marked in the manifest. The draw path refuses that view unless it starts at
+        resource mip 0, because GetDimensions(0) reads the view's first mip."""
         base, dword = sym[2], sym[3] & ~7
-        tex = self.pipe.resource((sym[1], None if base is None else base + 4 * dword), kind)
+        key = (sym[1], None if base is None else base + 4 * dword)
+        tex = self.pipe.resource(key, kind)
         helpers = getattr(self.pipe, 'image_dim_helpers', None)
         if helpers is None:
             helpers = self.pipe.image_dim_helpers = set()
         helpers.add((kind, component))
+        marked = getattr(self.pipe, 'image_size_srvs', None)
+        if marked is None:
+            marked = self.pipe.image_size_srvs = set()
+        entry = self.pipe.resources.get(key)
+        if entry is not None:
+            marked.add(entry['index'])
         return 'img_%s_%s(%s)' % (component, kind, tex)
 
     def image_field_expr(self, base, srcs, syms):
@@ -6085,7 +6095,9 @@ class Stage:
             if kind is None:
                 hits.append(('opaque', field, base, 'word used as two dimensions'))
                 continue
-            if base == 's_bfe_u32' and i != 0:
+            # s_bfe_u32 and s_lshr_b32 are not commutative. The descriptor word is the value
+            # (operand 0). A shift whose amount is the descriptor word is a different number.
+            if base in ('s_bfe_u32', 's_lshr_b32') and i != 0:
                 hits.append(('opaque', field, base, ''))
                 continue
             found = IMAGE_FIELDS.get((field, base, constants[1 - i]))
@@ -12139,6 +12151,7 @@ class Pipeline:
         self.uses_cube_dir = False
         self.uses_gather_2d_lod = False
         self.image_dim_helpers = set()
+        self.image_size_srvs = set()
         self.uses_store_d16_x = False
         self.uses_sad = set()
         self.uses_dot8 = set()
@@ -12839,6 +12852,8 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
             if r.get('d16_exact'):
                 lines.append('d16srv %d exact' % r['index'])
+        for index in sorted(getattr(self, 'image_size_srvs', ()) or ()):
+            lines.append('imagedim %d' % index)
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
             source, off = key
             if source[0] != 'table':
