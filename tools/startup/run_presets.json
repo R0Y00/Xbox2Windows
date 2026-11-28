@@ -1,7 +1,7 @@
 {
   "about": "Shared settings for tools/startup/run_preset.py. Layers apply in order base, os, console, gpu; a later layer overrides an earlier one, and an env value of null unsets it. 'run' keys are run.ps1/run.sh switches (see OPTIONS in run_preset.py); 'env' keys are exported before the script starts. Every entry says why it is there. Change a value here, with the measured run that supports it, rather than adding a launcher option.",
   "base": {
-    "why": "The settings shared by the furthest real-title runs reported in #870 (-Render -Translate -FakeUser -GpuMirror -StartupBelow40, a large assert budget, more than the default 14 GiB, the package on its console drive letter, an empty storage folder per run). package_drive is mapped with subst for the run, not run.ps1 -MapDrive: with -MapDrive a real-title run stayed on its first screens (11 pipelines translated in 420 s) where the same settings on a subst drive went on loading (76). suspend_others 0 turns off #1408's thread holding (run.ps1 -SuspendOthers, #3332): with it on, real-title runs on main stop before the first input poll (bisected to #1408 on 2026-11-28), and #3331 measured a 3-4x slower load. RING_RELEASE_AT_SUBMIT (#2949), ROOT_SRV_AT_DRAW (#3028), TABLE_ALIAS (#2977) and RUNTIME_LOCAL were measured together against the previous shared set (RELEASE_RETIRED_VIEWS and XAPU_TYPED_COMPLETIONS instead): 420 s on the same input, 163,846 vs 75,028 translated draws, 76 vs 62 pipelines, 2,079 vs 1,925 textures, NVIDIA, Windows 11, ec71c290.",
+    "why": "The settings shared by the furthest real-title runs reported in #870 (-Render -Translate -FakeUser -GpuMirror -StartupBelow40, a large assert budget, more than the default 14 GiB, the package on its console drive letter, an empty storage folder per run). package_drive is mapped with subst for the run, not run.ps1 -MapDrive: with -MapDrive a real-title run stayed on its first screens (11 pipelines translated in 420 s) where the same settings on a subst drive went on loading (76). suspend_others 0 turns off #1408's thread holding (run.ps1 -SuspendOthers, #3332): with it on, real-title runs on main stop before the first input poll (bisected to #1408 on 2026-11-28), and #3331 measured a 3-4x slower load. RING_RELEASE_AT_SUBMIT (#2949), ROOT_SRV_AT_DRAW (#3028), TABLE_ALIAS (#2977) and RUNTIME_LOCAL were measured together against the previous shared set (RELEASE_RETIRED_VIEWS and XAPU_TYPED_COMPLETIONS instead): 420 s on the same input, 163,846 vs 75,028 translated draws, 76 vs 62 pipelines, 2,079 vs 1,925 textures, NVIDIA, Windows 11, ec71c290. X2W_PROBE_PRECHECK=0 (#3313) skips the VirtualQuery pre-check that the stand-ins run before each probe and copy while a debugger is attached, which title runs always are: 420 s on the same input, 1,142,089 vs 162,303 translated draws, 80,175 vs 15,001 executes, 5,372 vs 2,134 textures, NVIDIA, Windows 11, ec71c290.",
     "run": {
       "seconds": 3600,
       "memory_gib": 40,
@@ -21,6 +21,7 @@
       "X2W_D3D12_RING_RELEASE_AT_SUBMIT": "1",
       "X2W_D3D12_ROOT_SRV_AT_DRAW": "1",
       "X2W_D3D12_TABLE_ALIAS": "1",
+      "X2W_PROBE_PRECHECK": "0",
       "X2W_PRESENT_COMPOSITE": "1",
       "X2W_RUNTIME_LOCAL": "1",
       "X2W_D3D12_BUDGET": "1"

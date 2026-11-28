@@ -955,7 +955,9 @@ The launcher:
   hooks, and a real-title run with it stayed on its first screens where the same settings on a `subst`
   drive went on loading. Under Wine, link `dosdevices/g:` in the prefix yourself;
 - turns off the debugger's thread holding (`run.ps1 -SuspendOthers 0`, #3332). With holding on, real
-  runs on main stopped before the first input poll; a bisect points at #1408;
+  runs on main stopped before the first input poll; a bisect points at #1408. The base layer also
+  sets `X2W_PROBE_PRECHECK=0` (#3313), because title runs always start under the debugger. On the
+  same 420 s input it raised translated draws from 162,303 to 1,142,089;
 - starts `run.ps1`, or `run.sh` on Linux, then prints `tools/startup/triage_run.py` for the run's logs.
 
 Runs go to `out/startup/runs/<time>-<console>-<os>-<gpu>/`, which holds `log/`, `stage/`, `storage/`
