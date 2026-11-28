@@ -1083,6 +1083,8 @@ QUAD_ANY_HLSL = [
     '    return row + abs(ddy_fine(row)) != 0.0;',
     '}',
 ]
+# 32-bit compares (not cmpx) that may read src0 through a quad swap (VOPC DPP16).
+DPP_COMPARE = re.compile(r'v_cmp_(?:[lg][te]|eq|lg|neq|nlt|nle|ngt|nge|o|u|ne)_[fiu]32')
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
@@ -5544,7 +5546,9 @@ class Stage:
         if not intrinsic:
             raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
                               % (base, perm))
-        if base == 'v_mov_b32':
+        if DPP_COMPARE.fullmatch(base):
+            arity, text, kind = 2, '', 'c'
+        elif base == 'v_mov_b32':
             arity, text, kind = 1, '{0}', 'u'
         elif base in VEC_U:
             (arity, text), kind = VEC_U[base], 'u'
@@ -5567,6 +5571,9 @@ class Stage:
                 if not re.fullmatch(r'v\d+', base_tok):
                     raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
                 src_neg_abs.append((neg, absolute, base_tok))
+        elif kind == 'c':
+            if len(ops) != 3 or ops[0] not in ('vcc', 'vcc_lo') or not re.fullmatch(r'v\d+', ops[1]):
+                raise Unsupported('%s_dpp needs a VCC result and a VGPR src0' % base)
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
@@ -5576,6 +5583,8 @@ class Stage:
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
         self.note_quad_flow(base)
         self.needs_sm6 = True
+        if kind == 'c':
+            return self.dpp_compare(base, ops, intrinsic)
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
             neg0, abs0, base0 = src_neg_abs[0]
@@ -5591,6 +5600,18 @@ class Stage:
             args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+
+    def dpp_compare(self, base, ops, intrinsic):
+        """v_cmp_*_dpp with a quad swap on src0 (VOPC DPP16, RDNA 2 ISA 12.19): the exchanged value goes to the hidden
+        temp register and the plain compare reads it; src1 stays this lane's own register. The caller proved whole-quad
+        EXEC, so no source lane is disabled."""
+        self.used_v.add(self.DPP_TEMP)
+        self.uniform_v.discard(self.DPP_TEMP)
+        if isinstance(self.align4_v, set):
+            self.align4_v.discard(self.DPP_TEMP)
+        self.set_v(self.DPP_TEMP, '%s(%s)' % (intrinsic, self.u(ops[1])))
+        operands = [ops[0], 'v%d' % self.DPP_TEMP, ops[2]]
+        return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
 
     def half_operand(self, tok, kind):
         """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
