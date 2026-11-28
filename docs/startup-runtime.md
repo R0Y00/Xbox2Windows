@@ -921,6 +921,53 @@ It writes:
 | `<log>/files.txt` | every file the process opened |
 | `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
 
+### Run with the shared presets
+
+`tools/startup/run_preset.py` starts a run with the settings kept in `tools/startup/run_presets.json`
+instead of a hand-picked set of switches. It takes three choices and the package root:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools\startup\run_preset.py --package <package root> --console x --gpu nvidia
+```
+
+| Choice | Values | Default |
+|---|---|---|
+| `--console` | `x` (Series X), `s` (Series S) | required |
+| `--gpu` | `nvidia`, `amd` | required |
+| `--os` | `win11`, `win10`, `linux` | this host |
+
+The settings file has a `base` layer and one layer per choice. They apply in the order base, OS,
+console, GPU. A later layer overrides an earlier one, and an `env` value of `null` unsets it. Each entry
+records why it is there. To change what everyone runs with, change the file and cite the run that
+supports the change. Do not add a launcher option for it. `--print` shows the merged switches, the
+environment and the command without staging or starting anything.
+
+The launcher:
+
+- reads the executable's path from the package's `MicrosoftGame.config`;
+- stages the PE files of that executable's folder in `<run>/stage`, hard-linked where the volume
+  allows and copied otherwise. `run.ps1` and `run.sh` copy the stand-ins next to the executable, so
+  the package folder itself is never written;
+- gives every run an empty storage folder (`<run>/storage`);
+- maps the package on its console drive letter with `subst` for the run and removes the mapping
+  afterwards. A letter that is taken is refused, unless `subst` already maps it onto this package. It
+  does not use `run.ps1 -MapDrive`: that rewrites only opens that pass through the debugger's file
+  hooks, and a real-title run with it stayed on its first screens where the same settings on a `subst`
+  drive went on loading. Under Wine, link `dosdevices/g:` in the prefix yourself;
+- turns off the debugger's thread holding (`run.ps1 -SuspendOthers 0`, #3332). With holding on, real
+  runs on main stopped before the first input poll; a bisect points at #1408;
+- starts `run.ps1`, or `run.sh` on Linux, then prints `tools/startup/triage_run.py` for the run's logs.
+
+Runs go to `out/startup/runs/<time>-<console>-<os>-<gpu>/`, which holds `log/`, `stage/`, `storage/`
+and `settings.json`, the merged settings and the exact command. Input comes from the keyboard and
+XInput pad 0 while the output window has focus; `input_script` in the settings file (or
+[Input script](#input-script)) replays a fixed sequence instead. No AMD or NVIDIA entry
+changes a switch today: no stand-in branches on the vendor, and no reported AMD run needed a
+different one. The two entries are there so that a measured difference has a place to go.
+`tests/startup_run_preset_check.py` checks every choice against the switches that `run.ps1` and
+`run.sh` define, and checks staging on a synthetic package. It also checks refusals: a misspelt
+switch, an unknown key, a non-string value, an unknown choice, and a package without an executable.
+
 ### Package on another volume
 
 A console executable opens its package at a fixed drive letter, so a package that lives on another
