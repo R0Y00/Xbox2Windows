@@ -78,10 +78,11 @@ def generate_command(args):
         for block in classes:
             name = block["name"]
             lines.append(f'    std::printf("sizeof({name})=%zu\\n", sizeof({name}));')
-            for member, _ in member_offsets(block):
-                lines.append(
-                    f'    std::printf("offsetof({name}, {member})=%zu\\n", offsetof({name}, {member}));'
-                )
+            if args.offsetof:
+                for member, _ in member_offsets(block):
+                    lines.append(
+                        f'    std::printf("offsetof({name}, {member})=%zu\\n", offsetof({name}, {member}));'
+                    )
         lines += ["    return 0;", "}"]
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")

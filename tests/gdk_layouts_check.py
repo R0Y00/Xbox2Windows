@@ -144,6 +144,24 @@ def check_probe():
         check("offsetof(Derived, C)" not in text, "base-class offset emitted")
         check('std::printf("offsetof(Simple, B)=%zu\\n", offsetof(Simple, B));' in text, "print B")
 
+        size_only = directory / "size-only.cpp"
+        private_classes = classes + [
+            {"name": "PrivateField", "size": 4, "bases": [], "members": [
+                {"offset": 0, "type": "int", "name": "hidden", "bits": None, "kind": "field"},
+            ]},
+        ]
+        private_layout = directory / "private.json"
+        write_layouts(private_layout, private_classes)
+        code = abi.main([
+            "generate", "--layouts", str(private_layout), "--out", str(size_only),
+            "--include", "synthetic.h", "--print",
+        ])
+        check(code == 0, f"size-only generate exit {code}")
+        size_text = size_only.read_text(encoding="utf-8")
+        check('std::printf("sizeof(PrivateField)=%zu\\n"' in size_text, "size-only sizeof")
+        check("offsetof(PrivateField, hidden)" not in size_text, "print-only emitted offsetof")
+        check('std::printf("offsetof(Simple, B)=%zu\\n"' not in size_text, "print-only emitted a public offsetof")
+
         log = directory / "probe.log"
         log.write_text("sizeof(Simple)=12\noffsetof(Simple, A)=0\n", encoding="utf-8")
         parsed = directory / "parsed.json"
