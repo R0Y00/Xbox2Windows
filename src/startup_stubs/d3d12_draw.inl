@@ -154,7 +154,7 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
 }
 
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
+    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind {
         rect = udsrc_rect, base_vertex = udsrc_base_vertex, start_instance = udsrc_start_instance,
         root_constant = udsrc_root_constant, stride = udsrc_stride, mrt_bits = udsrc_mrt_bits,
@@ -386,10 +386,43 @@ bool append_pso_recipe(const wchar_t* path, const x2w_startup::PsoRecipe& recipe
     return ok && done == record.size();
 }
 
+// The revisions every request key starts with. tools/startup/gfx2hlsl.py hashes the same bytes, without a
+// trailing NUL (pipeline_key, compute_key, mesh57_key); a change of either side makes every cached request a miss.
+namespace shader_cache {
+constexpr char revision[] = "x2w-startup-shader-29";
+constexpr char compute_revision[] = "x2w-startup-shader-29cs";  // tools/startup/gfx2hlsl.py compute_key
+constexpr char mesh57_revision[] = "x2w-startup-mesh-57-3";
+}  // namespace shader_cache
+
+// Once per process, before its first request: <X2W_SHADER_CACHE>\revision.txt names this runtime's revisions, so
+// that the launchers (tools/startup/shader_cache_revision.py) can warn before they start a translator of another
+// revision. A file that already says the same is left as it is.
+void write_cache_revision()
+{
+    static LONG written;
+    if (InterlockedCompareExchange(&written, 1, 0)) return;
+    wchar_t dir[MAX_PATH], path[MAX_PATH], temporary[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    swprintf(path, MAX_PATH, L"%s\\revision.txt", dir);
+    swprintf(temporary, MAX_PATH, L"%s\\revision.txt.%lu.tmp", dir, GetCurrentProcessId());
+    const std::string text = std::string("graphics ") + shader_cache::revision + "\ncompute " + shader_cache::compute_revision +
+                             "\nmesh57 " + shader_cache::mesh57_revision + "\n";
+    std::string old;
+    if (read_text(path, old) && old == text) return;
+    HANDLE file = CreateFileW(temporary, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD done = 0;
+    const bool complete = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &done, nullptr) && done == text.size();
+    CloseHandle(file);
+    if (!complete || !MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temporary);
+}
+
 // Publish each input atomically. The callers write the request's ready marker last.
 bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::size_t bytes)
 {
     wchar_t path[MAX_PATH], temporary[MAX_PATH], suffix[32];
+    write_cache_revision();
     if (!cache_path(path, L"req_", key, ext)) return false;
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return true;
     swprintf(suffix, std::size(suffix), L"%s.%lu.tmp", ext, GetCurrentProcessId());
@@ -453,7 +486,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             tr.uds.push_back({udsrc.kind, udsrc.a, udsrc.b});
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
+                                     !std::strcmp(kind, "texcube") ? 5 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (line.compare(0, 6, "wmask ") == 0) {
@@ -513,10 +547,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                                 const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
-    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
-    // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-29";
-    const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
+    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache (shader_cache::revision).
+    const u64 seed = fnv_bytes(shader_cache::revision, sizeof(shader_cache::revision) - 1);
     u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
     if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
@@ -557,12 +589,7 @@ u64 fnv_part(const std::vector<unsigned char>& part, u64 key)
 // so a title write in between cannot leave a file that does not match its key.
 bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept
 {
-    __try {
-        std::memcpy(to, from, bytes);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+    return x2w_local::guarded_memcpy(to, from, bytes, true);
 }
 
 // Aligned qwords of a published blob that name committed memory of this process (one VirtualQuery each, so
@@ -636,8 +663,7 @@ u64 publish_compute_request(const void* desc)
     std::vector<unsigned char> fields(sizeof(words));
     words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
     std::memcpy(fields.data(), words, sizeof(words));
-    constexpr char compute_revision[] = "x2w-startup-shader-29cs";  // tools/startup/gfx2hlsl.py compute_key
-    u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
+    u64 key = fnv_bytes(shader_cache::compute_revision, sizeof(shader_cache::compute_revision) - 1);
     const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
     for (const auto* part : order) key = fnv_part(*part, key);
     // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
@@ -700,8 +726,8 @@ void request_slot57_mesh(Wrapper* pipeline, const std::vector<RootParameter>* bo
         return copy_title_bytes(out.data(), pointer, out.size());
     };
     if (!copy_stage(13, true, mesh) || !copy_stage(5, false, pixel)) return;
-    constexpr char revision[] = "x2w-startup-mesh-57-3";
-    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(revision, sizeof(revision) - 1))));
+    const u64 key = fnv_part(root_blob, fnv_part(pixel, fnv_part(mesh, fnv_bytes(shader_cache::mesh57_revision,
+                                                                                 sizeof(shader_cache::mesh57_revision) - 1))));
     static SRWLOCK request_lock = SRWLOCK_INIT;
     static std::unordered_set<u64> written;
     x2w_startup::ExclusiveNoteLock guard(request_lock);
@@ -1977,6 +2003,14 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
+// The view dimension a manifest texture kind declares (Translation::Srv::kind 1 to 5).
+D3D12_SRV_DIMENSION translated_view_dimension(int kind)
+{
+    return kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D : kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+           kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE :
+                       D3D12_SRV_DIMENSION_TEXTURE3D;
+}
+
 bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
 {
     if (!tr.d16_srvs.any()) return true;
@@ -1991,9 +2025,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         const Translation::Srv& srv = tr.srvs[i];
         if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(i, "non-table texture binding", srv.kind);
-        const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                               srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        const auto dimension = translated_view_dimension(srv.kind);
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
@@ -2529,7 +2561,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             return refuse(i, "the texture is also a render or depth target of this draw", reinterpret_cast<u64>(texture));
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
-            if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
+            if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
             const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
@@ -2754,10 +2786,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
         if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
-        if (srv.kind >= 1 && srv.kind <= 4) {
-            const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                                   srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        if (srv.kind >= 1 && srv.kind <= 5) {
+            const auto dimension = translated_view_dimension(srv.kind);
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -2980,7 +3010,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
             ID3D12Resource* chunk = nullptr;
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            const bool readable_range = readable_window(address, bytes) >= bytes;
+            auto* target = readable_range ? reserve_upload_ring(self, padded, &offset, &chunk) : nullptr;
+            if (readable_range && !target) {
+                // The guest memory is there; only the copy failed. A null binding would read zeros as if the title had bound nothing.
+                static LONG copy_refused;
+                if (first_calls(copy_refused, 6))
+                    log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+                count_null_binding(x2w_local::NullCause::ring_full);
+                ReleaseSRWLockExclusive(&draw_lock);
+                return false;
+            }
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
@@ -2995,16 +3035,29 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         ID3D12Resource* chunk = nullptr;
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(self, address, bytes, &offset, &chunk);
+        const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+        bool have = readable_range && frame_copy(self, address, bytes, &offset, &chunk);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && formatted.entry) {
+            // A readable range whose copy failed (upload ring full) is a ring_full refusal, not an unresolved buffer.
+            if (readable_range) count_null_binding(x2w_local::NullCause::ring_full);
             InterlockedIncrement(&formatted_draws_refused);
             static LONG refused;
             if (first_calls(refused, 6))
                 log("x2w-draw %016llx srv %u: formatted buffer refused (unresolved buffer)", tr->key, i);
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
+        if (readable_range && !have) {
+            // The guest memory is readable and only the frame copy failed (upload ring full): refuse the draw instead of
+            // binding null, which would read zeros as if the title had bound nothing.
+            static LONG copy_refused;
+            if (first_calls(copy_refused, 6))
+                log("x2w-draw %016llx srv %u: buffer copy failed (upload ring), draw refused", tr->key, i);
+            count_null_binding(x2w_local::NullCause::ring_full);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }

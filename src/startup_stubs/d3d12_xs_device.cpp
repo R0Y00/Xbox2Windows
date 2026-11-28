@@ -2691,12 +2691,19 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // no recording can submit its bytes and every queue that used it has finished. With
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 every chunk is 16 MiB, up to 512 MiB, and a fenced submit releases its lists.
 
+volatile LONG64 upload_ring_reserved_bytes, upload_ring_capacity_bytes;
+volatile LONG upload_ring_reservations, upload_ring_refusals;
+
 UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
 {
     constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
+    const auto note_reserved = [](u64 reserved) {
+        InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(reserved));
+        InterlockedIncrement(&upload_ring_reservations);
+    };
 
     auto& chunks = upload_chunks;
     static unsigned active = 0;
@@ -2711,7 +2718,10 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     };
     if (!chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) return finish(active);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(active);
+        }
     }
 
     const bool release_at_submit = ring_release_at_submit();
@@ -2741,7 +2751,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
+                        InterlockedAdd64(&upload_ring_capacity_bytes, static_cast<LONG64>(chunk_bytes));
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        note_reserved(rounded);
                         return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
@@ -2758,15 +2770,22 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     // Allocation failed or the cap was reached. Older unused tails are still safe.
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reserve_upload_chunk(chunks[index], rounded);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     ReleaseSRWLockExclusive(&allocator_lock);
+    InterlockedIncrement(&upload_ring_refusals);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity");
@@ -5052,7 +5071,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? ViewRecord::srv_desc_bytes :
+            N == 19 ? ViewRecord::uav_desc_bytes : N == 20 ? 20 : 16;
         note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
                   described_bytes, title_dest, args[D], materialized);
     };
@@ -7395,14 +7415,14 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             root_srv_copies_made);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
-            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
             "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
-            texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
+            texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
@@ -7413,6 +7433,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
             pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
     if (render_mode() && frame % 300 == 0) {
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, capacity %llu MiB",
+            static_cast<unsigned long long>(upload_ring_reserved_bytes) >> 20, upload_ring_reservations, upload_ring_refusals,
+            static_cast<unsigned long long>(upload_ring_capacity_bytes) >> 20);
         log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
             compute_builder_gate_refusals);

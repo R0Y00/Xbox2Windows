@@ -378,7 +378,7 @@ struct DirectCompute {
         return ir.invoke("%dx.types.ResRet.i32", raw ? "rawBufferLoad.i32" : "bufferLoad.i32", raw ? 139 : 68, args,
                          "nounwind readonly");
     }
-    void buffer_atomic(const Inst &i, const State &s) {
+    void buffer_atomic(const Inst &i, const State &s, const string &pixel_predicate = {}) {
         // The operation set and VGPR ordering follow gfx2hlsl.MUBUF_ATOMIC_OPS.
         static const std::map<Name, unsigned> operations{
             {"buffer_atomic_add", 0},  {"buffer_atomic_sub", 0},  {"buffer_atomic_and", 1},  {"buffer_atomic_or", 2},
@@ -424,6 +424,30 @@ struct DirectCompute {
             args.emplace_back("i32", read(data + 1));
         args.emplace_back("i32", value);
         auto tag = to_string(label_number++), pred = active();
+        if (!pixel_predicate.empty()) {
+            // Graphics uses SSA rather than the compute VGPR allocas. The caller
+            // proves a single guest block and supplies exact coverage and EXEC.
+            // Keep the original VGPR for inactive lanes, including helpers.
+            const auto size = ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
+                {{"%dx.types.Handle", h}, {"i32", "undef"}}, "nounwind readonly");
+            const auto bytes = ir.value("extractvalue %dx.types.Dimensions " + size + ", 0");
+            const auto in_view = cmp("ult", address, bytes); // aligned DWORD, raw view length is a multiple of 4
+            const auto fallback = (i.a & 0x4000) ? select(pixel_predicate, "0", value) : "";
+            const auto execute = ir.value("and i1 " + pixel_predicate + ", " + in_view);
+            ir.body << "  br i1 " << execute << ", label %atomic" << tag << ", label %atomicSkip" << tag
+                    << "\natomic" << tag << ":\n";
+            const auto previous = ir.invoke("i32", "atomicBinOp.i32", 78, args, "nounwind");
+            ir.body << "  br label %atomicEnd" << tag << "\natomicSkip" << tag
+                    << ":\n  br label %atomicEnd" << tag << "\natomicEnd" << tag << ":\n";
+            if (i.a & 0x4000) {
+                auto returned = ir.value("phi i32 [ " + previous + ", %atomic" + tag + " ], [ " +
+                                         fallback + ", %atomicSkip" + tag + " ]");
+                // Contention makes the old value varying even with uniform operands.
+                ir.dependencies[returned].set(128);
+                write(data, returned);
+            }
+            return;
+        }
         if (indexed) {
             if (i.a & 0x4000) {
                 auto out_of_range = ir.value("and i1 " + pred + ", " + ir.value("xor i1 " + in_range + ", true"));
