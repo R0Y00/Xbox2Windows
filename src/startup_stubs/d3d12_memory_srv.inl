@@ -555,7 +555,19 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
 {
     const auto bytes = address_texture_bytes(device, desc);
     // The transient upload ring accepts individual copies up to 64 MiB.
-    if (bytes > x2w_startup::max_published_texture_bytes || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
+    if (bytes > x2w_startup::max_published_texture_bytes || !bytes || address < 0x10000) return nullptr;
+    // The texels must be readable. The test goes through xmem's page registry (readable_window), so an
+    // unmapped page inside a title page reservation is not touched; an address found unmapped is not
+    // probed again for 30 frames (recently_unreadable).
+    if (recently_unreadable(address)) {
+        InterlockedIncrement(&address_probe_skipped);
+        return nullptr;
+    }
+    const std::size_t readable_bytes = readable_window(address, static_cast<std::size_t>(bytes));
+    if (readable_bytes != bytes) {
+        if (!readable_bytes) note_unreadable(address);
+        return nullptr;
+    }
     std::lock_guard lock(tiled_srv_mutex);
     const auto [first, last] = tiled_srv_addresses.equal_range(address);
     for (auto it = first; it != last; ++it) {

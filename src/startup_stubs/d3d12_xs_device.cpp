@@ -41,6 +41,7 @@
 #include "startup_stubs/address_texture.h"
 #include "startup_stubs/list_upload_pages.h"
 #include "startup_stubs/resource_budget.h"
+#include <atomic>
 #include "startup_stubs/upload_reservation.h"
 #include <optional>
 #include "startup_stubs/derived_blend.h"
@@ -415,10 +416,11 @@ void guid_text(const GUID* g, char* out, std::size_t size)
                   g->Data4[7]);
 }
 
+std::size_t readable_window(u64 address, std::size_t wanted);
 void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
 {
     out[0] = 0;
-    if (!data || !x2w_local::readable(data, bytes)) return;
+    if (!data || readable_window(reinterpret_cast<u64>(data), bytes) < bytes) return;
     const auto* p = static_cast<const unsigned char*>(data);
     std::size_t used = 0;
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
@@ -585,9 +587,14 @@ void fill_all_traps(std::index_sequence<K...>)
 
 // A call that passes a known interface IID is a creation or query call: a no-op that returned 0
 // would hand the title "success" with no object. Such calls trap instead of being ignored.
+// The readability test goes through xmem's page registry first (readable_window): a value that is an
+// address inside a title page reservation with nothing mapped there, such as the base of a physical-page
+// pool whose mapping failed, is answered without touching it. Probing it cost one first-chance access
+// violation per call (423 for one such pool base passed to queue slot 31 in one run, before slot 31 was
+// mapped to queue_page_mappings).
 bool names_known_iid(u64 value)
 {
-    if (value < 0x10000 || !x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(GUID))) return false;
+    if (value < 0x10000 || readable_window(value, sizeof(GUID)) < sizeof(GUID)) return false;
     return kind_for(*reinterpret_cast<const GUID*>(value)) != other_kind;
 }
 bool create_shaped(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g)
@@ -2829,9 +2836,38 @@ D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(Wrapper* list, u64 title_address, st
     return ring_copy(list, title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
 }
 
-// Number of contiguous readable bytes at address, up to wanted.
+// xmem's page registry (x2w_xmem_mapped_bytes) answers for addresses in the title's mapped-page
+// reservations without touching them. Probing an unmapped page there costs a first-chance access
+// violation each, and under the debug launcher a debugger round trip each (about 21000 in one
+// loading screen, almost all from by-address textures whose pages were not mapped yet).
+using XmemMappedBytes = BOOL(WINAPI*)(ULONG_PTR, SIZE_T, SIZE_T*);
+XmemMappedBytes xmem_mapped_bytes() noexcept
+{
+    static std::atomic<XmemMappedBytes> found{nullptr};
+    static std::atomic<LONG> lookups{0};
+    if (const auto f = found.load(std::memory_order_acquire)) return f;
+    if (lookups.fetch_add(1, std::memory_order_relaxed) >= 256) return nullptr;  // xmem.dll not loaded or an older one
+    const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+    const auto f = xmem ? reinterpret_cast<XmemMappedBytes>(GetProcAddress(xmem, "x2w_xmem_mapped_bytes")) : nullptr;
+    if (f) found.store(f, std::memory_order_release);
+    return f;
+}
+LONG xmem_answered_unmapped;
+
+// Number of contiguous readable bytes at address, up to wanted. Where xmem knows the pages, only its
+// mapped prefix is touched (no fault in the common case); elsewhere one byte per page is touched.
 std::size_t readable_window(u64 address, std::size_t wanted)
 {
+    if (const auto query = wanted ? xmem_mapped_bytes() : nullptr) {
+        SIZE_T mapped = 0;
+        if (query(static_cast<ULONG_PTR>(address), wanted, &mapped)) {
+            if (!mapped) {
+                InterlockedIncrement(&xmem_answered_unmapped);
+                return 0;
+            }
+            return x2w_local::probe_readable(static_cast<std::uintptr_t>(address), mapped);
+        }
+    }
     return x2w_local::probe_readable(static_cast<std::uintptr_t>(address), wanted);
 }
 
@@ -4747,7 +4783,7 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
                 static_cast<unsigned long>(hr));
         return static_cast<u64>(hr);
     }
-    if (rdx >= 1 && rdx <= 64 && r8 >= 0x10000 && x2w_local::readable(reinterpret_cast<void*>(r8), rdx * sizeof(void*))) {
+    if (rdx >= 1 && rdx <= 64 && r8 >= 0x10000 && readable_window(r8, rdx * sizeof(void*)) >= rdx * sizeof(void*)) {
         auto* const* lists = reinterpret_cast<void* const*>(r8);
         bool all_lists = true;
         for (u64 i = 0; i < rdx; ++i) {
@@ -4760,7 +4796,11 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
             return 0;
         }
     }
-    if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
+    // As in noop_slot, only the first calls of a slot are checked for an IID: the check reads its
+    // arguments, and an unchecked slot called every frame with a pointer-shaped non-pointer (slot 31's
+    // r9, before slot 31 was mapped to queue_page_mappings) paid a first-chance access violation per call.
+    static LONG shape_checks;
+    if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
         char name[64];
         std::snprintf(name, sizeof(name), "CommandQueue::slot%d(passes an IID)", N);
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, reinterpret_cast<u64>(self), rdx, r8, r9,
@@ -7486,6 +7526,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
             static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
+        log("x2w-d3d12 readability: unmapped by xmem's page registry %ld, unreadable probes skipped %ld",
+            InterlockedCompareExchange(&xmem_answered_unmapped, 0, 0), InterlockedCompareExchange(&address_probe_skipped, 0, 0));
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);

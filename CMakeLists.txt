@@ -277,6 +277,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # and section count the DirectStorage heartbeat reports from it.
     add_test(NAME xmem_page_stats COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_page_stats_check.py" "$<TARGET_FILE:xmem_shim>")
+    # Readability checks ask the page registry instead of touching unmapped pages.
+    add_test(NAME xmem_mapped_bytes COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_bytes_check.py" "$<TARGET_FILE:xmem_shim>")
     # A page-token write names granted pages only: no section outside a grant, and a fresh grant reads zero.
     add_test(NAME xmem_physical_write_owner COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_physical_write_owner_check.py" "$<TARGET_FILE:xmem_shim>")
@@ -1429,6 +1432,18 @@ set_tests_properties(startup_queue_page_batch_warp PROPERTIES RUN_SERIAL TRUE TI
     ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
 set_tests_properties(startup_queue_page_batch_runs_warp PROPERTIES RUN_SERIAL TRUE TIMEOUT 90 SKIP_RETURN_CODE 77
     ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=0;X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=1")
+
+# Unknown queue slots do not fault on every call for a reserved, unmapped argument address.
+add_executable(startup_queue_probe tests/startup_queue_probe.cpp)
+target_compile_features(startup_queue_probe PRIVATE cxx_std_17)
+target_link_libraries(startup_queue_probe PRIVATE d3d12_xs_shim d3d12 dxgi)
+add_dependencies(startup_queue_probe xmem_shim)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_queue_probe_reserved_${backend} COMMAND startup_queue_probe ${backend} reserved)
+    add_test(NAME startup_queue_probe_xmem_${backend} COMMAND startup_queue_probe ${backend} xmem "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(startup_queue_probe_reserved_${backend} startup_queue_probe_xmem_${backend} PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
+endforeach()
 
 # Closed lists stay submittable, also after their allocator's Reset (#1352).
 add_executable(startup_list_resubmit tests/startup_list_resubmit.cpp)

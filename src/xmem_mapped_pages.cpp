@@ -66,6 +66,9 @@ struct PhysicalMemory {
         ULONG64 stamp = 0;
     };
     std::map<ULONG_PTR, Run> runs;
+    // Ordinary commits the caller placed at an address (XMemVirtualAlloc "commit at address"): memory that
+    // x2w_xmem_mapped_bytes cannot judge from the page registry.
+    std::map<ULONG_PTR, SIZE_T> commits;
     // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
     // are adjacent slots again.
     x2w_xmem::SlabSlots<HANDLE> slots{era_physical::page_bytes};
@@ -1071,6 +1074,10 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
                 VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
                 result = VirtualAlloc2(GetCurrentProcess(), address, bytes,
                                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
+            }
+            if (result) {
+                const std::lock_guard guard(memory.mutex);
+                memory.commits.insert_or_assign(reinterpret_cast<ULONG_PTR>(result), bytes);
             }
             how = "commit at address";
         }
@@ -2273,6 +2280,40 @@ const int file_io_wrapped = [] {
     return wrapped;
 }();
 }  // namespace
+
+// Experimental export: whether [address, address + bytes) is mapped, answered from the page registry
+// without touching the memory. A probe that touches an unmapped page costs one first-chance access
+// violation (under the debug launcher, one debugger round trip each). Answers only for addresses inside
+// a placeholder reservation that pages are mapped into (the reservations recorded for page mapping):
+// *mapped receives the number of bytes from address on whose 64 KiB pages have a view, up to bytes.
+// Returns FALSE (no answer; the caller probes instead) for any other address, for one that a commit at
+// address may cover, for a range that runs past its reservation, and for an unmapped answer that Windows
+// does not confirm (a released reservation the registry still names).
+extern "C" BOOL WINAPI x2w_xmem_mapped_bytes(ULONG_PTR address, SIZE_T bytes, SIZE_T* mapped)
+{
+    if (!mapped || !bytes || address > std::numeric_limits<ULONG_PTR>::max() - bytes) return FALSE;
+    const ULONG_PTR end = address + bytes;
+    ULONG_PTR at = address & ~(ULONG_PTR{page_bytes} - 1);
+    {
+        const std::lock_guard guard(memory.mutex);
+        const auto reservation = owned_reservation(address);
+        if (reservation == memory.reservations.end()) return FALSE;
+        const ULONG_PTR reservation_end = reservation->first + reservation->second;
+        if (end > reservation_end) return FALSE;
+        if (!memory.commits.empty()) {
+            auto commit = memory.commits.lower_bound(end);
+            if (commit != memory.commits.begin() && std::prev(commit)->first + std::prev(commit)->second > address) return FALSE;
+        }
+        while (at < end && memory.views.count(at)) at += page_bytes;
+    }
+    *mapped = at <= address ? 0 : static_cast<SIZE_T>((at < end ? at : end) - address);
+    if (*mapped == 0) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) || info.State != MEM_RESERVE)
+            return FALSE;
+    }
+    return TRUE;
+}
 
 // Experimental export: writes bytes into physical pages named by the title's
 // page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the

@@ -1681,6 +1681,34 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
+
+// Texel addresses of by-address textures whose first page a probe found unreadable, with the frame of
+// the probe. Outside xmem's page reservations the probe touches one byte per page, and an unmapped page
+// costs a first-chance access violation (under the debug launcher one debugger round trip each). Such an
+// address is not probed again for unreadable_retry_frames frames; after that it is, since the title maps
+// its pages while it loads.
+constexpr LONG unreadable_retry_frames = 30;
+std::mutex unreadable_mutex;
+std::unordered_map<u64, LONG> unreadable_addresses;
+LONG address_probe_skipped;
+
+bool recently_unreadable(u64 address)
+{
+    const std::lock_guard guard(unreadable_mutex);
+    const auto it = unreadable_addresses.find(address);
+    if (it == unreadable_addresses.end()) return false;
+    if (frame_number - it->second <= unreadable_retry_frames) return true;
+    unreadable_addresses.erase(it);
+    return false;
+}
+
+void note_unreadable(u64 address)
+{
+    const std::lock_guard guard(unreadable_mutex);
+    if (unreadable_addresses.size() > 65536) unreadable_addresses.clear();
+    unreadable_addresses[address] = frame_number;
+}
+
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
 {
     u64 h = 0xcbf29ce484222325ull;
@@ -1791,7 +1819,15 @@ bool upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
     const bool reusable = state.done && (!state.pending_list || state.pending_list == list);
     if (reusable && !announced && !recheck) return true;
-    if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
+    // An address a probe found unmapped is not probed again for 30 frames, unless a write was announced.
+    bool skipped_probe = false;
+    if (tiled_address && !announced && recently_unreadable(reinterpret_cast<u64>(memory))) {
+        skipped_probe = true;
+        InterlockedIncrement(&address_probe_skipped);
+    }
+    std::size_t window = 0;
+    if (skipped_probe || (window = readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total))) < total) {
+        if (tiled_address && !skipped_probe && !window) note_unreadable(reinterpret_cast<u64>(memory));
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         if (console) return false;
         state.done = true;
