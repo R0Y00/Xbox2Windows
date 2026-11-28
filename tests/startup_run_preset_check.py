@@ -83,9 +83,36 @@ for os_name, console, gpu in combos:
         check("X2W_XMEM_LAZY_COMMIT" not in s["env"], f"{where}: lazy commit stays off on Windows")
     check(cmd[cmd.index("--storage" if host == "linux" else "-StoragePath") + 1] == str(pkg / "storage"),
           f"{where}: per-run storage")
-for os_name in presets["os"]:
-    envs = [rp.merge(presets, {"os": os_name, "console": "x", "gpu": g})["env"] for g in presets["gpu"]]
-    check(all(e == envs[0] for e in envs), f"{os_name}: AMD and NVIDIA differ without a recorded reason")
+
+
+def unexplained_gpu_differences(presets):
+    """Switches or env values that differ between GPU choices, where a GPU layer that sets the key does not
+    name it in its `why`. A measured difference belongs in that layer (AGENTS.md), with its reason."""
+    out = []
+    for os_name, console in itertools.product(presets["os"], presets["console"]):
+        merged = {g: rp.merge(presets, {"os": os_name, "console": console, "gpu": g}) for g in presets["gpu"]}
+        for part in ("env", "run"):
+            keys = set().union(*(m[part] for m in merged.values()))
+            for key in sorted(keys):
+                if len({json.dumps(m[part].get(key)) for m in merged.values()}) == 1:
+                    continue
+                setters = [g for g, body in presets["gpu"].items() if key in body.get(part, {})]
+                for g in setters or ["(no gpu layer)"]:
+                    if key not in presets["gpu"].get(g, {}).get("why", ""):
+                        out.append(f"{console}/{os_name}: gpu.{g} {part} {key} without its reason in why")
+    return out
+
+
+check(unexplained_gpu_differences(presets) == [],
+      f"AMD and NVIDIA differ without a recorded reason: {unexplained_gpu_differences(presets)}")
+named = copy.deepcopy(presets)
+named["gpu"]["amd"]["env"] = {"X2W_SPLIT_INDIRECT_DISPATCH": "1"}  # the amd why names it
+check(unexplained_gpu_differences(named) == [], "a GPU difference named in the layer's why is accepted")
+unnamed = copy.deepcopy(presets)
+unnamed["gpu"]["amd"]["env"] = {"X2W_PRESET_CHECK_ONLY": "1"}
+unnamed["gpu"]["nvidia"]["run"] = {"seconds": 60}
+check(len(unexplained_gpu_differences(unnamed)) == 2 * len(presets["os"]) * len(presets["console"]),
+      "control: a GPU difference without its reason is not caught")
 
 # --- layer rules (controls) ------------------------------------------------------------------
 mini = {"base": {"run": {"render": True}, "env": {"X2W_A": "1", "X2W_B": "1"}},

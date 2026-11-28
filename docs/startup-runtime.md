@@ -972,7 +972,9 @@ and `settings.json`: the merged settings, the exact command, and under `inherite
 XInput pad 0 while the output window has focus; `input_script` in the settings file (or
 [Input script](#input-script)) replays a fixed sequence instead. No AMD or NVIDIA entry
 changes a switch today: no stand-in branches on the vendor, and no reported AMD run needed a
-different one. The two entries are there so that a measured difference has a place to go.
+different one. The two entries are there so that a measured difference has a place to go: name the
+switch in that entry's `why`, because `tests/startup_run_preset_check.py` refuses a GPU difference
+whose switch the `why` of the layer that sets it does not name.
 `tests/startup_run_preset_check.py` checks every choice against the switches that `run.ps1` and
 `run.sh` define, and checks staging on a synthetic package. It also checks refusals: a misspelt
 switch, an unknown key, a non-string value, an unknown choice, and a package without an executable.

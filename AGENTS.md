@@ -317,8 +317,9 @@ settings on main:
 - Give each change its evidence in the layer's `why`: commit, host, GPU,
   duration, and the counters before and after.
 - When a host needs a setting that no layer covers, such as a GPU generation, a
-  driver or an OS, put it in that host's layer with the run that showed it. Do
-  not add a launcher option.
+  driver or an OS, put it in that host's layer with the run that showed it, and
+  name the switch in that layer's `why` (the check refuses a GPU difference it
+  does not name). Do not add a launcher option.
 - Leave out switches that main does not read yet, such as one from an open pull
   request.
 - After editing, run `tests/startup_run_preset_check.py`.
