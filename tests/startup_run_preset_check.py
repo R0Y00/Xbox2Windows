@@ -3,7 +3,8 @@
 
 Every console x OS x GPU choice must merge, name only switches that run.ps1 and run.sh really have,
 and give the console its ConsoleMode answer. Staging is checked on a synthetic package in a temporary
-folder: only the executable's folder's PE files are staged, and nothing in the package changes.
+folder: only the executable's folder's PE files are staged, and nothing in the package changes, also
+after the stand-ins are copied over the staged files the way run.ps1 and run.sh copy them.
 Negative controls: a misspelt switch, an unknown key, a non-string value, an unknown choice, a drive
 letter that is taken and a package without an executable must each be refused.
 """
@@ -133,22 +134,50 @@ refused(lambda: rp.mount("G", Path(pkg_dir), run=FakeSubst(), exists=lambda _p: 
 refused(lambda: rp.mount("G", Path(pkg_dir), run=FakeSubst(rc=1), exists=lambda _p: False), "a failed subst")
 
 # --- staging on a synthetic package ----------------------------------------------------------
+def script_stand_ins():
+    """The stand-in names run.ps1 and run.sh copy next to the executable."""
+    ps1 = (ROOT / "tools" / "startup" / "run.ps1").read_text(encoding="utf-8")
+    sh = (ROOT / "tools" / "startup" / "run.sh").read_text(encoding="utf-8")
+    m1 = re.search(r'foreach \(\$dll in ([^)]*)\)', ps1)
+    m2 = re.search(r'for dll in ([^;]*);', sh)
+    return (tuple(re.findall(r'"([^"]+)"', m1.group(1))) if m1 else (),
+            tuple(m2.group(1).split()) if m2 else ())
+
+
+check(script_stand_ins() == (rp.STAND_INS, rp.STAND_INS), f"STAND_INS matches run.ps1 and run.sh: {script_stand_ins()}")
+
+
+def copy_stand_ins(folder):
+    """What run.ps1 (Copy-Item -Force) and run.sh (cp -f) do: an existing file is rewritten in place."""
+    for name in rp.STAND_INS:
+        with open(folder / f"{name}.dll", "wb") as out:
+            out.write(b"MZ stand-in")
+
+
+def snapshot(root):
+    return sorted((str(f.relative_to(root)), f.read_bytes(), f.stat().st_mtime_ns) for f in root.rglob("*") if f.is_file())
+
+
 with tempfile.TemporaryDirectory() as tmp:
     package = Path(tmp) / "package"
     (package / "bin").mkdir(parents=True)
     (package / "MicrosoftGame.config").write_text(
         '<?xml version="1.0" encoding="utf-8"?>\n<Game configVersion="1" xmlns="http://schemas.microsoft.com/x">'
         '<ExecutableList><Executable Name="bin\\t.exe" Id="Game"/></ExecutableList></Game>\n', encoding="utf-8")
-    for name, data in [("t.exe", b"MZ exe"), ("a.dll", b"MZ dll"), ("data.bin", b"data"), ("B.DLL", b"MZ up")]:
+    for name, data in [("t.exe", b"MZ exe"), ("a.dll", b"MZ dll"), ("data.bin", b"data"), ("B.DLL", b"MZ up"),
+                       ("GameInput.dll", b"MZ package GameInput"), ("XMEM.dll", b"MZ package xmem")]:
         (package / "bin" / name).write_bytes(data)
     (package / "other.dll").write_bytes(b"MZ elsewhere")
-    before = sorted((str(f.relative_to(package)), f.read_bytes(), f.stat().st_mtime_ns) for f in package.rglob("*") if f.is_file())
+    before = snapshot(package)
     exe = rp.package_executable(package)
     check(exe == package / "bin" / "t.exe", "the executable comes from MicrosoftGame.config")
     staged, linked, copied = rp.stage(package, exe, Path(tmp) / "run" / "stage")
     names = sorted(f.name for f in staged.parent.iterdir())
-    check(names == ["B.DLL", "a.dll", "t.exe"], f"only the executable folder's PE files are staged: {names}")
-    check(linked + copied == 3 and staged.read_bytes() == b"MZ exe", "staged files match")
+    check(names == ["B.DLL", "GameInput.dll", "XMEM.dll", "a.dll", "t.exe"],
+          f"only the executable folder's PE files are staged: {names}")
+    check(linked + copied == 5 and copied >= 2 and staged.read_bytes() == b"MZ exe", "staged files match")
+    copy_stand_ins(staged.parent)
+    check(snapshot(package) == before, "the stand-in copy over the stage leaves the package's same-named files alone")
     rp.stage(package, exe, Path(tmp) / "run" / "stage")  # staging again replaces, never fails
     real_link = rp.os.link
 
@@ -159,9 +188,21 @@ with tempfile.TemporaryDirectory() as tmp:
         staged2, linked2, copied2 = rp.stage(package, exe, Path(tmp) / "run2" / "stage")
     finally:
         rp.os.link = real_link
-    check((linked2, copied2) == (0, 3) and staged2.read_bytes() == b"MZ exe", "copies when hard links fail")
-    after = sorted((str(f.relative_to(package)), f.read_bytes(), f.stat().st_mtime_ns) for f in package.rglob("*") if f.is_file())
-    check(before == after, "the package is unchanged")
+    check((linked2, copied2) == (0, 5) and staged2.read_bytes() == b"MZ exe", "copies when hard links fail")
+    check(snapshot(package) == before, "the package is unchanged")
+    # Control: with stand-in names linked like the rest, the same copy writes into the package.
+    real_stand_ins = rp.STAND_INS
+    rp.STAND_INS = ()
+    try:
+        staged3, linked3, _ = rp.stage(package, exe, Path(tmp) / "run3" / "stage")
+    finally:
+        rp.STAND_INS = real_stand_ins
+    if linked3 == 5:  # only where the temporary folder allows hard links
+        copy_stand_ins(staged3.parent)
+        check((package / "bin" / "GameInput.dll").read_bytes() == b"MZ stand-in",
+              "control: a linked stand-in name is not caught")
+        for name, data in [("GameInput.dll", b"MZ package GameInput"), ("XMEM.dll", b"MZ package xmem")]:
+            (package / "bin" / name).write_bytes(data)
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):

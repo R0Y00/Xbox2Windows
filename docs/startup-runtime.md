@@ -947,7 +947,9 @@ The launcher:
 - reads the executable's path from the package's `MicrosoftGame.config`;
 - stages the PE files of that executable's folder in `<run>/stage`, hard-linked where the volume
   allows and copied otherwise. `run.ps1` and `run.sh` copy the stand-ins next to the executable, so
-  the package folder itself is never written;
+  the package folder itself is never written. A package file named like a stand-in (`xg_xs.dll`,
+  `GameInput.dll`, ...) is always copied: `Copy-Item -Force` and `cp -f` rewrite an existing file in
+  place, so through a hard link they would write into the package;
 - gives every run an empty storage folder (`<run>/storage`);
 - maps the package on its console drive letter with `subst` for the run and removes the mapping
   afterwards. A letter that is taken is refused, unless `subst` already maps it onto this package. It

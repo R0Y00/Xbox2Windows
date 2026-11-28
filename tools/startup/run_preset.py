@@ -8,7 +8,8 @@ the chosen `os`, `console` and `gpu` layers, each overriding the one before. The
   - finds the executable named in the package's MicrosoftGame.config,
   - stages it with the other PE files of its folder in <run>/stage (hard links where the volume allows, copies
     otherwise), because run.ps1 and run.sh copy the stand-in DLLs next to the executable and the package
-    folder must never be written,
+    folder must never be written. A file named like a stand-in is always copied: the scripts' copy
+    rewrites an existing file in place, which would write through a hard link into the package,
   - gives every run an empty storage folder (<run>/storage),
   - on Windows, maps the package on its console drive letter with `subst` for the run (and removes the mapping),
   - starts tools/startup/run.ps1 (Windows) or tools/startup/run.sh (Linux, under Wine) with the merged switches
@@ -35,6 +36,8 @@ REPO = Path(__file__).resolve().parent.parent.parent
 PRESETS = Path(__file__).resolve().with_name("run_presets.json")
 LAYERS = ("os", "console", "gpu")
 PE_SUFFIXES = {".exe", ".dll"}
+# The DLLs run.ps1 and run.sh copy next to the executable (their `foreach ($dll in ...)` / `for dll in` lists).
+STAND_INS = ("xmem", "d3d12_xs", "AcpHal", "XCRDAPI", "chad", "xapu", "xg_xs", "GameInput")
 
 # Launcher option -> (run.ps1 parameter, run.sh flag, kind). kind: "switch" (true/false), "value".
 OPTIONS = {
@@ -135,23 +138,29 @@ def package_executable(package: Path) -> Path:
 
 def stage(package: Path, exe: Path, stage_dir: Path) -> tuple[Path, int, int]:
     """Link (or copy) the executable's folder's PE files into stage_dir, keeping the relative folder.
-    Returns (staged exe, linked, copied). Nothing under the package is written."""
+    Returns (staged exe, linked, copied). Nothing under the package is written, and nothing written later
+    into the stage reaches it: a file named like a stand-in is copied, never linked, because Copy-Item -Force
+    and cp -f overwrite an existing destination in place (measured on NTFS: the linked package file changed)."""
     rel = exe.parent.relative_to(package)
     dst = stage_dir / rel
     dst.mkdir(parents=True, exist_ok=True)
     linked = copied = 0
+    stand_ins = {f"{n.lower()}.dll" for n in STAND_INS}
     for f in sorted(exe.parent.iterdir()):
         if not f.is_file() or f.suffix.lower() not in PE_SUFFIXES:
             continue
         target = dst / f.name
         if target.exists():
             target.unlink()
-        try:
-            os.link(f, target)
-            linked += 1
-        except OSError:
-            shutil.copy2(f, target)
-            copied += 1
+        if f.name.lower() not in stand_ins:
+            try:
+                os.link(f, target)
+                linked += 1
+                continue
+            except OSError:
+                pass
+        shutil.copy2(f, target)
+        copied += 1
     return dst / exe.name, linked, copied
 
 
