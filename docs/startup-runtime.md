@@ -47,15 +47,13 @@ controls for other barrier types, flagged barriers, invalid resources and arrays
 
 ## Occlusion queries
 
-Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
-(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
-the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
-implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
-`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
-diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
-no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
-end at Close, not the numbering.
+The GXDK 261000 `ID3D12GraphicsCommandList8` table confirms `BeginQuery`, `EndQuery` and
+`ResolveQueryData` at command-list slots 28 to 30, and `SetPredication` at 31. Slots 32 to 55
+are the desktop slots 28 to 51 plus four; slots 56 to 58 are `SetMarker`, `BeginEvent` and
+`EndEvent`, and `ExecuteIndirect` is 61. The query bindings stay a diagnostic opt-in: only with
+`X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay no-ops
+as before. The fixture below calls those slots directly, so it checks the forwarding, the
+refusals and the end at Close, not the numbering.
 
 The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
 binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
@@ -76,7 +74,7 @@ the console `Map`. It then checks that the refused calls, among them resolves ov
 with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
 error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
-`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
+Slots 56 to 58 are the desktop marker methods, not query methods.
 
 ## Depth target on translated draws
 
@@ -1010,7 +1008,9 @@ The existing dispatch path records the result, and a program is accepted only wi
 fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
 and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
 scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
-not lower) is refused. The first 16 refusals of a process are logged as
+not lower) is refused. Programs published as `<key>.txt` also bind 1D, 2D, 2D-array and 3D texture SRVs
+(`srv N tex1d|tex2d|tex2da|tex3d table R B`) from the title's described view of that dimension, or are
+refused by name; cube texture SRVs are not published. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
@@ -1571,7 +1571,7 @@ the two recovery checks are its sole failures),
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
 `PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
 A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
-copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when a debugger is attached or `X2W_PROBE_PRECHECK` is set to anything but `0` (read once; otherwise the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when `X2W_PROBE_PRECHECK` is set to anything but `0`, or when it is unset and a debugger is attached (read once; `X2W_PROBE_PRECHECK=0` keeps it off under the debugger that title runs start in, and off, the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
 region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
 Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
 a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render
@@ -1645,7 +1645,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
 | `X2W_D3D12_ROOT_SRV_AT_DRAW=1` | opt-in, render mode: a graphics root SRV (slot 44) without an upload mapping is not copied into the upload ring, since no draw reads that desktop binding (default: a 64 KiB copy at every slot 44 call). Translated draws copy the SRV themselves and are unaffected (`startup_root_srv_draw_*`). See [the experiment note](experiments/startup-root-srv-at-draw.md) |
 | `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1` | opt-in, render mode: a closed command list releases its upload ring chunks once its submit is fenced instead of holding them until Reset, and the ring grows in 16 MiB chunks up to 512 MiB (default: doubling chunks up to 256 MiB, holds until Reset). The larger ring can add up to about 1 GiB of process commit at peak (startup runs in the experiment note). A later submit of the same list before its Reset fences its unchanged chunks again; if one was reused in between, that list is refused before the execute and logged (`startup_address_console_gate_ring_keep_*`, `upload_reservation`). See [the experiment note](experiments/startup-upload-ring-release-at-submit.md) |
-| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
+| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the confirmed `BeginQuery`, `EndQuery` and `ResolveQueryData` methods (see [Occlusion queries](#occlusion-queries)). The bindings remain diagnostic because the forwarding behavior is not a console runtime oracle. Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
@@ -2472,7 +2472,12 @@ These are measured on one executable; treat them as hypotheses for others.
   [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
-  `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
+  `-AssertSites N` (`--assert-sites N` for `run.sh`), which steps over every hit at up to N distinct
+  main-image `int3` sites, so a site that repeats never runs the budget out however long the run is.
+  The first hit at one more site still stops the run, as do `X2W_STOP_AT` sites. `-ContinueAsserts N`
+  counts hits instead: it steps over the first N hits at any site. A hit is stepped over when either
+  budget allows it, and each budget counts only the hits it covers: the site budget takes the first N
+  distinct sites, and the hit budget counts the hits at other sites. Run `ctest --preset dev --no-tests=error -R "^startup_debug"`. One of them fires about ten times a second in the texture-streaming path
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
@@ -2842,7 +2847,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/logical_view_table.h` without a device. It covers the first and last records, one
   past the end, handles inside a record or below the heap, missing heap fields, memory that wraps past
   the top of the address space, and records crossing the end of a window.
-- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations. At process exit, one `x2w-dstorage BCPack summary` line reports request and zero-filled counts for every format 1..15 that was requested. The consumer fixture sends a format 6 request and checks that it succeeds, leaves a zero-filled destination, and appears in both counts; BC1 and BC7 requests must not be counted as zero-filled.
+- BCPack DirectStorage requests decode BC1–BC7 complete multi-lane rANS payloads into temporary memory and publish only after success. They are excluded from continuation caching. BC2/BC6H now reconstruct packed blocks; invalid formats and damaged streams fail without publishing blank textures. BC1 uses independent endpoint/index history and exact format dictionaries; the fitted window and quadrant masks have been removed. File and memory sources, outer zlib and physical-page destinations share this path. Historical zero-filled counters remain in the summary log schema but are no longer incremented. [Implementation, synthetic fixtures and oracle reproduction](experiments/bcpack-standalone.md).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
@@ -3650,9 +3655,13 @@ texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The vie
 
 
 A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
-at most 2048 texels on each side and an uncompressed format with a known element size, with one mip
-or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit the
-chain. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+at most 2048 texels on each side and a format with a known element size (8- to 128-bit texels and
+BC1 to BC7, whose largest mip must then be whole 4x4 blocks across and down; the depth is any), with
+one mip or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit
+the chain. A block-compressed volume is laid out as the volume of its 4x4 blocks, each one depth layer
+deep: the sides are rounded up to whole blocks first, and every mip size after that is counted in
+blocks (`ElemLib::AdjustSurfaceInfo`), so a mip whose texel side is not a multiple of 4 can be a block
+wider in the layout than in the view. addrlib lays a 3D resource in a standard or display mode out in thick blocks
 (`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
 16-byte elements, and the volume is stored a layer of blocks (one block deep) at a time. Each layer
@@ -3664,7 +3673,7 @@ read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoM
 depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
 without a live texture, cube views of other arrays, three-dimensional descriptions in any
-other layout or with a block-compressed format, multisampled textures, the XOR swizzle modes and
+other layout, multisampled textures, the XOR swizzle modes and
 every other layout value. The texels must be readable and span
 at most 64 MiB.
 
@@ -3705,9 +3714,10 @@ Limits and choices that are not measured against a console:
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
 - The thick `0x105` volume layout is compared with addrlib itself when the build has it
-  (`startup_gfx10_volume_addrlib`: every element address of every mip of 305 volumes, 115 of them
-  with a mip chain). Block-compressed volumes and volumes in the other modes are not handled; they
-  stay refused.
+  (`startup_gfx10_volume_addrlib`: every element address of every mip of 501 volumes, 115 of the uncompressed ones
+  with a mip chain, and 196 block-compressed ones, every mip count of four chains for each of BC1
+  to BC7). Only BC1 volumes are drawn. Volumes in the other modes are not handled; they stay
+  refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
