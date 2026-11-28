@@ -69,6 +69,7 @@ for os_name, console, gpu in combos:
     check(s["env"].get("X2W_DEVICE_TYPE") == {"x": "7", "s": "6"}[console], f"{where}: X2W_DEVICE_TYPE")
     check(s["layers"] == ["base", f"os.{os_name}", f"console.{console}", f"gpu.{gpu}"], f"{where}: layer order")
     check(all(isinstance(v, str) for v in s["env"].values()), f"{where}: env values are strings")
+    check(s["env"].get("X2W_HIDE_TITLE_WINDOW") == "1", f"{where}: the title's own window is hidden")
     host = "linux" if os_name == "linux" else "windows"
     cmd = rp.build_command(host, s, pkg / "stage" / "t.exe", pkg, pkg / "log", pkg / "storage")
     if host == "linux":
