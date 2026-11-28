@@ -7450,8 +7450,9 @@ void report_budget(ID3D12CommandQueue* queue)
     log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
-// X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
-// window composites every presented plane. Unset, the window shows plane 0 alone, as before.
+// X2W_PRESENT_COMPOSITE=1 (diagnostic, docs/startup-runtime.md#presented-planes): forces the
+// all-plane path, including for a one-plane present, and enables the raw-plane sample. Multi-plane
+// presents composite by default.
 bool present_composite_enabled()
 {
     static const bool on = x2w_local::env_on("X2W_PRESENT_COMPOSITE");
@@ -7459,9 +7460,11 @@ bool present_composite_enabled()
 }
 
 // The planes the output window draws for a present, resolved to real resources it can draw.
-// X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count). Otherwise
-// plane 0 alone is kept, unless X2W_PRESENT_COMPOSITE=1 keeps every plane for the composite
-// (present_planes.h). The baseline capture and readback do not use this: they read plane 0 as before.
+// X2W_PRESENT_PLANE=<n> (diagnostic) keeps plane n alone (plane 0 when n is past the count) and wins
+// over the default. Otherwise every plane of a multi-plane present is kept for the composite; a
+// one-plane present keeps plane 0 alone (present_planes.h select_presented_planes).
+// X2W_PRESENT_COMPOSITE=1 forces the all-plane path. The baseline capture and readback do not use
+// this: they read plane 0 as before.
 struct PresentedPlanes {
     ID3D12Resource* drawable[window_planes] = {};  // per plane, null when left out
     x2w_startup::PlaneStep steps[window_planes];
@@ -7479,11 +7482,10 @@ PresentedPlanes presented_planes(UINT planes, const void* plane_parameters)
     PresentedPlanes out;
     std::uint64_t shown[window_planes] = {};
     const unsigned total = planes < window_planes ? planes : window_planes;
-    const unsigned only = wanted >= 0 ? (static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u)
-                          : present_composite_enabled() ? ~0u
-                                                        : 0u;
+    const x2w_startup::PlaneSelection selection =
+        x2w_startup::select_presented_planes(planes, wanted, present_composite_enabled());
     for (unsigned i = 0; i < total; ++i) {
-        if (only != ~0u && i != only) continue;
+        if (!selection.all && i != selection.only) continue;
         const std::uint64_t resource = x2w_startup::present_plane_resource(plane_parameters, planes, i, readable);
         Wrapper* const surface = resource ? as_wrapper(reinterpret_cast<void*>(resource)) : nullptr;
         if (!surface || surface->own().kind != resource_kind || !surface->own().real) continue;
@@ -7567,13 +7569,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         capture::present(frame, surface);
         if (surface && surface->own().kind == resource_kind)
             red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
-        // Render mode: the presented planes go to the output window through a swap chain: plane 0 alone
-        // by default, every plane with X2W_PRESENT_COMPOSITE=1. The compositor draws the steps in order.
+        // Render mode: the presented planes go to the output window through a swap chain. The
+        // compositor draws the selected steps in order; a multi-plane present keeps them all by default.
         if (render_mode()) {
             const PresentedPlanes presented = presented_planes(planes, plane_parameters);
             if (presented.count)
                 shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), presented.steps, presented.count,
-                                                    presented.drawable, present_composite_enabled() ? window_planes : 1);
+                                                    presented.drawable, window_planes);
             if (present_composite_enabled() && presented.top && presented.top_plane > 0) {
                 raw_surface = presented.top;
                 raw_plane = presented.top_plane;

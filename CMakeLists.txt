@@ -2402,8 +2402,9 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_sharedexp_target_${adapter} COMMAND offscreen_check ${adapter} --startup-sharedexp-target)
     set_tests_properties(startup_sharedexp_target_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
-# Presented planes (src/startup_stubs/present_planes.h): the plane record layout and the composite order
-# on synthetic records. The control reads 0x40-byte records and composites plane 0 alone, and must FAIL.
+# Presented planes (src/startup_stubs/present_planes.h): the plane record layout, the selection policy
+# and the composite order on synthetic records. The control reads 0x40-byte records, composites plane 0
+# alone and keeps the old single-plane selection, and must FAIL.
 add_executable(startup_present_planes tests/startup_present_planes_check.cpp)
 target_include_directories(startup_present_planes PRIVATE src)
 target_compile_features(startup_present_planes PRIVATE cxx_std_17)

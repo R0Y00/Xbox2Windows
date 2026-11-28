@@ -39,6 +39,26 @@ struct PlaneStep {
     bool blended = false;
 };
 
+// Which planes of a present the output window draws. A diagnostic choice (X2W_PRESENT_PLANE=<n>)
+// keeps plane n alone and wins over the default; n past the count falls back to plane 0. Otherwise a
+// present with more than one plane keeps them all, so a black or empty plane 0 does not hide a
+// picture on a higher plane. A one-plane present keeps plane 0 alone, as before. `composite`
+// (X2W_PRESENT_COMPOSITE=1) forces the every-plane path, including for a one-plane present.
+struct PlaneSelection {
+    bool all = false;   // keep every plane
+    unsigned only = 0;  // otherwise the single plane kept
+};
+
+inline PlaneSelection select_presented_planes(unsigned planes, long wanted, bool composite)
+{
+    PlaneSelection selection;
+    if (wanted >= 0)
+        selection.only = static_cast<unsigned long>(wanted) < planes ? static_cast<unsigned>(wanted) : 0u;
+    else if (composite || planes > 1)
+        selection.all = true;
+    return selection;
+}
+
 // The window composite of a present, bottom to top, the way planes stack on the console: plane 0
 // first, each later plane over it. `resources[i]` is plane i's surface, 0 when it cannot be shown;
 // those planes and repeats of a surface already drawn are left out. The lowest drawn plane is

@@ -4,7 +4,9 @@
 // A flip-model swap chain on the title window, created on the queue the title presents with; each
 // present draws its planes into the back buffer, bottom to top, with the plane compositor
 // (plane_compositor.h: one full-window triangle a plane; a surface is usually larger than the
-// window), and flips. Plane 0 alone by default; every plane with X2W_PRESENT_COMPOSITE=1. Diagnostics go to the window title, because GDI drawing does not mix with a
+// window), and flips. Plane 0 alone for a one-plane present; every selected plane otherwise. The
+// compositor capacity is fixed on the first present so a later multi-plane present can still draw
+// every plane. Diagnostics go to the window title, because GDI drawing does not mix with a
 // flip-model swap chain.
 
 struct WindowPresenter {
@@ -157,7 +159,8 @@ bool presentable_surface(ID3D12Resource* surface)
 
 // Composites the steps of a present (present_planes.h composite_steps) into the window and flips.
 // plane_surfaces[step.plane] is that plane's surface (resting in COMMON and presentable), or null to
-// leave it out. Returns false if not shown.
+// leave it out. plane_capacity is fixed for the window presenter's lifetime: pass the largest present
+// it can draw, not this present's step count. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* steps, unsigned count,
                        ID3D12Resource* const* plane_surfaces, UINT plane_capacity)
 {
