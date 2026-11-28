@@ -362,7 +362,6 @@ int draw_frame(Scene& s, void* device, void* pso, UINT frame, UINT frames, bool 
         }
     }
     if (FAILED(static_cast<HRESULT>(invoke(s.list, 9)))) return 31;
-    invoke(s.queue, 10, 1, arg(&s.list));
     if (!s.signature) {
         // Plane record as queue_present reads it: +0x08 resource count, +0x10 pointer to the resource array.
         alignas(8) unsigned char plane[0x48]{};
