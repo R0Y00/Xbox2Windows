@@ -108,9 +108,14 @@ if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 try {
-    & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @mapArgs @traceArgs @captureArgs *> "$LogDir.out"
-    $debuggerExit = $LASTEXITCODE
+    # Windows PowerShell 5.1 wraps redirected native stderr as an error record. Keep that
+    # from aborting the launcher before it can report the debugger's exit code.
+    & {
+        $ErrorActionPreference = "Continue"
+        & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
+            --trace-files 1 --continue-asserts $ContinueAsserts @mapArgs @traceArgs @captureArgs
+        $script:debuggerExit = $LASTEXITCODE
+    } *> "$LogDir.out"
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.
     if ($translator -and -not $translator.HasExited) {

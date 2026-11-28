@@ -60,6 +60,7 @@ struct Inst {
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
     unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
+    std::optional<Word> dpp8_selectors;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -287,6 +288,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
         const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
+        const bool dpp8 = i.src[0] == 233 || i.src[0] == 234;
+        if (direct && half_alu && dpp8)
+            refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -326,7 +330,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 if (half_alu && ((i.dst_select != 4 && i.dst_select != 5) ||
                                  (i.dst_unused != 0 && i.dst_unused != 2)))
                     refuse(pc, "unsupported SDWA destination modifier");
-                if (i.dst_select == 7 || i.dst_unused == 3 || ((i.clamp || i.scale) && !floats.count(name) && !conversion) ||
+                const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
+                if (i.dst_select == 7 || i.dst_unused == 3 ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }
@@ -334,8 +340,6 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 const unsigned control = (ext >> (16 + 8*j)) & 255;
                 i.src_select[j] = control & 7;
                 i.src_sext[j] = (control & 8) != 0;
-                if (half_alu && (control & 128))
-                    refuse(pc, "SDWA binary16 source must be a VGPR");
                 if (half_alu && i.src_select[j] < 4)
                     refuse(pc, "invalid SDWA source modifier");
                 if (i.src_select[j] == 7 || (control & 64) || (fp_input && i.src_sext[j]) || (!fp_input && (control & 0x30)))
@@ -399,7 +403,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.src[0]=256+(control&255);
             i.neg=((control>>20)&1)|((control>>21)&2);
             i.abs=((control>>21)&1)|((control>>22)&2);
-        } else if (graphics && (i.src[0] == 233 || i.src[0] == 234) && i.enc != Encoding::Vopc && !lit) {
+        } else if (direct && !graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
+            const Word control = take();
+            i.dpp8_selectors = control >> 8;
+            i.dpp_fetch_inactive = i.src[0] == 234;
+            i.src[0] = 256 + (control & 255);
+        } else if (graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
             // pixel_aot.parse_dpp: both halves of an octet must select the
             // same local 2x2 permutation to map to desktop quad operations.
             const Word control = take();
@@ -650,6 +659,10 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
         if (i.name == "s_mov_b64")
             set(i.dst + 1, high);
+    } else if (!graphics && !wave64 && (i.name == "s_and_saveexec_b32" || i.name == "s_or_saveexec_b32")) {
+        // Both the saved EXEC and the updated EXEC are numeric mask words.
+        set(i.dst, {});
+        set(126, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};
@@ -1691,7 +1704,11 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    const bool wave64 = stage && !stage->wave32;
+    // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
+    // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
+    // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
+    // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
+    const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
