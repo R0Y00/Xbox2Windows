@@ -71,6 +71,14 @@ def make_tree(root):
     </ClCompile>
   </ItemDefinitionGroup>""",
     )
+    write(
+        platform / "999999" / "Platform.Common.props",
+        """  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>PROFILE_999999</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>""",
+    )
     return platform
 
 
@@ -109,6 +117,28 @@ def main():
         conditions = document["properties"]["UseDebugLibraries"]
         check(conditions[0]["condition"] == "'$(Configuration)'=='Debug'", f"condition {conditions}")
         check(len(document["sources"]) == 4, f"sources {len(document['sources'])}")
+
+        other_output = root / "profile-999999.json"
+        other = profiles.main([
+            "scan", "--root", str(root), "--platform", "Gaming.Xbox.Scarlett.x64",
+            "--sdk", "999999", "--json", str(other_output),
+        ])
+        check(other == 0, f"999999 scan exit {other}")
+        other_document = json.loads(other_output.read_text(encoding="utf-8"))
+        check(other_document["sdk"] == "999999", f"sdk {other_document['sdk']}")
+        check(other_document["defines"] == ["PROFILE_999999"], f"defines {other_document['defines']}")
+        source_paths = [item["path"] for item in other_document["sources"]]
+        check(any("999999" in path and "Platform.Common.props" in path for path in source_paths),
+              f"999999 source {source_paths}")
+        check(not any("261000" in path for path in source_paths), f"261000 leaked {source_paths}")
+
+        unsupported_output = root / "profile-unsupported.json"
+        unsupported = profiles.main([
+            "scan", "--root", str(root), "--platform", "Gaming.Xbox.Scarlett.x64",
+            "--sdk", "888888", "--json", str(unsupported_output),
+        ])
+        check(unsupported == 2, f"unsupported SDK exit {unsupported}")
+        check(not unsupported_output.exists(), "unsupported SDK wrote output")
 
         missing = profiles.main([
             "scan", "--root", str(root), "--platform", "Gaming.Desktop.x64",
