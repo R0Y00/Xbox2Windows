@@ -260,29 +260,44 @@ int draw_bc_address_srvs(void* guest, void* list)
 }
 
 // X2W_TEST_CONSOLE_VIEW names a file of texels and X2W_TEST_CONSOLE_DESC the texture they belong to
-// ("width,height,mips,format,layout,viewed mip", and a depth for a volume viewed as a Texture3D). No
-// resource object exists at the address; one mip is viewed and drawn over the whole target. With X2W_TEST_CONSOLE_XG_ROWS=1 the address is first announced
+// ("width,height,mips,format,layout,viewed mip", then optionally ",1d" for a one-dimensional texture with a
+// one-dimensional view, ",cube" for a two-dimensional array of six with a cube view, or ",depth" for a volume
+// viewed as a Texture3D). No resource object exists at the address; one mip is viewed and drawn over the whole
+// target. With X2W_TEST_CONSOLE_XG_ROWS=1 the address is first announced
 // the way the XG stand-in announces a copy of desktop-footprint rows; with =after the announcement comes
 // between the publication and the draw.
 int draw_console_address_srv(void* guest, void* list)
 {
     wchar_t path[MAX_PATH]{};
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", path, MAX_PATH);
-    char text[96]{};
-    unsigned width = 0, height = 0, mips = 0, format = 0, layout = 0, viewed = 0, depth = 0;
-    if (!length || length >= MAX_PATH || !GetEnvironmentVariableA("X2W_TEST_CONSOLE_DESC", text, sizeof(text)) ||
-        std::sscanf(text, "%u,%u,%u,%u,%u,%u,%u", &width, &height, &mips, &format, &layout, &viewed, &depth) < 6) return 43;
+    char text[96]{}, extra[8]{};
+    unsigned width = 0, height = 0, mips = 0, format = 0, layout = 0, viewed = 0;
+    if (!length || length >= MAX_PATH || !GetEnvironmentVariableA("X2W_TEST_CONSOLE_DESC", text, sizeof(text))) return 43;
+    const int fields = std::sscanf(text, "%u,%u,%u,%u,%u,%u,%7s", &width, &height, &mips, &format, &layout, &viewed, extra);
+    const bool one_d = fields == 7 && !std::strcmp(extra, "1d");
+    const bool cube = fields == 7 && !std::strcmp(extra, "cube");
+    const unsigned depth = fields == 7 && !one_d && !cube ? static_cast<unsigned>(std::strtoul(extra, nullptr, 10)) : 0;
+    if (fields != 6 && !one_d && !cube && !depth) return 43;
     alignas(4096) static std::array<char, 1 << 20> backing{};
     std::ifstream input(path, std::ios::binary);
     input.read(backing.data(), backing.size());
     if (!input.gcount() || !input.eof()) return 43;
-    const D3D12_RESOURCE_DESC desc{depth ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width,
-        height, static_cast<UINT16>(depth ? depth : 1), static_cast<UINT16>(mips), static_cast<DXGI_FORMAT>(format), {1, 0},
-        static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
+    const D3D12_RESOURCE_DESC desc{one_d ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                                   : depth ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        0, width, height, static_cast<UINT16>(depth ? depth : cube ? 6 : 1), static_cast<UINT16>(mips),
+        static_cast<DXGI_FORMAT>(format), {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(layout), D3D12_RESOURCE_FLAG_NONE};
     ViewAt v{};
     v.view.Format = desc.Format;
     v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (depth) {
+    if (one_d) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        v.view.Texture1D.MostDetailedMip = viewed;
+        v.view.Texture1D.MipLevels = 1;
+    } else if (cube) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        v.view.TextureCube.MostDetailedMip = viewed;
+        v.view.TextureCube.MipLevels = 1;
+    } else if (depth) {
         v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         v.view.Texture3D.MostDetailedMip = viewed;
         v.view.Texture3D.MipLevels = 1;
@@ -1171,7 +1186,7 @@ int draw_volume_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     bad_clamp.view.Texture3D.ResourceMinLODClamp = 1.0f;
     invoke(guest, 70, ptr(&desc), ptr(&bad_clamp), cpu);
 
-    // 5. Wrong layout (console layout 0x105)
+    // 5. A console layout (0x105) over the live desktop-layout volume: refused as overlapping_resource
     D3D12_RESOURCE_DESC bad_layout = desc;
     bad_layout.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
     invoke(guest, 70, ptr(&bad_layout), ptr(&v), cpu);

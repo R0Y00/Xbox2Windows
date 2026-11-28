@@ -566,6 +566,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
         extern int draw_root_reset(void*, void*);
         if (const int result = draw_root_reset(guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_RECT_GAP", nullptr, 0)) {
+        extern int draw_rect_gap(void*, void*);
+        if (const int result = draw_rect_gap(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
         extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
         if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;

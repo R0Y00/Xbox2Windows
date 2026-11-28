@@ -172,11 +172,11 @@ def check_single_root_srv(base, consumer, dxc, adapter):
     # Manifest parser refusal controls on bad `srv ... buf root ...` lines and descriptor-word udsrc on a root SRV.
     for bad_manifest, expected_reason in (
         (manifest.replace("srv 0 buf root 2", "srv 0 buf root -1"),
-         "a resource that is not a raw table buffer or a 2D texture"),
+         "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"),
         (manifest.replace("srv 0 buf root 2", "srv 0 buf root 2 trailing"),
-         "a resource that is not a raw table buffer or a 2D texture"),
+         "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"),
         (manifest.replace("srv 0 buf root 2", "srv 1 buf root 2"),
-         "a resource that is not a raw table buffer or a 2D texture"),
+         "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"),
         (manifest.replace("ud 3\nudsrc 0 rootconst 0 0\nudsrc 1 rootconst 0 1\nudsrc 2 rootconst 0 2",
                           "ud 4\nudsrc 0 rootconst 0 0\nudsrc 1 rootconst 0 1\nudsrc 2 rootconst 0 2\nudsrc 3 stride 0"),
          "an entry value names a descriptor that is not a buffer input or output"),
@@ -185,6 +185,8 @@ def check_single_root_srv(base, consumer, dxc, adapter):
         sub_cache, sub_env = setup_case(sub, two_srvs=False, adapter=adapter)
         (sub_cache / f"{key:016x}.txt").write_text(bad_manifest, encoding="utf-8")
         (sub_cache / f"{key:016x}.cs.cso").write_bytes(cso_path.read_bytes())
+        # The Python translator's sidecar marks these unmarked manifests as Python output, not stale native output.
+        (sub_cache / f"{key:016x}.cs.hlsl").write_bytes(hlsl_path.read_bytes())
         got, result = run(sub, consumer, sub_env, "dispatch-root-srv")
         assert got == [SENTINEL] * WORDS
         assert lines(result, f"compute pipeline {key:016x} not translated: {expected_reason}"), result.stderr[-3000:]
