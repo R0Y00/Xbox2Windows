@@ -427,6 +427,51 @@ void drop_unrecorded_view(const ViewRecord& record, bool materialized, const cha
             container, record.slot);
 }
 
+// Opt-in, bounded descriptor provenance. Called with note_lock held: sequence is
+// the order in which shadow updates are published, not GPU execution order.
+// Guest bytes are sampled BEFORE this operation publishes its token/copy.
+bool descriptor_history_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_D3D12_DESCRIPTOR_HISTORY");
+    return enabled;
+}
+void trace_descriptor_history(const char* operation, u64 title, u64 desktop, u64 source,
+                              std::uint32_t previous, std::uint32_t next, UINT token_bytes)
+{
+    if (!descriptor_history_enabled()) return;
+    static u64 sequence;
+    const u64 event = ++sequence;
+    if (event > 8192) {
+        if (event == 8193) log("x2w-descriptor-history truncated limit=8192");
+        return;
+    }
+    const DWORD saved_error = GetLastError();
+    std::uint32_t guest[8]{};
+    const UINT guest_bytes = (std::min)(token_bytes, UINT{sizeof(guest)});
+    SIZE_T copied = 0;
+    const bool readable = guest_bytes && title != desktop && ReadProcessMemory(GetCurrentProcess(),
+        reinterpret_cast<const void*>(title), guest, guest_bytes, &copied) && copied == guest_bytes;
+    const ViewRecord* view = next && next - 1 < view_records().size() ? &view_records()[next - 1] : nullptr;
+    u64 first = 0;
+    UINT stride = 0;
+    if (view && view->slot == 18 && view->desc_bytes >= sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        std::memcpy(&srv, view->desc, sizeof(srv));
+        if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            first = srv.Buffer.FirstElement;
+            stride = srv.Buffer.StructureByteStride;
+        }
+    }
+    log("x2w-descriptor-history seq=%llu op=%s guest=%llx desktop=%llx source=%llx old=%u new=%u "
+        "slot=%u resource=%llx backing=%llx first=%llu stride=%u materialized=%u guest_bytes=%u guest_read=%u "
+        "guest_before=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+        event, operation, title, desktop, source, previous, next, view ? view->slot : 0,
+        view ? view->resource : 0, view ? unwrap(view->resource) : 0, first, stride,
+        view && view_materialized()[next - 1] ? 1 : 0, guest_bytes, readable ? 1 : 0,
+        guest[0], guest[1], guest[2], guest[3], guest[4], guest[5], guest[6], guest[7]);
+    SetLastError(saved_error);
+}
+
 // A view is created: remembered by id; the id is also written into title-owned descriptor memory so
 // that copies the title makes there itself can be followed.
 void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop,
@@ -491,6 +536,8 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     }
     if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
         const std::uint32_t prev = *slot_ptr;
+        trace_descriptor_history("create", dest_title, dest_desktop, 0, prev, record.id + 1,
+            slot == 22 ? x2w_startup::title_sampler_stride : 32u);
         *slot_ptr = record.id + 1;
         // The same view written to the same slot again keeps its id and changes no reference count. A different view
         // takes over the slot: the new record adds its refs, the previous materialized record drops its own.
@@ -515,11 +562,21 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
 }
 void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop, UINT count, UINT increment)
 {
+    const bool history = descriptor_history_enabled();
+    const UINT dest_stride = history ? title_descriptor_stride(dest_title, increment) : 0;
+    const UINT src_stride = history ? title_descriptor_stride(src_title, increment) : 0;
     AcquireSRWLockExclusive(&note_lock);
     descriptors_copied += count;
     std::uint32_t dest_room = 0, src_room = 0;
     std::uint32_t* to = shadow_slot(dest_desktop, &dest_room);
     const std::uint32_t* from = shadow_slot(src_desktop, &src_room);
+    if (history)
+        for (UINT i = 0; i < count; ++i) {
+            const auto previous = to && i < dest_room ? to[i] : 0;
+            const auto next = to && count <= dest_room ? (from && count <= src_room ? from[i] : 0) : previous;
+            trace_descriptor_history("copy", dest_title + u64{i} * dest_stride, dest_desktop + u64{i} * increment,
+                src_title + u64{i} * src_stride, previous, next, dest_stride);
+        }
     if (to && count <= dest_room) {
         if (from && count <= src_room) {
             // Every copied-in view is now named by one more tracked slot; every view the destination named before is
