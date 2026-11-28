@@ -4,6 +4,7 @@
 // length or one input byte. --mutate collapse is the negative control: every failure is reported as one
 // class, which this test must reject.
 #include "bcpack_encoder.h"
+#include "bcpack_format_fixtures.h"
 #include "startup_stubs/bcpack_inspect.h"
 
 #include <cstdint>
@@ -155,7 +156,7 @@ void test_bc1()
     expect_class("bc1 12 bytes (one and a half blocks)", bc1, 1, 12, C::destination_misaligned);
     expect_class("bc1 0 bytes", bc1, 1, 0, C::bad_arguments);
     expect_class("bc1 empty input", Bytes(), 1, 512, C::bad_arguments);
-    expect_class("bc1 format 6", bc1, 6, 512, C::unsupported_format);
+    expect_class("bc1 format 8", bc1, 8, 512, C::unsupported_format);
     expect_class("bc1 format 0", bc1, 0, 512, C::unsupported_format);
     check(x2w_bcpack::inspect_bcpack(nullptr, 515, 1, 512).cls == C::bad_arguments, "null input");
     check(x2w_bcpack::inspect_bcpack(bc1.data(), bc1.size(), 1, x2w_bcpack::inspect_max_output + 8).cls ==
@@ -249,8 +250,58 @@ void test_bc345()
     }
 }
 
-// A fragment header whose first byte names an alphabet wider than 8 bits cannot come from the BC1 or BC7
-// layouts, whose alphabets never go below 3 bits. A one-lane decode with a 2-bit alphabet reaches it.
+void test_bc2_bc6_bc7()
+{
+    using C = InspectClass;
+    for (unsigned format : { 2u, 6u }) {
+        const unsigned mode = format == 6 ? 13 : 0;
+        const auto symbols = bcpack_fixture::reference_symbols(format, 0, 0, mode);
+        Bytes stream;
+        check(bcpack_fixture::encode(format, symbols, 1, stream), "bc" + std::to_string(format) + " fixture encoder");
+        if (!stream.empty()) {
+            expect_class("bc" + std::to_string(format) + " exact", stream, format,
+                         bcpack_fixture::block_bytes(format), C::ok);
+        }
+    }
+
+    const auto invalid_mode_symbols = bcpack_fixture::reference_symbols(6, 0, 0, 14);
+    Bytes invalid_mode;
+    check(bcpack_fixture::encode(6, invalid_mode_symbols, 1, invalid_mode), "bc6 invalid mode fixture encoder");
+    if (!invalid_mode.empty()) {
+        expect_class("bc6 undefined mode", invalid_mode, 6, 16, C::bc6_mode_invalid);
+    }
+
+    auto invalid_control_symbols = bcpack_fixture::reference_symbols(7, 0, 0, 0);
+    invalid_control_symbols[30] = 31;
+    invalid_control_symbols[31] = 3;
+    Bytes invalid_control;
+    check(bcpack_fixture::encode(7, invalid_control_symbols, 1, invalid_control),
+          "bc7 unmapped control fixture encoder");
+    if (!invalid_control.empty()) {
+        expect_class("bc7 unmapped control 0x07f", invalid_control, 7, 16, C::control_code_unmapped);
+    }
+}
+
+void test_inspect_layouts()
+{
+    for (unsigned format = 1; format <= 7; ++format) {
+        const x2w_bcpack::InspectLayout* layout = x2w_bcpack::inspect_layout(format);
+        check(layout != nullptr, "bc" + std::to_string(format) + " inspector layout exists");
+        if (!layout) continue;
+        check(layout->lanes == bcpack_fixture::lanes(format), "bc" + std::to_string(format) + " lane count");
+        check(layout->block_bytes == bcpack_fixture::block_bytes(format),
+              "bc" + std::to_string(format) + " block size");
+        check(layout->symbols_per_block == bcpack_fixture::per(format),
+              "bc" + std::to_string(format) + " symbols per block");
+        for (std::size_t lane = 0; lane < layout->lanes; ++lane) {
+            check(layout->alphabet_bits[lane] == bcpack_fixture::AB[format - 1][lane],
+                  "bc" + std::to_string(format) + " lane " + std::to_string(lane) + " alphabet index");
+        }
+    }
+}
+
+// A fragment header whose first byte names an alphabet index above 8 cannot come from the BC1 or BC7
+// layouts, whose indices never go below 3. A one-lane decode with index 2 reaches it.
 void test_lane_report()
 {
     using x2w_bcpack::LaneFailure;
@@ -261,14 +312,14 @@ void test_lane_report()
     const uint8_t input[3] = { 0xC0, 0x00, 0x00 };
     check(!x2w_bcpack::decode_lanes(input, sizeof(input), narrow, 1, 1, symbols, &report) &&
               report.failure == LaneFailure::header_invalid,
-          "lane report: header names a wider alphabet");
+          "lane report: header names an alphabet index above 8");
     check(!x2w_bcpack::decode_lanes(input, sizeof(input), narrow, 0, 1, symbols, &report) &&
               report.failure == LaneFailure::bad_arguments,
           "lane report: no lanes");
-    const uint8_t wide[1] = { 9 };
-    check(!x2w_bcpack::decode_lanes(input, sizeof(input), wide, 1, 1, symbols, &report) &&
+    const uint8_t above_limit[1] = { 9 };
+    check(!x2w_bcpack::decode_lanes(input, sizeof(input), above_limit, 1, 1, symbols, &report) &&
               report.failure == LaneFailure::bad_arguments,
-          "lane report: alphabet wider than 8 bits");
+          "lane report: alphabet index above 8");
     // Without a report the call answers as before.
     check(!x2w_bcpack::decode_lanes(input, sizeof(input), narrow, 1, 1, symbols), "lane decode without a report");
 }
@@ -288,6 +339,8 @@ int main(int argc, char** argv)
     test_bc1();
     test_bc7();
     test_bc345();
+    test_bc2_bc6_bc7();
+    test_inspect_layouts();
     test_lane_report();
     std::printf("bcpack_inspect_check: %d cases, %d failed%s\n", cases, failures, collapse ? " (collapsed control)" : "");
     return failures ? 1 : 0;

@@ -249,8 +249,8 @@ inline bool phase1(Lane& ln) {
 // Why decode_lanes returned false, for inspect_bcpack (bcpack_inspect.h). Filled only when a report is passed.
 enum class LaneFailure : uint8_t {
     none,
-    bad_arguments,       // no lanes, more than 16, a zero target or an alphabet wider than 8 bits
-    header_invalid,      // a fragment header names an alphabet wider than 8 bits
+    bad_arguments,       // no lanes, more than 16, a zero target or an alphabet index above 8
+    header_invalid,      // a fragment header names an alphabet index above 8
     fragment_not_home,   // a flushed fragment did not end at the rANS home state
     end_state_invalid,   // all lanes finished in a state that is not a terminal state
     trailing_input,      // all lanes finished and a non-zero input byte is left

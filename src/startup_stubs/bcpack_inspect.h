@@ -4,10 +4,10 @@
 //
 // The class is a reading of lane state, not a proof about the source data. A stream cut exactly at a
 // fragment boundary in every lane reads as request_longer_than_stream, because it is a shorter stream.
-// Every format decode_bcpack decodes (BC1, BC3, BC4, BC5 and BC7) has a lane layout here, the same alphabets and
-// symbols per block; add a layout entry when decode_bcpack gains a format. The BC1, BC3, BC4 and BC5 block
-// stages fail only on a destination that is too small, which this header never passes, so only BC7 has a
-// control_code_unmapped class.
+// Every format decode_bcpack decodes (BC1 through BC7) has a lane layout here, the same alphabets and symbols
+// per block; add a layout entry when decode_bcpack gains a format. The BC1 through BC5 block stages fail only
+// on a destination that is too small, which this header never passes. BC6H can reject an undefined mode and
+// BC7 can reject an unmapped control code.
 #pragma once
 
 #include <cstddef>
@@ -23,7 +23,7 @@ enum class InspectClass : uint8_t {
     bad_arguments,               // null or empty input, empty or oversized destination, or no lane layout fits
     unsupported_format,          // a format number without a lane layout in this header
     destination_misaligned,      // destination size is not a whole number of blocks
-    header_invalid,              // a fragment header names an alphabet wider than 8 bits
+    header_invalid,              // a fragment header names an alphabet index above 8
     fragment_not_home,           // a flushed fragment did not end at the rANS home state
     end_state_invalid,           // all lanes finished in a state that is not a terminal state
     trailing_input,              // all lanes finished and a non-zero input byte is left
@@ -31,6 +31,7 @@ enum class InspectClass : uint8_t {
     request_longer_than_stream,  // all input read, every lane stopped at a fragment boundary short of the count
     truncated_in_fragment,       // all input read, a lane stopped inside a fragment short of the count
     cycle_limit,                 // no progress for 64 cycles in another state, or the cycle limit
+    bc6_mode_invalid,             // lanes decoded; a BC6H block names an undefined mode
     control_code_unmapped,       // lanes decoded; a BC7 block names an unmapped control code
 };
 
@@ -57,10 +58,12 @@ struct InspectLayout {
 
 inline constexpr InspectLayout INSPECT_LAYOUTS[] = {
     { 1, 12, { 7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7 }, 8, 1 },
-    { 7, 16, { 3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4 }, 16, 2 },
+    { 2, 15, { 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 5, 4, 7, 7 }, 16, 2 },
     { 3, 12, { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 }, 16, 2 },
     { 4, 12, { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 }, 8, 1 },
     { 5, 12, { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 }, 16, 2 },
+    { 6, 16, { 3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4 }, 16, 2 },
+    { 7, 16, { 3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4 }, 16, 2 },
 };
 
 inline const InspectLayout* inspect_layout(unsigned format) {
@@ -100,6 +103,7 @@ inline const char* inspect_class_name(InspectClass cls) {
     case InspectClass::request_longer_than_stream: return "request_longer_than_stream";
     case InspectClass::truncated_in_fragment: return "truncated_in_fragment";
     case InspectClass::cycle_limit: return "cycle_limit";
+    case InspectClass::bc6_mode_invalid: return "bc6_mode_invalid";
     case InspectClass::control_code_unmapped: return "control_code_unmapped";
     }
     return "unknown";
@@ -134,7 +138,12 @@ inline InspectResult inspect_bcpack(const unsigned char* input, size_t input_siz
         return result;
     }
     result.cls = InspectClass::ok;
-    if (bc_format == 7) {
+    if (bc_format == 6) {
+        std::vector<unsigned char> scratch(output_size);
+        if (!decode_bc6_blocks(symbols, num_blocks, scratch.data(), scratch.size())) {
+            result.cls = InspectClass::bc6_mode_invalid;
+        }
+    } else if (bc_format == 7) {
         std::vector<unsigned char> scratch(output_size);
         if (!decode_bc7_blocks(symbols, num_blocks, scratch.data(), scratch.size())) {
             result.cls = InspectClass::control_code_unmapped;
