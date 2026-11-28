@@ -74,43 +74,46 @@ class Case:
 
 def all_cases():
     return [
-        # 1. Positive fractions and exact positive integers.
+        # 1. Positive fractions and exact positive integers (with nonzero unused high halves on op_sel[0]=0 VGPR reads).
         Case('pos_zero', 257, 0x0000),
-        Case('pos_frac_half', 257, 0x3800),
-        Case('pos_frac_mixed', 257, 0x3D00),      # 1.25 -> 0.25
-        Case('pos_frac_three_quarters', 257, 0x4380),  # 3.75 -> 0.75
-        Case('pos_exact_one', 257, 0x3C00),       # 1.0 -> +0.0
-        Case('pos_exact_max', 257, 0x7BFF),       # 65504 -> +0.0
+        Case('pos_frac_mixed', 257, 0x7BFF3D00),      # 1.25 -> 0.25 (hi=65504 ignored)
+        Case('pos_exact_one', 257, 0x3C00),           # 1.0 -> +0.0
+        Case('pos_exact_max', 257, 0x7BFF),           # 65504 -> +0.0
         # 2. Negative fractions and exact negative integers (-0.0, -1.0, -65504).
-        Case('neg_zero', 257, 0x8000),            # -0.0 -> +0.0
-        Case('neg_quarter', 257, 0xB400),         # -0.25 -> 0.75
-        Case('neg_1_75', 257, 0xBF00),            # -1.75 -> 0.25
-        Case('neg_2_5', 257, 0xC100),             # -2.5 -> 0.5
-        Case('neg_exact_one', 257, 0xBC00),       # -1.0 -> +0.0
-        Case('neg_exact_max', 257, 0xFBFF),       # -65504 -> +0.0
-        # 3. Tiny negatives: x - floor(x) rounds up to 1.0 (0x3c00), hardware clamps strictly below 1.0 to 0x3bff.
-        Case('tiny_neg_2_m11', 257, 0xB000),       # -2^-11 -> 0x3bff
-        Case('tiny_neg_2_m12', 257, 0xAC00),       # -2^-12 (rounds to 1.0 without clamp) -> 0x3bff
+        Case('neg_zero', 257, 0x8000),                # -0.0 -> +0.0
+        Case('neg_quarter', 257, 0x7BFFB400),         # -0.25 -> 0.75 (hi=65504 ignored)
+        Case('neg_1_75', 257, 0xBF00),                # -1.75 -> 0.25
+        Case('neg_exact_one', 257, 0xBC00),           # -1.0 -> +0.0
+        Case('neg_exact_max', 257, 0xFBFF),           # -65504 -> +0.0
+        # 3. Tiny negatives: x - floor(x) near 1.0 (0x3bff clamp + RNE-vs-truncation discriminators).
+        Case('tiny_neg_2_m11', 257, 0x9000),          # -2^-11 -> 0x3bff exact
+        Case('tiny_neg_2_m12', 257, 0x8C00),          # -2^-12 (rounds to 1.0 without clamp) -> 0x3bff
+        Case('tiny_neg_5_m12', 257, 0x9500),          # -5*2^-12 (halfway tie -> 0x3bfe under RNE vs 0x3bfd trunc)
+        Case('tiny_neg_9_m13', 257, 0x9480),          # -9*2^-13 (rounds to 0x3bfe under RNE vs 0x3bfd trunc)
         Case('tiny_neg_min_subnormal', 257, 0x8001),  # -2^-24 -> 0x3bff
-        # 4. Positive binary16 subnormals preserved as exact fraction.
+        # 4. Positive binary16 subnormal preserved as exact fraction.
         Case('pos_min_subnormal', 257, 0x0001),
-        Case('pos_max_subnormal', 257, 0x03FF),
-        # 5. Non-finite inputs: +Inf, -Inf, and NaN -> 0x7e00 (or +0.0 with clamp).
+        # 5. Non-finite inputs (+Inf, -Inf, NaN -> 0x7e00 or +0.0 with clamp) and finite clamp=1 preservation.
         Case('pos_inf', 257, 0x7C00),
         Case('neg_inf', 257, 0xFC00),
         Case('nan_payload', 257, 0x7E01),
         Case('vop3_clamp_inf_and_neg', 257, 0xFC00, wide=True, clamp=1),
         Case('vop3_clamp_nan', 257, 0x7E01, wide=True, clamp=1),
-        # 6. VOP3 modifiers: abs, neg, abs+neg, high-half op_sel[0]/op_sel[3] preserving D[15:0].
-        Case('vop3_abs_neg', 257, 0xB400, wide=True, abs_=1, neg=1),  # -abs(-0.25) = -0.25 -> 0.75
+        Case('vop3_clamp_pos', 257, 0x7BFF3D00, wide=True, clamp=1),
+        Case('vop3_clamp_neg', 257, 0x7BFFB400, wide=True, clamp=1),
+        # 6. VOP3 modifiers: separate abs, neg, and high-half op_sel[0]/op_sel[3] preserving D[15:0].
+        Case('vop3_abs', 257, 0x7BFFB400, wide=True, abs_=1),  # abs(-0.25) = 0.25 -> 0.25
+        Case('vop3_neg', 257, 0x7BFF3400, wide=True, neg=1),   # neg(0.25) = -0.25 -> 0.75
+        Case('vop3_opsel_hi_src', 257, 0x3D003C00, wide=True, op_sel=0b0001),
+        Case('vop3_opsel_hi_dst', 257, 0x3C003D00, wide=True, op_sel=0b1000),
         Case('vop3_opsel_hi_rw', 257, 0x3D00BEEF, wide=True, op_sel=0b1001),
-        # 7. SGPR, literal (255), inline binary16 float (240=0.5, 248=0x3118) and inline integer subnormal (129=0x0001).
+        # 7. SGPR, literal (255), inline binary16 float (248=0x3118) and inline integer subnormal (129=0x0001).
         Case('sgpr_src0', 10, 0xB400),
-        Case('literal_src0', 255, 0xAC00),
+        Case('literal_src0', 255, 0x8C00),
         Case('inline_f16_248', 248, 0),
         Case('inline_int_129', 129, 0),
         # 8. Partial EXEC_LO mask: inactive lanes keep DST_INIT.
-        Case('partial_exec', 257, 0x3D00, exec_mask=0xAAAAAAAA),
+        Case('partial_exec', 257, 0x7BFF3D00, exec_mask=0xAAAAAAAA),
     ]
 
 
@@ -136,6 +139,7 @@ def emit_case(c: Case):
 
 
 def compute_program(cases):
+    assert len(cases) <= 32, len(cases)
     code = list(PROLOGUE)
     for slot, c in enumerate(cases):
         code += emit_case(c) + F.store(slot * 4, 4)
