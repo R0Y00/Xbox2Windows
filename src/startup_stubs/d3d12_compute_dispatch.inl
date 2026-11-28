@@ -78,6 +78,22 @@ bool float_output_format(DXGI_FORMAT format)
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 
+// Whether the adapter runs 32-lane waves: 1 yes, 0 no, -1 the capability query failed.
+int adapter_32_lane_waves()
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+    if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))))
+        return -1;
+    return waves.WaveOps && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 32;
+}
+
+bool adapter_reports_shader_model_below_6_6()
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+    return SUCCEEDED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) &&
+           model.HighestShaderModel < D3D_SHADER_MODEL_6_6;
+}
+
 // The root signature and pipeline of a translation whose entry values and views are filled in. Returns why it is
 // unavailable, or null when it is ready.
 const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, std::size_t bytes)
@@ -216,7 +232,17 @@ const char* load_compute_translation(ComputeTranslation& tr)
     }
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
-    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) return failure;
+    if (const char* failure = create_compute_pipeline(tr, code->GetBufferPointer(), code->GetBufferSize())) {
+        // The manifest does not declare a wave size. Report the adapter capability alongside the PSO failure.
+        if (!std::strcmp(failure, "pipeline creation failed")) {
+            const int waves = adapter_32_lane_waves();
+            if (waves < 0) return "pipeline creation failed (adapter wave capability query failed)";
+            if (!waves) return "pipeline creation failed (adapter has no 32-lane waves)";
+            if (adapter_reports_shader_model_below_6_6())
+                return "pipeline creation failed (adapter shader model below 6.6)";
+        }
+        return failure;
+    }
     log("x2w-draw compute pipeline %016llx translated: %zu entry values, %zu inputs, %zu outputs", tr.key, tr.uds.size(),
         tr.srvs.size(), tr.uavs.size());
     return nullptr;
@@ -224,8 +250,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
 
 // X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>: the first Dispatch of a slot 67 request translates
 // it in this process with the C++ compiler (src/gfx1013_compute_native.cpp), before a published <key>.txt is read
-// and with no offline translator running. The dispatch path below binds the result, so a program is accepted only
-// with root constants, raw table buffers it loads per lane (buffer_load_dword) and raw table buffers it stores to.
+// and with no offline translator running. The dispatch path below binds root constants and supported table views.
 // A refusal is logged and leaves the key to the published translations. draw_lock held. Returns whether tr is ready.
 bool translate_compute_natively(ComputeTranslation& tr)
 {
@@ -254,22 +279,40 @@ bool translate_compute_natively(ComputeTranslation& tr)
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {
-            // The two kinds a fixture has run through this path: a raw buffer read per lane, and one written.
-            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav;
+            using Kind = x2w::ComputeViewKind;
+            // Match the float texture and buffer slots in format_compute_runtime_manifest.
+            const bool texture_output = view.kind == Kind::texture_uav || view.kind == Kind::half4_texture_uav;
+            const bool output = texture_output || view.kind == Kind::raw_buffer_uav;
+            const bool texture_input = view.kind == Kind::texture_srv && view.image_dimension == 1;
+            auto dimension = D3D12_UAV_DIMENSION_UNKNOWN;
+            if (texture_output) {
+                switch (view.image_dimension) {
+                case 0: dimension = D3D12_UAV_DIMENSION_TEXTURE1D; break;
+                case 1: dimension = D3D12_UAV_DIMENSION_TEXTURE2D; break;
+                case 2: dimension = D3D12_UAV_DIMENSION_TEXTURE3D; break;
+                case 5: dimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; break;
+                }
+            }
             auto& slots = output ? tr.uavs : tr.srvs;
-            if ((!output && view.kind != x2w::ComputeViewKind::raw_vector_srv) || view.array_count != 1 ||
+            const bool supported = view.kind == Kind::raw_buffer_uav || view.kind == Kind::raw_vector_srv ||
+                                   view.kind == Kind::buffer_srv || texture_input ||
+                                   dimension != D3D12_UAV_DIMENSION_UNKNOWN;
+            if (!supported || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
                 throw std::runtime_error("view kind " + std::to_string(static_cast<unsigned>(view.kind)) +
                                          " is not bound for a natively translated program");
-            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset)});
+            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset),
+                             texture_input || texture_output});
+            if (texture_output)
+                slots.back().uav_dimension = dimension;
         }
         if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
             throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
-        // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
-        D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
-        if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))) ||
-            !waves.WaveOps || waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32)
+        // Direct modules use shader model 6.6 with WaveSize(32).
+        if (adapter_32_lane_waves() != 1)
             throw std::runtime_error("the adapter has no 32-lane waves");
+        if (adapter_reports_shader_model_below_6_6())
+            throw std::runtime_error("the adapter reports shader model below 6.6");
         // Never released: a static destructor would release DXC after its module may have detached.
         static x2w::ShaderDxilCompiler* const compiler =
             new x2w::ShaderDxilCompiler(x2w::ShaderDxilCompiler::runtime_worker(sdk));

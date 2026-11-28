@@ -4848,6 +4848,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${DXC_BIN_DIR}/dxil.dll")
+            add_test(NAME startup_compute_dispatch_texture_native_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+                "${DXC_EXECUTABLE}" ${adapter} "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+            set_tests_properties(startup_compute_dispatch_texture_native_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})

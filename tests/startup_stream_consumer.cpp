@@ -545,7 +545,9 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32;
-    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w";
+    const bool zero_w = mode == "texture-volume-native-zero-w";
+    const bool native_inputs = mode == "texture-volume-native-inputs" || zero_w;
+    const bool volume = native_inputs || mode == "texture-volume" || mode == "texture-volume-bad-w";
     const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
     const UINT first_mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
@@ -601,10 +603,15 @@ static int texture_slot67(void* device, const std::string& mode)
         for (UINT i = 0; i < bytes / 2; ++i) static_cast<UINT16*>(memory)[i] = static_cast<UINT16>(0x5000 + i);
     }
     invoke(upload, 9, 0, 0);
+    constexpr StreamWord record_bytes = 32;
+    const StreamWord increment = invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT descriptor_count = dual ? 5 : 4;
+    // On wider heaps, reserve a separate region for the shader's packed guest table.
+    const UINT table_slot = increment == record_bytes ? 0 : descriptor_count;
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, dual ? 5u : 4u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, table_slot + descriptor_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -614,12 +621,37 @@ static int texture_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&list)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
-    if (!cpu || !gpu) return 73;
+    if (!cpu || !gpu || increment < record_bytes) return 73;
+    const StreamWord table_cpu = cpu + table_slot * increment;
+    const StreamWord uav_handle = cpu + 2 * increment;
+    void* input_texture = nullptr;
+    if (native_inputs) {
+        // A hardware buffer descriptor in record 0 and a 2D SRV token in record 1.
+        auto* input = static_cast<UINT*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!input) return 70;
+        input[0] = 0x3f200000u; // 0.625f, not a value the store fixture writes
+        void* placed = nullptr;
+        const D3D12_RESOURCE_DESC input_buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, sizeof(UINT), 1, 1, 1,
+            DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(input), word(&input_buffer), D3D12_RESOURCE_STATE_COMMON,
+                0, word(&__uuidof(ID3D12Resource)), word(&placed))))) return 71;
+        const auto address = reinterpret_cast<UINT64>(input);
+        const UINT descriptor[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | (4u << 16), 1, 0};
+        std::memcpy(reinterpret_cast<void*>(table_cpu), descriptor, sizeof(descriptor));
+        const D3D12_RESOURCE_DESC input_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, format, {1, 0}};
+        input_texture = make(D3D12_HEAP_TYPE_DEFAULT, input_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!input_texture) return 71;
+        D3D12_SHADER_RESOURCE_VIEW_DESC input_view{format, D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        input_view.Texture2D.MipLevels = 1;
+        invoke(device, 18, word(input_texture), word(&input_view), cpu + 1 * increment);
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (volume) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
         // At mip 1 the depth is six. The bad count fits only if the binder uses the base mip's depth.
         view.Texture3D = {first_mip, 1, mode == "texture-volume-bad-w" ? layers : ~0u};
+        if (zero_w) view.Texture3D.WSize = 0;
     } else if (line) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
         view.Texture1D.MipSlice = mode == "texture-line-bad-mip" ? first_mip + 1 : first_mip;
@@ -629,32 +661,44 @@ static int texture_slot67(void* device, const std::string& mode)
     } else {
         view.Texture2D.MipSlice = swapped ? 1 : 0;
     }
-    if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), uav_handle);
     if (mode == "texture-store-copied") {
         // The view is created at another handle and its token copied into this slot by memcpy, as a title does; a
         // refused creation at this slot then keeps that copied token.
         invoke(device, 19, word(texture), 0, word(&view), cpu);
-        std::memcpy(reinterpret_cast<void*>(cpu + 64), reinterpret_cast<void*>(cpu), 32);
+        std::memcpy(reinterpret_cast<void*>(uav_handle), reinterpret_cast<void*>(cpu), record_bytes);
         D3D12_RESOURCE_DESC plain = texture_desc;
         plain.Flags = D3D12_RESOURCE_FLAG_NONE;
         void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
         if (!other) return 79;
-        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+        invoke(device, 19, word(other), 0, word(&view), uav_handle);
     } else if (mode == "texture-store-occupied") {
         // A second creation at the same handle, over a texture without unordered access, is refused and leaves the first view.
         D3D12_RESOURCE_DESC plain = texture_desc;
         plain.Flags = D3D12_RESOURCE_FLAG_NONE;
         void* const other = make(D3D12_HEAP_TYPE_DEFAULT, plain, D3D12_RESOURCE_STATE_COMMON);
         if (!other) return 79;
-        invoke(device, 19, word(other), 0, word(&view), cpu + 64);
+        invoke(device, 19, word(other), 0, word(&view), uav_handle);
     }
     if (dual) {
         view.Texture2D.MipSlice = swapped ? 0 : 1;
-        invoke(device, 19, word(texture), 0, word(&view), cpu + 128);
+        invoke(device, 19, word(texture), 0, word(&view), cpu + 4 * increment);
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
+    if (table_slot) {
+        // Creation writes 32-byte tokens at the stride-aligned CPU handles. The translated
+        // Dispatch reads them from packed 32-byte records in the bound guest table.
+        const auto copy_token = [&](UINT slot) {
+            std::memcpy(reinterpret_cast<void*>(table_cpu + slot * record_bytes),
+                        reinterpret_cast<const void*>(cpu + slot * increment), record_bytes);
+        };
+        if (native_inputs) copy_token(1);
+        if (mode == "texture-store-self") copy_token(0);
+        copy_token(2);
+        if (dual) copy_token(4);
+    }
     const auto transfer = [&](void* buffer, bool to_texture) {
         for (UINT layer = 0; layer < subresources; ++layer)
             for (UINT mip = 0; mip < mips; ++mip) {
@@ -668,11 +712,19 @@ static int texture_slot67(void* device, const std::string& mode)
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
+    if (input_texture) {
+        D3D12_TEXTURE_COPY_LOCATION input_image{static_cast<ID3D12Resource*>(input_texture),
+            D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION input_source{static_cast<ID3D12Resource*>(upload),
+            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        input_source.PlacedFootprint = {0, {format, 1, 1, 1, pitch}};
+        invoke(list, 16, word(&input_image), 0, 0, 0, word(&input_source), 0);
+    }
     transfer(upload, true);
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));
     invoke(list, 39, 0, 3, word(constants), 0);
-    invoke(list, 35, 1, gpu);
+    invoke(list, 35, 1, gpu + table_slot * increment);
     if (mode != "texture-store-none") invoke(list, 14, 2, 1, 1);
     transfer(readback, false);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
