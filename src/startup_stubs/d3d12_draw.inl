@@ -3337,6 +3337,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::SamplerSource source;
     u64 sampler_wrapper = 0;
     x2w_startup::ViewTable heap_records;
+    UINT heap_entries = 0;
     x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
@@ -3346,9 +3347,11 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
                                                                    heap.increment, heap.desktop_gpu);
+                    if (heap_records.address) heap_entries = heap.logical_count;
+                }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu) {
                     sampler_wrapper = heap.wrapper;
@@ -3367,6 +3370,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.title_samplers = source;
     pass.sampler_heap_wrapper = sampler_wrapper;
     pass.title_view_heap = heap_records;
+    pass.title_view_heap_entries = heap_entries;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).

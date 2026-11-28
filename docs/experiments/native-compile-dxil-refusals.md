@@ -25,7 +25,8 @@
      exit: a zero group dimension, root constants above parameter 15 or more than 8 in one parameter,
      more than 32 user data words, a resource or sampler heap view, a view above root parameter 15,
      non-contiguous SRV or UAV registers, an SRV or UAV kind with no manifest line (the kind, and for
-     images the dimension and `array`), more than 32 SRVs or 8 UAVs, a comparison sampler, and stride
+     images the dimension and `array`; a texture SRV of dimension 1D, 2D, 3D or 2D array has a line, a
+     cube or multisampled one does not), more than 32 SRVs or 8 UAVs, a comparison sampler, and stride
      words from a view that is not one raw vector SRV. No register numbers, offsets or keys.
    - `--requests` still publishes `<key>.cs.cso` and no `<key>.txt`, still counts the request as
      compiled and still removes `<key>.fail`. It prints the reason in that job's report as

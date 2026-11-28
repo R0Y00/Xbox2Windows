@@ -2,8 +2,9 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
-// outputs) named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
+// outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
+// named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
+// (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -37,11 +38,14 @@ struct ComputeTranslation {
         bool root = false;
         bool atomic_uint_texture = false;
         unsigned channels = 4;
+        D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
+        unsigned half_buffer_bytes = 0;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     x2w_startup::ManifestRetry manifest_retry;  // absent and stale manifests can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    UINT heap_srvs = 0;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
@@ -82,6 +86,16 @@ unsigned float_output_channels(DXGI_FORMAT format)
         return 0;
     }
 }
+
+bool half_buffer_descriptor_matches(const std::uint32_t* words, unsigned bytes)
+{
+    // gfx10 V# with identity selectors for each stored component and structured
+    // bounds (OOB_SELECT=0). Swizzled or padded records need a different view.
+    const unsigned format = bytes == 2 ? 13 : bytes == 4 ? 29 : 71;
+    const unsigned selectors = (1u << (3 * (bytes / 2))) - 1;
+    return (words[1] >> 16) == bytes && (words[3] & (0xfffff000u | selectors)) ==
+        (0x01000000u | (format << 12) | (0xfacu & selectors));
+}
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 LONG compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib;  // inputs by path: this list's GPU copy, a title snapshot
@@ -92,7 +106,7 @@ const char* create_compute_pipeline(ComputeTranslation& tr, const void* code, st
 {
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), tr.heap_srvs)))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -163,6 +177,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (!std::strcmp(name, "tex3d")) return D3D12_UAV_DIMENSION_TEXTURE3D;
             return D3D12_UAV_DIMENSION_UNKNOWN;
         };
+        const auto srv_dimension = [&] {
+            if (!std::strcmp(name, "tex1d")) return D3D12_SRV_DIMENSION_TEXTURE1D;
+            if (!std::strcmp(name, "tex2d")) return D3D12_SRV_DIMENSION_TEXTURE2D;
+            if (!std::strcmp(name, "tex2da")) return D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            if (!std::strcmp(name, "tex3d")) return D3D12_SRV_DIMENSION_TEXTURE3D;
+            return D3D12_SRV_DIMENSION_UNKNOWN;
+        };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
         if (std::sscanf(line.c_str(), "ud %u%n", &declared_uds, &used) == 1 && whole()) continue;
         if (std::sscanf(line.c_str(), "udsrc %u rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uds.size())
@@ -188,6 +209,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u bufhalf table %d %d bytes %u%n", &i, &a, &b, &x, &used) == 4 &&
+                 whole() && i == tr.uavs.size() && x2w::native_half_buffer_format(x) != DXGI_FORMAT_UNKNOWN) {
+            tr.uavs.push_back({a, b});
+            tr.uavs.back().half_buffer_bytes = x;
+        }
         else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
                  whole() && i == tr.uavs.size()) {
             tr.uavs.push_back({a, b, true});
@@ -201,8 +227,16 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.back().uav_dimension = uav_dimension();
             tr.uavs.back().channels = x;
         }
-        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+        else if (std::sscanf(line.c_str(), "srv %u %15s table %d %d%n", &i, name, &a, &b, &used) == 4 && whole() &&
+                 i == tr.srvs.size() && srv_dimension() != D3D12_SRV_DIMENSION_UNKNOWN) {
             tr.srvs.push_back({a, b, true});
+            tr.srvs.back().srv_dimension = srv_dimension();
+        }
+        else if (std::sscanf(line.c_str(), "resheap %u %u%n", &x, &y, &used) == 2 && whole()) {
+            if (tr.heap_srvs || !x || x > x2w_startup::max_translated_resheap || y != x2w_startup::translated_resheap_space)
+                return "a resource heap range outside the supported layout";
+            tr.heap_srvs = x;
+        }
         // A static sampler, decoded as the draw path does: plain (smp), with the descriptor's LOD clamp (smpl) or a
         // comparison one (smpc). Not modelled here: the run-time sampler heap table (smpheap).
         else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
@@ -211,8 +245,8 @@ const char* load_compute_translation(ComputeTranslation& tr)
                   std::sscanf(line.c_str(), "smpc %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 1D/2D/2D-array/3D float texture"
+        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 1D/2D/2D-array/3D texture"
+                  : line.rfind("uav", 0) == 0 ? "an unsupported compute output view"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant or a buffer descriptor word"
                   : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
@@ -399,11 +433,11 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         union {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv;
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
-        } desc;  // a texture view's description, as the title gave it with a desktop format
+        } desc;  // a described desktop texture or typed buffer view
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
-    } views[40]{};
+    };
     static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) >= ViewRecord::srv_desc_bytes);
     static_assert(sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) >= ViewRecord::uav_desc_bytes);
     const auto type = list->GetType();
@@ -437,6 +471,9 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         if (tr->uds[i].source == ComputeTranslation::root_constant && !pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1))
             reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
+    std::vector<View> views(reason ? 0 : count + tr->heap_srvs);
+    if (!reason && dispatch.signature && tr->heap_srvs)
+        reason = "translated indirect Dispatch requires fixed-table raw buffers";
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
@@ -480,7 +517,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         // A heap record sits at the 32-bit byte offset the program computes, the index shifted left by 5, in the
         // title memory of the list's view heap: a literal byte offset, as a table's is.
-        const u64 entry = slot.heap ? (slot.word_param >= 0 || slot.a >= 0 ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
+        const u64 entry = slot.heap ? ((slot.word_param >= 0 || slot.a >= 0) && index < pass.title_view_heap_entries
+                                         ? pass.title_view_heap.record(std::uint32_t{index << 5}, 16) : 0)
             : slot.a < 0 || slot.b < 0 ? 0 : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
@@ -515,6 +553,21 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
                 else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
                     reason = "an input texture has no desktop texture to sample";
+                else if (slot.srv_dimension != D3D12_SRV_DIMENSION_TEXTURE2D) {
+                    // 1D, 2D array and 3D: only the title's own described view of that dimension, inside its texture.
+                    const bool one = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE1D;
+                    const bool array = slot.srv_dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    if (!described)
+                        reason = one ? "an input 1D texture has no recorded view description"
+                            : array ? "an input 2D array texture has no recorded view description"
+                            : "an input 3D texture has no recorded view description";
+                    else if (desc.ViewDimension != slot.srv_dimension)
+                        reason = one ? "an input texture view is not 1D" : array ? "an input texture view is not 2D array"
+                            : "an input texture view is not 3D";
+                    else if (!x2w_startup::address_view_fits(resource, desc))
+                        reason = "an input texture view does not fit its texture";
+                    else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                }
                 else if (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
                                    : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                     reason = "an input texture view is not 2D";
@@ -618,26 +671,69 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         // Each refused condition has its own reason.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
+        const unsigned half_bytes = slot.half_buffer_bytes;
+        const unsigned alignment = half_bytes ? half_bytes : D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const bool sized = words[0] != view_token_magic && bytes && bytes % 4 == 0 && bytes <= (16u << 20);
+        const bool sized = words[0] != view_token_magic && bytes && (half_bytes || bytes % 4 == 0) && bytes <= (16u << 20);
         const auto placed = sized ? placed_buffer_range(self->own().list_device, address, bytes) : PlacedVertexView{};
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
         if (words[0] == view_token_magic) reason = "an output buffer descriptor is a view token";
+        else if (half_bytes && !half_buffer_descriptor_matches(words, half_bytes))
+            reason = "a half buffer store requires matching format, stride and structured bounds";
         else if (!bytes) reason = "an output buffer descriptor has zero records";
-        else if (!sized) reason = "an output buffer range is over 16 MiB or not whole dwords";
+        else if (!sized) reason = half_bytes ? "an output half buffer range is over 16 MiB"
+                                           : "an output buffer range is over 16 MiB or not whole dwords";
         else if (placed.reject) reason = "an output range crosses the end of a placed buffer";
         else if (!placed.owner) reason = "an output is in title memory outside any placed buffer";
         else if (!placed.alias) reason = "an output is in a placed buffer that does not alias title memory";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
             reason = "an output buffer's resource was not created in the common state";
-        else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output buffer range is not 16-byte aligned in its resource";
+        else if (offset % alignment) reason = half_bytes ? "an output half buffer is not element-aligned in its resource"
+                                                       : "an output buffer range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer has no unordered access";
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
+        if (!reason && half_bytes) {
+            const auto format = x2w::native_half_buffer_format(half_bytes);
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            constexpr UINT required = D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                (support.Support1 & required) != required ||
+                !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+                reason = "an output half buffer format does not support typed UAV stores";
+            } else {
+                views[i].described = true;
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+                desc.Format = format;
+                desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                desc.Buffer.FirstElement = offset / half_bytes;
+                desc.Buffer.NumElements = words[2];
+                views[i].desc.uav = desc;
+            }
+        }
         std::memcpy(views[i].words, words, sizeof(views[i].words));
+    }
+    for (UINT r = 0; r < tr->heap_srvs && !reason; ++r) {
+        std::memset(words, 0, sizeof(words));
+        const u64 entry = r < pass.title_view_heap_entries ? pass.title_view_heap.record(u64{r} << 5, 16) : 0;
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 16)) {
+            reason = "a heap record is outside the list's view heap";
+            break;
+        }
+        std::memcpy(words, reinterpret_cast<const void*>(entry), 16);
+        const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20);
+        if (view.resource && view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+            reason = "an input buffer range is not 16-byte aligned in its resource";
+        if (reason && !tr->first_refusal)
+            log("x2w-draw compute %016llx first refused heap record %u, descriptor at 0x%llx", key, r, entry);
+        for (std::size_t output = inputs; output < count && !reason; ++output)
+            if (views[output].resource == view.resource) reason = "an output buffer is also an input";
+        views[count + r] = {view.resource, view.offset, view.bytes, !view.upload};
+        views[count + r].stride = view.stride;
+        std::memcpy(views[count + r].words, words, sizeof(views[count + r].words));
     }
     if (dispatch.argument)
         for (std::size_t i = 0; i < count && !reason; ++i)
@@ -684,14 +780,14 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return reason;
     }
-    const UINT n = static_cast<UINT>(count);
+    const UINT n = static_cast<UINT>(count + tr->heap_srvs);
     UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n))) % draw_heap_size;
     if (first + n > draw_heap_size) {
         first = 0;
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
-    for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
+    for (std::size_t i = 0; i < n; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
         if (i < inputs && view.texture) {
             // A compute list accepts no pixel-shader or depth state in a transition.
@@ -701,13 +797,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 view.described ? &view.desc.srv : nullptr, dest);
             continue;
         }
-        if (i < inputs) {
+        if (i < inputs || i >= count) {
             if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));
             continue;
         }
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (view.texture) {
+        if (view.texture || view.described) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
                 view.described ? &view.desc.uav : nullptr, dest);
             continue;

@@ -2883,6 +2883,7 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
+    UINT title_view_heap_entries = 0;        // logical descriptor count of title_view_heap (indices 0..count-1)
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -3384,9 +3385,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
     return TRUE;
 }
 
-// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
-// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
-// desktop desc. Only occlusion queries are
+// Query slots 28 to 30, confirmed by the GXDK 261000 ID3D12GraphicsCommandList8 function table
+// (command_list_slot_names.h): they are bound only with X2W_D3D12_QUERY_SLOTS=1 because the behavior is
+// diagnostic. The heap reaches device slot 39 with the desktop desc. Only occlusion queries are
 // forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
 // heap it names is refused and logged with its values instead of reaching the desktop list.
 enum QueryMethod { begin_query, end_query, resolve_query };
@@ -6662,8 +6663,8 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_written_probe(void* address, uns
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
 // serves pageSize 2 (bits 14-15) from a 64 MiB block, then asserts that the block was used up:
 // the console runtime evidently takes committed-resource memory from XMemAlloc with allocatorId
-// 0x80. Hypothesis used here: attributes = pageSize (2 from 4 MiB up, else 1) << 14 | 0x80 << 16 |
-// log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
+// 0x80. Hypothesis used here: attributes = pageSize (2, a 2 MiB page, selected from 4 MiB up; else 1)
+// << 14 | 0x80 << 16 | log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
 // own memory and does not alias it.
 using XMemAllocHook = void*(__stdcall*)(SIZE_T, ULONGLONG);
 XMemAllocHook title_alloc_hook()
@@ -7676,8 +7677,8 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
-        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
-        // bindings are opt-in. Unset, the slots stay no-ops.
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): the 261000 table confirms BeginQuery, EndQuery and
+        // ResolveQueryData at 28 to 30, but the bindings stay opt-in. Unset, the slots stay no-ops.
         if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
             list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
             list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);
