@@ -17992,3 +17992,174 @@ ctest --preset dev --no-tests=error -j1 -R '^native_pixel_atomic_(warp|hardware)
 ```
 
 Repeat with the release preset. The source-built fixture verifies 13 actual draws and four refusal controls per adapter/configuration, including contention, guard words, active out-of-view, odd raster edges and real WQM quad-neighbor reads with and without GLC. WQM+GLC records returned old values through a second exact atomic in a private lane slot and checks a valid serialization of the varying addends. Local RX 7900 XT/WARP Debug/Release integration over main 4b0350e passed 52 draws, 3328 DWORD and 1664 pixel comparisons, and 16 refusal controls. The debug layer was unavailable; actual title rendering is not established.
+## Source-built native compute translation and offline cache
+
+`tools/startup/compute_native.py` turns a bounded set of gfx1013 compute machine
+code into a validated, signed desktop compute container and records it in a
+revision-scoped cache. The machine code is assembled from source by LLVM 15
+(`llvm-mc -triple=amdgcn--amdpal -mcpu=gfx1013`), decoded by `pixel_aot.disassemble`,
+lowered by the existing `compute_store_aot.lower`, compiled by DXC as `cs_6_0 -E main`,
+validated and signed through `probe_roots`/`dxil_retarget`, and probed with
+`CreateRootSignature` and `CreateComputePipelineState`. It is an offline
+translator and cache producer. It does not execute anything through the startup
+stand-in, does not load a slot 62 pipeline, does not parse slot 67, and does not
+change the shim.
+
+### Fixture profiles
+
+Two source-built programs are supported. Both read two descriptor words through
+the table pointer, apply a lane guard, and store to a `RWTexture2D<uint>`:
+
+| Profile | Group | Dispatch | Output |
+|---|---|---|---|
+| `1d` | 32x1x1 | 6x1x1 | 192 words, one column per dispatch |
+| `2d` | 8x4x1 | 3x2x1 | 24 columns by 8 rows, 96-byte row stride |
+
+The 2-D store uses the translator's proven two-axis layout. The guard is the
+column bound, the only lane guard the translator verifies, and the load is a
+column broadcast because the accepted load form has no row term. Other group
+shapes, other descriptors, LDS, missing source bindings, a wrong table register
+and a linear-index guard are refused with a named reason.
+
+### Record and cache protocol
+
+A record is a canonical little-endian structure with a fixed magic, the scalar
+contract fields, the root parameter list, a SHA-256 of the code and the code
+bytes. The supported contract is `version 1`, `stage 5` (compute), `isa gfx1013`,
+`guest_wave 32`, translator revision 1, decoder identity 1, `cs_6_0`, and no
+interpreted `COMPUTE_PGM_RSRC2`: `rsrc2_interpretation` must be 0 and
+`recorded_rsrc2` must be 0. A nonzero field, another guest wave or another
+profile is refused rather than defaulted.
+
+The cache uses revision `x2w-startup-compute-native-2`. For each record:
+
+| File | Contents |
+|---|---|
+| `req_<key>.csn` | the canonical record |
+| `<key>.csn.src` | the request manifest (`status request`) |
+| `<key>.csn.hlsl` | the accepted HLSL |
+| `<key>.csn.cso` | the signed desktop container |
+| `<key>.csn.manifest` | `x2w-native-compute 2` manifest with the status and evidence |
+
+`<key>` is FNV-1a 64 over the revision string and the canonical record digest,
+formatted as 16 lowercase hex digits. The manifest repeats the key, revision,
+record digest, code size and digest, group, HLSL digest, output size and digest,
+the dependency identity, the two validation HRESULTs, the `RTS0` contract, the
+intrinsic-gate verdict, the signing state, and one `pso-<backend>` line per
+probed adapter. Publication writes the artifacts first and the manifest last; a
+reader accepts only a manifest whose digests, identity and backend evidence all
+match, and an interrupted publication therefore never reads as a hit. A refusal
+is written as `status refused` with its reason before any obsolete success
+artifact is removed, and it is permanent for that revision. Refusal manifests
+carry no dependency identity, so a translator change does not expire them; a
+cache produced under another translator must be regenerated rather than reused.
+
+### Dependency identity
+
+Every validated manifest declares eight identity fields. Three of them hash the
+working-tree content of the repository tools used to produce the artifact:
+`translator` (`compute_store_aot.py`), `decoder` (`pixel_aot.py`) and `pipeline`
+(all of `compute_store_aot.py`, `pixel_aot.py`, `resource_inventory.py`,
+`dxil_retarget.py`, `probe_roots.py`, `xbox_intrinsic_gate.py` and
+`compute_native.py`). The remaining fields identify the selected toolchain or
+compilation contract:
+
+| Field | Identity |
+|---|---|
+| `llvm` | SHA-256 of the supplied `libLLVM` |
+| `compiler` | SHA-256 of `dxcompiler.dll` beside the selected `dxc` |
+| `validator` | SHA-256 of the supplied `dxil.dll` |
+| `target` | `dxil-ms-dx` |
+| `dxc_flags` | `cs_6_0 -E main` |
+
+The three content identities hash the bytes on disk, so the same tools checked
+out with `core.autocrlf=true` and with LF line endings produce different
+`translator`, `decoder` and `pipeline` values. A cache is therefore machine-local: it is
+valid for the checkout and toolchain that produced it. A manifest from another
+checkout, LLVM library, compiler or validator is stale; the compile stage
+rebuilds it instead of accepting an artifact produced by a different toolchain.
+
+### Reproduction
+
+Requirements: x64 Windows with the Visual Studio C++ tools and the Windows SDK,
+CMake/Ninja, Python 3.11 or newer, WSL with LLVM 15 for the assemble and
+translate stages, `root_probe.exe`/`root_device_probe.exe` built from this
+repository, and a physical D3D12 adapter for the full cache suite because both
+backends are required; the preflight alone can be limited with `--warp-only`.
+
+```powershell
+.\tools\dev.ps1
+cmake --preset dev
+cmake --build --preset dev --target root_probe root_device_probe
+
+$py = 'out\pe-env\Scripts\python.exe'
+$dxc = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe'
+
+# Machine-code preflight: translate, refusals, reference, assemble, disassemble,
+# compile, validate, probe.
+& $py -B tests\compute_native_check.py --out out\native-compute\preflight `
+    --wsl-distro Ubuntu-22.04 --dxc $dxc `
+    --root-probe out\build\dev\root_probe.exe --device-probe out\build\dev\root_device_probe.exe
+
+# Full offline cache suite: 156 checks over requests, translation, publication,
+# acceptance, identity, locking, refusals, cache hits and stale entries.
+& $py -B tests\compute_native_cache_check.py --out out\native-compute\fresh `
+    --wsl-distro Ubuntu-22.04 --dxc $dxc `
+    --probe out\build\dev\root_probe.exe --pso-probe out\build\dev\root_device_probe.exe
+```
+
+`--linux-worker` is the internal entry point that the Windows orchestrator runs
+inside WSL; it is not the command to start on Windows. The stages can also be
+split by hand with `compute_native.py --pending <cache> --stage request`,
+`--stage translate --llvm <libLLVM>` and `--stage compile --dxc <dxc> --probe
+<root_probe> --pso-probe <root_device_probe>`.
+
+### Measured results
+
+The measurements below predate the change from pinned to supplied-toolchain
+hashes; they document the earlier run and do not verify this revision.
+
+On Windows 11 build 26300.9974 with LLVM 15.0.7 in WSL Ubuntu-22.04, Windows SDK
+10.0.26100 DXC, WARP and an Intel Iris Xe (`8086:9a49`, driver 31.0.101.5333):
+
+| Item | `1d` | `2d` |
+|---|---|---|
+| Machine code | 124 bytes, SHA-256 `57f31991…` | 128 bytes, SHA-256 `8374d7b3…` |
+| Record | 336 bytes, SHA-256 `420b4d31…` | 340 bytes, SHA-256 `15c4cc21…` |
+| Cache key | `d55528b6b2cfa1f8` | `95c4c65e03a8b336` |
+| HLSL | 466 bytes, SHA-256 `6b6e8250…` | 482 bytes, SHA-256 `6836ef38…` |
+| Signed container | 3640 bytes, SHA-256 `92d6a012…` | 3660 bytes, SHA-256 `6be3003e…` |
+
+Both manifest identities were `translator compute_store_aot/d47dacfb7be907f9`,
+`decoder pixel_aot/419cde0d50268c70` and `pipeline a6002e220219d61b` on the
+checkout that produced them. Validation returned `0x00000000` for the container
+and the module through `dxil.dll`, the root-signature contract `RTS0` was
+present, the intrinsic gate returned `ALLOW`, and signing left a nonzero
+container digest. `CreateRootSignature` and `CreateComputePipelineState` returned
+`0x00000000` on WARP and on the physical adapter at shader model `0x65`.
+
+The preflight passed its translate, refusal, reference, assemble, disassemble,
+compile, validate and probe stages, with 9 text refusals and 9 byte refusals. The
+refusals include a `COMPUTE_PGM_RSRC2` combined with explicit group registers
+(`COMPUTE_PGM_RSRC2 places the group IDs; do not also give group registers`) and
+`TG_SIZE_EN` (`COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported`); the adapter does
+not interpret that field. The earlier cache-suite run covered request,
+translation, publication, acceptance, identity, locking, refusals, cache hits
+and stale entries.
+
+A manifest rewritten to a different identity is stale, not accepted. The cache
+is trusted only as far as the local filesystem: every accepted entry is
+re-hashed on read, and nothing verifies who wrote it.
+
+### Scope and registration
+
+Not covered here: native runtime execution, GPU readback through the startup
+stand-in, a slot 62 loader, production slot 67 parsing, ExecuteIndirect, any new
+instruction lowering, profiles other than the two above, interpreted
+`COMPUTE_PGM_RSRC2`, `TG_SIZE_EN`, and guest waves other than 32.
+
+`tests/compute_native_check.py --unit` is registered in the Linux Python check
+list. It covers the oversized thread-group refusal and supplied-toolchain
+fingerprinting without requiring DXC, LLVM, WSL or a GPU. The full preflight and
+cache suite remain manual because they require a selected WSL distribution,
+DXC, both probe executables and, for the full suite, a physical adapter.
