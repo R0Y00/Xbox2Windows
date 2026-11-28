@@ -59,16 +59,17 @@ def check(native_path, lifted_path):
     # A legacy XMM load without VMOVD still needs an XMM declaration.
     old_load = list(Decoder(64, bytes.fromhex("c5 fa 6f 01 31 c0 c3")))
     source = lower(old_load, [], {}, {}, {})
-    assert "__m128i xmm0" in source and "xmm0 = load<__m128i>" in source, source
+    assert "__m128i xmm0" in source and "xmm0 = mem;" in source, source
+    assert source.count("load_always<__m128i>(") == 1, source
 
-    # Aligned memory moves require evidence that this profile does not have.
-    for raw in ("66 0f 28 01 c3", "c5 f9 7f 01 c3"):
-        try:
-            lower(list(Decoder(64, bytes.fromhex(raw))), [], {}, {}, {})
-        except ValueError as error:
-            assert "unsupported" in str(error), error
-        else:
-            raise AssertionError(f"accepted aligned memory move {raw}")
+    # Legacy MOVAPD now has a fault-preserving aligned load path.
+    legacy = list(Decoder(64, bytes.fromhex("66 0f 28 01 c3")))
+    source = lower(legacy, [], {}, {}, {})
+    assert source.count("load_legacy_aligned_m128(") == 1, source
+    aligned_store = list(Decoder(64, bytes.fromhex("c5 f9 7f 01 c3")))
+    source = lower(aligned_store, [], {}, {}, {})
+    assert "if (target & 15u) raise_aligned_m128_fault();" in source, source
+    assert source.index("if (target & 15u)") < source.index("memcpy(reinterpret_cast<void*>(target)"), source
 
     native, lifted = load_lib(native_path), load_lib(lifted_path)
 

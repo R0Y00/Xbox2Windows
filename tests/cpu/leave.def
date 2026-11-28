@@ -1,0 +1,13 @@
+EXPORTS
+    leave_frame
+    leave_lea
+    leave_join
+    leave_split
+    leave_unsaved
+    leave_overwritten
+    leave_released
+    leave_lowers
+    leave_above
+    leave_word
+    mov_rsp_frame
+    enter_frame

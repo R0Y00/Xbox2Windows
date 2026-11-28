@@ -3,10 +3,51 @@
 import argparse
 import json
 import re
+import struct
+import tempfile
+import zlib
 from pathlib import Path
 
 from pixel_aot import container_code, disassemble
 from resource_inventory import parts
+
+
+# Coverage comparisons: the compare kills the lanes for which it is true, so
+# the generated discard uses the same relation with the scalar limit first.
+KILL_RELATIONS = {"lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+# Both the VOP2 (e32) and the VOP3 (e64) spellings are accepted. Only the plain
+# register form is lowered: the e64 encoding also carries clamp, output scale
+# and input negate or absolute value, which the lowering does not model.
+FORMS = ("e32", "e64")
+SAMPLED_PRODUCTS = tuple(
+    f"v_mul{kind}_f32_{form}" for kind in ("_legacy", "") for form in FORMS
+)
+COVERAGE_COMPARES = tuple(
+    f"v_cmpx_{name}_f32_{form}" for name in KILL_RELATIONS for form in FORMS
+)
+
+
+# The explicit-level zero form takes the same operands as the implicit one, so
+# the same pattern accepts it. It reads mip 0 without a derivative, hence
+# SampleLevel with a literal zero rather than Sample.
+SAMPLE_CALLS = {
+    "image_sample": "Sample(samp,uv)",
+    "image_sample_lz": "SampleLevel(samp,uv,0)",
+}
+# The explicit-level form takes the level as a third address register after the
+# two coordinates. The biased form takes the bias as the first address register,
+# before them (bias, s, t). Only a register copied from a buffered float is
+# modeled for either, so the value is a GPU resource like the other comparison
+# inputs.
+LEVEL_SAMPLE = "image_sample_l"
+BIAS_SAMPLE = "image_sample_b"
+EXTRA_SAMPLES = {LEVEL_SAMPLE: "SampleLevel", BIAS_SAMPLE: "SampleBias"}
+
+
+def plain(bank, *tokens):
+    # One unmodified register of the bank, so a modifier suffix or prefix, a
+    # special register or an inline constant is rejected rather than ignored.
+    return all(re.fullmatch(bank + r"\d+", token) for token in tokens)
 
 
 def regs(token, bank, width):
@@ -56,10 +97,36 @@ def coverage_exit(tail, scalar):
         raise ValueError("Unverified coverage export or branch target")
 
 
+def _validate_bindings(bindings):
+    if not isinstance(bindings, dict) or not bindings:
+        raise ValueError("Bindings must be a non-empty JSON object")
+    for key in ("selector_byte", "descriptors", "words", "interp"):
+        if key not in bindings:
+            raise ValueError(f"Missing bindings field: {key}")
+    descriptors = bindings["descriptors"]
+    if (
+        not isinstance(descriptors, (list, tuple))
+        or not descriptors
+        or any(
+            not isinstance(entry, (list, tuple)) or len(entry) != 4
+            for entry in descriptors
+        )
+    ):
+        raise ValueError(
+            "Bindings descriptors must be a non-empty list of 4-item entries"
+        )
+    words = bindings["words"]
+    if not isinstance(words, (list, tuple)) or any(
+        not isinstance(entry, (list, tuple)) or len(entry) != 2 for entry in words
+    ):
+        raise ValueError("Bindings words must be a list of 2-item entries")
+
+
 def lower(decoded, bindings):
     # Locations are keyed by low table-pointer register and byte offset. A
     # descriptor may refer to a static selector, a desktop CB slice, one SRV,
     # or the fixture's point-clamp sampler.
+    _validate_bindings(bindings)
     scalar = {}
     slots = {}
     selector_byte = bindings["selector_byte"]
@@ -204,16 +271,40 @@ def lower(decoded, bindings):
                 vector[dst] = "uv." + attr[-1]
             else:
                 raise ValueError("Unmatched interpolation pair")
-        elif op == "image_sample":
+        elif op == "v_mov_b32_e32":
+            if len(args) != 2 or not (plain("v", args[0]) and plain("s", args[1])):
+                raise ValueError("Unsupported move operands")
+            source = read(args[1])
+            if (
+                args[0] in pending_sample
+                or not isinstance(source, tuple)
+                or source[0] != "float"
+            ):
+                raise ValueError("Unresolved move source")
+            vector[args[0]] = ("level", source[1])
+        elif op in SAMPLE_CALLS or op in EXTRA_SAMPLES:
             match = re.fullmatch(
                 r"(v\d+), (v\[\d+:\d+\]), (s\[\d+:\d+\]), (s\[\d+:\d+\]) dmask:0x([1248]) dim:SQ_RSRC_IMG_2D",
                 operands,
             )
             if not match or mask != "quad" or samples:
                 raise ValueError("Unsupported sample")
-            coords = regs(match[2], "v", 2)
-            if [vector.get(v) for v in coords] != ["uv.x", "uv.y"]:
+            explicit = op in EXTRA_SAMPLES
+            coords = regs(match[2], "v", 3 if explicit else 2)
+            extra = coords[0] if op == BIAS_SAMPLE else coords[-1]
+            uv_regs = coords[1:] if op == BIAS_SAMPLE else coords[:2]
+            if [vector.get(v) for v in uv_regs] != ["uv.x", "uv.y"]:
                 raise ValueError("Unresolved sample coordinates")
+            call = SAMPLE_CALLS.get(op)
+            if explicit:
+                level = vector.get(extra)
+                if (
+                    extra in pending_sample
+                    or not isinstance(level, tuple)
+                    or level[0] != "level"
+                ):
+                    raise ValueError("Unresolved sample level")
+                call = f"{EXTRA_SAMPLES[op]}(samp,uv,{level[1]})"
             texture = list(map(read, regs(match[3], "s", 8)))
             descriptor, _ = texture[0]
             if (
@@ -226,11 +317,15 @@ def lower(decoded, bindings):
             channel = int(match[5]).bit_length() - 1
             vector[match[1]] = (
                 "sample",
-                f"tex{descriptor[1]}.Sample(samp,uv).{'rgba'[channel]}",
+                f"tex{descriptor[1]}.{call}.{'rgba'[channel]}",
             )
             pending_sample.add(match[1])
             samples += 1
-        elif op == "v_mul_legacy_f32_e32":
+        elif op in SAMPLED_PRODUCTS:
+            if len(args) != 3 or not (
+                plain("v", args[0], args[2]) and plain("s", args[1])
+            ):
+                raise ValueError("Unsupported multiply operands or modifiers")
             dst, src, v = args
             scale, value = read(src), vector[v]
             if (
@@ -242,8 +337,12 @@ def lower(decoded, bindings):
                 or value[0] != "sample"
             ):
                 raise ValueError("Unresolved sampled product")
-            vector[dst] = ("product", scale[1], value[1])
-        elif op == "v_cmpx_gt_f32_e32":
+            # The legacy multiply returns zero when either input is zero; the
+            # IEEE multiply keeps NaN for zero times infinity.
+            vector[dst] = ("product", scale[1], value[1], op.startswith("v_mul_legacy_"))
+        elif op in COVERAGE_COMPARES:
+            if len(args) != 2 or not (plain("s", args[0]) and plain("v", args[1])):
+                raise ValueError("Unsupported compare operands or modifiers")
             limit, product = read(args[0]), vector[args[1]]
             if (
                 pending
@@ -257,15 +356,21 @@ def lower(decoded, bindings):
             ):
                 raise ValueError("Unresolved coverage predicate")
             coverage_exit(decoded[i + 1 :], scalar)
-            _, scale, sampled = product
+            _, scale, sampled, legacy = product
+            relation = KILL_RELATIONS[op.split("_")[2]]
+            multiply = (
+                f"({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha"
+                if legacy
+                else f"{scale} * alpha"
+            )
             return f"""Texture2D<float4> tex0 : register(t0);
 Texture2D<float4> tex1 : register(t1);
 SamplerState samp : register(s0);
 cbuffer Constants : register(b0) {{ float4 params[16]; }};
 void main(float2 uv : TEXCOORD0) {{
     float alpha = {sampled};
-    precise float product = ({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha;
-    if ({limit[1]} > product) discard;
+    precise float product = {multiply};
+    if ({limit[1]} {relation} product) discard;
 }}
 """
         else:
@@ -274,27 +379,64 @@ void main(float2 uv : TEXCOORD0) {{
 
 
 def translate(blob, bindings, llvm):
-    code = container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+    sections = parts(blob)
+    if b"DXIL" not in sections:
+        raise ValueError("DXBC container has no DXIL part")
+    code = container_code(sections[b"DXIL"], stage=0, llvm=llvm)
     return lower(disassemble(code, llvm, offsets=True), bindings)
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("container", type=Path)
-    p.add_argument("--bindings", type=Path, required=True)
-    p.add_argument("--llvm", required=True)
-    p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if a.output.suffix.lower() != ".hlsl" or a.output.resolve() in (
-        a.container.resolve(),
-        a.bindings.resolve(),
-    ):
-        p.error("Expected a separate HLSL output")
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("container", type=Path)
+    parser.add_argument("--bindings", type=Path, required=True)
+    parser.add_argument("--llvm", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
     try:
-        source = translate(
-            a.container.read_bytes(), json.loads(a.bindings.read_text()), a.llvm
-        )
-    except (ValueError, KeyError, TypeError, IndexError) as error:
-        p.error(f"Unsupported coverage input: {error}")
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(source, encoding="ascii")
+        dest = args.output.resolve()
+        src = args.container.resolve()
+        bindings_path = args.bindings.resolve()
+    except OSError as error:
+        parser.error(f"Unsupported coverage input: {error}")
+    if dest.suffix.lower() != ".hlsl" or dest in (src, bindings_path):
+        parser.error("Expected a separate HLSL output")
+    tmp_path = None
+    try:
+        blob = args.container.read_bytes()
+        bindings = json.loads(args.bindings.read_text(encoding="utf-8"))
+        _validate_bindings(bindings)
+        source = translate(blob, bindings, args.llvm)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            dir=dest.parent,
+            prefix=f".{dest.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(source)
+        tmp_path.replace(dest)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        struct.error,
+        zlib.error,
+    ) as error:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        parser.error(f"Unsupported coverage input: {error}")
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

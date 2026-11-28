@@ -1,0 +1,12 @@
+LIBRARY xcrdapi
+EXPORTS
+    DStorageGetFactory
+    get_dstorage_factory_calls
+    get_dstorage_queue_calls
+    get_dstorage_staging_buffer_size
+    get_dstorage_staged_requests_count
+    get_dstorage_submitted_count
+    set_dstorage_factory_success
+    set_dstorage_queue_success
+    set_dstorage_eager_completion
+    reset_dstorage_records

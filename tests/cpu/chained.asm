@@ -35,8 +35,8 @@ IFDEF USE_XOR_ZERO
     xor rdx, rdx
     lea rax, [rdx + 21]
 ELSEIFDEF USE_IMM_REG
-    mov r8d, 21
-    mov rax, r8
+    mov r8d, 80000015h
+    lea rax, [r8 - 2147483648]
 ELSE
     mov eax, 21
 ENDIF
@@ -54,7 +54,9 @@ IFDEF USE_XOR_ZERO
     xor eax, eax
 ELSEIFDEF USE_IMM_REG
     mov edx, 7
-    mov rax, rdx
+    lea rdx, [rdx - 2147483648]
+    mov eax, edx
+    lea rax, [rax - 2147483648]
 ELSE
     mov eax, 7
 ENDIF

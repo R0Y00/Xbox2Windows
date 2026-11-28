@@ -18,10 +18,10 @@ from direct_check import GUARDS, MASK, SENTINELS, input_pairs, observe, register
 
 # The export list of cpu_translation(cpu_frame ...) in CMakeLists.txt. frame_bound is translated and never called.
 ENTRIES = ("push_loop", "spill_widths", "home_save", "home_args", "two_paths", "home_spill", "loop_counter",
-           "realloc_slot", "frame_bound")
+           "realloc_slot", "anchored_frame", "frame_bound")
 # Bytes of each frame array: from the lowest RSP, rounded down to 8 mod 16, to entry RSP + 40.
 SIZES = {"push_loop": 64, "spill_widths": 64, "home_save": 80, "home_args": 64, "two_paths": 64, "home_spill": 48,
-         "loop_counter": 64, "realloc_slot": 64, "frame_bound": MAX_FRAME}
+         "loop_counter": 64, "realloc_slot": 64, "anchored_frame": 80, "frame_bound": MAX_FRAME}
 
 
 def signed(value, bits):
@@ -85,6 +85,9 @@ def reference(name, x, y):
     elif name == "realloc_slot":
         rax = trace[0] = (x + y) & MASK
         path = "straight line"
+    elif name == "anchored_frame":
+        rax = trace[0] = (x + (y if y & 1 else 0)) & MASK
+        path = "reanchored" if y & 1 else "original anchor"
     return rax, (GUARDS[0], *trace, GUARDS[1]), path
 
 
@@ -157,6 +160,10 @@ PATCHES = [
     ("home_args", [("mov [rsp+8],rcx", 0, "48 89 4c 24 00")], "return address slot"),
     ("home_args", [("mov rax,[rsp+28h]", 0, "48 8d 44 24 08")], "frame address escapes"),
     ("home_args", [("mov rax,rcx", 0, "48 8b c4")], "frame address escapes"),
+    ("anchored_frame", [("lea rbp,[rsp+20h]", 0, "48 8d 6c 24 18")], "frame pointer differs at join"),
+    ("anchored_frame", [("mov rax,[rbp-8]", 0, "48 8d 45 f8")], "unsupported stack operand"),
+    ("anchored_frame", [("mov rax,[rbp-8]", 0, "48 8b 45 f0")], "undefined stack byte"),
+    ("anchored_frame", [("pop rbp", 0, "5b")], "hold the saved rbp"),
     ("home_args", [("sub rsp,18h", 0, "48 2b e1 90")], "dynamic frame"),
     ("home_args", [("sub rsp,18h", 0, "48 83 ec 14"), ("add rsp,18h", 0, "48 83 c4 14")],
      "unsupported stack adjustment"),

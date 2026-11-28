@@ -41,6 +41,8 @@ SEQUENCES = {
     "fimul_i32_m64": ("f64i32", [("fld", "m64", 0), ("fimul", "i32", 16), ("fstp", "m64", 0)]),
     # Two integer operations in a row: an m32 integer at 16 and an m16 integer at 20.
     "fiadd_fisub": ("i32i16", [("fld", "m80", 0), ("fiadd", "i32", 16), ("fisub", "i16", 20), ("fstp", "m80", 0)]),
+    "fisub_i16_depth2": ("iarith_depth2", [("fld", "m80", 0), ("fld", "m80", 16), ("fisub", "i16", 32),
+                                           ("fstp", "m80", 0), ("fstp", "m80", 16)]),
     # The eighth register; the integer is the low half of the m64 value loaded last.
     "fidivr_depth8": ("m64x8", [("fld", "m64", 8 * k) for k in range(8)] + [("fidivr", "i32", 56)]
                       + [("fstp", "m64", 8 * k) for k in range(8)]),
@@ -52,11 +54,11 @@ CONTROLS = {
     # FIDIV divides the integer by ST(0), as FIDIVR does.
     "divrev": (re.compile(r"= x87_div\((.*)  // fidiv "), r"= x87_divr(\1  // fidiv "),
     # An m16 integer is zero-extended instead of sign-extended.
-    "zext16": (re.compile(r"static_cast<int16_t>\(load<uint16_t>\(a\)\)"), "static_cast<int64_t>(load<uint16_t>(a))"),
+    "zext16": (re.compile(r"static_cast<int16_t>\((load(?:_always)?)<uint16_t>\(a\)\)"), r"static_cast<int64_t>(\1<uint16_t>(a))"),
     # An m32 integer is zero-extended instead of sign-extended.
-    "zext32": (re.compile(r"static_cast<int32_t>\(load<uint32_t>\(a\)\)"), "static_cast<int64_t>(load<uint32_t>(a))"),
+    "zext32": (re.compile(r"static_cast<int32_t>\((load(?:_always)?)<uint32_t>\(a\)\)"), r"static_cast<int64_t>(\1<uint32_t>(a))"),
     # An m16 integer is read as 32 bits; the two bytes after each m16 operand are not a sign extension.
-    "wide16": (re.compile(r"static_cast<int16_t>\(load<uint16_t>\(a\)\)"), "static_cast<int32_t>(load<uint32_t>(a))"),
+    "wide16": (re.compile(r"static_cast<int16_t>\((load(?:_always)?)<uint16_t>\(a\)\)"), r"static_cast<int32_t>(\1<uint32_t>(a))"),
     # The result keeps 64 significand bits, as if the precision control did not apply.
     "pc64": (re.compile(r"x87_arith\{53, 16383, 0x7ffe\}"), "x87_arith{64, 16383, 0x7ffe}"),
 }
@@ -205,6 +207,8 @@ def cases():
     blocks["i32i16"] = [m80_bytes(rng.choice(st0)) + integer_bytes("i32", rng.choice(ints["i32"]), rng)[:4]
                         + integer_bytes("i16", rng.choice(ints["i16"]), rng) for _ in range(600)]
     blocks["m64x8"] = [b"".join(rng.choice(f64).to_bytes(8, "little") for _ in range(8)) for _ in range(300)]
+    blocks["iarith_depth2"] = [m80_bytes((0xA000000000000000, 0x4002)) + m80_bytes((0xC000000000000000, 0x4000))
+                               + b"\x02\x00"]
     for name, (kind, _) in SEQUENCES.items():
         for block in blocks[kind]:
             yield name, bytes(block).ljust(INPUT, b"\0")
@@ -267,7 +271,7 @@ def check_rejections():
     fld, fstp = "db 29", "db 3a"  # fld tbyte ptr [rcx]; fstp tbyte ptr [rdx]
     rejected = {
         "fbld m80": (attempt(f"{fld} df 21 {fstp} c3"), "unsupported x87 operation"),
-        "fbstp m80": (attempt(f"{fld} df 31 {fstp} c3"), "unsupported x87 operation"),
+        "fyl2x": (attempt(f"{fld} d9 f1 {fstp} c3"), "unsupported x87 operation"),
         "fiadd m32 on an empty stack": (attempt(f"da 01 {fld} {fstp} c3"), "x87 stack underflow"),
         "fidivr m16 on an empty stack": (attempt(f"de 39 {fld} {fstp} c3"), "x87 stack underflow"),
         "fisub m32 with two values and one store": (attempt(f"{fld} {fld} da 21 {fstp} c3"),

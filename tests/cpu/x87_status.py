@@ -518,6 +518,12 @@ def check_rejections():
         "a jump to an external edge with the status word in AX": (
             attempt(f"{fld} {fcom.replace('d1', 'd0')} {sw} dd d8 e9 00 01 00 00", exits={0x110d: "return rax;"}),
             "RAX holds unknown status-word bits 0x82ff at the external edge"),
+        "an AH store after a path skips masking AH": (status("", "e3 03 80 e4 45 88 22"),
+                                                      "reads AX bits 0x8200, " + ax),
+        "TEST EAX, EAX after writing AL": (status("", "b0 00 85 c0"), "reads AX bits 0x8200, " + ax),
+        "a direct call with the status word in AX": (
+            attempt(f"{two} {fcom} {sw} {pop2} e8 00 00 00 00 {clear}", calls={0x100c: ";"}),
+            "RAX holds unknown status-word bits 0x82ff at call"),
         # PF of the integer lowering.
         "FUCOMI and INC EAX, then JP": (attempt(f"{two} db e9 ff c0 7a 00 {pop2} {clear}"), parity),
         "CMP, then JP": (attempt(f"{two} 39 c0 7a 00 {pop2} {clear}"), parity),
@@ -526,13 +532,13 @@ def check_rejections():
         "SAHF in a function without x87": (attempt(f"b4 01 9e 72 00 {clear}"), "unsupported query operation"),
         "LAHF": (attempt(f"{two} {fcom} 9f {pop2} {clear}"), "unsupported query operation"),
         # Forms outside the profile.
-        "FNSTSW m16": (attempt(f"{two} {fcom} dd 3a {pop2} {clear}"), "unsupported x87 operand"),
+        "FNSTSW m16": (attempt(f"{two} {fcom} dd 3a {pop2} {clear}"), "stores status-word bits"),
         "FCOM alias DC D1": (attempt(f"{two} dc d1 {pop2} {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DC D9": (attempt(f"{two} dc d9 dd d8 {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DE D1": (attempt(f"{two} de d1 dd d8 {clear}"), "unsupported x87 encoding"),
-        "FSINCOS": (attempt(f"{fld} d9 fb dd d8 {clear}"), "unsupported x87 operation"),
-        "FPATAN": (attempt(f"{fld} d9 f3 dd d8 {clear}"), "unsupported x87 operation"),
-        "FBSTP m80": (attempt(f"{fld} df 31 dd d8 {clear}"), "unsupported x87 operation"),
+        "F2XM1": (attempt(f"{fld} d9 f0 dd d8 {clear}"), "unsupported x87 operation"),
+        "FYL2X": (attempt(f"{fld} d9 f1 dd d8 {clear}"), "unsupported x87 operation"),
+        "FLDENV m28": (attempt(f"{fld} d9 21 dd d8 {clear}"), "unsupported x87 operation"),
         "FCOMPP with one value": (attempt(f"{fld} de d9 {clear}"), "x87 stack underflow"),
         "FUCOM ST(2) with two values": (attempt(f"{two} dd e2 {pop2} {clear}"), "x87 stack underflow"),
         "FCOM m32 on an empty stack": (attempt(f"d8 11 {clear}"), "x87 stack underflow"),

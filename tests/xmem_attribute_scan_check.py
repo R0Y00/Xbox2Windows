@@ -52,10 +52,19 @@ def check_decoding():
     amd = scan.decode(AMD_WORD)
     check(amd == {"object_type": 0, "page_size": 1, "allocator_id": 0, "alignment": 8, "memory_type": 5,
                   "reserved": 0}, "AMD word fields")
+    # Bits 0-32 all set plus reserved bit 33: every field at its widest value, so each mask is checked
+    # at full width (neither word above sets an object type bit).
+    widest = scan.decode(0x3FFFFFFFF)
+    check(widest == {"object_type": 0x3FFF, "page_size": 3, "allocator_id": 0xFF, "alignment": 0x1F,
+                     "memory_type": 0xF, "reserved": 1}, f"widest word fields {widest}")
     cases = {
         BINK_WORD: HEAP32,
         0: HEAP16,
+        # 1 << 12 is exactly one 4 KiB page: era_heap pages an alignment only above the page size.
+        12 << 24: "heap: aligned allocation, 4096-byte alignment",
         13 << 24: "heap: page-backed, 8192-byte alignment",
+        # Memory type 6 is the last graphics type; 4 KiB pages and 16-byte alignment fit in 64 KiB.
+        6 << 29: GRAPHICS,
         AMD_WORD: GRAPHICS,
         (1 << 29) | (2 << 14): "null: graphics page size or alignment above the allocation granularity",
         (1 << 29) | (17 << 24): "null: graphics page size or alignment above the allocation granularity",
@@ -67,7 +76,7 @@ def check_decoding():
     }
     for word, expected in cases.items():
         check(scan.desktop(word) == expected, f"desktop({word:#x}) = {scan.desktop(word)!r}")
-    print(f"decoding: {len(cases) + 2} cases passed")
+    print(f"decoding: {len(cases) + 3} cases passed")
 
 
 def sites_by_export(report, path):
@@ -85,7 +94,9 @@ def sites_by_export(report, path):
 def check_fixture(path):
     report = scan.scan(path)
     by_export = sites_by_export(report, path)
-    check([(i["import"], i["kind"]) for i in report["imports"]] == [("XMemAlloc", "import"), ("XMemFree", "import")],
+    check([(i["import"], i["kind"]) for i in report["imports"]] ==
+          [("XMemAlloc", "import"), ("XMemAllocDefault", "import"),
+           ("XMemFree", "import"), ("XMemFreeDefault", "import")],
           f"imports {report['imports']}")
     check(report["unmatched_xmem_ordinals"] == [], "no ordinal imports")
     check(len(report["thunks"]) >= 1 and all(not t["exported"] for t in report["thunks"]), f"thunks {report['thunks']}")
@@ -150,6 +161,11 @@ def check_fixture(path):
     check("via" in constant("saved_across_call", AMD_WORD, GRAPHICS), "saved_across_call follows rbx")
     constant("low_half", AMD_WORD, GRAPHICS)
     attributes("partial_write", "computed")
+    # An 8- or 16-bit xor of a register with itself clears only the low bits, so unlike
+    # xor edx, edx (zero_word) it is a partial write and never the constant 0.
+    for name in ("partial_xor_byte", "partial_xor_word"):
+        partial = attributes(name, "computed")
+        check("xor" in partial["instruction"].lower(), f"{name}: {partial}")
     passthrough = attributes("exported_passthrough", "argument", exported=True)
     check(passthrough["callers"] == [], f"exported_passthrough: {passthrough}")
     # Entry-register propagation: the callee copies R8 into RDX, while the caller also sets RDX to
@@ -166,24 +182,39 @@ def check_fixture(path):
     check(low["register"] == "R8" and low.get("truncated") is True and len(low["callers"]) == 1,
           f"caller_copy_low must be truncated from R8: {low}")
     check(low["callers"][0]["word"] == AMD_WORD, f"caller_copy_low caller word: {low['callers']}")
+    # The Default aliases have their own IAT slots and import names. A site through one must be
+    # recorded under the alias it imported, not under the name the alias forwards to.
+    alloc_alias = site("default_alloc")
+    check(alloc_alias["import"] == "XMemAllocDefault" and alloc_alias["route"] == "slot"
+          and alloc_alias["transfer"] == "call", f"default_alloc: {alloc_alias}")
+    constant("default_alloc", BINK_WORD, HEAP32)
+    free_alias = site("default_free_tail")
+    check(free_alias["import"] == "XMemFreeDefault" and free_alias["route"] == "slot"
+          and free_alias["transfer"] == "jmp", f"default_free_tail: {free_alias}")
+    constant("default_free_tail", AMD_WORD, GRAPHICS)
+    # A conditional move chooses the word at run time. The scanner has no constant for it, so it
+    # must report the site as computed and never report the immediate written before the compare.
+    guarded = attributes("cmove_guarded", "computed")
+    check("cmove" in guarded["instruction"].lower(), f"cmove_guarded: {guarded}")
     for name in ("forward_free", "set_word"):
         check(name not in by_export, f"{name} has no xmem call site")
-    check(len(report["sites"]) == 25, f"expected 25 sites, found {len(report['sites'])}")
+    check(len(report["sites"]) == 30, f"expected 30 sites, found {len(report['sites'])}")
 
     summary = report["summary"]
-    check(summary["sites"] == 25, "summary site count")
+    check(summary["sites"] == 30, "summary site count")
     check(sorted(summary["null_words"]) == ["0x2a8004000", "0xe0000000"], f"null words {summary['null_words']}")
     # --fail-on-unresolved exits with 1 exactly when this list is not empty.
     unresolved = {int(s, 16) for s in summary["sites_not_fully_constant"]}
     expected_unresolved = {int(site(n)["site"], 16) for n in
                            ("data_unwritten", "pointer_written", "data_written", "tail_argument", "computed_word",
-                            "indirect_reached", "call_clobber", "partial_write", "exported_passthrough")}
+                            "indirect_reached", "call_clobber", "partial_write", "partial_xor_byte",
+                            "partial_xor_word", "exported_passthrough", "cmove_guarded")}
     check(unresolved == expected_unresolved, f"not fully constant: {summary['sites_not_fully_constant']}")
     words = {w["word_hex"]: w for w in summary["words"]}
     check(set(words) == {"0x0", "0x1", "0x5e50000", "0xa8004000", "0x20004000", "0xe0000000", "0x2a8004000"},
           f"distinct words {sorted(words)}")
     # Not counted: data_unwritten and pointer_written, whose 0xa8004000 is only an initial value.
-    check(len(words["0xa8004000"]["sites"]) == 6, f"0xa8004000 sites {words['0xa8004000']['sites']}")
+    check(len(words["0xa8004000"]["sites"]) == 7, f"0xa8004000 sites {words['0xa8004000']['sites']}")
 
     for flag, code in ((None, 0), ("--fail-on-null", 1), ("--fail-on-unresolved", 1)):
         command = [sys.executable, "-B", str(TOOL), str(path), "--output", str(Path(path).with_suffix(".scan.json"))]

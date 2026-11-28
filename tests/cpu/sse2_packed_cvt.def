@@ -1,0 +1,25 @@
+EXPORTS
+    cvtdq2ps_op
+    cvtdq2pd_op
+    cvtps2dq_op
+    cvtpd2dq_op
+    cvttps2dq_op
+    cvttpd2dq_op
+    cvtps2pd_op
+    cvtpd2ps_op
+    cmpps_lt_op
+    cmpps_unord_op
+    cmppd_le_op
+    cmppd_neq_op
+    movhlps_op
+    movlhps_op
+    movlps_hps_op
+    movlpd_hpd_op
+    sqrtss_op
+    minss_op
+    maxss_op
+    sqrtsd_op
+    minsd_op
+    maxsd_op
+    read_mxcsr
+    write_mxcsr

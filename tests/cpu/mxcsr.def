@@ -1,0 +1,6 @@
+EXPORTS
+    mxcsr_round
+    mxcsr_leak
+    mxcsr_after
+    mxcsr_badload
+    mxcsr_fault

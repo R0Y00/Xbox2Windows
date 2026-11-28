@@ -91,7 +91,7 @@ def emit_bridge(directory, tools, mask, pred_flip=0, write_bias=0):
     subprocess.run([assembler, "--target-env", "vulkan1.2", source, "-o", module], check=True)
     subprocess.run([validator, "--target-env", "vulkan1.2", module], check=True)
     hlsl = stem.with_suffix(".hlsl")
-    subprocess.run([cross, module, "--hlsl", "--shader-model", "66", "--output", hlsl], check=True)
+    subprocess.run([cross, module, "--hlsl", "--shader-model", "60", "--output", hlsl], check=True)
     # spirv-cross emits no root signature; the fixture contract is a single u0 byte-address UAV.
     text = hlsl.read_text(encoding="utf-8")
     marker = "void main(SPIRV_Cross_Input stage_input)"
@@ -99,14 +99,14 @@ def emit_bridge(directory, tools, mask, pred_flip=0, write_bias=0):
         raise RuntimeError("unexpected spirv-cross entry point")
     hlsl.write_text(text.replace(marker, '[RootSignature("UAV(u0)")]\n' + marker), encoding="utf-8")
     compiled = stem.with_suffix(".dxil")
-    subprocess.run([dxc, "-T", "cs_6_6", "-E", "main", "-Fo", compiled, hlsl], check=True)
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", compiled, hlsl], check=True)
     return compiled
 
 
 def emit_direct(directory, dxc, mask):
     lo, hi = mask
     compiled = directory / f"compaction-direct-{lo:08x}.dxil"
-    subprocess.run([dxc, "-T", "cs_6_6", "-E", "main",
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main",
                     f"-DMASK_LO=0x{lo:08x}u", f"-DMASK_HI=0x{hi:08x}u",
                     "-Fo", compiled, DIRECT_HLSL], check=True)
     return compiled
@@ -115,17 +115,21 @@ def emit_direct(directory, dxc, mask):
 def run(offscreen_check, adapter, dxil):
     result = subprocess.run([offscreen_check, adapter, "--spirv-compaction", dxil],
                             capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+    for line in lines:
+        if line.startswith(("adapter=", "driver=", "backend=", "debug_errors=", "skip:")):
+            print(line)
     if result.returncode == SKIP:
         return SKIP, None
     if result.returncode != 0:
         raise RuntimeError(f"offscreen_check failed for {dxil.name}: {result.stderr.strip()}")
+    if f"backend={adapter} debug_layer=enabled" in lines and "debug_errors=0 debug_warnings=0" not in lines:
+        raise RuntimeError(f"D3D12 debug diagnostics for {dxil.name}: {result.stderr.strip()}")
     observed = {}
-    for line in result.stdout.splitlines():
+    for line in lines:
         match = re.fullmatch(r"observed\[(\d+)\]=([0-9a-f]{8})", line)
         if match:
             observed[int(match.group(1))] = int(match.group(2), 16)
-        elif line.startswith(("adapter=", "driver=", "backend=")):
-            print(line)
     if sorted(observed) != list(range(WORD_COUNT)):
         raise RuntimeError(f"incomplete readback from {dxil.name}: {len(observed)} words")
     return 0, observed
@@ -200,6 +204,16 @@ def mismatches(observed, expected):
     return [index for index in range(WORD_COUNT) if observed[index] != expected[index]]
 
 
+def require_matching_dispatches(context, first_name, first, second_name, second):
+    differences = mismatches(first, second)
+    if differences:
+        i = differences[0]
+        raise RuntimeError(f"{context}: first_mismatch=word={i} field={field(i)} "
+                           f"{first_name}={first[i]:08x} {second_name}={second[i]:08x} "
+                           f"{first_name}_width={first[WIDTH]} {second_name}_width={second[WIDTH]} "
+                           f"mismatches={len(differences)}")
+
+
 def report_mismatches(observed, expected, problems):
     first = problems[0]
     print(f"first_mismatch=word={first} field={field(first)} "
@@ -208,15 +222,6 @@ def report_mismatches(observed, expected, problems):
         print(f"mismatch word={extra} field={field(extra)} "
               f"cpu={expected[extra]:08x} gpu={observed[extra]:08x}")
     return first
-
-
-def observed_width(observed):
-    width = observed[WIDTH]
-    if width not in SUPPORTED_WIDTHS or THREADS % width:
-        return None
-    if any(observed[LANE + local] != local % width for local in range(THREADS)):
-        return None
-    return width
 
 
 def check_source(label, adapter, mask_name, observed, width, mask):
@@ -230,14 +235,26 @@ def check_source(label, adapter, mask_name, observed, width, mask):
         raise RuntimeError(f"{label} readback differs from the CPU reference at word {problems[0]}")
 
 
-def run_control(adapter, observed, mask, width, name, predicted):
+def run_control(adapter, observed, mask, baseline_width, name, mutation, predicted):
+    width = observed[WIDTH]
+    widths = f"baseline_width={baseline_width} control_width={width}"
+    if width not in SUPPORTED_WIDTHS:
+        raise RuntimeError(f"negative control {name} reported an unsupported subgroup width: {widths}")
+    mutated = reference(mask, width, **mutation)
+    unexpected = mismatches(observed, mutated)
+    if unexpected:
+        first = report_mismatches(observed, mutated, unexpected)
+        raise RuntimeError(f"negative control {name} differs from its mutated reference at word {first}: {widths}")
+    if width != baseline_width:
+        raise RuntimeError(f"negative control {name} changed subgroup width: {widths} mutated_reference=exact")
+
     expected = reference(mask, width)
     problems = mismatches(observed, expected)
     if not problems:
         raise RuntimeError(f"negative control {name} produced the reference readback")
     first = report_mismatches(observed, expected, problems)
     print(f"negative_control={name} adapter={adapter} first_mismatch={first} "
-          f"predicted={predicted} mismatches={len(problems)} status=caught")
+          f"predicted={predicted} mismatches={len(problems)} mutated_reference=exact status=caught")
     if first != predicted:
         raise RuntimeError(f"negative control {name}: first mismatch word {first}, predicted {predicted}")
 
@@ -258,21 +275,22 @@ def main(argv):
                 if code == SKIP:
                     print(f"skip: {adapter} has no capable D3D12 adapter")
                     return SKIP
-                width = observed_width(observed)
-                if width is None:
-                    print(f"skip: {adapter} subgroup width {observed[WIDTH]} is not a supported "
-                          f"power-of-two width dividing {THREADS}")
+                width = observed[WIDTH]
+                if width == 128:
+                    print(f"skip: {adapter} subgroup width {width} exceeds the {THREADS}-thread fixture")
                     return SKIP
+                if width not in SUPPORTED_WIDTHS:
+                    raise RuntimeError(f"{label} reported an invalid subgroup width: {width}")
                 check_source(label, adapter, mask_name, observed, width, mask)
                 code, repeat = run(offscreen_check, adapter, dxil)
-                if repeat != observed:
-                    raise RuntimeError(f"{label} readback changed between identical dispatches")
+                if code == SKIP:
+                    raise RuntimeError(f"{label} {mask_name} repeat skipped after first dispatch at width {width}")
+                require_matching_dispatches(f"{label} readback changed between identical dispatches ({mask_name})",
+                                            "first", observed, "repeat", repeat)
                 print(f"source={label} adapter={adapter} mask={mask_name} repeat=identical")
                 results[label] = observed
-            if results["bridge"] != results["direct"]:
-                first = next(index for index in range(WORD_COUNT)
-                             if results["bridge"][index] != results["direct"][index])
-                raise RuntimeError(f"bridge and direct HLSL differ at word {first} ({field(first)})")
+            require_matching_dispatches(f"bridge and direct HLSL differ ({mask_name})",
+                                        "bridge", results["bridge"], "direct", results["direct"])
             print(f"adapter={adapter} mask={mask_name} bridge_equals_direct=true")
             for control_name, (mutation, predicted) in CONTROLS.items():
                 control = emit_bridge(directory, tools, mask, **mutation)
@@ -280,7 +298,7 @@ def main(argv):
                 if code == SKIP:
                     print(f"skip: {adapter} has no capable D3D12 adapter")
                     return SKIP
-                run_control(adapter, observed, mask, width, control_name, predicted)
+                run_control(adapter, observed, mask, results["bridge"][WIDTH], control_name, mutation, predicted)
     print(f"subgroup compaction fixture passed on {adapter}")
     return 0
 

@@ -1,0 +1,3 @@
+EXPORTS
+    vminps_op
+    vmaxps_op

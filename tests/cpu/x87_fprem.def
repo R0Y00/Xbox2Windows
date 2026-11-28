@@ -1,0 +1,12 @@
+EXPORTS
+    prem
+    prem1
+    prem_value
+    prem1_value
+    prem_readers
+    prem1_readers
+    fmod_loop
+    remainder_loop
+    prem_twice
+    prem_depth8
+    prem_cw

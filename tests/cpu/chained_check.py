@@ -31,7 +31,8 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None,
     for orig_path, lifted_path, null_expected in pairs:
         source = ctypes.CDLL(str(orig_path)).choose_value
         lifted = ctypes.CDLL(str(lifted_path)).try_lifted
-        for value, expected in ((None, null_expected), (0, null_expected), (1, 21), (0xffffffffffffffff, 21)):
+        for value, expected in ((None, null_expected), (0, null_expected), (1, 21),
+                                (0xffffffffffffffff, 21), (1 << 32, 21)):
             slot = Word(value or 0)
             address = 0 if value is None else ctypes.addressof(slot)
             result, trace, regs = observe(probe, source, address, 0x1122334455667788)
@@ -45,6 +46,7 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None,
         neighbor = export_rva(pe, "neighbor")
         ranges = function_ranges(pe, entry)
         assert len(ranges) == 3 and all(not a <= neighbor < b for a, b in ranges)
+        entry_offset = pe.get_offset_from_rva(entry)
         body = pe.get_data(entry, ranges[0][1] - entry)
         jump = next(i for i in Decoder(64, body, ip=entry) if i.code == Code.JE_REL8_64)
         jump_opcode_offset = pe.get_offset_from_rva(jump.ip)
@@ -121,7 +123,33 @@ def check(native, compiled, harness, native_jne=None, compiled_jne=None,
                     raise
             else:
                 raise AssertionError("accepted stack frame exceeding 4096 bytes")
-    print("two null paths, two non-null inputs (JE, JNE, XOR zeroing, 32-bit immediates and 32-bit stack frames), RBX/RSI, guarded writes, version-2 chained unwind and eleven rejection controls passed")
+        # Translation-only controls. Use 40 bytes for shadow space and call alignment.
+        def callback_image(slot, save="", result=""):
+            code = bytes.fromhex(f"48 83 ec 28 {save} ff 51 {slot} {result} 48 83 c4 28 c3")
+            assert len(code) <= len(body)
+            patched = bytearray(data)
+            patched[entry_offset:entry_offset + len(body)] = code.ljust(len(body), b"\x90")
+            path.write_bytes(patched)
+
+        callback_image("08")
+        _, _, returns, stops = translate(path, "choose_value", callback_offset=8)
+        assert len(returns) == 1 and not stops
+
+        # Each control is refused at the instruction it changes: the call, the RDX read or the shadow-slot reload.
+        for label, slot, save, result, at in (
+            ("wrong table slot", "10", "", "", 4),
+            ("volatile RDX after callback", "08", "", "48 89 d0", 7),
+            ("first shadow slot after callback", "08", "48 89 14 24", "48 8b 04 24", 11),
+        ):
+            callback_image(slot, save, result)
+            try:
+                translate(path, "choose_value", callback_offset=8)
+            except ValueError as exc:
+                if f"unsupported operation at {entry + at:#x}" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(f"accepted callback control: {label}")
+    print("two null paths, three nonzero inputs (JE, JNE, XOR zeroing, 32-bit register writes and 32-bit stack frames), RBX/RSI, guarded writes, version-2 chained unwind and fifteen rejection controls passed")
 
 
 if __name__ == "__main__":

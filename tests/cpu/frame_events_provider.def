@@ -1,0 +1,12 @@
+LIBRARY d3d12_xs
+EXPORTS
+    SetFrameIntervalX
+    ScheduleFrameEventX
+    WaitFrameEventX
+    get_frame_events_origin_waits
+    get_frame_events_last_token
+    get_frame_events_timeouts
+    get_frame_events_rejections
+    get_frame_events_schedule_calls
+    get_frame_events_blocked_waits
+    get_frame_events_mode

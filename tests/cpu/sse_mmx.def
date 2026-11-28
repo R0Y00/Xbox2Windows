@@ -1,0 +1,23 @@
+EXPORTS
+    op_cvtpi2ps_reg
+    op_cvtpi2ps_mem
+    op_cvtpi2ps_mem_plus1
+    op_cvtps2pi_reg
+    op_cvtps2pi_mem
+    op_cvtps2pi_mem_plus1
+    op_cvttps2pi_reg
+    op_cvttps2pi_mem
+    op_pshufw_reg_e4
+    op_pshufw_reg_1b
+    op_pshufw_reg_00
+    op_pshufw_reg_ff
+    op_pshufw_mem_4e
+    op_pshufw_mem_39
+    op_movntq
+    op_movntq_disp
+    op_movq_gpr_bridge
+    op_discarded_read
+    op_pipeline
+    op_maskmovq
+    op_maskmovdqu
+    op_maskmov_pipeline

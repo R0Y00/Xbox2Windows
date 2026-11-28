@@ -1,0 +1,14 @@
+LIBRARY acphal
+EXPORTS
+    ApuAlloc
+    ApuFree
+    ApuMapVirtualAddress
+    ApuMapApuAddress
+    ApuIsVirtualAddressValid
+    get_apu_map_virtual_calls
+    get_apu_map_apu_calls
+    get_apu_is_valid_calls
+    get_apu_unmapped_refusals
+    get_apu_alloc_count
+    get_apu_free_count
+    reset_apu_address_records

@@ -128,3 +128,6 @@ EXPORTS
     op_pinsrw_reg_3
     op_zeroupper_ymm1
     op_movdqu_load128
+    op_palignr_255
+    op_pmovsxbq_wide_src
+    op_zeroupper_ymm2

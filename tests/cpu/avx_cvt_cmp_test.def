@@ -1,0 +1,26 @@
+EXPORTS
+    vcvtdq2ps_op
+    vcvtdq2pd_op
+    vcvtps2dq_op
+    vcvtpd2dq_op
+    vcvttps2dq_op
+    vcvttpd2dq_op
+    vcvtps2pd_op
+    vcvtpd2ps_op
+    vcvtsi2ss_op
+    vcvtsi2sd_op
+    vcvtss2sd_op
+    vcvtsd2ss_op
+    vcvtss2si_op
+    vcvttss2si_op
+    vcvtsd2si_op
+    vcvttsd2si_op
+    vcmpps_op
+    vcmppd_op
+    vcmpss_op
+    vcmpsd_op
+    vptest_op
+    vtestps_op
+    vtestpd_op
+    vlddqu_op
+    vcmpps_true_signaling

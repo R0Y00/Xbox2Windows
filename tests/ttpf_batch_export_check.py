@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -178,6 +180,30 @@ class BatchExportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch.parse_indices("10-2")
 
+    def test_malformed_indices_are_usage_errors(self):
+        cases = {
+            "5-3": "Invalid range '5-3'",
+            "1-": "Invalid index '' in '1-'",
+            "abc": "Invalid index 'abc' in 'abc'",
+            "-2": "Invalid index '' in '-2'",
+        }
+        self.assertEqual(batch.parse_indices("0-1,3"), [0, 1, 3])
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "empty.ttpf"
+            pool.write_bytes(b"")
+            for spec, expected in cases.items():
+                out_dir = Path(tmp) / "out"
+                with self.subTest(spec=spec):
+                    proc = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / "tools" / "ttpf_batch_export.py"),
+                         str(pool), "-o", str(out_dir), f"--indices={spec}"],
+                        capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("--indices:", proc.stderr)
+                    self.assertIn(expected, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(out_dir.exists())
+
     def test_export_texture_entry_strict_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
@@ -211,6 +237,100 @@ class BatchExportTests(unittest.TestCase):
             self.assertEqual(res_prov["format_name"], "BC7")
             self.assertEqual(res_prov["sha256"], hashlib.sha256(b"DDS_PROVISIONAL_BC7_DATA").hexdigest())
             self.assertTrue((out_dir / "tex_00001.dds").exists())
+
+    def test_requested_provisional_history_is_read_before_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, history = root / "pool.ttpf", root / "history.json"
+            pool.write_bytes(make_synthetic_ttpf_archive())
+            dds, manifest = root / "tex_00001.dds", root / "manifest.json"
+            dds.write_bytes(b"previous DDS")
+            manifest.write_bytes(b"previous manifest")
+            command = [sys.executable, "-B", batch.__file__, pool, "-o", root,
+                       "--indices", "1", "--allow-provisional", "--history", history]
+            for data in (None, b"{", b"\xff", b"null", b"[]"):
+                with self.subTest(data=data):
+                    if data is not None:
+                        history.write_bytes(data)
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--history " + str(history), result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(dds.read_bytes(), b"previous DDS")
+                    self.assertEqual(manifest.read_bytes(), b"previous manifest")
+
+            with patch.object(batch, "load_tools", return_value=MockTtpfModule), patch.object(
+                MockTtpfModule, "export", wraps=MockTtpfModule.export
+            ) as export:
+                for profile in ({}, {"bc7": {"historyIndices": [2, 5]}}):
+                    history.write_text(json.dumps(profile), encoding="utf-8")
+                    summary = batch.batch_export(pool, root, indices=[1], allow_provisional=True, history_path=history)
+                    self.assertEqual(summary["stats"]["provisional"], 1)
+                    self.assertEqual(export.call_args.kwargs["history"], profile)
+
+    def test_require_rust_checks_selected_tools_and_kernels(self):
+        library = SimpleNamespace(
+            unpack_lanes=object(), decode_strict_bc1=object(),
+            decode_strict_mode6=object(), rebuild_calibrated_bc1=object(),
+        )
+        native = SimpleNamespace(library=Mock(return_value=library))
+        tools = SimpleNamespace(bcpack=SimpleNamespace(_native=native))
+        batch.require_rust_backend(tools)
+        native.library.assert_called_once_with()
+        del library.decode_strict_mode6
+        with self.assertRaisesRegex(RuntimeError, "Could not load the Rust BCPack kernels"):
+            batch.require_rust_backend(tools)
+        with self.assertRaisesRegex(RuntimeError, "do not include the optional Rust BCPack backend"):
+            batch.require_rust_backend(MockTtpfModule)
+
+    def test_local_profile_retries_strict_failures_and_records_current_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            out_dir = tmp / "dds_out"
+            out_dir.mkdir()
+            existing_dds = out_dir / "tex_00005.dds"
+            existing_dds.write_bytes(b"PREVIOUS_DDS")
+            profile = tmp / "profile.json"
+            profile.write_text('{"version": 1}', encoding="utf-8")
+            fitted = b"DDS_FITTED_DATA"
+            decoder = Mock()
+            decoder.dds.side_effect = lambda index: {1: fitted}[index]
+            create_decoder = Mock(return_value=decoder)
+            tools = SimpleNamespace(
+                __file__=str(tmp / "ttpf_mips.py"),
+                Pool=MockTtpfModule.Pool,
+                analyze=MockTtpfModule.analyze,
+                export=MockTtpfModule.export,
+                BC_FORMATS=MockTtpfModule.BC_FORMATS,
+            )
+            calibrated = SimpleNamespace(
+                __file__=str(tmp / "calibrated_texture.py"), ttpf=tools,
+                native=Mock(), LocalDecoder=create_decoder,
+            )
+            with patch.object(batch, "load_tools", return_value=tools), patch.dict(
+                sys.modules, {"calibrated_texture": calibrated}
+            ):
+                summary = batch.batch_export(tmp / "mock.ttpf", out_dir, indices=[0, 1, 5], threads=1,
+                                             calibration_path=profile)
+                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                    batch.batch_export(tmp / "mock.ttpf", out_dir, allow_provisional=True,
+                                       calibration_path=profile)
+
+            calibrated.native.assert_called_once_with()
+            self.assertEqual([call.args for call in decoder.dds.call_args_list], [(1,), (5,)])
+            self.assertEqual(decoder.read_chunk.cache_clear.call_count, 2)
+            self.assertEqual(summary["stats"], {"strict": 1, "provisional": 0, "fitted": 1,
+                                                "failed": 1, "skipped": 0})
+            strict, fitted_row, failed = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(strict["mode"], "strict")
+            self.assertEqual(fitted_row["mode"], "fitted")
+            self.assertEqual(fitted_row["sha256"], hashlib.sha256(fitted).hexdigest())
+            self.assertEqual((out_dir / fitted_row["file"]).read_bytes(), fitted)
+            self.assertEqual(failed["status"], "failed")
+            self.assertNotIn("file", failed)
+            self.assertNotIn("sha256", failed)
+            self.assertEqual(existing_dds.read_bytes(), b"PREVIOUS_DDS")
+            self.assertEqual(list(out_dir.glob(".tmp_*")), [])
 
     def test_export_texture_entry_atomic_publish_and_failure_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:

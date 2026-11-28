@@ -1,6 +1,8 @@
 #include "bvh_fixture.h"
 #include "desktop_gpu.h"
 #include "pixel_aot_vs.h"
+#include "pixel_aot_vs_linear.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -61,6 +63,8 @@ struct PixelInput {
     std::optional<D3D12_VIEWPORT> viewport;
     std::vector<Word> titleRanges;                // TitleRange records, empty without title memory
     std::vector<std::vector<Word>> titleAliases;  // one buffer per alias slot
+    bool linearMips = false;     // sample through the MIN_MAG_POINT_MIP_LINEAR root signature
+    float tolerance = 0;         // per-channel absolute error; 0 compares bit for bit
 };
 
 // Flag bit 2 of the case trailer: the range count and the slot count (titleAliasSlots), the ranges,
@@ -143,6 +147,7 @@ struct MipDraw {
     UINT requestedMip = 0;
     bool isTailDraw = false;
     bool partialQuad = false;
+    bool allowUpperRawLodStep = false;
 };
 
 struct Extent {
@@ -154,7 +159,8 @@ struct Extent {
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr,
+                   ID3D12RootSignature* rootOverride = nullptr, const char* vsPath = nullptr)
 {
     const auto& input = levels.front();
     ComPtr<ID3D12Resource> uploadedConstants;
@@ -175,13 +181,30 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
     const bool titleMemory = !input.titleRanges.empty();
     ComPtr<ID3D12RootSignature> root;
-    if (titleMemory)
+    std::vector<char> vsFile;
+    D3D12_SHADER_BYTECODE vs = input.linearMips
+        ? D3D12_SHADER_BYTECODE{pixel_aot_vs_linear, sizeof(pixel_aot_vs_linear)}
+        : D3D12_SHADER_BYTECODE{pixel_aot_vs, sizeof(pixel_aot_vs)};
+    if (vsPath) {
+        // A comparison gather compiles its pixel stage with FXC ps_5_1 too, which needs a matching
+        // vs_5_1 blob instead of the embedded DXC vertex shader.
+        std::ifstream file(vsPath, std::ios::binary);
+        vsFile.assign(std::istreambuf_iterator<char>(file), {});
+        if (vsFile.empty() || file.bad()) throw std::runtime_error("Cannot read compiled vertex shader");
+        vs = {vsFile.data(), vsFile.size()};
+    }
+    // The title root signature has its own point sampler.
+    if (titleMemory && input.linearMips)
+        throw std::runtime_error("The mip-linear sampler is not available with title memory");
+    if (rootOverride)
+        root = rootOverride;  // the caller owns the comparison-sampler root and keeps it alive
+    else if (titleMemory)
         root = title_root_signature(device);
     else
-        check(device->CreateRootSignature(0, pixel_aot_vs, sizeof(pixel_aot_vs), IID_PPV_ARGS(&root)), "Pixel root");
+        check(device->CreateRootSignature(0, vs.pShaderBytecode, vs.BytecodeLength, IID_PPV_ARGS(&root)), "Pixel root");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root.Get();
-    desc.VS = {pixel_aot_vs, sizeof(pixel_aot_vs)};
+    desc.VS = vs;
     desc.PS = {ps.data(), ps.size()};
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -206,9 +229,19 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     const UINT residentCount = static_cast<UINT>(levels.size());
     srcDesc.MipLevels = static_cast<UINT16>(firstResident + residentCount);
     auto texture = resource(device, srcDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_CLEAR_VALUE clear{
-        desc.RTVFormats[0], {-1, input.maskedCase ? 2.0f : -1.0f,
-                                 input.maskedCase ? -3.0f : -1.0f, input.maskedCase ? 4.0f : -1.0f}};
+    D3D12_CLEAR_VALUE clear{desc.RTVFormats[0], {}};
+    if (input.integerRT) {
+        // Integer masked cases use distinct nonzero words so a wrong PSO mask is visible.
+        clear.Color[0] = 1.0f;
+        clear.Color[1] = 2.0f;
+        clear.Color[2] = 3.0f;
+        clear.Color[3] = 4.0f;
+    } else {
+        clear.Color[0] = -1.0f;
+        clear.Color[1] = input.maskedCase ? 2.0f : -1.0f;
+        clear.Color[2] = input.maskedCase ? -3.0f : -1.0f;
+        clear.Color[3] = input.maskedCase ? 4.0f : -1.0f;
+    }
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(residentCount);
     UINT64 sourceBytes = 0;
     std::vector<UINT> rows(residentCount);
@@ -405,6 +438,17 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
             std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
         }
         auto words = read(back.Get(), resultBytes/4);
+        if (rawReadback) {
+            std::ofstream output(rawReadback, std::ios::binary);
+            for (UINT y = 0; y < height; ++y) {
+                const auto* row = words.data() + y * resultLayout.Footprint.RowPitch / sizeof(UINT);
+                output.write(reinterpret_cast<const char*>(row), width * sizeof(Color));
+            }
+            output.close();
+            if (!output) throw std::runtime_error("Cannot save raw pixel readback");
+        }
+        float maxError = 0;
+        std::array<UINT, 4> firstBits{};
         std::vector<BYTE> image;
         if (capture) image.reserve(size_t(width) * height * 4);
         for (UINT y = 0; y < height; ++y) {
@@ -429,8 +473,10 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 // bitwise. A masked channel accepts a NaN against an expected NaN of any sign or
                 // payload and still logs both raw words; masking a channel whose expected word is
                 // not NaN is a case-format error.
+                float pixelError = 0;
                 const auto matches_at = [&](size_t index) {
                     const auto& reference = sampled.expected[index];
+                    float candidateError = 0;
                     const BYTE mask = index < sampled.nanMask.size() ? sampled.nanMask[index] : BYTE{0};
                     for (size_t c = 0; c < actual.size(); ++c) {
                         const UINT expected_bits = bits(reference[c]);
@@ -442,9 +488,21 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                         x, y, c, expected_bits, actual_bits);
                             if (!is_nan_bits(actual_bits)) return false;
                         } else if (expected_bits != actual_bits) {
-                            return false;
+                            // Only the rendered raw-LOD channel in the upper-clamp fixture.
+                            if (req.allowUpperRawLodStep && c == 0 && expected_bits == 0) {
+                                constexpr float step = 1.0f / (1u << D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT);
+                                const float error = std::fabs(actual[c]);
+                                if (!(error <= step)) return false;
+                                candidateError = (std::max)(candidateError, error);
+                                continue;
+                            }
+                            if (!input.tolerance) return false;
+                            const float error = std::fabs(actual[c] - reference[c]);
+                            if (!(error <= input.tolerance)) return false;   // NaN fails too
+                            candidateError = (std::max)(candidateError, error);
                         }
                     }
+                    pixelError = candidateError;
                     return true;
                 };
                 bool matched = matches_at(sampleY * sampled.width + sampleX);
@@ -478,28 +536,36 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                      c, expected[c], actual[c], bits(expected[c]), bits(actual[c]));
                     throw PixelMismatch();
                 }
+                maxError = (std::max)(maxError, pixelError);
+                if (!x && !y)
+                    for (size_t c = 0; c < actual.size(); ++c) firstBits[c] = bits(actual[c]);
                 if (capture) {
                     for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
                 }
             }
         }
+        // Filtered results may differ by adapter within the tolerance; the raw bits let callers compare them.
+        if (input.tolerance)
+            std::printf("first_pixel_bits=%08x,%08x,%08x,%08x\n", firstBits[0], firstBits[1], firstBits[2], firstBits[3]);
         if (capture) {
             std::ofstream output(capture, std::ios::binary);
             output.write(reinterpret_cast<const char*>(image.data()), image.size());
             output.close();
             if (!output) throw std::runtime_error("Cannot save GPU readback");
         }
-        std::printf("pixels=%u channels=%u max_absolute_error=0\n", width * height, width * height * 4);
+        std::printf("pixels=%u channels=%u max_absolute_error=%g\n", width * height, width * height * 4, maxError);
     }
 }
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    UINT firstResident, UINT sampledLevel, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr,
+                   ID3D12RootSignature* rootOverride = nullptr, const char* vsPath = nullptr)
 {
     const auto& top = levels.front();
     draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
-                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants);
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants, rawReadback,
+                  rootOverride, vsPath);
 }
 
 ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char* path)
@@ -541,7 +607,7 @@ ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char*
 }
 
 static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
-                        UINT8 writeMask, ID3D12Resource* gpuConstants)
+                        UINT8 writeMask, ID3D12Resource* gpuConstants, const char* rawReadback = nullptr)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
     input.writeMask = writeMask;
@@ -567,9 +633,6 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
             input.integerRT = (flags & 1u) != 0;
             const UINT8 caseMask = flags >> 4;
             if (caseMask) {
-                if (input.integerRT || (caseMask != 0x3 && caseMask != 0xC &&
-                                        caseMask != D3D12_COLOR_WRITE_ENABLE_ALL))
-                    throw std::runtime_error("Invalid floating-point case write mask");
                 input.maskedCase = true;
                 input.writeMask = caseMask;
             }
@@ -605,12 +668,13 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
-    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants);
+    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants, rawReadback);
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
+                            UINT8 writeMask, const char* rawReadback)
 {
-    check_pixel(device, path, swapRB, reference, writeMask, nullptr);
+    check_pixel(device, path, swapRB, reference, writeMask, nullptr, rawReadback);
 }
 
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
@@ -622,7 +686,94 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                 stale ? stale.Get() : current.Get());
 }
 
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
+void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference)
+{
+    constexpr UINT side = 8;
+    std::ifstream file(reference, std::ios::binary);
+    std::array<UINT, 2> view{};
+    file.read(reinterpret_cast<char*>(view.data()), sizeof(view));
+    const auto [first, count] = view;
+    if (!file || first > 1 || !count || count > 3)
+        throw std::runtime_error("Invalid pixel gather view");
+    std::vector<PixelInput> levels;
+    for (UINT mip = 0; mip < count; ++mip) {
+        const UINT extent = side >> mip;
+        PixelInput input{extent, extent, 1, DXGI_FORMAT_R32G32B32A32_FLOAT};
+        input.rows.resize(size_t(extent) * extent * sizeof(Color));
+        file.read(reinterpret_cast<char*>(input.rows.data()), static_cast<std::streamsize>(input.rows.size()));
+        levels.push_back(std::move(input));
+    }
+    auto& expected = levels.front().expected;
+    expected.resize(side * side);
+    file.read(reinterpret_cast<char*>(expected.data()), side * side * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Invalid pixel gather case data");
+    draw_verified(device, shader, levels, first, 0, nullptr);
+}
+
+// Comparison gathers bind a SamplerComparisonState built from the translated smpc line and a
+// single-component R32_FLOAT view (R32G32B32A32_FLOAT does not advertise SHADER_GATHER_COMPARISON).
+// The case layout is the gather case with one float per texel instead of four.
+void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const char* reference,
+                                const char* sampler_line, const char* vsPath)
+{
+    constexpr UINT side = 8;
+    std::ifstream file(reference, std::ios::binary);
+    std::array<UINT, 2> view{};
+    file.read(reinterpret_cast<char*>(view.data()), sizeof(view));
+    const auto [first, count] = view;
+    if (!file || first > 1 || !count || count > 3)
+        throw std::runtime_error("Invalid comparison gather view");
+    std::vector<PixelInput> levels;
+    for (UINT mip = 0; mip < count; ++mip) {
+        const UINT extent = side >> mip;
+        PixelInput input{extent, extent, 1, DXGI_FORMAT_R32_FLOAT};
+        input.rows.resize(size_t(extent) * extent * sizeof(float));
+        file.read(reinterpret_cast<char*>(input.rows.data()), static_cast<std::streamsize>(input.rows.size()));
+        levels.push_back(std::move(input));
+    }
+    auto& expected = levels.front().expected;
+    expected.resize(side * side);
+    file.read(reinterpret_cast<char*>(expected.data()), side * side * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Invalid comparison gather case data");
+
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1 ||
+        samplers.comparison.size() != 1 || !samplers.comparison[0])
+        throw std::runtime_error("Expected exactly one smpc line for the comparison gather");
+    const auto statics = x2w_startup::decode_statics(samplers);
+
+    // Same parameter layout as tests/pixel_aot_vs.hlsl, with the comparison sampler in place of its
+    // ordinary point sampler: table t0 at 0, b0..b2 at 1..3, one static sampler at s0.
+    D3D12_DESCRIPTOR_RANGE srv{};
+    srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable = {1, &srv};
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    for (UINT i = 1; i < 4; ++i) {
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        parameters[i].Descriptor.ShaderRegister = i - 1;
+        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 4;
+    signature.pParameters = parameters;
+    signature.NumStaticSamplers = 1;
+    signature.pStaticSamplers = statics.data();
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+          "Serialize comparison gather root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "Comparison gather root");
+    draw_verified(device, shader, levels, first, 0, nullptr, nullptr, nullptr, root.Get(), vsPath);
+}
+
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback,
+                          bool allowUpperRawLodStep)
 {
     PixelInput top{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
     PixelInput next{4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
@@ -639,7 +790,57 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
         next.rows.insert(next.rows.end(), {0, 255, 0, 255});
     MipDraw draw{0, 1};
     draw.partialQuad = true;
-    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
+    draw.allowUpperRawLodStep = allowUpperRawLodStep;
+    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr,
+                  nullptr, rawReadback);
+}
+
+namespace {
+// One solid color per mip, so the color alone identifies the level a sample read.
+constexpr std::array<std::array<BYTE, 4>, 4> kMipColors{{
+    {255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 0, 255}}};
+
+std::vector<PixelInput> solid_mips()
+{
+    std::vector<PixelInput> levels;
+    for (UINT level = 0; level < kMipColors.size(); ++level) {
+        PixelInput input{8u >> level, 8u >> level, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+        for (UINT texel = 0; texel < input.width * input.height; ++texel)
+            input.rows.insert(input.rows.end(), kMipColors[level].begin(), kMipColors[level].end());
+        levels.push_back(std::move(input));
+    }
+    return levels;
+}
+}
+
+void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, UINT expectedLevel)
+{
+    if (expectedLevel >= kMipColors.size()) throw std::runtime_error("Expected a mip level from 0 to 3");
+    auto levels = solid_mips();
+    const auto& rgba = kMipColors[expectedLevel];
+    const Color expected{expected_channel(rgba[0]), expected_channel(rgba[1]),
+                         expected_channel(rgba[2]), expected_channel(rgba[3])};
+    levels.front().expected.assign(64, expected);
+    draw_verified(device, shader, levels, {8, 8}, 0, {MipDraw{0, 1}}, nullptr);
+}
+
+void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance)
+{
+    if (!(clamp >= 0 && clamp <= 8) || !(tolerance > 0 && tolerance < 0.5f))
+        throw std::runtime_error("Expected a clamp from 0 to 8 and a tolerance below 0.5");
+    // The constant coordinate has no derivatives, so the LOD is the clamp, limited to the last mip.
+    const float lod = (std::min)(clamp, float(kMipColors.size() - 1));
+    const UINT low = UINT(lod);
+    const UINT high = (std::min)(low + 1, UINT(kMipColors.size() - 1));
+    const float weight = lod - float(low);
+    Color expected{};
+    for (size_t c = 0; c < expected.size(); ++c)
+        expected[c] = (1 - weight) * (kMipColors[low][c] / 255.0f) + weight * (kMipColors[high][c] / 255.0f);
+    auto levels = solid_mips();
+    levels.front().expected.assign(64, expected);
+    levels.front().linearMips = true;
+    levels.front().tolerance = tolerance;
+    draw_verified(device, shader, levels, {8, 8}, 0, {MipDraw{0, 1}}, nullptr);
 }
 
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg)

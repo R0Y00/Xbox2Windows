@@ -98,10 +98,15 @@ def check_named_binding_rejections(image, provider, slot):
         parse_data_directories=lambda *, directories: None,
     )
     assert resolve_import(caller, slot, provider, "mix_args") == "mix_args"
+    # Model a PE import descriptor spelling the same DLL with different case.
+    desc.dll = module.upper() if provider.name == provider.name.lower() else module.lower()
+    assert desc.dll.decode("ascii") != provider.name
+    assert resolve_import(caller, slot, provider, "mix_args") == "mix_args"
+    desc.dll = module
 
-    def expect_rejection(bound, symbol, reason):
+    def expect_rejection(bound, symbol, reason, *, link_name=None):
         try:
-            resolve_import(caller, slot, bound, symbol)
+            resolve_import(caller, slot, bound, symbol, link_name=link_name)
         except ValueError as exc:
             if str(exc) != reason:
                 raise AssertionError(f"expected {reason!r}, got {str(exc)!r}") from exc
@@ -110,6 +115,8 @@ def check_named_binding_rejections(image, provider, slot):
 
     dll = module.decode("ascii")
     identity = f"{dll}!mix_args"
+    expect_rejection(provider, "mix_args", f"unexpected link name for named import {identity}",
+                     link_name="mix_args")
     expect_rejection(provider, "MIX_ARGS", f"unbound import {identity} at IAT slot RVA {slot:#x}")
     desc.dll = module + b"."
     expect_rejection(provider, "mix_args", f"unbound import {dll}.!mix_args at IAT slot RVA {slot:#x}")
@@ -181,6 +188,8 @@ def check(native, lifted, provider, altered, probe, ordinal_control=None):
                 if ordinal:
                     reject(source, bound, f"unbound import {identity}", ["mix_args"])
                     reject(source, bound, f"import-library link name required for {identity}", ["#77"])
+                    reject(source, bound, f"unsupported C import name {identity}",
+                           ["#77", "--link-name", "m\u00e9"])
                     system_ordinal(source, bound)
                 else:
                     check_named_binding_rejections(source, bound, slot)

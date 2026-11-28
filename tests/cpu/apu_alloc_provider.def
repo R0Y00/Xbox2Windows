@@ -1,0 +1,12 @@
+LIBRARY acphal
+EXPORTS
+    ApuAlloc
+    ApuFree
+    get_apu_alloc_call_count
+    get_apu_free_call_count
+    get_apu_live_block_count
+    get_apu_rejected_free_count
+    get_apu_recorded_size
+    get_apu_recorded_alignment
+    get_apu_recorded_result
+    reset_apu_records

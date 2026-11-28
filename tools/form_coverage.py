@@ -19,13 +19,15 @@ Rules:
   of each line of every program tools/pixel_aot.py lowered without an error, in the file CTest names
   in FORM_COVERAGE_RECORD (<build>/form_coverage/<test>.txt). Programs a check expects to be rejected
   raise before they are recorded. A record not written during the JUnit file's run is ignored, so a
-  record and a test status always come from the same run.
+  record and a test status always come from the same run. A --records path that is not a directory is an
+  error (exit 2); a directory whose records all come from another run is measured with a warning.
 - Reference lists (denominators) live in docs/coverage/ and are produced by tools/form_reference.py.
 Python standard library only.
 """
 import argparse
 from datetime import datetime
 import json
+import math
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -71,12 +73,21 @@ CPU_FIXTURES = {
     "rdrand": "cpu_aot_rdrand",
     "rdseed": "cpu_aot_rdseed",
     "rdrand_harness": None,  # native CPUID and RFLAGS reads
+    "cpuid": "cpu_aot_cpuid",
+    "xgetbv": "cpu_aot_xgetbv",
+    "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
+    "mxcsr_harness": None,  # native MXCSR reads and writes
+    "sse_fp_harness": None,  # native MXCSR driver for cpu_aot_sse_fp
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
     "avx2_regs": "cpu_aot_avx2_regs",
     "avx_int_regs": "cpu_aot_avx_int_regs",
+    "avx_int_ymm_addsub": "cpu_aot_avx_int_ymm_addsub",
+    "avx_int_ymm_minmax": "cpu_aot_avx_int_ymm_minmax",
+    "avx_int_ymm_sat": "cpu_aot_avx_int_ymm_sat",
     "avx_move_regs": "cpu_aot_avx_move_regs",
+    "avx_move_mem": "cpu_aot_avx_move_mem",
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
@@ -100,11 +111,13 @@ CPU_FIXTURES = {
 # their passing differential test, rather than guessing the macro expansion.
 CPU_RECORD_FIXTURES = {"flag_conditions"}
 
-MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
-                   "externdef", "include", "includelib", "option", "align", "even", "org", "assume", "local"}
+MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "elseifdef", "endif",
+                   "ifidni", "rept", "end", "public", "extern", "externdef", "include", "includelib",
+                   "option", "align", "even", "org", "assume", "local"}
 MASM_DEFINERS = {"proc", "endp", "label", "equ", "db", "dw", "dd", "dq", "byte", "word", "dword",
                  "qword", "segment", "ends", "struct", "macro", "endm", "textequ"}
 MASM_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz"}
+MASM_LABEL = re.compile(r"^\s*(?:@@|[@$?A-Za-z_][\w@$?]*)::?")
 # MASM condition-code spellings -> iced-x86's canonical mnemonic suffix.
 CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb": "ae", "nbe": "a",
                      "na": "be", "nge": "l", "nl": "ge", "nle": "g", "ng": "le", "pe": "p", "po": "np"}
@@ -113,22 +126,45 @@ CONDITION_ALIASES = {"z": "e", "nz": "ne", "c": "b", "nae": "b", "nc": "ae", "nb
 def masm_mnemonics(text):
     """Instruction mnemonics in MASM source; both arms of IFDEF/ELSE count (both variants are built)."""
     found = set()
-    macros = set()
+    ignored = MASM_DIRECTIVES | MASM_DEFINERS
     for line in text.splitlines():
-        line = re.sub(r"^\s*\w+::?", "", line.split(";", 1)[0]).strip()  # local or global label
+        # Local (`@@:`) or global label, then a MASM assembly-time assignment.
+        line = line.partition(";")[0]
+        if ":" in line:
+            line = MASM_LABEL.sub("", line)
         words = line.lower().split()
-        if len(words) > 1 and words[1] == "macro":
-            macros.add(words[0])
+        if len(words) > 1 and words[1] == "=":
             continue
-        if (not words or words[0].startswith(".") or words[0] in MASM_DIRECTIVES | MASM_DEFINERS | macros
+        if len(words) > 1 and words[1] == "macro":
+            ignored.add(words[0])
+            continue
+        if (not words or words[0].startswith(".") or words[0] in ignored
                 or (len(words) > 1 and words[1] in MASM_DEFINERS and words[2:3] != ["ptr"])):
             continue
         while words and words[0] in MASM_PREFIXES:
             words = words[1:]
         if not words:
             continue
+        if words[0] == "int" and len(words) > 1 and masm_integer(words[1]) == 3:
+            # ML64 has no INT3 mnemonic and encodes INT 3 (also written 3h or 03h) as the one-byte CC form,
+            # the reference's int3.
+            found.add("int3")
+            continue
+        if words[0] == "fsetpm":
+            # ML64 has no FNSETPM spelling and assembles FSETPM as DB E4 without a WAIT (9B), the
+            # reference's fnsetpm. Its other WAIT spellings (FCLEX, FINIT, FSTSW, ...) do emit the 9B.
+            found.add("fnsetpm")
+            continue
         found.add(x64_canonical(words[0]))
     return found
+
+
+def masm_integer(token):
+    """A MASM integer literal (decimal, or hexadecimal with an h suffix), or None."""
+    try:
+        return int(token[:-1], 16) if token.endswith("h") else int(token, 10)
+    except ValueError:
+        return None
 
 
 def x64_canonical(mnemonic):
@@ -157,17 +193,35 @@ def read_results(junit):
     """CTest JUnit status per test (pass, fail or skip; CTest writes skips as status="notrun"), and the
     run's (start, end) in seconds since the epoch. CTest writes the start as local time in whole seconds."""
     suite = ET.parse(junit).getroot()
+    if suite.tag != "testsuite":
+        # Records are matched to the run's time window, so a file merging several runs cannot be used.
+        raise ValueError(f"expected one CTest <testsuite> root, found <{suite.tag}>")
+    try:
+        start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> timestamp {suite.get('timestamp')!r} is not an ISO date and time") from None
+    try:
+        duration = float(suite.get("time"))
+    except (TypeError, ValueError):
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} is not a number of seconds") from None
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError(f"<testsuite> time {suite.get('time')!r} must be finite and nonnegative")
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
+        name = case.get("name")
+        if not name or not name.strip():
+            raise ValueError("CTest <testcase> needs a nonempty name")
+        if name in results:
+            # Coverage records have only the test name, not its CTest directory.
+            raise ValueError(f"duplicate CTest <testcase> name {name!r}; coverage records require unique names")
         state = status.get(case.get("status"), "fail")
         if case.find("failure") is not None or case.find("error") is not None:
             state = "fail"
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
-        results[case.get("name")] = state
-    start = datetime.fromisoformat(suite.get("timestamp")).timestamp()
-    return results, (start - 1, start + float(suite.get("time")) + 2)
+        results[name] = state
+    return results, (start - 1, start + duration + 2)
 
 
 def read_records(directory, window):
@@ -277,8 +331,24 @@ def main(argv):
     parser.add_argument("--gaps", choices=("x64_zen2", "gfx1013", "gfx1030"),
                         help="print uncovered forms for one architecture as tab-separated group, form and evidence")
     args = parser.parse_args(argv)
-    results, window = read_results(args.junit)
-    m = measure(results, records=read_records(args.records, window), gaps_for=args.gaps)
+    try:
+        results, window = read_results(args.junit)
+    except (OSError, ET.ParseError, ValueError) as error:
+        print(f"form_coverage: {args.junit}: {error}", file=sys.stderr)
+        return 2
+    # Reading nothing from a mistyped or wrong --records path would silently count every record-mode and shader
+    # form as uncovered, so a path that is not a directory is an error.
+    if not args.records.is_dir():
+        problem = "records path is not a directory" if args.records.exists() else "records directory does not exist"
+        print(f"form_coverage: {args.records}: {problem}", file=sys.stderr)
+        return 2
+    records = read_records(args.records, window)
+    stored = sum(1 for _ in args.records.glob("*.txt"))
+    if stored and not records:
+        # For example the records of another preset's build directory: valid, but nothing from this run counts.
+        print(f"form_coverage: {args.records}: none of the {stored} records here was written during this JUnit "
+              "run, so no record-mode or shader form is counted", file=sys.stderr)
+    m = measure(results, records=records, gaps_for=args.gaps)
     if args.gaps:
         gaps = m[args.gaps].pop("gaps")
     if args.json:
@@ -290,7 +360,8 @@ def main(argv):
             print("\t".join(row))
     else:
         print(report(m))
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))

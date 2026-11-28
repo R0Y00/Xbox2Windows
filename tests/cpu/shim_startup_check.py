@@ -35,6 +35,11 @@ def imports_by_dll(image):
 
 
 def mapped(mapper_path, exe, companion, io, xmem, d3d12_xs, *, withheld):
+    # DXGI loads d3d10warp.dll from the process's directory first. The native EXE finds an app-local
+    # WARP (OFFSCREEN_WARP_DIR) beside itself; this host is python.exe, so load that copy explicitly.
+    warp = exe.with_name("d3d10warp.dll")
+    if warp.exists():
+        ctypes.WinDLL(str(warp))
     mapper = Mapper(mapper_path)
     providers = {"kernel32.dll": ctypes.WinDLL("kernel32.dll")}
     providers.update({dll.name.casefold(): ctypes.WinDLL(str(dll))
@@ -66,6 +71,7 @@ def mapped(mapper_path, exe, companion, io, xmem, d3d12_xs, *, withheld):
             COMPANION: {b"run_startup_shims": entry},
             "cpu_shim_compute.dll": ctypes.WinDLL(str(exe.with_name("cpu_shim_compute.dll"))),
             "cpu_shim_draw.dll": ctypes.WinDLL(str(exe.with_name("cpu_shim_draw.dll"))),
+            d3d12_xs.name.casefold(): providers[d3d12_xs.name.casefold()],
             io.name.casefold(): ctypes.WinDLL(str(io)),
         })
         print("mapped host returned", file=sys.stderr)
@@ -80,6 +86,7 @@ def compare(mapper_path, exe, companion, io, xmem, d3d12_xs):
     for image in (exe, companion, xmem, d3d12_xs):
         print(f"{image.name} sha256={hashlib.sha256(image.read_bytes()).hexdigest()}")
     check("EXE companion import", imports_by_dll(exe)[COMPANION], ["run_startup_shims"])
+    check("EXE device import", imports_by_dll(exe)["d3d12_xs.dll"], ["D3D12XboxCreateDevice"])
     actual = imports_by_dll(companion)
     for dll, symbols in SHIM_IMPORTS.items():
         check(dll, set(actual[dll]), symbols)

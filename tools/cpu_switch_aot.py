@@ -4,7 +4,9 @@ Each export takes three integer words in RCX, RDX and R8 and returns RAX. The
 translator follows branches and jump-table entries from the export, so data
 placed after the code (as MSVC does with its tables) is never decoded. An
 indirect JMP is accepted only at the end of one of these sequences, reached by
-the fallthrough of an unsigned bound check on the index:
+the fallthrough of an unsigned bound check on the index (JA or JAE to the default),
+or by the taken branch of the inverted form (JB or JBE to the dispatch block,
+which a JMP to the default precedes and no other edge enters):
 
     mov E32, [B+I*4+table]; add E, B; jmp E   B = image base (MSVC)
     movsxd E, [B+I*4];      add E, B; jmp E   B = table      (LLVM)
@@ -18,14 +20,57 @@ defined at entry and the generated function has a fourth parameter. "name" and
 "name:3" take three, and R9 is a scratch register that must be written before it
 is read; any other count is rejected. The count is chosen by whoever invokes the
 translator, not derived from the machine code, and the host must call the
-translated function with the same number of arguments. Stack arguments (the
-fifth and later) and floating-point arguments are not supported.
+translated function with the same number of arguments. An export's stack
+arguments (the fifth and later) and floating-point arguments are not supported;
+an internal callee may take stack arguments, as described below.
 
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+Instructions that leave the flags unchanged (moves, LEA, NOT, BSWAP, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
+
+SHL, SAL (its /6 encoding alias), SHR and SAR produce flags only with an immediate
+count whose masked value (five bits, six for a 64-bit operand) is 1 to the operand
+width minus 1. A count of 0 leaves the flags of an earlier instruction, which a
+shift by CL may do, and CF is undefined for SHL, SAL and SHR by the operand width
+or more, so those are refused, and SAR by such a count with them. CF is the last
+bit shifted out and ZF, SF and PF come from the result. OF is defined only for a
+count of 1 (MSB of the result XOR CF for SHL and SAL, MSB of the operand for SHR,
+0 for SAR), so O, NO, L, GE, LE and G are refused after a larger count.
+
+BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
+a register or immediate bit offset. Register bases and immediate offsets use
+the offset modulo the operand width. A register offset into ordinary memory is
+signed and addresses a bit string; frame, image-relative and 32-bit-address
+forms are refused. CF is the selected bit before the
+write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
+only the B and AE conditions may read it.
+
+POPCNT, LZCNT and TZCNT take a 16-, 32- or 64-bit register or memory source.
+LZCNT and TZCNT return the operand width for a zero source. As the Intel SDM
+defines their flags, POPCNT sets ZF for a zero source and clears OF, SF, AF, CF
+and PF, so every condition may read them. LZCNT and TZCNT set CF for a zero
+source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only
+B, AE, E, NE, BE and A may read them. The host must support the instructions
+whose results the original computes: without ABM and BMI1 a processor runs
+LZCNT and TZCNT as BSR and BSF.
+
+BSF and BSR take a 16-, 32- or 64-bit register destination and a register or
+memory source of the same width. A nonzero source gives the index of its lowest
+(BSF) or highest (BSR) set bit and clears ZF. For a zero source ZF is set and
+the destination is left unchanged. The Intel SDM calls that destination
+undefined; AMD documents it as unchanged, and the translation follows the
+unchanged behaviour of the processors measured, 32-bit destinations included:
+a zero source does not clear bits 63:32. A nonzero source zero-extends a 32-bit
+result and keeps bits 63:16 of a 16-bit destination. CF, OF, SF, PF and AF are
+undefined, so only the E and NE conditions may read them and every other
+condition is refused. The destination is read, so it must be defined.
+
+BSWAP takes a 32- or 64-bit register and reverses its bytes in place; no flag changes.
+A 32-bit BSWAP zero-extends its result into the 64-bit register like any other 32-bit
+write. The 16-bit form (operand-size prefix) is refused: the Intel SDM leaves its
+result undefined.
 
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
@@ -59,15 +104,16 @@ a guest address, which the switch replaces, and never needs the mapping. The
 generated source states the binding contract.
 A function may use its stack. A forward pass gives RSP at
 every instruction as entry RSP plus a constant that must agree at joins and be
-0 at every RET. PUSH and POP of a nonvolatile register and SUB or ADD RSP by a
-multiple of 8 are the only changes of RSP accepted; any other write of RSP is a
-dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
+0 at every RET. PUSH and POP of a nonvolatile register, SUB or ADD RSP by a
+multiple of 8, and LEAVE where the RBP anchor is proven are the only changes of
+RSP accepted. LEAVE sets RSP to the anchor and pops RBP from it. ENTER, MOV RSP,
+RBP and any other write of RSP is a dynamic frame, and any use of RSP as a value (MOV RAX, RSP or LEA RAX, [RSP+8])
 would let the frame's address escape. Both are rejected. The frame becomes one
 byte array per call, from the lowest RSP up to the end of the caller's 32-byte
 home space at entry RSP + 40, at most MAX_FRAME bytes, and each RSP-based
 operand a load or store at a constant index into it. An access below the
-current RSP (Windows x64 has no red zone), of the return address or at or
-above entry RSP + 40 (a stack argument) is rejected. A second pass follows
+current RSP (Windows x64 has no red zone), of the return address or, in an
+export, at or above entry RSP + 40 (a stack argument) is rejected. A second pass follows
 every stack byte: a read needs each byte written on every path, so home space
 must be written before it is read. RBX, RBP, RSI, RDI and R12-R15 may be used
 when every RET is reached with each one holding its entry value again, saved
@@ -83,21 +129,37 @@ once, as a static function named fn_<rva> that takes RCX, RDX, R8 and R9,
 defined before its first caller. A target must be the first byte of a verified
 primary runtime function (unchained, version 1 or 2 unwind data, executable) or
 a non-forwarded code export that no other function's interval holds; chained
-ranges, interior labels, forwarded and data exports are refused. A call
-to the caller's own entry and any call cycle are refused, and a caller is
-refused when any callee is. A callee records how many low bytes of each argument
+ranges, interior labels, forwarded and data exports are refused. A caller
+is refused when any callee is. A callee records how many low bytes of each argument
 register it may read before writing it, and the caller must define them at the
 call. After a call RAX holds the callee's return width of defined bytes; the
 other volatile registers, the flags and the callee's 32-byte home space at RSP
 are undefined, and the nonvolatile registers and the rest of the frame,
 including the caller's own home space above entry RSP, are kept. The return
 address and the callee's frame lie below RSP, where every byte is already
-undefined because the frame proof forgets the bytes that ADD RSP and POP leave
-below RSP. RSP must be 8
+undefined because the frame proof forgets the bytes that ADD RSP, POP and LEAVE
+leave below RSP. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
-width. The callee's frame is its own array, so no frame address crosses a call,
-and stack arguments stay refused.
+width. The callee's frame is its own array, so no frame address crosses a call.
+
+An internal function may read and write up to MAX_STACK_ARGUMENTS stack
+arguments, the 8-byte slots from entry RSP + 40, each access inside one slot. Its
+frame array extends over them, copied at entry from one parameter per slot after
+R9, and it records how many low bytes of each slot some read reaches. A caller
+must have those bytes written at RSP + 32 + 8 * slot when the CALL executes, below
+its own return address, and passes the 8 bytes of each slot. Afterwards the slots
+are undefined, like the callee's home space, because the callee may write them.
+A tail jump to a function with stack arguments is refused.
+
+A CALL may close a call cycle, an export's own entry included, which becomes an
+internal function too. A call into a function whose translation is in progress
+uses an assumed return width and demands, at first 8 bytes and none, and the
+functions of the cycle are translated again from the meet of the assumed and
+computed values until no computed width is lower and no demand higher. Each
+function of a cycle is declared before the definitions. A tail jump that closes
+a cycle is refused: the original runs such a cycle in constant stack. The host
+stack bounds the depth of recursion, at a depth that differs from the original.
 
 A target without unwind data or export is refused, with a message saying that
 a range binding is needed, unless the invoker supplies one: --bind-ranges names
@@ -159,6 +221,9 @@ NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R
 # Integer argument registers in order. An entry takes the first three unless it is listed as "name:4".
 ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
 ARGUMENT_COUNTS = (3, 4)
+IMPORT_ARGUMENT_COUNTS = range(len(ARGUMENT_REGISTERS) + 1)
+IMPORT_RETURN_WIDTHS = (0, 1, 2, 4, 8)
+STACK_OUTPUT_WIDTHS = (1, 2, 4, 8)
 DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 NONVOLATILE = tuple(sorted(set(NAMES) - VOLATILE - {R.RSP}))  # RBX, RBP, RSI, RDI, R12-R15
@@ -169,13 +234,21 @@ HOME_END = 40
 MAX_FRAME = 4096
 # The home space a callee may write: the 32 bytes at RSP when the CALL executes.
 HOME_SIZE = 32
+# Stack arguments an internal function may take: the fifth to the twelfth, 8 bytes each from entry RSP + 40.
+MAX_STACK_ARGUMENTS = 8
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 # Flow that continues at the next instruction (a direct call does once its callee returns).
 STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, FlowControl.INDIRECT_CALL)
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
-SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+SHIFTS = {M.SHL: "<<", M.SAL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
+# Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
+BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit scans, by the PRELUDE helper that computes the index of the bit found in a nonzero source.
+BIT_SCANS = {M.BSF: "trailing_zeros", M.BSR: "highest_bit"}
+# Bit counts, by the PRELUDE helper that computes each.
+BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -194,9 +267,16 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
-                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, M.BSWAP, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE,
+                M.RDFSBASE, M.RDGSBASE, M.RDPID}
+HOST_CPU_READ_BASE_CODES = {
+    Code.RDFSBASE_R32: ("_readfsbase_u32", 4),
+    Code.RDFSBASE_R64: ("_readfsbase_u64", 8),
+    Code.RDGSBASE_R32: ("_readgsbase_u32", 4),
+    Code.RDGSBASE_R64: ("_readgsbase_u64", 8),
+}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -465,8 +545,6 @@ class Function:
     def callee(self, ins):
         """Validate the target of a direct CALL as the entry of another function in the image."""
         target = ins.near_branch_target
-        if target == self.entry:
-            raise ValueError(f"self-recursion at RVA {ins.ip:#x}")
         if not 0 <= target < self.pe.OPTIONAL_HEADER.SizeOfImage:
             raise ValueError(f"call target outside the image at RVA {ins.ip:#x}")
         section = self.pe.get_section_by_rva(target)
@@ -691,20 +769,33 @@ class Function:
         else:
             raise ValueError(f"unrecognized table load at RVA {load.ip:#x}")
 
-        # The bound check must fall through into the dispatch block.
+        # The bound check falls through into the dispatch block, or (inverted) branches to it with a
+        # JMP to the default in front of it.
         bound = load
         between = []
+        inverted = False
         while True:
             bound = self.ending.get(bound.ip)
             if bound is None:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             if bound.flow_control == FlowControl.CONDITIONAL_BRANCH:
                 break
+            if (bound.flow_control == FlowControl.UNCONDITIONAL_BRANCH and bound.is_jmp_short_or_near
+                    and not inverted):
+                inverted = True
+                first = between[-1] if between else load
+                bound = self.ending.get(bound.ip)
+                if (bound is None or bound.flow_control != FlowControl.CONDITIONAL_BRANCH
+                        or not bound.is_jcc_short_or_near or bound.near_branch_target != first.ip):
+                    raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
+                break
             if bound.flow_control != FlowControl.NEXT or len(between) >= 8:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             between.append(bound)
         compare = self.ending.get(bound.ip)
-        if bound.condition_code not in (CC.A, CC.AE):
+        # The branch that enters the table is the one the index passed: JA/JAE when the default is
+        # taken, JB/JBE when the table is.
+        if bound.condition_code not in ((CC.B, CC.BE) if inverted else (CC.A, CC.AE)):
             raise ValueError(f"jump-table bound is not an unsigned upper limit at RVA {bound.ip:#x}")
         if (compare is None or compare.mnemonic != M.CMP or compare.op0_kind != OpKind.REGISTER
                 or compare.op1_kind not in (OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64,
@@ -712,7 +803,7 @@ class Function:
                 or RegisterExt.size(compare.op0_register) not in (4, 8)):
             raise ValueError(f"unbounded jump-table index at RVA {bound.ip:#x}")
         limit = compare.immediate(1) & ((1 << RegisterExt.size(compare.op0_register) * 8) - 1)
-        count = limit + 1 if bound.condition_code == CC.A else limit
+        count = limit + 1 if bound.condition_code in (CC.A, CC.BE) else limit
         if not 0 < count <= MAX_CASES:
             raise ValueError(f"unsupported jump-table size {count} at RVA {compare.ip:#x}")
         entries = struct.unpack(f"<{count}{'I' if kind == 'image' else 'i'}",
@@ -726,7 +817,14 @@ class Function:
 
     def prove(self, ip, edges, constants):
         index, _, sequence, window, _, (compare, bound, base, anchor) = self.dispatches[ip]
-        if any(address in edges for address in (bound.ip, *(i.ip for i in window), *sequence, ip)):
+        block = [*(i.ip for i in window), *sequence, ip]
+        if bound.condition_code in (CC.B, CC.BE):
+            # The inverted bound branch is the one way into the block, and it enters at the top.
+            entries = {source for source, targets in self.successors.items() if block[0] in targets}
+            if entries != {bound.ip}:
+                raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
+            block = block[1:]
+        if any(address in edges for address in (bound.ip, *block)):
             raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
         if constants.get(sequence[0], {}).get(base) != anchor:
             raise ValueError(f"table base {NAMES[base]} differs on another path to RVA {sequence[0]:#x}")
@@ -810,9 +908,10 @@ def image_target(pe, ins):
 
 
 class Lifter:
-    def __init__(self, image=None):
+    def __init__(self, image=None, *, host_cpu=False):
         self.used = set()
         self.flags = False
+        self.host_cpu = host_cpu
         # The input image when RIP-relative operands address the bound mapping, and whether one does.
         self.image = image
         self.image_used = False
@@ -837,8 +936,8 @@ class Lifter:
         if ins.memory_base == R.RIP and self.image is not None and not ins.has_segment_prefix:
             self.image_used = True
             return f"(image + {image_target(self.image, ins):#x}ull)"
-        if ins.memory_base == R.RSP and ins.ip in self.frame:
-            # A constant index into the frame array: RSP itself never becomes a C++ value.
+        if ins.ip in self.frame:
+            # A constant index into the frame array: stack bases never become C++ values.
             return self.slot(ins)
         if (ins.memory_base in (R.RIP, R.EIP, R.RSP, R.ESP) or ins.memory_index in (R.RSP, R.ESP)
                 or ins.has_segment_prefix or ins.memory_base == R.NONE):
@@ -870,7 +969,7 @@ class Lifter:
         if kind == OpKind.REGISTER:
             return self.reg(ins.op_register(number))
         if kind == OpKind.MEMORY:
-            if ins.memory_base == R.RSP and ins.ip in self.frame:
+            if ins.ip in self.frame:
                 # The function's own frame array: a read of it cannot fault.
                 return f"load<{unsigned(width)}>({self.address(ins)})"
             # The instruction's memory operand is read once, at its own width, into a local declared before
@@ -913,6 +1012,36 @@ class Lifter:
 
     def condition(self, producer, jcc):
         code = CONDITIONS.get(jcc.condition_code)
+        if producer.mnemonic in BIT_TESTS:
+            # fb is CF, the selected bit. ZF is unaffected and OF, SF, AF and PF are undefined.
+            if code not in ("b", "ae"):
+                raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
+            return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_SCANS:
+            # fa is the source. ZF is set for a zero source; CF, OF, SF, PF and AF are undefined.
+            if code not in ("e", "ne"):
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"only ZF is defined after {name} at RVA {jcc.ip:#x}")
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            return source_zero if code == "e" else f"!({source_zero})"
+        if producer.mnemonic in BIT_COUNTS:
+            # fa is the source and fb the result.
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            if producer.mnemonic == M.POPCNT:
+                # ZF is set for a zero source; OF, SF, AF, CF and PF are cleared.
+                table = {"e": source_zero, "be": source_zero, "le": source_zero, "o": "false", "b": "false",
+                         "s": "false", "p": "false", "l": "false"}
+            else:
+                result_zero = f"static_cast<{unsigned(self.width(producer))}>(fb) == 0"
+                table = {"b": source_zero, "e": result_zero, "be": f"{source_zero} || {result_zero}"}
+            for negated, base in (("no", "o"), ("ae", "b"), ("ne", "e"), ("a", "be"), ("ns", "s"), ("np", "p"),
+                                  ("ge", "l"), ("g", "le")):
+                if base in table:
+                    table[negated] = f"!({table[base]})"
+            if code not in table:
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"OF, SF and PF are undefined after {name} at RVA {jcc.ip:#x}")
+            return table[code]
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
         a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
@@ -926,6 +1055,22 @@ class Lifter:
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
                      "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
+        elif producer.mnemonic in SHIFTS:
+            # fa is the result; bit 0 of fb is CF and bit 1 is OF (see lower()).
+            flag_result = f"static_cast<{u}>(fa)"
+            carry, zero = "((fb & 1u) != 0)", f"{flag_result} == 0"
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            table = {"e": zero, "ne": f"{flag_result} != 0", "s": s_cond,
+                     "ns": f"static_cast<{s}>({flag_result}) >= 0",
+                     "b": carry, "ae": f"!{carry}", "be": f"{carry} || {zero}", "a": f"!{carry} && !({zero})"}
+            overflow = None
+            if shift_count(producer) == 1:
+                overflow = "((fb & 2u) != 0)"
+                table.update({"l": f"({s_cond}) != {overflow}", "ge": f"({s_cond}) == {overflow}",
+                              "le": f"{zero} || ({s_cond}) != {overflow}",
+                              "g": f"!({zero}) && ({s_cond}) == {overflow}"})
+            elif code in ("o", "no", "l", "ge", "le", "g"):
+                raise ValueError(f"OF is undefined after a shift by more than 1 at RVA {jcc.ip:#x}")
         else:
             if producer.mnemonic == M.ADD:
                 flag_result = f"static_cast<{u}>({a} + {b})"
@@ -960,8 +1105,9 @@ class Lifter:
                                   "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        table.update({"o": overflow, "no": f"!({overflow})",
-                      "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        table.update({"p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        if overflow is not None:
+            table.update({"o": overflow, "no": f"!({overflow})"})
         if code not in table:
             raise ValueError(f"unsupported condition after {producer.mnemonic} at RVA {jcc.ip:#x}")
         return table[code]
@@ -978,6 +1124,36 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if mnemonic == M.CLZERO:
+            if ins.len != 3:
+                raise ValueError(f"unsupported CLZERO prefix or address size at RVA {ins.ip:#x}")
+            address = self.reg(R.RAX)
+            # One aligned cache line per executed instruction. Volatile retains writes
+            # even when a following iteration or caller overwrites the same line.
+            return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
+                    "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
+        if mnemonic in (M.RDFSBASE, M.RDGSBASE, M.RDPID):
+            if not self.host_cpu:
+                raise ValueError(f"{str(ins).split()[0].upper()} requires host_cpu=True (--host-cpu) at RVA {ins.ip:#x}")
+            if (ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix
+                    or ins.has_segment_prefix or ins.has_xacquire_prefix or ins.has_xrelease_prefix):
+                raise ValueError(f"unsupported instruction prefix at RVA {ins.ip:#x}")
+            if ins.op_count != 1 or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported operand at RVA {ins.ip:#x}: {ins}")
+            dest_reg = ins.op0_register
+            if full(dest_reg) == R.RSP:
+                raise ValueError(f"unsupported use of rsp at RVA {ins.ip:#x}")
+            if mnemonic == M.RDPID:
+                if ins.code != Code.RDPID_R64:
+                    raise ValueError(f"unsupported RDPID encoding at RVA {ins.ip:#x}: {ins}")
+                line = f"{{ const volatile std::uint32_t pid = _rdpid_u32(); {self.write(ins, 8, 'pid')} }}"
+                return line, {}, {full(dest_reg): 8}
+            if ins.code not in HOST_CPU_READ_BASE_CODES:
+                raise ValueError(f"unsupported FSGSBASE encoding at RVA {ins.ip:#x}: {ins}")
+            intrinsic, op_width = HOST_CPU_READ_BASE_CODES[ins.code]
+            u = unsigned(op_width)
+            line = f"{{ const volatile {u} base = {intrinsic}(); {self.write(ins, op_width, 'base')} }}"
+            return line, {}, {full(dest_reg): op_width}
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
             if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
@@ -1017,7 +1193,7 @@ class Lifter:
                 kind = ins.op_kind(number)
                 if kind == OpKind.REGISTER:
                     read(ins.op_register(number))
-                elif kind == OpKind.MEMORY:
+                elif kind == OpKind.MEMORY and ins.ip not in self.frame:
                     for register in (ins.memory_base, ins.memory_index):
                         if register not in (R.NONE, R.RSP) and (register != R.RIP or self.image is None):
                             read(register)
@@ -1034,6 +1210,9 @@ class Lifter:
                 note(0)
                 return f"store<std::uint64_t>({self.slot(ins)}, {self.reg(ins.op0_register)});", reads, {}
             return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})"), {}, writes
+        if mnemonic == M.LEAVE:
+            # Frame proved the anchor: RSP stays a constant offset, and RBP is reloaded from the anchor slot.
+            return self.write(ins, 8, f"load<std::uint64_t>({self.slot(ins)})", R.RBP), {}, {R.RBP: 8}
         if ins.ip in self.adjustments:
             # SUB or ADD RSP, imm: Frame knows RSP as a constant offset, so nothing is computed.
             if sets_flags:
@@ -1084,11 +1263,88 @@ class Lifter:
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
+        if mnemonic in BIT_TESTS:
+            if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
+                # Frame and image proofs cover the nominal address only; the dynamic bit offset
+                # can reach outside that range. Address-size overrides need separate wrap proof.
+                if (ins.ip in self.frame or ins.memory_base in (R.RIP, R.EIP)
+                        or RegisterExt.is_gpr32(ins.memory_base)):
+                    raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+                note(0, 1)
+                bits = width * 8
+                shift = bits.bit_length() - 1
+                raw = self.operand(ins, 1, width)
+                # Unsigned arithmetic implements a sign-extended arithmetic shift without
+                # signed overflow or an implementation-defined right shift of a negative value.
+                lines = [f"const std::uint64_t bit_index = {raw};",
+                         f"const std::uint64_t sign = 0ull - (bit_index >> {bits - 1});",
+                         f"const std::uint64_t word_index = (bit_index >> {shift}) | (sign << {bits - shift});",
+                         f"const word address = {self.address(ins)} + word_index * {width}ull;",
+                         f"const {unsigned(width)} value = load_always<{unsigned(width)}>(address);",
+                         f"const std::uint64_t bit = bit_index & {bits - 1}u;"]
+                if sets_flags:
+                    self.flags = True
+                    lines.append("fb = (static_cast<std::uint64_t>(value) >> bit) & 1u;")
+                if mnemonic != M.BT:
+                    lines.append(f"store<{unsigned(width)}>(address, static_cast<{unsigned(width)}>(value {BIT_TESTS[mnemonic]}(1ull << bit)));")
+                return "{ " + " ".join(lines) + " }", reads, writes
+            note(0, 1)
+            bits = width * 8
+            a = self.operand(ins, 0, width)
+            offset = (f"(static_cast<std::uint64_t>({self.operand(ins, 1, width)}) & {bits - 1}u)"
+                      if ins.op1_kind == OpKind.REGISTER else f"{ins.immediate(1) & (bits - 1)}u")
+            lines = []
+            if sets_flags:
+                self.flags = True
+                lines.append(f"fb = (static_cast<std::uint64_t>({a}) >> {offset}) & 1u;")
+            if mnemonic == M.BT:
+                writes.clear()
+            else:
+                lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
+            return " ".join(lines), reads, writes
+        if mnemonic == M.BSWAP:
+            if width not in (4, 8) or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported BSWAP operands at RVA {ins.ip:#x}: the 16-bit form is undefined")
+            note(0)
+            return self.write(ins, width, f"byte_swap<{unsigned(width)}>({self.operand(ins, 0, width)})"), reads, writes
+        if mnemonic in BIT_SCANS:
+            if width not in (2, 4, 8) or ins.op0_kind != OpKind.REGISTER or ins.op1_kind not in (OpKind.REGISTER, OpKind.MEMORY):
+                raise ValueError(f"unsupported {str(ins).split()[0].upper()} operands at RVA {ins.ip:#x}")
+            note(1)
+            # A zero source leaves the whole destination register as it was, so it is read: 16 bits for a
+            # 16-bit destination, all 64 otherwise (a 32-bit result zero-extends only for a nonzero source).
+            destination = full(ins.op0_register)
+            reads[destination] = max(reads.get(destination, 0), 2 if width == 2 else 8)
+            u = unsigned(width)
+            source = self.operand(ins, 1, width)
+            found = self.write(ins, width, f"{BIT_SCANS[mnemonic]}<{u}>(source)")
+            if sets_flags:
+                self.flags = True
+                return f"fa = {source}; {{ const {u} source = static_cast<{u}>(fa); if (source != 0) {{ {found} }} }}", reads, writes
+            return f"{{ const {u} source = {source}; if (source != 0) {{ {found} }} }}", reads, writes
+        if mnemonic in BIT_COUNTS:
+            note(1)
+            source = self.operand(ins, 1, width)
+            value = f"{BIT_COUNTS[mnemonic]}<{unsigned(width)}>({source})"
+            if not sets_flags:
+                return self.write(ins, width, value), reads, writes
+            self.flags = True
+            return (f"fa = {source}; fb = {value}; " + self.write(ins, width, "fb")), reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
-                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if mnemonic in ROTATES:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if ins.op1_kind == OpKind.REGISTER:
+                    # A masked count of 0 leaves the flags unchanged, so they may come from an earlier instruction.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a shift by CL may leave the flags unchanged")
+                if shift_count(ins) == 0:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a zero-count shift leaves the flags unchanged")
+                if shift_count(ins) >= width * 8:
+                    # CF is undefined for SHL and SHR (Intel SDM, SAL/SAR/SHL/SHR); SAR is refused with them.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: "
+                                     "a shift by the operand width or more (CF is undefined for SHL and SHR)")
             note(0)
-            a = self.operand(ins, 0, width)
+            a = source = self.operand(ins, 0, width)
             # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
             # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
             # rotates mask modulo the operand width inside rotate_bits.
@@ -1108,6 +1364,19 @@ class Lifter:
                 else:
                     a = f"static_cast<std::uint64_t>({a})"
                 value = f"{a} {SHIFTS[mnemonic]} {count}"
+            if sets_flags:
+                # CF is the last bit shifted out. OF, defined only for a count of 1, is the MSB of the
+                # result XOR CF for SHL/SAL, the MSB of the operand for SHR and 0 for SAR.
+                self.flags = True
+                bits, n, wide = width * 8, shift_count(ins), f"static_cast<std::uint64_t>({source})"
+                carry = f"(({wide} >> {bits - n if mnemonic in (M.SHL, M.SAL) else n - 1}) & 1u)"
+                overflow = "0u"
+                if n == 1 and mnemonic in (M.SHL, M.SAL):
+                    overflow = f"((({wide} >> {bits - 1}) ^ ({wide} >> {bits - 2})) & 1u)"
+                elif n == 1 and mnemonic == M.SHR:
+                    overflow = f"(({wide} >> {bits - 1}) & 1u)"
+                return (f"fa = static_cast<{unsigned(width)}>({value}); fb = {carry} | ({overflow} << 1); "
+                        + self.write(ins, width, "fa")), reads, writes
             return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
@@ -1202,6 +1471,12 @@ class Lifter:
         raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 
 
+def shift_count(ins):
+    """The immediate count of a shift, masked as x86 does: to six bits for a 64-bit operand, else five."""
+    width = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else _memory_width(ins)
+    return ins.immediate(1) & (63 if width == 8 else 31)
+
+
 def _memory_width(ins):
     width = MemorySizeExt.size(ins.memory_size)
     if width not in (1, 2, 4, 8):
@@ -1217,7 +1492,7 @@ class Frame:
     """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP or POP, which leaves
+    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP, POP or LEAVE, which leaves
     those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
@@ -1225,31 +1500,78 @@ class Frame:
     frame_limit = MAX_FRAME
     incoming_end = HOME_END
 
-    def __init__(self, function):
+    def __init__(self, function, edges, internal=False):
+        if internal:
+            # An internal function may read the stack arguments its callers write above its home space.
+            self.incoming_end = HOME_END + 8 * MAX_STACK_ARGUMENTS
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
+        self.output_calls = {}
+        self.output_addresses = {}
+        self.outputs = {}
+        for ip, host in function.host_calls.items():
+            if host.output is None:
+                continue
+            register, width = host.output
+            if ip not in function.calls or host.noreturn or register not in host.demands or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"unsupported stack output contract at RVA {ip:#x}")
+            before = ip
+            while before not in edges and before != function.entry:
+                ins = function.ending.get(before)
+                if ins is None or ins.flow_control != FlowControl.NEXT:
+                    break
+                if (ins.mnemonic == M.LEA and ins.op0_register == register and ins.memory_base in (R.RSP, R.RBP)
+                        and ins.memory_index == R.NONE and not ins.has_segment_prefix):
+                    self.output_calls[ip] = (ins, register, width)
+                    self.output_addresses[ins.ip] = width
+                    break
+                if any(RegisterExt.full_register(used.register) == register
+                       or RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
+                       for used in INFO.info(ins).used_registers()):
+                    break
+                before = ins.ip
+            if ip not in self.output_calls:
+                raise ValueError(f"stack output call at RVA {ip:#x} needs a proven frame address")
+        anchors, self.set_anchor = {function.entry: None}, set()
         work = [function.entry]
         while work:
             ip = work.pop()
+            anchor = anchors[ip]
             if ip in function.calls or ip in function.tails:
                 # The callee pops its return address; call sites are checked by check_call_sites.
                 after = self.offsets[ip]
             else:
-                after = self.step(function.instructions[ip], self.offsets[ip])
+                after, anchor = self.step(function.instructions[ip], self.offsets[ip], anchor)
                 if after > self.offsets[ip]:
                     self.released[ip] = (self.offsets[ip], after)
             for successor in function.successors[ip]:
                 if successor not in self.offsets:
                     self.offsets[successor] = after
+                    anchors[successor] = anchor
                     work.append(successor)
                 elif self.offsets[successor] != after:
                     raise ValueError(f"stack depth differs at join RVA {successor:#x}: entry RSP"
                                      f"{self.offsets[successor]:+#x} and entry RSP{after:+#x}")
+                elif anchors[successor] != anchor:
+                    raise ValueError(f"frame pointer differs at join RVA {successor:#x}")
         for ip in sorted(self.offsets):
             if function.instructions[ip].mnemonic == M.RET and self.offsets[ip]:
                 raise ValueError(f"stack not balanced at RET RVA {ip:#x}: RSP is entry RSP{self.offsets[ip]:+#x}")
+        for ip, (ins, _, width) in self.output_calls.items():
+            offset = self.accesses[ins.ip][0]
+            if offset < self.offsets[ip] + HOME_SIZE or offset % width:
+                raise ValueError(f"misaligned stack output or overlap with callee home space at RVA {ip:#x}")
+            self.outputs[ip] = (offset, width)
+        # Per stack argument slot: the low bytes that some read reaches, 0 for a slot only written.
+        slots = {}
+        for offset, width, reads, _ in self.accesses.values():
+            if offset >= HOME_END:
+                slot = (offset - HOME_END) // 8
+                slots[slot] = max(slots.get(slot, 0), offset + width - HOME_END - 8 * slot if reads else 0)
+        self.stack = tuple(slots.get(slot, 0) for slot in range(max(slots, default=-1) + 1))
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
-        self.size = HOME_END - self.start
+        self.end = HOME_END + 8 * len(self.stack)
+        self.size = self.end - self.start
         if self.size > self.frame_limit:
             raise ValueError(f"frame of {self.size} bytes exceeds the {self.frame_limit}-byte bound")
 
@@ -1258,21 +1580,50 @@ class Frame:
             raise ValueError(f"stack access below RSP at RVA {ins.ip:#x}")
         if offset < 8 and offset + width > 0:
             raise ValueError(f"return address slot accessed at RVA {ins.ip:#x}")
-        if offset + width > self.incoming_end:
+        if offset + width > HOME_END and (offset + width > self.incoming_end or offset < HOME_END
+                                          or (offset - HOME_END) // 8 != (offset + width - 1 - HOME_END) // 8):
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
-    def step(self, ins, rsp):
-        """RSP after ins; rejects every use of RSP other than a constant change or a frame access."""
+    def step(self, ins, rsp, anchor):
+        """RSP and the optional RBP anchor as offsets from entry RSP, after ins."""
         ip, mnemonic = ins.ip, ins.mnemonic
         if mnemonic == M.RET:
-            return rsp
+            return rsp, anchor
+        if mnemonic == M.LEAVE:
+            if ins.code != Code.LEAVEQ:
+                raise ValueError(f"unsupported LEAVE operand size at RVA {ip:#x}")
+            # RSP becomes the anchor and RBP is popped from it, so only a proven anchor gives the new RSP.
+            # __init__ then releases every byte from the old RSP through anchor + 8, the pop slot included.
+            if anchor is None:
+                raise ValueError(f"LEAVE without a proven frame anchor at RVA {ip:#x}")
+            if anchor < rsp:
+                raise ValueError(f"LEAVE with the frame anchor below RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}, RSP entry RSP{rsp:+#x}")
+            if anchor + 8 > 0:
+                raise ValueError(f"LEAVE would raise RSP above entry RSP at RVA {ip:#x}: "
+                                 f"anchor entry RSP{anchor:+#x}")
+            self.access(ins, rsp, anchor, 8, True, False)
+            return anchor + 8, None
+        if ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RBP:
+            if mnemonic == M.MOV and ins.op1_kind == OpKind.REGISTER and ins.op1_register == R.RSP:
+                self.set_anchor.add(ip)
+                return rsp, rsp
+            if (mnemonic == M.LEA and ins.memory_base == R.RSP and ins.memory_index == R.NONE
+                    and not ins.has_segment_prefix):
+                self.set_anchor.add(ip)
+                displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+                return rsp, rsp + displacement
         if mnemonic in (M.PUSH, M.POP):
             if ins.op0_kind != OpKind.REGISTER or ins.op0_register not in NONVOLATILE:
                 raise ValueError(f"unsupported push or pop at RVA {ip:#x}: {ins}")
+            if ins.op0_register == R.RBP and anchor is not None:
+                if mnemonic == M.PUSH:
+                    raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+                anchor = None
             pushed = rsp - 8 if mnemonic == M.PUSH else rsp
             self.access(ins, pushed, pushed, 8, mnemonic == M.POP, mnemonic == M.PUSH)
-            return pushed if mnemonic == M.PUSH else rsp + 8
+            return (pushed if mnemonic == M.PUSH else rsp + 8), anchor
         if (mnemonic in (M.SUB, M.ADD) and ins.op0_kind == OpKind.REGISTER and ins.op0_register == R.RSP
                 and ins.op1_kind in (OpKind.IMMEDIATE8TO64, OpKind.IMMEDIATE32TO64)):
             change = ins.immediate(1) & ((1 << 64) - 1)
@@ -1281,8 +1632,15 @@ class Frame:
             if change % 8 or after > 0:
                 raise ValueError(f"unsupported stack adjustment at RVA {ip:#x}: {ins}")
             self.adjustments.add(ip)
-            return after
+            return after, anchor
         info = INFO.info(ins)
+        if ip in self.output_addresses:
+            base = rsp if ins.memory_base == R.RSP else anchor
+            if base is None:
+                raise ValueError(f"stack output uses an unproven frame anchor at RVA {ip:#x}")
+            displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+            self.access(ins, rsp, base + displacement, self.output_addresses[ip], False, False)
+            return rsp, anchor
         if any(RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
                for used in info.used_registers()):
             raise ValueError(f"dynamic frame at RVA {ip:#x}: {ins}")
@@ -1290,41 +1648,58 @@ class Frame:
                 for n in range(ins.op_count))
                 or mnemonic == M.LEA and RegisterExt.full_register(ins.memory_base) == R.RSP):
             raise ValueError(f"frame address escapes at RVA {ip:#x}: {ins}")
-        if mnemonic != M.NOP and ins.memory_base == R.RSP and OpKind.MEMORY in map(ins.op_kind, range(ins.op_count)):
-            used = [memory for memory in info.used_memory() if memory.base == R.RSP]
+        has_memory = OpKind.MEMORY in map(ins.op_kind, range(ins.op_count))
+        anchored_memory = anchor is not None and ins.memory_base == R.RBP and has_memory
+        stack_base = anchor if anchored_memory else rsp
+        if mnemonic != M.NOP and has_memory and (ins.memory_base == R.RSP or anchored_memory):
+            used = [memory for memory in info.used_memory() if memory.base == ins.memory_base]
             if (ins.memory_index != R.NONE or ins.has_segment_prefix or len(used) != 1
                     or used[0].access not in (OpAccess.READ, OpAccess.WRITE, OpAccess.READ_WRITE)):
                 raise ValueError(f"unsupported stack operand at RVA {ip:#x}: {ins}")
             displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
-            self.access(ins, rsp, rsp + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
+            self.access(ins, rsp, stack_base + displacement, _memory_width(ins), used[0].access != OpAccess.WRITE,
                         used[0].access != OpAccess.READ)
-        return rsp
+        if anchor is not None and mnemonic != M.NOP:
+            restores_rbp = (mnemonic == M.MOV and ins.op0_kind == OpKind.REGISTER
+                            and ins.op0_register == R.RBP and ip in self.accesses)
+            if (any(ins.op_kind(n) == OpKind.REGISTER and RegisterExt.full_register(ins.op_register(n)) == R.RBP
+                    and not (n == 0 and restores_rbp) for n in range(ins.op_count))
+                    or has_memory and RegisterExt.full_register(ins.memory_index) == R.RBP
+                    or has_memory and RegisterExt.full_register(ins.memory_base) == R.RBP and not anchored_memory):
+                raise ValueError(f"frame pointer escapes at RVA {ip:#x}: {ins}")
+            if restores_rbp:
+                anchor = None
+        return rsp, anchor
 
 
 def slot_register(ins):
     """The nonvolatile register that PUSH, POP or a 64-bit MOV copies whole to or from the frame, else None."""
     if ins.mnemonic in (M.PUSH, M.POP):
         return ins.op0_register
-    if ins.mnemonic == M.MOV and ins.memory_base == R.RSP:
+    if ins.mnemonic == M.LEAVE:
+        return R.RBP
+    if ins.mnemonic == M.MOV and ins.memory_base in (R.RSP, R.RBP):
         for number in (0, 1):
             if ins.op_kind(number) == OpKind.REGISTER and ins.op_register(number) in NONVOLATILE:
                 return ins.op_register(number)
     return None
 
 
-def prove_frame(function, order, effects, frame):
+def prove_frame(function, order, effects, frame, stacks=None):
     """Check that every stack byte is written before it is read and that every RET is reached with each
     nonvolatile register holding its entry value, on every path.
 
     Per stack byte: 1 once a store writes it; 2 + 8 * i + k while it holds byte k of the entry value of
     NONVOLATILE[i], saved by PUSH or MOV [RSP+d] while that register holds its entry value; 0 when not
-    written on some path, or released since: when ADD RSP or POP raises RSP, the bytes it leaves below RSP
+    written on some path, or released since: when ADD RSP, POP or LEAVE raises RSP, the bytes it leaves below RSP
     become 0 after the POP has read its source, because their contents may change before a later allocation
     brings them back into the frame. Per nonvolatile register: "entry", "written" since entry or the last restore, or
     None when paths disagree. A join keeps what both sides agree on. A save is not a read of the entry value
     as data, so its register read is removed from effects before the register pass."""
     instructions = function.instructions
     saved = {register: bytes(range(2 + 8 * i, 10 + 8 * i)) for i, register in enumerate(NONVOLATILE)}
+    # Per call: the low bytes of each stack argument that the callee may read.
+    stacks = stacks or {}
 
     def step(ip, status, data):
         if ip in function.calls:
@@ -1332,8 +1707,15 @@ def prove_frame(function, order, effects, frame):
             # callee's frame lie below RSP, where every byte is already 0: no access is below RSP, and the
             # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
             # function's own home space above entry RSP, is kept.
+            # It may also write the stack arguments above that home space.
             index = frame.offsets[ip] - frame.start
-            return status, data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            size = HOME_SIZE + 8 * len(stacks.get(ip, ()))
+            data = data[:index] + bytes(size) + data[index + size:]
+            if ip in frame.outputs:
+                offset, width = frame.outputs[ip]
+                index = offset - frame.start
+                data = data[:index] + b"\1" * width + data[index + width:]
+            return status, data
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
             offset, width, reads, writes = frame.accesses[ip]
@@ -1351,7 +1733,9 @@ def prove_frame(function, order, effects, frame):
                 status[register] = "entry" if register == restored else "written"
         return tuple(status.values()), data
 
-    state = {function.entry: (("entry",) * len(NONVOLATILE), bytes(frame.size))}
+    # The caller writes the stack arguments before the call.
+    state = {function.entry: (("entry",) * len(NONVOLATILE),
+                              bytes(HOME_END - frame.start) + b"\1" * (frame.end - HOME_END))}
     work = [function.entry]
     while work:
         ip = work.pop()
@@ -1373,6 +1757,14 @@ def prove_frame(function, order, effects, frame):
             if status.get(read, "written") != "written":
                 raise ValueError(f"nonvolatile register {NAMES[read]} may hold the caller's value where RVA "
                                  f"{ip:#x} reads it")
+        for slot, needed in enumerate(stacks.get(ip, ())):
+            index = frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start
+            passed = data[index:index + needed]
+            if passed != b"\1" * needed:
+                at = index + frame.start + (passed.index(0) if 0 in passed else 0)
+                raise ValueError(f"stack argument {5 + slot} of the call at RVA {ip:#x} is undefined at entry "
+                                 f"RSP{at:+#x}" if 0 in passed else
+                                 f"stack argument {5 + slot} of the call at RVA {ip:#x} holds a saved register")
         got = data[offset - frame.start:offset - frame.start + width]
         if loads and got != b"\1" * width and not (register is not None and got == saved[register]):
             if 0 in got:
@@ -1438,14 +1830,14 @@ def prove_direction(function):
                 work.append(target)
 
 
-def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False):
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=False, host_cpu=False):
     """Translate one export that takes the given number of integer arguments, 3 or 4.
 
     Functions it reaches through direct calls and tail jumps are translated into program."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
         raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
-    program = program or Program(pe, image_data=image_data)
+    program = program or Program(pe, image_data=image_data, host_cpu=host_cpu)
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
@@ -1455,6 +1847,7 @@ class Binding(NamedTuple):
     link_name: str | None
     arguments: int
     return_bytes: int
+    output: tuple[int, int] | None = None
 
 
 class HostImport(NamedTuple):
@@ -1462,22 +1855,58 @@ class HostImport(NamedTuple):
     widths: tuple
     return_width: int
     noreturn: bool = False
+    # An explicitly bound synchronous import always initializes this output and does not retain its address.
+    output: tuple[int, int] | None = None
 
     @property
     def demands(self):
         return dict(zip(ARGUMENT_REGISTERS, self.widths))
 
 
+class Assumed(NamedTuple):
+    """The summary that calls into a function still being translated use: its return width,
+    argument demands and stack argument demands, assumed until its translation computes them."""
+    entry: int
+    return_width: int
+    demands: dict
+    stack: tuple = ()
+
+
+def parameters(registers, stack=()):
+    """The C++ parameters of a function: its argument registers, then one word per stack argument."""
+    return ", ".join([f"word {NAMES[r]}" for r in registers] + [f"word arg{5 + slot}" for slot in range(len(stack))])
+
+
+def at_least_as_good(computed, assumed):
+    """Whether a computed summary defines at least the assumed RAX bytes and demands no more."""
+    return (computed.return_width >= assumed.return_width
+            and all(width <= assumed.demands.get(r, 0) for r, width in computed.demands.items())
+            and len(computed.stack) <= len(assumed.stack)
+            and all(width <= assumed.stack[slot] for slot, width in enumerate(computed.stack)))
+
+
 class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
-    jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
+    jumps. Each callee is translated once, in internal mode, and its source precedes its callers'.
 
-    def __init__(self, pe, bindings=None, *, image_data=False, imports=None):
+    A call to an internal function whose translation is in progress closes a call cycle. It uses an
+    assumed summary, at first 8 defined RAX bytes and no demands. Each function of the cycle is
+    translated again with the meet of the assumed and computed summaries until each computed
+    summary defines at least the assumed bytes and demands no more. Its returns then define those
+    bytes and it reads no more, by induction on the depth of calls that return. The functions of a
+    cycle are kept once its first function is done, after declarations, so each may call any other."""
+
+    def __init__(self, pe, bindings=None, *, image_data=False, imports=None, host_cpu=False):
         self.pe = pe
         self.image_data = image_data
+        self.host_cpu = host_cpu
         self.imports = imports or {}
         self.entries = Entries(pe, bindings)
-        self.active = []
+        self.active = []  # entry of each translation in progress, outermost first
+        self.internal = []  # whether each of those is an internal function
+        self.lows = []  # per active translation: the lowest active depth it has used a summary from
+        self.assumed = {}
+        self.pending = []  # (entry, source, function, low) of cycle functions not yet kept
         self.callees = {}
         self.refused = {}
         self.sources = []
@@ -1485,33 +1914,79 @@ class Program:
 
     def lift(self, entry, symbol, arguments, internal=False):
         self.active.append(entry)
+        self.internal.append(internal)
+        self.lows.append(len(self.active) - 1)
         try:
             return lift_function(self, entry, symbol, arguments, internal)
         finally:
             self.active.pop()
+            self.internal.pop()
+            self.low = self.lows.pop()
+            if self.lows:
+                self.lows[-1] = min(self.lows[-1], self.low)
+
+    def depends(self, depth):
+        self.lows[-1] = min(self.lows[-1], depth)
+
+    def committed(self, callee):
+        return isinstance(callee, HostImport) or self.callees.get(callee.entry) is callee
 
     def callee(self, target, ip):
         if target in self.refused:
             raise ValueError(f"callee at RVA {target:#x} refused: {self.refused[target]}")
         if target in self.callees:
             return self.callees[target]
-        if target in self.active:
-            cycle = self.active[self.active.index(target):] + [target]
-            raise ValueError(f"mutual recursion: call cycle {' -> '.join(f'{rva:#x}' for rva in cycle)} "
-                             f"at RVA {ip:#x}")
-        if len(self.callees) >= MAX_CALLEES:
+        for entry, _, function, low in self.pending:
+            if entry == target:
+                self.depends(low)
+                return function
+        depth = next((d for d, (entry, internal) in enumerate(zip(self.active, self.internal))
+                      if internal and entry == target), None)
+        if depth is not None:
+            self.depends(depth)
+            return self.assumed.setdefault(target, Assumed(target, 8, {}))
+        if len(self.callees) + len(self.pending) >= MAX_CALLEES:
             raise ValueError(f"callee limit reached at RVA {ip:#x}")
-        try:
-            source, function = self.lift(target, f"fn_{target:x}", ARGUMENT_REGISTERS, internal=True)
-        except ValueError as error:
-            self.refused[target] = str(error)
-            raise ValueError(f"callee at RVA {target:#x} refused: {error}") from None
-        if function.return_width is None:
-            error = "no reachable normal return"
-            self.refused[target] = error
-            raise ValueError(f"callee at RVA {target:#x} refused: {error}")
-        self.callees[target] = function
-        self.sources.append(source)
+        depth = len(self.active)
+        start = len(self.pending)
+        while True:
+            try:
+                source, function = self.lift(target, f"fn_{target:x}", ARGUMENT_REGISTERS, internal=True)
+                if function.return_width is None:
+                    raise ValueError("no reachable normal return")
+            except ValueError as error:
+                del self.pending[start:]
+                self.assumed.pop(target, None)
+                self.refused[target] = str(error)
+                raise ValueError(f"callee at RVA {target:#x} refused: {error}") from None
+            assumed = self.assumed.get(target)
+            if assumed is None or at_least_as_good(function, assumed):
+                break
+            # Translate the cycle again from a summary that both bounds.
+            demands = {r: max(width, function.demands.get(r, 0))
+                       for r, width in assumed.demands.items()} | {
+                       r: width for r, width in function.demands.items() if r not in assumed.demands}
+            slots = max(len(assumed.stack), len(function.stack))
+            stack = tuple(max(assumed.stack[slot] if slot < len(assumed.stack) else 0,
+                              function.stack[slot] if slot < len(function.stack) else 0) for slot in range(slots))
+            self.assumed[target] = Assumed(target, min(assumed.return_width, function.return_width), demands, stack)
+            del self.pending[start:]
+        if self.low < depth:
+            # Part of a cycle through a function below it on the stack, which keeps it when that is done.
+            # The functions pending from its translation now depend on what it depends on: a later
+            # translation at this depth that reuses one is in the same cycle.
+            self.pending[start:] = [(e, t, f, min(l, self.low)) for e, t, f, l in self.pending[start:]]
+            self.pending.append((target, source, function, self.low))
+            return function
+        members = [(entry, text, member) for entry, text, member, _ in self.pending[start:]] + [(target, source, function)]
+        del self.pending[start:]
+        cyclic = [self.assumed.pop(entry, None) for entry, _, _ in members]
+        if any(cyclic) or len(members) > 1:
+            self.sources.append("\n".join(f"static word fn_{entry:x}({parameters(ARGUMENT_REGISTERS, member.stack)});"
+                                          for entry, _, member in sorted(members, key=lambda m: m[0])))
+        for entry, text, member in members:
+            self.callees[entry] = member
+            self.sources.append(text)
         return function
 
 
@@ -1556,12 +2031,12 @@ def lift_function(program, entry, symbol, arguments, internal):
                              "(an indirect jump through memory)")
     edges = function.explore(program.imports, import_resolver=program.import_resolver)
     image_data = program.image_data
-    lifter = Lifter(pe if image_data else None)
+    lifter = Lifter(pe if image_data else None, host_cpu=program.host_cpu)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
     bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
     instructions = function.instructions
-    frame = Frame(function)
+    frame = Frame(function, edges, internal)
     if internal and not function.unwound:
         # Without unwind data a function may not move RSP, so it cannot push, allocate or call.
         moved = sorted(ip for ip, offset in frame.offsets.items() if offset or ip in function.calls)
@@ -1579,6 +2054,18 @@ def lift_function(program, entry, symbol, arguments, internal):
     callees = {ip: (function.host_calls[ip] if ip in function.host_calls
                     else program.callee(target, ip))
                for ip, target in sorted({**function.calls, **function.tails}.items())}
+    for ip in sorted(function.tails):
+        if not program.committed(callees[ip]):
+            # The original runs a cycle of tail jumps in constant stack; the host call does not.
+            raise ValueError(f"tail jump within a call cycle at RVA {ip:#x}")
+    # Per call: the low bytes of each stack argument that the callee may read.
+    stacks = {ip: callee.stack for ip, callee in callees.items() if getattr(callee, "stack", ())}
+    for ip, stack in sorted(stacks.items()):
+        if ip in function.tails:
+            # The stack arguments would be this function's own, which its caller wrote.
+            raise ValueError(f"tail jump to a function with stack arguments at RVA {ip:#x}")
+        if frame.offsets[ip] + HOME_SIZE + 8 * len(stack) > 0:
+            raise ValueError(f"stack arguments of the call at RVA {ip:#x} reach the return address")
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -1591,13 +2078,27 @@ def lift_function(program, entry, symbol, arguments, internal):
         if ip in callees:
             callee = callees[ip]
             if isinstance(callee, HostImport):
-                call = f"{callee.symbol}({', '.join(lifter.reg(r) for r in callee.demands)})"
+                output = frame.output_calls.get(ip)
+                call_args = [lifter.slot(output[0]) if output and r == output[1] else lifter.reg(r)
+                             for r in callee.demands]
+                call = f"{callee.symbol}({', '.join(call_args)})"
             else:
-                call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
-            lifter.used.add(R.RAX)
+                # Stack arguments are passed by value from the bytes above the callee's home space. A slot
+                # that the callee never reads is passed as 0; the caller then need not have a frame.
+                passed = [lifter.reg(r) for r in ARGUMENT_REGISTERS] + [
+                    f"load<word>(reinterpret_cast<word>(frame + {frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start}))"
+                    if width else "0" for slot, width in enumerate(stacks.get(ip, ()))]
+                call = f"fn_{callee.entry:x}({', '.join(passed)})"
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
-            body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
-            effects[ip] = (dict(callee.demands), {}, set())
+            if isinstance(callee, HostImport) and callee.return_width == 0:
+                body[ip] = f"{call}; return 0;" if ip in function.tails else f"{call};"
+            else:
+                lifter.used.add(R.RAX)
+                body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
+            reads = dict(callee.demands)
+            if ip in frame.output_calls:
+                del reads[frame.output_calls[ip][1]]
+            effects[ip] = (reads, {}, set())
         elif ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
             effects[ip] = ({}, {}, set())
@@ -1620,6 +2121,11 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
             effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
+        elif ip in frame.set_anchor:
+            # Only the frame proof observes the anchor. No host pointer stands in for RBP.
+            effects[ip] = ({}, {R.RBP: 8}, set())
+        elif ip in frame.output_addresses:
+            effects[ip] = ({}, {}, {full(ins.op0_register)})
         elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
               and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
             # A guest address is only usable as a jump-table base, which the switch replaces.
@@ -1637,7 +2143,7 @@ def lift_function(program, entry, symbol, arguments, internal):
               for ip, ins in instructions.items()
               if ins.mnemonic == M.MOV and ins.op0_kind == ins.op1_kind == OpKind.REGISTER
               and RegisterExt.size(ins.op0_register) >= 4 and full(ins.op0_register) in effects[ip][1]}
-    prove_frame(function, order, effects, frame)
+    prove_frame(function, order, effects, frame, stacks)
 
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
     # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
@@ -1694,6 +2200,11 @@ def lift_function(program, entry, symbol, arguments, internal):
     # Consecutive low RAX bytes defined at every reachable RET or tail jump; None when there is none.
     function.return_width = min(widths) if widths else None
     function.demands = argument_demands(function, order, effects)
+    # Calls in a cycle pass the stack arguments the assumed summary names; the definition takes them all.
+    assumed = program.assumed.get(entry) if internal else None
+    stack = frame.stack + (0,) * max(0, len(assumed.stack) - len(frame.stack)) if assumed else frame.stack
+    function.stack = tuple(max(width, assumed.stack[slot] if assumed and slot < len(assumed.stack) else 0)
+                           for slot, width in enumerate(stack))
 
     labels = set(edges)
     if order[0] != entry:
@@ -1717,7 +2228,10 @@ def lift_function(program, entry, symbol, arguments, internal):
         declarations.append("word fa = 0, fb = 0;")
     if lifter.frame:
         declarations.append(f"alignas(16) std::uint8_t frame[{frame.size}] = {{}};  "
-                            f"// entry RSP{frame.start:+#x} to entry RSP+{HOME_END:#x}")
+                            f"// entry RSP{frame.start:+#x} to entry RSP+{frame.end:#x}")
+    for slot, width in enumerate(frame.stack):
+        if width:
+            declarations.append(f"std::memcpy(frame + {HOME_END + 8 * slot - frame.start}, &arg{5 + slot}, 8);")
     text = [f"    goto loc_{entry:x};"] if order[0] != entry else []
     for position, ip in enumerate(order):
         if ip in labels:
@@ -1729,7 +2243,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
     linkage = "static" if internal else 'extern "C" __declspec(dllexport)'
-    signature = f'{linkage} word {symbol}({", ".join(f"word {NAMES[r]}" for r in function.arguments)})'
+    signature = f'{linkage} word {symbol}({parameters(function.arguments, function.stack)})'
     comment = []
     if function.return_width is None:
         comment = ["// RAX: no reachable normal return"]
@@ -1748,6 +2262,7 @@ def lift_function(program, entry, symbol, arguments, internal):
 PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <intrin.h>
 using word = std::uint64_t;
 static inline bool even_parity(word value) {
@@ -1762,6 +2277,32 @@ template <class T> static inline T rotate_bits(T value, word count, bool left) {
     const unsigned amount = left ? shift : bits - shift;
     const word wide = value;
     return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
+// POPCNT, LZCNT and TZCNT, at the width of T; LZCNT and TZCNT of 0 are the width.
+template <class T> static inline T count_ones(T value) {
+    unsigned count = 0;
+    for (word bits = value; bits != 0; bits &= bits - 1) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T leading_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> (sizeof(T) * 8 - 1 - count)) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T trailing_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+// BSR of a nonzero value: the index of its highest set bit.
+template <class T> static inline T highest_bit(T value) {
+    return static_cast<T>(sizeof(T) * 8 - 1 - leading_zeros<T>(value));
+}
+// BSWAP: reverse the bytes of a 32- or 64-bit value.
+template <class T> static inline T byte_swap(T value) {
+    T result = 0;
+    for (unsigned i = 0; i < sizeof(T); ++i) result = static_cast<T>((result << 8) | ((static_cast<word>(value) >> (8 * i)) & 0xffu));
+    return result;
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
@@ -1911,17 +2452,21 @@ def import_identities(pe):
             for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in desc.imports}
 
 
-def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
+def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None, host_cpu=False):
     """binding is one Binding or a sequence of them; with several, each binds the IAT slot of the import it names."""
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
-    program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
+    program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data, host_cpu=host_cpu)
     bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
     for item in bound:
-        if item.arguments not in ARGUMENT_COUNTS or item.return_bytes not in (0, 1, 2, 8):
+        if item.arguments not in IMPORT_ARGUMENT_COUNTS or item.return_bytes not in IMPORT_RETURN_WIDTHS:
             raise ValueError(f"unsupported binding of {item.symbol}")
+        if item.output is not None:
+            position, width = item.output
+            if not 1 <= position <= item.arguments or width not in STACK_OUTPUT_WIDTHS:
+                raise ValueError(f"invalid stack output argument or width for {item.symbol}")
     # With several bindings, each names one ordinary import of the image and a slot takes the binding of its import.
     imported = import_identities(pe) if len(bound) > 1 else {}
     by_import = {}
@@ -1953,7 +2498,12 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
             if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
                        and s.Characteristics & SCN_READ for s in pe.sections):
                 raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
-            slots[slot], chosen[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes), index
+            output = None
+            if item.output is not None:
+                position, width = item.output
+                output = (ARGUMENT_REGISTERS[position - 1], width)
+            slots[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes, output=output)
+            chosen[slot] = index
             return slots[slot]
         program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
@@ -1972,13 +2522,14 @@ def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
         if symbol == other:
             raise ValueError(f"bindings {Path(earlier.provider).name}!{earlier.symbol} and "
                              f"{Path(item.provider).name}!{item.symbol} both declare the C name {symbol}")
-    declarations = "".join(f'\nextern "C" __declspec(dllimport) word {symbol}({", ".join(["word"] * item.arguments)});'
+    declarations = "".join(f'\nextern "C" __declspec(dllimport) {"word" if item.return_bytes else "void"} '
+                           f'{symbol}({", ".join(["word"] * item.arguments)});'
                            for symbol, item in lines) + "\n" if lines else ""
     return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
 class BindingOption(argparse.Action):
-    """Records --bind, --link-name, --import-arguments and --return-bytes in command-line order."""
+    """Records options for each import in command-line order."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         # The canonical spelling: argparse also accepts an abbreviation such as --return.
@@ -1993,7 +2544,7 @@ def parse_binding_options(options):
         group = dict(options)  # the last value of each option counts
         if not binds:
             if group:
-                raise ValueError("--link-name, --import-arguments and --return-bytes require --bind")
+                raise ValueError("--link-name, --import-arguments, --return-bytes and --stack-output require --bind")
             return None
         groups = [group]
     else:
@@ -2012,14 +2563,15 @@ def parse_binding_options(options):
         if "--import-arguments" not in group or "--return-bytes" not in group:
             raise ValueError("--bind requires --import-arguments and --return-bytes")
         provider, symbol = group["--bind"]
+        output = group.get("--stack-output")
         found.append(Binding(Path(provider), symbol, group.get("--link-name"), group["--import-arguments"],
-                             group["--return-bytes"]))
+                             group["--return-bytes"], None if output is None else tuple(output)))
     return found[0] if len(found) == 1 else tuple(found)
 
 
-def translate(image, names, bindings=None, *, image_data=False, binding=None):
+def translate(image, names, bindings=None, *, image_data=False, binding=None, host_cpu=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names, bindings, image_data=image_data, binding=binding)
+        return translate_pe(pe, names, bindings, image_data=image_data, binding=binding, host_cpu=host_cpu)
 
 
 if __name__ == "__main__":
@@ -2028,6 +2580,8 @@ if __name__ == "__main__":
     parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--host-cpu", action="store_true",
+                        help="opt into read-only host-CPU instructions (rdfsbase, rdgsbase, rdpid)")
     parser.add_argument("--image-data", action="store_true",
                         help="translate RIP-relative data against a live mapping of the image that the host "
                              "binds at run time with lifted_bind_image; the generated source states the contract")
@@ -2041,19 +2595,23 @@ if __name__ == "__main__":
                              "Repeat it to bind several imports, each followed by its own options below")
     parser.add_argument("--link-name", action=BindingOption,
                         help="local import-library symbol for an ordinal binding")
-    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS, action=BindingOption,
+    parser.add_argument("--import-arguments", type=int, choices=IMPORT_ARGUMENT_COUNTS, action=BindingOption,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
                              "the provider (required with --bind)")
-    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8), action=BindingOption,
+    parser.add_argument("--return-bytes", type=int, choices=IMPORT_RETURN_WIDTHS, action=BindingOption,
                         help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
                              "the binding, not derived from the provider (required with --bind)")
+    parser.add_argument("--stack-output", nargs=2, type=int, metavar=("ARG", "WIDTH"), action=BindingOption,
+                        help="1-based argument that the import fully writes before returning; WIDTH is 1, 2, "
+                             "4 or 8. It must not read the initial contents or retain the address")
     args = parser.parse_args()
     try:
         binding = parse_binding_options(args.binding_options)
     except ValueError as error:
         parser.error(str(error))
     try:
-        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
+        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges,
+                                      image_data=args.image_data, binding=binding, host_cpu=args.host_cpu)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "

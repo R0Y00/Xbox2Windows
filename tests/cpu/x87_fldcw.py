@@ -7,7 +7,8 @@ Usage:
     python tests/cpu/x87_fldcw.py check <harness> <native> <lifted> [controls...]
 
 Each export loads control words from its input block (offsets 48, 50 and 52), runs rounding operations
-and stores the results in its output block. The native exports run through x87_call of
+and stores the results in its output block; cw_fninit and cw_finit also run FNINIT, which empties the
+stack, clears C0 to C3 and loads 0x037F. The native exports run through x87_call of
 tests/cpu/x87_harness.asm, which reports the control word each one leaves. The translation is
 lower(..., x87=Checked(REJECT)) inside a checked entry, uint32_t name(word input, word output, word* result),
 which returns the profile-rejection status and writes *result only for status 0. It touches no x87
@@ -89,6 +90,23 @@ SEQUENCES = {
     "cw_writes": ("single", [("fld", "m80", 0), ("fst", "m32", 0), ("mov_byte", 12, 17), ENTER, ("fst", "m32", 4),
                              ("mov_byte", 13, 34), ("fldcw", "rcx", CW2), ("fst", "m32", 8), ("mov_byte", 14, 51),
                              ("fstp", "m64", 16), LEAVE]),
+    # FNINIT under a loaded word, after FCOM has set C0, C2 and C3: it empties the two-value stack, clears C0
+    # to C3 and sets the word to 0x037F (64-bit precision), under which a quotient is rounded and stored; the
+    # restore then returns 0x027F.
+    "cw_fninit": ("pair", [ENTER, *LOAD2, ("fcom",), ("fninit",), ("sw_c", 32), ("fnstcw", "rdx", 34), *LOAD2, ("fdivp",),
+                           ("fstp", "m80", 0), LEAVE]),
+    # FNSTSW m16 right after FNINIT, the only place where every status-word bit is known: the word is stored at
+    # an odd offset, after FCOM has set C0, C2 or C3 (FNINIT clears them) and a flag-neutral store, with a byte
+    # stored next to the word's end, and the quotient that follows is rounded under 0x037F.
+    "cw_fnstsw": ("pair", [ENTER, *LOAD2, ("fcom",), ("fninit",), ("mov_byte", 36, 0x77), ("fnstsw_m", 33), *LOAD2,
+                           ("fdivp",), ("fstp", "m80", 0), LEAVE]),
+    # The same at depth 8, after FINIT (WAIT and FNINIT) and a flag-neutral store, where TOP was 0 before and
+    # is 0 after; the word is stored at an even offset.
+    "cw_finit_fnstsw": ("single", [ENTER, ("fld", "m80", 0), *[("fld_st", 0)] * 7, ("finit",), ("mov_byte", 18, 0x66),
+                                   ("fnstsw_m", 16), LEAVE]),
+    # FINIT (WAIT and FNINIT) at depth 8, a square root under 0x037F, and a return without a restore.
+    "cw_finit": ("single", [("fld", "m80", 0), *[("fld_st", 0)] * 7, ("finit",), ("fld", "m80", 0), ("fsqrt",),
+                            ("fstp", "m80", 0), ("fnstcw", "rdx", 16)]),
 }
 
 
@@ -106,8 +124,14 @@ def asm_line(step):
         return f"    {op} st(1), st"
     if op == "fld_st":
         return f"    fld st({args[0]})"
-    if op in ("fsqrt", "frndint", "fscale", "fldz", *CONSTS):
+    if op == "fcom":
+        return "    fcom st(1)"
+    if op in ("fsqrt", "frndint", "fscale", "fldz", "fninit", "finit", *CONSTS):
         return f"    {op}"
+    if op == "fnstsw_m":
+        return f"    fnstsw word ptr [rdx+{args[0]}]"
+    if op == "sw_c":  # C0 to C3 of the status word through AH, then a known RAX
+        return f"    fnstsw ax\n    and ah, 47h\n    mov byte ptr [rdx+{args[0]}], ah\n    mov eax, 0"
     return {"movzx_eax": lambda: f"    movzx eax, word ptr [rsp+{args[0]}]",
             "or_eax_c00": lambda: "    or eax, 0C00h",
             "mov_ax": lambda: f"    mov word ptr [rsp+{args[0]}], ax",
@@ -123,13 +147,19 @@ def expected_forms(step):
     op, *args = step
     if op == "fstcw":
         return [("wait", 0), ("fnstcw", 2)]
+    if op == "finit":
+        return [("wait", 0), ("fninit", 0)]
+    if op in ("sw_c", "fnstsw_m"):
+        return [("fnstsw", 0 if op == "sw_c" else 2)]
     if op in ("fldcw", "fnstcw"):
         return [(op, 2)]
     if op in ("fld", "fadd", "fdivr", "fimul", "fidivr", "fst", "fstp", "fist", "fistp", "fisttp"):
         return [(op, SIZE[args[0]])]
     if op == "fld_st":
         return [("fld", 0)]
-    if op in POP_ARITH or op in ("fsqrt", "frndint", "fscale", "fldz", *CONSTS):
+    if op == "fcom":
+        return [("fcom", 0)]
+    if op in POP_ARITH or op in ("fsqrt", "frndint", "fscale", "fldz", "fninit", *CONSTS):
         return [(op, 0)]
     return []
 
@@ -205,6 +235,20 @@ CONTROLS = {
     "noreturn": _mutate(RETURN_CHECK, "return rax;"),
     # Of the two returns of cw_branch, only the one that restores from the saved slot checks.
     "onereturn": _mutate(RETURN_CHECK, "return rax;", only="cw_branch"),
+    # FNINIT leaves the control word as it was.
+    "fninitword": _mutate(r"x87_cw = 0x037f; (x87_sw = 0;  // fninit)", r"\1"),
+    # FNINIT leaves C0 to C3 as FCOM set them.
+    "fninitsw": _mutate(r"(x87_cw = 0x037f;) x87_sw = 0;(  // fninit)", r"\1\2"),
+    # FNSTSW m16 stores a TOP of 7 instead of the depth-derived 0.
+    "swtop": _mutate(r"x87_sw \| 0x0000\)\); \}  // fnstsw m16", "x87_sw | 0x3800)); }  // fnstsw m16"),
+    # FNSTSW m16 stores a byte, which leaves the second byte of the word untouched.
+    "swbyte": _mutate(r"store<uint16_t>\(a, static_cast<uint16_t>\(x87_sw \|", "store<uint8_t>(a, static_cast<uint8_t>(x87_sw |"),
+    # FNSTSW m16 stores a dword, which clobbers the two bytes after the word.
+    "swwide": _mutate(r"store<uint16_t>\(a, static_cast<uint16_t>\(x87_sw \|", "store<uint32_t>(a, static_cast<uint32_t>(x87_sw |"),
+    # FNSTSW m16 stores at offset 0 instead of its operand.
+    "swaddr": _mutate(r"= rdx \+ \d+ull; store<uint16_t>\(a, static_cast<uint16_t>\(x87_sw", "= rdx + 0ull; store<uint16_t>(a, static_cast<uint16_t>(x87_sw"),
+    # FNSTSW m16 stores nothing.
+    "swnone": _mutate(r"store<uint16_t>\(a, static_cast<uint16_t>\(x87_sw \| 0x0000\)\);", ";"),
     # A rejected FLDCW records its status but runs on, so the guest stores after it happen too.
     "deferred": _mutate(r"\{ x87_status = ([12]); return 0; \}", r"{ x87_status = \1; }"),
 }
@@ -417,6 +461,13 @@ def run(name, data, pc01=False):
             if (w >> 8) & 3 == 1 and not pc01:
                 return Outcome(STATUS["precision"], out)
             cw = (w & 0x1F3F) | 0x40  # as FNSTCW reads it back
+        elif op in ("fninit", "finit"):
+            cw, slots = 0x037F, []
+        elif op == "sw_c":  # only after FNINIT, which clears C0 to C3
+            write(args[0], 0, 1)
+            rax = 0
+        elif op == "fnstsw_m":  # the SDM: FNINIT clears the whole status word, and TOP is 8 minus the depth
+            write(args[0], (8 - len(slots)) % 8 << 11, 2)
         elif op in ("fnstcw", "fstcw"):
             if args[0] == "rdx":
                 write(args[1], cw, 2)
@@ -424,7 +475,7 @@ def run(name, data, pc01=False):
                 frame[args[1]] = cw
         elif op == "ret":
             return Outcome(STATUS["unrestored"] if cw != 0x027F else STATUS["ok"], out, cw, rax)
-        elif op == "label":
+        elif op in ("label", "fcom"):  # C0, C2 and C3 of FCOM are only read after FNINIT has cleared them
             pass
         elif op == "test_flag":
             zero = data[FLAG] & 1 == 0
@@ -591,8 +642,11 @@ def cases():
     prefix["scale"] = [m80_bytes(a) + m80_bytes(b) for a, b in scaled]
     for name, (kind, _) in SEQUENCES.items():
         values = prefix["scale" if name == "cw_scale" else kind]
-        if name in ("cw_fnstcw", "cw_branch", "cw_writes", "cw_msvc"):
+        if name in ("cw_fnstcw", "cw_branch", "cw_writes", "cw_msvc", "cw_fnstsw", "cw_finit_fnstsw"):
             values = values[:24]
+        if name == "cw_finit":  # loads no word: each value once, and nothing to reject
+            yield from ((name, block(p, VALID[0])) for p in values)
+            continue
         for k, p in enumerate(values):
             for j, w in enumerate(VALID):
                 cw1 = w ^ RESERVED[(k + j) % len(RESERVED)] if name in ("cw_constants", "cw_fnstcw", "cw_msvc") else w
@@ -719,6 +773,7 @@ def check_rejections():
 
     fldcw, fld, fstp = "d9 29", "db 29", "db 3a"  # fldcw word ptr [rcx]; fld/fstp tbyte ptr [rcx]/[rdx]
     live = "x87 control word may be live"
+    unknown = "stores status-word bits"
     rejected = {
         "fldcw in the fixed profile": (attempt(f"{fldcw} {fld} {fstp} c3", checked=False), "unsupported x87 operation"),
         "fldcw and a call": (attempt(f"{fldcw} e8 00 00 00 00 c3", calls={0x1002: ";"}), live),
@@ -726,7 +781,19 @@ def check_rejections():
         "fldcw and an external edge": (attempt(f"{fldcw} e9 00 01 00 00", exits={0x1107: "return 0;"}),
                                        "control word may be live at the external edge"),
         "fldcw and a return with a value": (attempt(f"{fldcw} {fld} c3"), "x87 stack not empty at return"),
-        "fnstsw m16 in the checked entry": (attempt(f"{fldcw} {fld} dd 3a {fstp} c3"), "unsupported x87 operand"),
+        "fnstsw m16 after a load": (attempt(f"{fldcw} {fld} dd 3a {fstp} c3"), unknown),
+        "fnstsw m16 at the entry": (attempt("dd 3a c3"), unknown),
+        "fnstsw m16 in the fixed profile": (attempt(f"{fld} dd 3a {fstp} c3", checked=False), unknown),
+        "fnstsw m16 after fninit and wait (fstsw m16)": (attempt("db e3 9b dd 3a c3"), unknown),
+        "fnstsw m16 after fninit and fnstcw": (attempt("db e3 d9 3a dd 3a c3"), unknown),
+        "fnstsw m16 after fninit and fnstsw ax": (attempt("db e3 df e0 dd 3a c3"), unknown),
+        "fnstsw m16 twice after fninit": (attempt("db e3 dd 3a dd 3a c3"), unknown),
+        "fnstsw m16 after fninit, two loads and fcomi": (attempt(f"db e3 {fld} {fld} db f1 dd 3a dd d8 dd d8 c3"), unknown),
+        "fnstsw m16 after fninit, two loads and fprem": (attempt(f"db e3 {fld} {fld} d9 f8 dd 3a dd d8 dd d8 c3"), unknown),
+        "fnstsw m16 where a path skips fninit": (attempt("85 c0 74 02 db e3 dd 3a c3"), unknown),
+        "fninit in the fixed profile": (attempt(f"{fld} db e3 c3", checked=False), "unsupported x87 operation"),
+        "fninit and a call": (attempt(f"db e3 e8 00 00 00 00 c3", calls={0x1002: ";"}), live),
+        "a store after fninit": (attempt(f"{fld} db e3 {fstp} c3"), "x87 stack underflow"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
@@ -735,6 +802,10 @@ def check_rejections():
     accepted = {
         "a call in a checked function without fldcw": attempt(f"e8 00 00 00 00 {fld} {fstp} c3", calls={0x1000: ";"}),
         "fldcw around a load and a store": attempt(f"{fldcw} {fld} {fstp} d9 69 02 c3"),
+        "fninit with a value on the stack, then a restore": attempt(f"{fld} db e3 d9 69 02 c3"),
+        "fnstsw m16 right after fninit": attempt("db e3 dd 3a c3"),
+        "fnstsw m16 after fninit and a flag-neutral store": attempt("db e3 89 02 dd 3a c3"),
+        "fnstsw m16 after two paths that each run fninit": attempt("85 c0 74 04 db e3 eb 02 db e3 dd 3a c3"),
     }
     for case, message in accepted.items():
         if message is not None:

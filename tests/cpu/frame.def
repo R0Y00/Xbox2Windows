@@ -7,6 +7,7 @@ EXPORTS
     home_spill
     loop_counter
     realloc_slot
+    anchored_frame
     frame_bound
     stale_save
     stale_pop

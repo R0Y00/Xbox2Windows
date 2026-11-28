@@ -58,8 +58,9 @@ void main(uint local : SV_GroupIndex)
                     + countbits(b1 & (lane_half == 0u ? 0u : below));
 
     output.Store(lane_word * 4 + local * 4, lane);
-    if (lane == 0u) {
+    if (local == 0u)
         output.Store(width_word * 4, width);
+    if (lane == 0u) {
         output.Store((ballot_words + wave * 4 + 0u) * 4, b0);
         output.Store((ballot_words + wave * 4 + 1u) * 4, b1);
         output.Store((ballot_words + wave * 4 + 2u) * 4, b2);

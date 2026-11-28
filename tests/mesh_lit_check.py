@@ -9,6 +9,7 @@ import tempfile
 
 from mesh_attribute_check import program
 from mesh_entry_check import binary, enumerate_pcs, fixture
+from mesh_fallback_check import compile_fallback, fallback_fixture
 from mesh_indexed_check import HEADER, SMALL, WORDS, inputs, lower
 from pixel_aot import disassemble, lower as lower_pixel, native_program
 from pixel_aot_check import compile_shader, envelope
@@ -112,28 +113,42 @@ def check_binary(tmp, assembler, objcopy, library):
     assert translate(disassemble(native, library)) == translate(pixel_program())
 
 
-def compile_pixel(tmp, compiler, code, name):
+def compile_pixel(tmp, compiler, code, name, *, fallback=False):
     source, shader = tmp / f"{name}.hlsl", tmp / f"{name}.dxil"
     source.write_text(translate(code), encoding="ascii")
-    compile_shader(compiler, source, shader)
+    if fallback:
+        # The fixture uses normal-range arithmetic and does not need -denorm (SM 6.2+).
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    else:
+        compile_shader(compiler, source, shader)
     return shader
 
 
-def draw(renderer, adapter, mesh, pixel, path, data, reference, *, mismatches=0):
-    path.write_bytes(fixture(data, POSITIONS, reference, True))
-    result = subprocess.run([renderer, adapter, "--mesh-indexed", mesh, pixel, path],
+def draw(renderer, adapter, shaders, path, data, reference, *, fallback, mismatches=0, allow_skip=False):
+    if fallback:
+        # Raw PARAM0 is (z, 1, y, x) in the indexed order already used by POSITIONS.
+        attributes = [(NORMAL_Z, 1, y, x) for x, y, _, _ in POSITIONS]
+        content = fallback_fixture(data, POSITIONS, reference, attributes)
+        operation = "--mesh-indexed-fallback"
+    else:
+        content = fixture(data, POSITIONS, reference, True)
+        operation = "--mesh-indexed"
+    path.write_bytes(content)
+    print(path.stem, flush=True)
+    result = subprocess.run([renderer, adapter, operation, *shaders, path],
                             capture_output=True, text=True)
-    print(result.stdout, end="")
-    if result.returncode == 77:
+    print(result.stdout, end="", flush=True)
+    if allow_skip and result.returncode == 77:
         return 77
     lines = result.stdout.splitlines()
-    clean = "debug_layer=enabled" not in result.stdout or "debug_errors=0 debug_warnings=0" in lines
-    if mismatches == 0 and (result.returncode or not clean):
-        raise AssertionError(f"Lit draw failed\n{result.stdout}\n{result.stderr}")
-    if mismatches and (result.returncode != 1 or not clean
-                       or f"pixels=1024 mismatches={mismatches}" not in lines
-                       or "Draw reference mismatch" not in result.stderr.splitlines()):
-        raise AssertionError(f"Expected {mismatches} mismatches\n{result.stdout}\n{result.stderr}")
+    clean = (f"backend={adapter} debug_layer=unavailable" in lines
+             or "debug_errors=0 debug_warnings=0" in lines)
+    if (result.returncode != int(mismatches != 0) or not clean
+            or f"pixels=1024 mismatches={mismatches}" not in lines
+            or (fallback and "mesh_exports bytes=128 matched=1" not in lines)
+            or (mismatches and "Draw reference mismatch" not in result.stderr.splitlines())):
+        raise AssertionError(f"Expected {mismatches} pixel mismatches for {path.stem}\n"
+                             f"{result.stdout}\n{result.stderr}")
     return 0
 
 
@@ -141,42 +156,51 @@ def differences(first, second):
     return sum(first[i:i + 4] != second[i:i + 4] for i in range(0, len(first), 4))
 
 
-def run(tmp, compiler, renderer, adapter):
-    mesh_source, mesh = tmp / "mesh.hlsl", tmp / "mesh.dxil"
-    mesh_source.write_text(lower(enumerate_pcs(program()), WORDS, (3, 1), HEADER), encoding="ascii")
-    subprocess.run([compiler, "-T", "ms_6_5", "-E", "main", "-DTRACE_EXPORTS", "-Fo", mesh, mesh_source],
-                   check=True)
-    lit = compile_pixel(tmp, compiler, pixel_program(), "lit")
-    path = tmp / "lit.case"
+def run(tmp, compiler, renderer, adapter, *, fallback=False):
+    if fallback:
+        *geometry, lit = compile_fallback(compiler, tmp, program(), translate(pixel_program()))
+    else:
+        mesh_source, mesh = tmp / "mesh.hlsl", tmp / "mesh.dxil"
+        mesh_source.write_text(lower(enumerate_pcs(program()), WORDS, (3, 1), HEADER), encoding="ascii")
+        subprocess.run([compiler, "-T", "ms_6_5", "-E", "main", "-DTRACE_EXPORTS", "-Fo", mesh, mesh_source],
+                       check=True)
+        geometry = [mesh]
+        lit = compile_pixel(tmp, compiler, pixel_program(), "lit")
+
+    def check(label, light, pixel, reference, *, mismatches=0, allow_skip=False):
+        return draw(renderer, adapter, [*geometry, pixel], tmp / f"{label}.case", scene(light),
+                    reference, fallback=fallback, mismatches=mismatches, allow_skip=allow_skip)
+
     base = shade(LIGHT)
-    for light in (LIGHT, SIDE_LIGHT, INVERTED):
-        if draw(renderer, adapter, mesh, lit, path, scene(light), shade(light)) == 77:
-            return 77
+    if check("baseline", LIGHT, lit, base, allow_skip=True) == 77:
+        return 77
+    check("side-light", SIDE_LIGHT, lit, shade(SIDE_LIGHT))
+    inverted = shade(INVERTED)
+    check("inverted-light", INVERTED, lit, inverted)
 
     # Inverted light: the same shaders and normals with the light negated in b0.
-    inverted = shade(INVERTED)
     expected = differences(base, inverted)
     # Every covered pixel has a nonzero N.L, so all 276 change and the background still matches.
     assert expected == 276
-    draw(renderer, adapter, mesh, lit, path, scene(INVERTED), base, mismatches=expected)
+    check("stale-light", INVERTED, lit, base, mismatches=expected)
     print(f"Expected failure: inverted light, mismatches={expected}")
 
     # Ignored normal: a pixel program that lights a fixed +Z normal, the constant PARAM0.y of one.
-    flat = compile_pixel(tmp, compiler, pixel_program(["v_mul_f32_e32 v12, s6, v11"]), "flat")
+    flat = compile_pixel(tmp, compiler, pixel_program(["v_mul_f32_e32 v12, s6, v11"]), "flat", fallback=fallback)
     ignored = shade(LIGHT, use_normal=False)
     expected = differences(base, ignored)
     assert expected == 276
-    draw(renderer, adapter, mesh, flat, path, scene(LIGHT), ignored)
-    draw(renderer, adapter, mesh, flat, path, scene(LIGHT), base, mismatches=expected)
+    check("flat-normal", LIGHT, flat, ignored)
+    check("stale-normal", LIGHT, flat, base, mismatches=expected)
     print(f"Expected failure: ignored normal, mismatches={expected}")
 
     # Without the clamp, only the pixels facing away from the light change.
-    unclamped = compile_pixel(tmp, compiler, pixel_program(clamp=False), "unclamped")
+    unclamped = compile_pixel(tmp, compiler, pixel_program(clamp=False), "unclamped", fallback=fallback)
     negative = shade(LIGHT, clamp=False)
     expected = differences(base, negative)
-    assert 0 < expected < 276
-    draw(renderer, adapter, mesh, unclamped, path, scene(LIGHT), negative)
-    draw(renderer, adapter, mesh, unclamped, path, scene(LIGHT), base, mismatches=expected)
+    assert expected == 132
+    check("unclamped", LIGHT, unclamped, negative)
+    check("stale-clamp", LIGHT, unclamped, base, mismatches=expected)
     print(f"Expected failure: missing clamp, mismatches={expected}")
     return 0
 
@@ -186,4 +210,6 @@ if __name__ == "__main__":
         if sys.argv[1] == "binary":
             check_binary(Path(directory), *sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "fallback":
+            sys.exit(run(Path(directory), *sys.argv[2:], fallback=True))
         sys.exit(run(Path(directory), *sys.argv[1:]))

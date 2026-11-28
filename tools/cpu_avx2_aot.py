@@ -16,6 +16,12 @@ Supported AVX2 instructions (all 28 forms from docs/coverage/x64_zen2.tsv group 
     vpgatherdd, vpgatherdq, vpgatherqd, vpgatherqq
   - Masked loads and stores: vpmaskmovd, vpmaskmovq
 
+Supported FMA3 instructions (all 60 forms from docs/coverage/x64_zen2.tsv group FMA):
+  - Scalar single/double (XMM, reg or m32/m64 op2): vfmadd/vfmsub/vfnmadd/vfnmsub
+    x {132, 213, 231} x {ss, sd}
+  - Packed single/double (XMM/YMM, reg or m128/m256 op2): vfmadd/vfmsub/vfnmadd/
+    vfnmsub/vfmaddsub/vfmsubadd x {132, 213, 231} x {ps, pd}
+
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 vzeroupper and terminal ret.
 
@@ -80,6 +86,32 @@ MASKMOV_SPECS = {
     Code.VEX_VPMASKMOVQ_M256_YMM_YMM: (True, 64, True),
 }
 
+# (kind: "ss"|"sd"|"ps"|"pd", order: 132|213|231, mode: 0..5, is_ymm: bool)
+# mode: 0=madd, 1=msub, 2=nmadd, 3=nmsub, 4=maddsub, 5=msubadd
+def _build_fma3_specs():
+    specs = {}
+    families = (
+        ("VFMADD", 0, True),
+        ("VFMSUB", 1, True),
+        ("VFNMADD", 2, True),
+        ("VFNMSUB", 3, True),
+        ("VFMADDSUB", 4, False),
+        ("VFMSUBADD", 5, False),
+    )
+    for fam, mode, has_scalar in families:
+        for order in (132, 213, 231):
+            specs[getattr(Code, f"VEX_{fam}{order}PS_XMM_XMM_XMMM128")] = ("ps", order, mode, False)
+            specs[getattr(Code, f"VEX_{fam}{order}PS_YMM_YMM_YMMM256")] = ("ps", order, mode, True)
+            specs[getattr(Code, f"VEX_{fam}{order}PD_XMM_XMM_XMMM128")] = ("pd", order, mode, False)
+            specs[getattr(Code, f"VEX_{fam}{order}PD_YMM_YMM_YMMM256")] = ("pd", order, mode, True)
+            if has_scalar:
+                specs[getattr(Code, f"VEX_{fam}{order}SS_XMM_XMM_XMMM32")] = ("ss", order, mode, False)
+                specs[getattr(Code, f"VEX_{fam}{order}SD_XMM_XMM_XMMM64")] = ("sd", order, mode, False)
+    return specs
+
+
+FMA3_SPECS = _build_fma3_specs()
+
 ALLOWED_CODES = {
     Code.VEX_VMOVDQU_XMM_XMMM128,
     Code.VEX_VMOVDQU_XMMM128_XMM,
@@ -117,13 +149,14 @@ ALLOWED_CODES = {
     Code.VEX_VPSRLVQ_YMM_YMM_YMMM256,
     *GATHER_SPECS,
     *MASKMOV_SPECS,
+    *FMA3_SPECS,
 }
 
 BROADCAST_HELPERS = {
-    M.VPBROADCASTB: "op_vpbroadcastb",
-    M.VPBROADCASTW: "op_vpbroadcastw",
-    M.VPBROADCASTD: "op_vpbroadcastd",
-    M.VPBROADCASTQ: "op_vpbroadcastq",
+    M.VPBROADCASTB: ("op_vpbroadcastb", "load_vec8"),
+    M.VPBROADCASTW: ("op_vpbroadcastw", "load_vec16"),
+    M.VPBROADCASTD: ("op_vpbroadcastd", "load_vec32"),
+    M.VPBROADCASTQ: ("op_vpbroadcastq", "load_vec64"),
 }
 
 SHIFT_HELPERS = {
@@ -134,8 +167,16 @@ SHIFT_HELPERS = {
     M.VPSRLVQ: "op_vpsrlvq",
 }
 
-PRELUDE = """#include <cstdint>
+PRELUDE = """#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define X2W_UNALIGNED __unaligned
+#else
+#define X2W_UNALIGNED
+#endif
 
 using word = std::uint64_t;
 
@@ -143,24 +184,36 @@ struct Vec256 {
     std::uint64_t q[4];
 };
 
-static Vec256 load128(word address) {
-    Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 16);
-    return v;
+static inline Vec256 load128(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto* p = reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    const std::uint64_t q0 = p[0];
+    const std::uint64_t q1 = p[1];
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{q0, q1, 0ull, 0ull}};
 }
 
-static Vec256 load256(word address) {
-    Vec256 v{};
-    std::memcpy(v.q, reinterpret_cast<const void*>(address), 32);
-    return v;
+static inline Vec256 load256(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto* p = reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    const std::uint64_t q0 = p[0];
+    const std::uint64_t q1 = p[1];
+    const std::uint64_t q2 = p[2];
+    const std::uint64_t q3 = p[3];
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{q0, q1, q2, q3}};
 }
 
-static void store128(word address, const Vec256& v) {
+static inline void store128(word address, const Vec256& v) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), v.q, 16);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-static void store256(word address, const Vec256& v) {
+static inline void store256(word address, const Vec256& v) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     std::memcpy(reinterpret_cast<void*>(address), v.q, 32);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
 static Vec256 copy128(const Vec256& v) {
@@ -322,15 +375,31 @@ static Vec256 op_vpsrlvq(const Vec256& src1, const Vec256& src2, bool wide) {
     return out;
 }
 
-static std::uint32_t load32(word address) {
-    std::uint32_t val = 0u;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 4);
+static inline std::uint8_t load8(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint8_t*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     return val;
 }
 
-static std::uint64_t load64(word address) {
-    std::uint64_t val = 0ull;
-    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
+static inline std::uint16_t load16(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint16_t X2W_UNALIGNED*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return val;
+}
+
+static inline std::uint32_t load32(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint32_t X2W_UNALIGNED*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return val;
+}
+
+static inline std::uint64_t load64(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto val = *reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     return val;
 }
 
@@ -446,6 +515,154 @@ static void op_vpmaskmovq_store(word address, const Vec256& mask, const Vec256& 
         }
     }
 }
+
+static inline Vec256 load_vec8(word address) {
+    Vec256 v{};
+    v.q[0] = static_cast<std::uint64_t>(load8(address));
+    return v;
+}
+
+static inline Vec256 load_vec16(word address) {
+    Vec256 v{};
+    v.q[0] = static_cast<std::uint64_t>(load16(address));
+    return v;
+}
+
+static inline Vec256 load_vec32(word address) {
+    Vec256 v{};
+    v.q[0] = static_cast<std::uint64_t>(load32(address));
+    return v;
+}
+
+static inline Vec256 load_vec64(word address) {
+    Vec256 v{};
+    v.q[0] = load64(address);
+    return v;
+}
+
+static float f32_from_bits(std::uint32_t bits) {
+    float f = 0.0f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+static std::uint32_t f32_to_bits(float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, 4);
+    return bits;
+}
+
+static double f64_from_bits(std::uint64_t bits) {
+    double d = 0.0;
+    std::memcpy(&d, &bits, 8);
+    return d;
+}
+
+static std::uint64_t f64_to_bits(double d) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &d, 8);
+    return bits;
+}
+
+static std::uint32_t fma_lane_f32(std::uint32_t op0_b, std::uint32_t op1_b, std::uint32_t op2_b,
+                                  unsigned order, bool neg_prod, bool neg_add) {
+    const std::uint32_t a_b = (order == 132u) ? op0_b : op1_b;
+    const std::uint32_t b_b = (order == 213u) ? op0_b : op2_b;
+    const std::uint32_t c_b = (order == 132u) ? op1_b : ((order == 213u) ? op2_b : op0_b);
+    const std::uint32_t ops[3] = {a_b, b_b, c_b};
+    for (std::uint32_t b : ops) {
+        if ((b & 0x7fffffffu) > 0x7f800000u) return b | 0x00400000u;
+    }
+    const float a = f32_from_bits(neg_prod ? (a_b ^ 0x80000000u) : a_b);
+    const float b = f32_from_bits(b_b);
+    const float c = f32_from_bits(neg_add ? (c_b ^ 0x80000000u) : c_b);
+    const float r = std::fmaf(a, b, c);
+    if (std::isnan(r)) return 0xffc00000u;
+    return f32_to_bits(r);
+}
+
+static std::uint64_t fma_lane_f64(std::uint64_t op0_b, std::uint64_t op1_b, std::uint64_t op2_b,
+                                  unsigned order, bool neg_prod, bool neg_add) {
+    const std::uint64_t a_b = (order == 132u) ? op0_b : op1_b;
+    const std::uint64_t b_b = (order == 213u) ? op0_b : op2_b;
+    const std::uint64_t c_b = (order == 132u) ? op1_b : ((order == 213u) ? op2_b : op0_b);
+    const std::uint64_t ops[3] = {a_b, b_b, c_b};
+    for (std::uint64_t b : ops) {
+        if ((b & 0x7fffffffffffffffull) > 0x7ff0000000000000ull) return b | 0x0008000000000000ull;
+    }
+    const double a = f64_from_bits(neg_prod ? (a_b ^ 0x8000000000000000ull) : a_b);
+    const double b = f64_from_bits(b_b);
+    const double c = f64_from_bits(neg_add ? (c_b ^ 0x8000000000000000ull) : c_b);
+    const double r = std::fma(a, b, c);
+    if (std::isnan(r)) return 0xfff8000000000000ull;
+    return f64_to_bits(r);
+}
+
+static void fma_lane_signs(unsigned mode, unsigned lane, bool& neg_prod, bool& neg_add) {
+    neg_prod = (mode == 2u || mode == 3u);
+    if (mode == 4u) {
+        neg_add = ((lane & 1u) == 0u);
+    } else if (mode == 5u) {
+        neg_add = ((lane & 1u) != 0u);
+    } else {
+        neg_add = (mode == 1u || mode == 3u);
+    }
+}
+
+static Vec256 op_fma_ss(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode) {
+    Vec256 out = copy128(op0);
+    bool neg_prod = false, neg_add = false;
+    fma_lane_signs(mode, 0u, neg_prod, neg_add);
+    set_lane32(out, 0u, fma_lane_f32(lane32(op0, 0u), lane32(op1, 0u), lane32(op2, 0u), order, neg_prod, neg_add));
+    return out;
+}
+
+static Vec256 op_fma_sd(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode) {
+    Vec256 out = copy128(op0);
+    bool neg_prod = false, neg_add = false;
+    fma_lane_signs(mode, 0u, neg_prod, neg_add);
+    out.q[0] = fma_lane_f64(op0.q[0], op1.q[0], op2.q[0], order, neg_prod, neg_add);
+    return out;
+}
+
+static Vec256 op_fma_ps(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 8u : 4u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        bool neg_prod = false, neg_add = false;
+        fma_lane_signs(mode, i, neg_prod, neg_add);
+        set_lane32(out, i, fma_lane_f32(lane32(op0, i), lane32(op1, i), lane32(op2, i), order, neg_prod, neg_add));
+    }
+    return out;
+}
+
+static Vec256 op_fma_pd(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 4u : 2u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        bool neg_prod = false, neg_add = false;
+        fma_lane_signs(mode, i, neg_prod, neg_add);
+        out.q[i] = fma_lane_f64(op0.q[i], op1.q[i], op2.q[i], order, neg_prod, neg_add);
+    }
+    return out;
+}
+#if defined(_MSC_VER)
+extern "C" __declspec(dllexport) std::uint32_t host_has_avx2() {
+    int info[4]{};
+    __cpuid(info, 1);
+    const int need = (1 << 27) | (1 << 28);
+    if ((info[2] & need) != need) return 0u;
+    if ((_xgetbv(0) & 6u) != 6u) return 0u;
+    __cpuid(info, 0);
+    if (info[0] < 7) return 0u;
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) ? 1u : 0u;
+}
+#endif
 """
 
 
@@ -460,12 +677,13 @@ def vec_index(register, ins):
     raise ValueError(f"unsupported vector register {register} at RVA {ins.ip:#x}: {ins}")
 
 
-def flat_address(ins):
+def flat_address(ins, *, store=False):
     """Lower a flat [base + disp] pointer operand rooted in an argument GPR64."""
     base = ins.memory_base
+    allowed = {R.R8} if store else ARGUMENTS
     if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
             or ins.memory_index != R.NONE or not RegisterExt.is_gpr64(base)
-            or base not in ARGUMENTS):
+            or base not in allowed):
         raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}: {ins}")
     disp = ins.memory_displacement & ((1 << 64) - 1)
     name = ARGUMENTS[base]
@@ -492,7 +710,7 @@ def vsib_address(ins, expected_idx_wide, expected_idx_bits):
     return ARGUMENTS[base], disp, scale, idx_num
 
 
-def lift_code(name, start, raw):
+def lift_code(name, start, raw, *, allow_memory=False):
     """Decode and lift one bounded straight-line AVX2 leaf function."""
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
@@ -524,6 +742,12 @@ def lift_code(name, start, raw):
         used.add(idx)
         return f"ymm{idx}", wide
 
+    def read_vec_or_mem(op_index, ins, mem_loader):
+        if ins.op_kind(op_index) == OpKind.MEMORY:
+            return f"{mem_loader}({flat_address(ins)})"
+        expr, _ = read_vec(op_index, ins)
+        return expr
+
     def write_vec(op_index, ins):
         if ins.op_kind(op_index) != OpKind.REGISTER:
             raise ValueError(f"expected register destination at RVA {ins.ip:#x}: {ins}")
@@ -540,7 +764,7 @@ def lift_code(name, start, raw):
                 or ins.zeroing_masking or ins.is_broadcast):
             raise ValueError(f"unsupported EVEX instruction at RVA {ins.ip:#x}: {ins}")
         mnemonic = ins.mnemonic
-        if mnemonic in REGISTER_ONLY_AVX2 and any(
+        if mnemonic in REGISTER_ONLY_AVX2 and not allow_memory and any(
                 ins.op_kind(i) == OpKind.MEMORY for i in range(ins.op_count)):
             raise ValueError(
                 f"unsupported memory operand for register-domain AVX2 instruction at RVA {ins.ip:#x}: {ins}")
@@ -577,55 +801,59 @@ def lift_code(name, start, raw):
             defined.add(dst_idx)
         elif mnemonic == M.VEXTRACTI128:
             src, _ = read_vec(1, ins)
-            dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
-            statements.append(f"{dst} = op_vextracti128({src}, {imm:#x}u);")
-            defined.add(dst_idx)
+            if ins.op0_kind == OpKind.MEMORY:
+                addr = flat_address(ins, store=True)
+                statements.append(f"store128({addr}, op_vextracti128({src}, {imm:#x}u));")
+            else:
+                dst_idx, dst, _ = write_vec(0, ins)
+                statements.append(f"{dst} = op_vextracti128({src}, {imm:#x}u);")
+                defined.add(dst_idx)
         elif mnemonic == M.VINSERTI128:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load128")
             dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
             statements.append(f"{dst} = op_vinserti128({src1}, {src2}, {imm:#x}u);")
             defined.add(dst_idx)
         elif mnemonic == M.VPERM2I128:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load256")
             dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
             statements.append(f"{dst} = op_vperm2i128({src1}, {src2}, {imm:#x}u);")
             defined.add(dst_idx)
         elif mnemonic in BROADCAST_HELPERS:
-            src, _ = read_vec(1, ins)
+            helper, mem_loader = BROADCAST_HELPERS[mnemonic]
+            src = read_vec_or_mem(1, ins, mem_loader)
             dst_idx, dst, wide = write_vec(0, ins)
-            helper = BROADCAST_HELPERS[mnemonic]
             statements.append(f"{dst} = {helper}({src}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in (M.VPERMD, M.VPERMPS):
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
+            src2 = read_vec_or_mem(2, ins, "load256")
             dst_idx, dst, _ = write_vec(0, ins)
             statements.append(f"{dst} = op_vpermd({src1}, {src2});")
             defined.add(dst_idx)
         elif mnemonic in (M.VPERMQ, M.VPERMPD):
-            src, _ = read_vec(1, ins)
+            src = read_vec_or_mem(1, ins, "load256")
             dst_idx, dst, _ = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
             statements.append(f"{dst} = op_vpermq({src}, {imm:#x}u);")
             defined.add(dst_idx)
         elif mnemonic == M.VPBLENDD:
-            src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
-            dst_idx, dst, wide = write_vec(0, ins)
+            src1, wide = read_vec(1, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
+            dst_idx, dst, dst_wide = write_vec(0, ins)
             imm = ins.immediate8 & 0xff
-            statements.append(f"{dst} = op_vpblendd({src1}, {src2}, {imm:#x}u, {'true' if wide else 'false'});")
+            statements.append(f"{dst} = op_vpblendd({src1}, {src2}, {imm:#x}u, {'true' if dst_wide else 'false'});")
             defined.add(dst_idx)
         elif mnemonic in SHIFT_HELPERS:
-            src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
-            dst_idx, dst, wide = write_vec(0, ins)
+            src1, wide = read_vec(1, ins)
+            src2 = read_vec_or_mem(2, ins, "load256" if wide else "load128")
+            dst_idx, dst, dst_wide = write_vec(0, ins)
             helper = SHIFT_HELPERS[mnemonic]
-            statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if wide else 'false'});")
+            statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if dst_wide else 'false'});")
             defined.add(dst_idx)
         elif ins.code in GATHER_SPECS:
             helper, count, dst_wide_exp, idx_wide_exp, idx_bits = GATHER_SPECS[ins.code]
@@ -670,6 +898,31 @@ def lift_code(name, start, raw):
                 helper = "op_vpmaskmovd_load" if elem_bits == 32 else "op_vpmaskmovq_load"
                 statements.append(f"{dst_name} = {helper}({mask_name}, {addr}, {'true' if wide else 'false'});")
                 defined.add(dst_idx)
+        elif ins.code in FMA3_SPECS:
+            kind, order, mode, wide = FMA3_SPECS[ins.code]
+            op0_name, op0_wide = read_vec(0, ins)
+            op1_name, op1_wide = read_vec(1, ins)
+            if op0_wide != wide or op1_wide != wide:
+                raise ValueError(f"FMA3 operand width mismatch at RVA {ins.ip:#x}: {ins}")
+            if ins.op2_kind == OpKind.REGISTER:
+                op2_expr, op2_wide = read_vec(2, ins)
+                if op2_wide != wide:
+                    raise ValueError(f"FMA3 operand width mismatch at RVA {ins.ip:#x}: {ins}")
+            elif ins.op2_kind == OpKind.MEMORY:
+                addr = flat_address(ins)
+                if kind == "ss":
+                    op2_expr = f"load_vec32({addr})"
+                elif kind == "sd":
+                    op2_expr = f"load_vec64({addr})"
+                else:
+                    op2_expr = f"{'load256' if wide else 'load128'}({addr})"
+            else:
+                raise ValueError(f"unsupported FMA3 operand 2 at RVA {ins.ip:#x}: {ins}")
+            if kind in ("ss", "sd"):
+                statements.append(f"{op0_name} = op_fma_{kind}({op0_name}, {op1_name}, {op2_expr}, {order}u, {mode}u);")
+            else:
+                statements.append(
+                    f"{op0_name} = op_fma_{kind}({op0_name}, {op1_name}, {op2_expr}, {order}u, {mode}u, {'true' if wide else 'false'});")
         else:
             raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 
@@ -688,25 +941,25 @@ def lift_code(name, start, raw):
     return "\n".join(lines), len(instructions)
 
 
-def lift(pe, name):
+def lift(pe, name, *, allow_memory=False):
     entry = export_rva(pe, name)
     raw = bounded_code(pe, entry)
-    source, count = lift_code(name, entry, raw)
+    source, count = lift_code(name, entry, raw, allow_memory=allow_memory)
     return source, entry, count
 
 
-def translate_pe(pe, names):
+def translate_pe(pe, names, *, allow_memory=False):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    lifted = [lift(pe, name) for name in names]
+    lifted = [lift(pe, name, allow_memory=allow_memory) for name in names]
     source = PRELUDE + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
     meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
     return source, meta
 
 
-def translate(image, names):
+def translate(image, names, *, allow_memory=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, allow_memory=allow_memory)
 
 
 if __name__ == "__main__":
@@ -714,9 +967,10 @@ if __name__ == "__main__":
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help="comma-separated export names")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--mem-ops", action="store_true", help="allow memory operands on register-domain AVX2 forms")
     args = parser.parse_args()
     try:
-        source, meta = translate(args.image, args.exports.split(","))
+        source, meta = translate(args.image, args.exports.split(","), allow_memory=args.mem_ops)
         args.output.write_text(source, encoding="utf-8")
         for name, entry, count in meta:
             print(f"{name} at RVA {entry:#x}: {count} instructions")

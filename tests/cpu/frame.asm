@@ -313,4 +313,25 @@ reuse_restored PROC FRAME
     mov rax, rbx
     ret
 reuse_restored ENDP
+
+anchored_frame PROC FRAME
+    push rbp
+    .pushreg rbp
+    mov rbp, rsp
+    sub rsp, 20h
+    .allocstack 20h
+    .setframe rbp, 20h
+    .endprolog
+    mov QWORD PTR [rbp-8], rcx
+    test dl, 1
+    jz anchored_join
+    lea rbp, [rsp+20h]
+    add QWORD PTR [rsp+18h], rdx
+anchored_join:
+    mov rax, QWORD PTR [rbp-8]
+    mov QWORD PTR [r8], rax
+    add rsp, 20h
+    pop rbp
+    ret
+anchored_frame ENDP
 END

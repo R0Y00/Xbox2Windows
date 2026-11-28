@@ -123,12 +123,19 @@ OpStore %lane_dst %lane
 %compact_offset_biased = OpIAdd %uint %compact_offset %write_bias
 %compact_index = OpIAdd %uint %compact_offset_biased %c257
 %payload = OpBitwiseOr %uint %local %payload_base
+; Exactly one thread writes the shared width word.
+%is_local0 = OpIEqual %bool %local %zero
+OpSelectionMerge %after_width None
+OpBranchConditional %is_local0 %write_width %after_width
+%write_width = OpLabel
+%width_dst = OpAccessChain %ptr %out %zero %c64
+OpStore %width_dst %width
+OpBranch %after_width
+%after_width = OpLabel
 %is_lane0 = OpIEqual %bool %lane %zero
 OpSelectionMerge %after_sections None
 OpBranchConditional %is_lane0 %write_sections %after_sections
 %write_sections = OpLabel
-%width_dst = OpAccessChain %ptr %out %zero %c64
-OpStore %width_dst %width
 %ballot_index = OpIMul %uint %wave %c4
 %ballot_index0 = OpIAdd %uint %ballot_index %c65
 %ballot_dst0 = OpAccessChain %ptr %out %zero %ballot_index0

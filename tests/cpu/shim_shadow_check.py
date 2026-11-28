@@ -32,19 +32,33 @@ def build(directory, dxc):
     first = shadow.scene_image(maps[0])[0]
     second = shadow.scene_image(maps[1], corners=moved)[0]
     stale = shadow.scene_image(maps[0], corners=moved)[0]
-    depths = b"".join(struct.pack("<f", float(value)) for frame in maps for value in frame)
+    depths = [b"".join(struct.pack("<f", float(value)) for value in frame) for frame in maps]
     mismatch = shadow.differences(second, stale)
     if not mismatch or maps[0] == maps[1]:
         raise AssertionError("moving the caster must change depth and reveal the stale binding")
-    return first + second + depths, first + stale + depths, mismatch
+    return first + depths[0], second + depths[1], stale + depths[1], mismatch
 
 
 def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
-    current, stale, mismatch = build(directory, dxc)
+    first, second, stale, mismatch = build(directory, dxc)
     mapped = [sys.executable, "-B", Path(__file__).with_name("shim_startup_check.py"), "--map",
               mapper, exe, companion, io, xmem, d3d12, ""]
     markers = sorted(f"bound {dll}!{symbol}" for dll, symbols in SHIM_IMPORTS.items() for symbol in symbols)
-    for case, expected in (("shadow", current), ("shadow-stale", stale), ("shadow-reject", b"")):
+    created = "Xbox device created: EXE import returned a desktop device"
+    closed = "shadow close surfaces=4 device=1"
+    frame_zero = [created, "shadow record frame=0 map=0", "shadow submit frame=0 fence=1", "shadow wait fence=1"]
+    frame_one = ["shadow submit frame=1 fence=2", "shadow wait fence=2", closed]
+    cases = (
+        ("shadow", first + second, 42, [*frame_zero, "shadow record frame=1 map=1", *frame_one]),
+        ("shadow-stale", first + stale, 42, [*frame_zero, "shadow record frame=1 map=0", *frame_one]),
+        ("shadow-reject", b"", 20,
+         ["D3D12XboxCreateDevice: unsupported IID {c1b6694f-ff09-44a9-b03c-77900a0a1d17}",
+          "Xbox device rejected: no device, released adapter and factory",
+          "shadow close surfaces=0 device=0"]),
+        ("shadow-fail", first, 24, [*frame_zero, "shadow record frame=1 map=1",
+                                  "shadow submit frame=2 rejected", closed]),
+    )
+    for case, expected, status, diagnostics in cases:
         env = dict(os.environ, X2W_SHIM_DRAW_CASE=case, X2W_SHIM_COMPUTE_CASE="", X2W_SHIM_CHAIN_DIR=str(directory))
         for runner, command in (("native", [exe]), ("pe_map", mapped), ("AOT", [lifted])):
             child = subprocess.run(command, env=env, capture_output=True, timeout=120)
@@ -52,23 +66,20 @@ def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
             if child.returncode == 77 and case == "shadow" and runner == "native":
                 print("skip:", child.stdout.decode(errors="replace"), lines)
                 return 77
-            diagnostics = [*markers, "mapped host returned"] if runner == "pe_map" else []
-            if case == "shadow-reject":
-                diagnostics.append("Xbox device rejected: no device, released adapter and factory")
-            check(f"{case} {runner} diagnostics", sorted(lines), sorted(diagnostics))
-            check(f"{case} {runner} exit", child.returncode, 20 if case == "shadow-reject" else 42)
+            if runner == "pe_map":
+                check(f"{case} mapped providers", sorted(lines[:len(markers)]), markers)
+                check(f"{case} mapped completion", lines[-1:], ["mapped host returned"])
+                lines = lines[len(markers):-1]
+            check(f"{case} {runner} ordered events", lines, diagnostics)
+            check(f"{case} {runner} exit", child.returncode, status)
             check(f"{case} {runner} startup", child.stdout[:len(EXPECTED.output)], EXPECTED.output)
             payload = child.stdout[len(EXPECTED.output):]
-            if case == "shadow-reject":
-                check(f"{case} {runner} publishes no frame data", payload, b"")
-                print(f"{case} {runner}: adapter and factory released, no frame payload, exit=20")
-                continue
-            check(f"{case} {runner} frame payload length", len(payload), len(expected) + 1)
-            check(f"{case} {runner} tracked surface releases", payload[-1], 4)
-            check(f"{case} {runner} readback mismatch count", shadow.differences(payload[:-1], expected), 0)
-            check(f"{case} {runner} differences from fresh depth binding",
-                  shadow.differences(payload[:-1], current), mismatch if case == "shadow-stale" else 0)
-            print(f"{case} {runner}: two color/depth frames match; releases=4 exit=42")
+            check(f"{case} {runner} frame payload length", len(payload), len(expected))
+            check(f"{case} {runner} readback mismatch count", shadow.differences(payload, expected), 0)
+            if case == "shadow-stale":
+                check(f"{case} {runner} differences from fresh depth binding",
+                      shadow.differences(payload, first + second), mismatch)
+            print(f"{case} {runner}: {len(payload)} frame bytes, ordered submissions and cleanup, exit={status}")
     print(f"stale map: {mismatch} second-frame color pixels differ; light depth still matches")
     return 0
 

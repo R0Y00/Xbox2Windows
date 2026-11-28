@@ -16,7 +16,8 @@ mix_args PROC FRAME
     mov [r8+8], rbx
     mov rax, rsi
     sub rax, rbx
-    add rax, 11
+    ; sub rax, -11, forced to the signed imm8 encoding.
+    DB 048h, 083h, 0E8h, 0F5h
     mov [r8+16], rax
 IFDEF ALTER_FIRST
     add rax, 1

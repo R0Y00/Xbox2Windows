@@ -977,6 +977,17 @@ def check_guard_page_fault_suppression(native_mem, lifted_mem):
         page0_data = bytes((i * 73 + 19) & 0xFF for i in range(page_size))
         ctypes.memmove(base, page0_data, page_size)
         page1 = base + page_size
+        name = "op_broadcastss_ymm_mem7"
+        src = page1 - 32
+        native_out = ctypes.create_string_buffer(32)
+        lifted_out = ctypes.create_string_buffer(32)
+        native_mem[name](src, src, ctypes.addressof(native_out))
+        lifted_mem[name](src, src, ctypes.addressof(lifted_out))
+        # The broadcast reads only the last dword before the protected page.
+        want = ref_vbroadcastss(page0_data[-32:], 7, True)
+        assert_equal_output("native-guard-broadcast", name, 0, native_out.raw, want)
+        assert_equal_output("lifted-guard-broadcast", name, 0, lifted_out.raw, want)
+
         init_dest = bytes(range(0xA1, 0xC1))
 
         for name, elem_bits, wide, _ in MASKMOV_LOAD_SPECS:
@@ -1053,6 +1064,15 @@ def check_differential(native_path, lifted_path, altered_path):
                 assert_equal_output(f"native-unaligned+{shift}", name, idx, got_n, want)
                 assert_equal_output(f"lifted-unaligned+{shift}", name, idx, got_l, want)
                 unalign_total += 1
+
+    # An XMM vmovapd needs only 16-byte alignment; this pins against a 32-byte requirement on the XMM form.
+    name = "op_movapd_store128"
+    a, b = bytes(range(32)), bytes(32)
+    want = reference_std(name, a, b)
+    got_n = invoke_std(native[name], a, b, unalign_shift=16)
+    got_l = invoke_std(lifted[name], a, b, unalign_shift=16)
+    assert_equal_output("native-align16", name, 0, got_n, want)
+    assert_equal_output("lifted-align16", name, 0, got_l, want)
 
     # Negative displacements ([rcx - 32] vector load, [rdx - 8] GPR load).
     neg_total = 0
@@ -1214,16 +1234,9 @@ def check_alt_encodings_and_rejections(original_path):
         src, count = lift_code(label, 0x1000, encode_seq(*seq))
         assert f"lifted_{label}" in src and count == len(seq), (label, count)
 
-    # 1) Memory-operand encodings of all 28 register-only AVX forms must be rejected explicitly.
+    # 1) Memory-operand encodings of all 20 register-only AVX forms must be rejected explicitly.
+    # (The eight logical ops take a memory source and are covered by avx_move_mem_check.py.)
     reg_only_mem_cases = [
-        ("vandpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandps_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandnpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDNPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandnps_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDNPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vorpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VORPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vorps_mem", Instruction.create_reg_reg_mem(Code.VEX_VORPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vxorpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VXORPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vxorps_mem", Instruction.create_reg_reg_mem(Code.VEX_VXORPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
         ("vblendpd_mem", Instruction.create_reg_reg_mem_u32(Code.VEX_VBLENDPD_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, MemoryOperand(R.RDX), 0xA)),
         ("vblendps_mem", Instruction.create_reg_reg_mem_u32(Code.VEX_VBLENDPS_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, MemoryOperand(R.RDX), 0xAA)),
         ("vblendvpd_mem", Instruction.create_reg_reg_mem_reg(Code.VEX_VBLENDVPD_YMM_YMM_YMMM256_YMM, R.YMM0, R.YMM1, MemoryOperand(R.RDX), R.YMM2)),
@@ -1247,6 +1260,8 @@ def check_alt_encodings_and_rejections(original_path):
         ("vmovshdup_mem", Instruction.create_reg_mem(Code.VEX_VMOVSHDUP_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX))),
         ("vmovsldup_mem", Instruction.create_reg_mem(Code.VEX_VMOVSLDUP_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX))),
     ]
+
+    reg_only = dict(reg_only_mem_cases)
 
     # 2) Carved-out move forms owned by cpu_vex_aot.py (PR #325) (vmovdqa, vmovups, vmovaps, vmovq, vmovd must reject).
     ld_rax = Instruction.create_reg_mem(Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RCX))
@@ -1341,6 +1356,7 @@ def check_alt_encodings_and_rejections(original_path):
         ("segment_prefix_maskmov", (ld_ymm1, seg_maskmov, ret_ins), "unsupported instruction prefix"),
         ("missing_ret", (ld_ymm0,), "missing terminal ret"),
         ("after_ret", (ret_ins, ld_ymm0), "unreachable instruction after ret"),
+        ("rep_ret", b"\xf3\xc3", "unsupported instruction prefix"),
     ]
 
     all_unit = [
@@ -1355,7 +1371,7 @@ def check_alt_encodings_and_rejections(original_path):
     ]
 
     for label, seq, expected_reason in all_unit:
-        raw = encode_seq(*seq)
+        raw = seq if isinstance(seq, bytes) else encode_seq(*seq)
         try:
             lift_code(label, 0x1000, raw)
         except ValueError as exc:
@@ -1378,9 +1394,9 @@ def check_alt_encodings_and_rejections(original_path):
         max_len = orig_end - entry
 
     pe_patches = [
-        ("pe_vandps_mem", encode_seq(ld_ymm1, reg_only_mem_cases[1][1], ret_ins),
+        ("pe_vshufps_mem", encode_seq(ld_ymm1, reg_only["vshufps_mem"], ret_ins),
          "unsupported memory operand for register-domain AVX instruction"),
-        ("pe_vperm2f128_mem", encode_seq(ld_ymm1, reg_only_mem_cases[16][1], ret_ins),
+        ("pe_vperm2f128_mem", encode_seq(ld_ymm1, reg_only["vperm2f128_mem"], ret_ins),
          "unsupported memory operand for register-domain AVX instruction"),
         ("pe_carved_vmovups", encode_seq(carved_out_cases[2][1], ret_ins),
          "unsupported instruction"),
@@ -1413,8 +1429,8 @@ def check_alt_encodings_and_rejections(original_path):
 
     print(f"{len(alt_accept)} alternate-encoding lift checks, {len(all_unit)} unit rejection controls "
           f"({len(reg_only_mem_cases)} register-domain memory, {len(carved_out_cases)} carved-out, "
-          f"{len(out_of_scope_cases)} out-of-scope, {len(other_cases)} EVEX/ABI/state/addressing), "
-          f"and {len(pe_patches)} PE-patched rejection controls passed")
+          f"{len(out_of_scope_cases)} out-of-scope, {len(other_cases)} EVEX/ABI/state/addressing/prefix),"
+          f" and {len(pe_patches)} PE-patched rejection controls passed")
 
 
 if __name__ == "__main__":

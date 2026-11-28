@@ -1,0 +1,22 @@
+EXPORTS
+    vpmovsxbw_op
+    vpmovsxbd_op
+    vpmovsxbq_op
+    vpmovsxwd_op
+    vpmovsxwq_op
+    vpmovsxdq_op
+    vpmovzxbw_op
+    vpmovzxbd_op
+    vpmovzxbq_op
+    vpmovzxwd_op
+    vpmovzxwq_op
+    vpmovzxdq_op
+    vphaddw_op
+    vphaddd_op
+    vphaddsw_op
+    vphsubw_op
+    vphsubd_op
+    vphsubsw_op
+    vphminposuw_op
+    vpmovsxbd_ymm_mem_op
+    vphaddd_ymm_mem_op

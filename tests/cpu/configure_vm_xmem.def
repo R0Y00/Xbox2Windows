@@ -1,0 +1,3 @@
+LIBRARY xmem
+EXPORTS
+    XMemVirtualAlloc=xmem_virtual_alloc_record

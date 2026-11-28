@@ -282,6 +282,16 @@ op_palignr_69 PROC FRAME
     ret
 op_palignr_69 ENDP
 
+op_palignr_255 PROC FRAME
+    .endprolog
+    vmovdqu xmm1, XMMWORD PTR [rcx]
+    vmovdqu xmm2, XMMWORD PTR [rdx]
+    vpalignr xmm0, xmm1, xmm2, 0FFh
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vzeroupper
+    ret
+op_palignr_255 ENDP
+
 op_pblendvb PROC FRAME
     .endprolog
     vmovdqu ymm0, YMMWORD PTR [rdx]
@@ -843,6 +853,15 @@ op_pmovsxbq PROC FRAME
     ret
 op_pmovsxbq ENDP
 
+op_pmovsxbq_wide_src PROC FRAME
+    .endprolog
+    vmovdqu ymm1, YMMWORD PTR [rcx]
+    vpmovsxbq xmm0, xmm1
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vzeroupper
+    ret
+op_pmovsxbq_wide_src ENDP
+
 op_pmovsxwd PROC FRAME
     .endprolog
     vmovdqu ymm0, YMMWORD PTR [rdx]
@@ -1350,6 +1369,14 @@ op_zeroupper_ymm1 PROC FRAME
     vmovdqu YMMWORD PTR [r8], ymm1
     ret
 op_zeroupper_ymm1 ENDP
+
+op_zeroupper_ymm2 PROC FRAME
+    .endprolog
+    vmovdqu ymm2, YMMWORD PTR [rcx]
+    vzeroupper
+    vmovdqu YMMWORD PTR [r8], ymm2
+    ret
+op_zeroupper_ymm2 ENDP
 
 ; Seeds all six volatile YMM registers, executes vzeroall, and stores all 192 bytes.
 op_zeroall PROC FRAME

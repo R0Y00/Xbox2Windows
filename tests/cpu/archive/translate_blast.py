@@ -13,21 +13,21 @@ class CodecFrame(Frame):
     frame_limit = 8192  # Includes blast's 4096-byte sliding window.
     incoming_end = 56   # Return slot, home space, left and in.
 
-    def step(self, ins, rsp):
+    def step(self, ins, rsp, anchor):
         if ins.mnemonic == M.MOV and ins.op1_kind == OpKind.REGISTER and ins.op1_register == R.RSP:
             if ins.op0_register != R.RDX:
                 raise ValueError(f"unexpected frame pointer copy at {ins.ip:#x}")
-            return rsp
+            return rsp, anchor
         if ins.mnemonic == M.LEA and ins.memory_base == R.RSP:
             if ins.memory_index != R.NONE or ins.has_segment_prefix:
                 raise ValueError(f"unsupported stack address at {ins.ip:#x}")
             self.access(ins, rsp, rsp + ins.memory_displacement, 1, False, False)
-            return rsp
+            return rsp, anchor
         if ins.memory_base == R.RSP and ins.memory_index != R.NONE:
             if ins.has_segment_prefix or not RegisterExt.is_gpr64(ins.memory_index):
                 raise ValueError(f"unexpected indexed stack operand at {ins.ip:#x}")
-            return rsp
-        return super().step(ins, rsp)
+            return rsp, anchor
+        return super().step(ins, rsp, anchor)
 
 
 class CodecLifter(Lifter):
@@ -75,7 +75,7 @@ SIGNATURE = "static word fn_{:x}(Context& ctx, word sp, word rcx, word rdx, word
 
 def emit(pe, fn, imports):
     edges = fn.explore(imports, callback_calls=True)
-    frame = CodecFrame(fn)
+    frame = CodecFrame(fn, edges)
     check_call_sites(fn, frame.offsets)
     lifter = CodecLifter(pe)
     lifter.frame = {ip: offset for ip, (offset, *_) in frame.accesses.items()}

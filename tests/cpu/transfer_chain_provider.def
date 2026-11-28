@@ -1,0 +1,14 @@
+LIBRARY xmem
+EXPORTS
+    XMemIsToolsMemAvailable
+    XMemGetWorkingSetStatistics
+    XMemTransferMemory
+    set_chain_tools_mem_available
+    set_chain_working_set_success
+    set_chain_working_set_budget
+    set_chain_transfer_success
+    get_chain_tools_mem_calls
+    get_chain_working_set_calls
+    get_chain_transfer_calls
+    get_chain_transferred_bytes
+    reset_chain_records

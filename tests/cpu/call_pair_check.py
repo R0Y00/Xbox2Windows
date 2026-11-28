@@ -122,6 +122,16 @@ def check_translation(image):
             path.write_bytes(damaged)
             expect_rejected(path, reason)
 
+        # Keep the second call but replace its R8 reload with mov rsi, rsi.
+        with pefile.PE(image, fast_load=True) as pe:
+            reload_offset = pe.get_offset_from_rva(caller + second_site - 3)
+        if original[reload_offset:reload_offset + 3] not in (b"\x49\x89\xf0", b"\x4c\x8b\xc6"):
+            raise AssertionError("expected mov r8, rsi immediately before the second call")
+        damaged = bytearray(original)
+        damaged[reload_offset:reload_offset + 3] = b"\x48\x89\xf6"
+        path.write_bytes(damaged)
+        expect_rejected(path, "undefined register")
+
         # Overlapping callee intervals: the runtime-function table itself is refused.
         with pefile.PE(image, fast_load=True) as pe:
             table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]

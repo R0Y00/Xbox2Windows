@@ -1,0 +1,10 @@
+LIBRARY xmem
+EXPORTS
+    XMemTransferMemory
+    get_total_call_count
+    get_transfer_call_count
+    get_argument_rejection_count
+    get_recorded_call_partition
+    get_recorded_call_bytes
+    get_recorded_call_result
+    reset_transfer_mem_records

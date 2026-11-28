@@ -13,7 +13,7 @@ bool shim_draw_gpu(unsigned mode, std::vector<unsigned char>& rgba);
 bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsigned& mismatches);
 bool shim_tex_gpu(unsigned mode, std::vector<unsigned char>& rgba);
 
-bool shim_shadow_gpu(bool stale, bool reject, std::vector<unsigned char>& output);
+bool shim_shadow_wait(void* request, std::vector<unsigned char>& output);
 
 namespace {
 constexpr unsigned side = 64;
@@ -74,6 +74,14 @@ unsigned scene_mismatches(const std::vector<unsigned char>& rgba)
 }
 } // namespace
 
+extern "C" __declspec(dllexport) HRESULT shadow_wait(void* request)
+{
+    std::vector<unsigned char> output;
+    if (!shim_shadow_wait(request, output)) return E_FAIL;
+    if (!publish(output.data(), static_cast<DWORD>(output.size()))) ExitProcess(23);
+    return S_OK;
+}
+
 extern "C" __declspec(dllexport) DWORD draw_request()
 {
     char mode[16]{};
@@ -92,6 +100,7 @@ extern "C" __declspec(dllexport) DWORD draw_request()
         if (!std::strcmp(mode, "shadow")) return 14;
         if (!std::strcmp(mode, "shadow-stale")) return 15;
         if (!std::strcmp(mode, "shadow-reject")) return 16;
+        if (!std::strcmp(mode, "shadow-fail")) return 17;
         if (!std::strcmp(mode, "texture")) return 10;
         if (!std::strcmp(mode, "texture-stale")) return 12;
         // Uploaded textures through a vertex-buffer quad (tests/cpu/shim_tex_gpu.cpp).
@@ -120,12 +129,6 @@ extern "C" __declspec(dllexport) DWORD draw_frame(DWORD mode)
         if (!shim_chain_gpu(mode, published, count)) return 0xFFFFFFFF;
         if (!publish(published.data(), static_cast<DWORD>(published.size()))) ExitProcess(23);
         return count;
-    }
-    if (mode >= 14 && mode <= 16) {
-        std::vector<unsigned char> output;
-        if (!shim_shadow_gpu(mode == 15, mode == 16, output)) return 0xFFFFFFFF;
-        if (!publish(output.data(), static_cast<DWORD>(output.size()))) ExitProcess(23);
-        return 0;
     }
     if (mode < 1 || mode > 13) ExitProcess(22);
     if (mode >= 6) std::fprintf(stderr, "draw_frame mode=%lu\n", static_cast<unsigned long>(mode));

@@ -13,6 +13,8 @@ Families, each changing one property:
   samples_N        N additional independent SampleLevel stores, flat control flow
   branches_B       B additional if/else regions with observable stores
   samplebranch_N   one SampleLevel inside each of N divergent regions
+  condstore_N      N conditional raw UAV stores, no additional sampling
+  stores_N         the same N stores without their branches (condstore twin)
 
 The tool needs only the Python standard library and an external DXC executable.
 It runs a fixed command (target cs_6_6, entry main, native 16-bit types allowed,
@@ -41,11 +43,13 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -94,11 +98,16 @@ void main(SPIRV_Cross_Input stage_input)
 SAMPLE_SIZES = (1, 4, 16, 64, 256, 1024, 4096, 16384)
 BRANCH_SIZES = (1, 4, 16, 64, 256, 1024, 4096, 16384)
 SAMPLEBRANCH_SIZES = (64, 256, 1024, 2048, 4096, 6144, 8192, 12288, 16384)
+CONDSTORE_SIZES = (64, 256, 1024, 2048, 4096, 8192, 16384)
 
-VARIANT_RE = re.compile(r"(samples|branches|samplebranch)_([1-9][0-9]*)")
+VARIANT_RE = re.compile(r"(samples|branches|samplebranch|condstore|stores)_([1-9][0-9]*)")
+# LLVM's timer report prints User, System, User+System and Wall columns, but
+# omits the System column when every pass has zero system time (common for
+# small inputs). The last two columns are always User+System and Wall.
+FTIME_COLUMN = r"([\d.]+)\s+\(\s*[\d.]+%\)\s+"
 FTIME_RE = re.compile(
-    r"^\s*;\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+"
-    r"([\d.]+)\s+\(\s*[\d.]+%\)\s+([\d.]+)\s+\(\s*[\d.]+%\)\s+(.+?)\s*$")
+    r"^\s*;\s+" + FTIME_COLUMN + r"(?:" + FTIME_COLUMN + r")?" + FTIME_COLUMN + FTIME_COLUMN
+    + r"(.+?)\s*$")
 
 CSV_FIELDS = (
     "variant", "family", "size", "hlsl_bytes", "dxil_bytes", "reps",
@@ -166,6 +175,34 @@ def samplebranch_source(n):
     return _wrap(FIXTURE_HEADER, "".join(lines) + CONTROL_STORES)
 
 
+def _store_region(k, conditional):
+    """One raw UAV store clear of the control words, optionally behind a divergent branch.
+
+    The branch condition is the samplebranch_N condition. The stored value is
+    not sampled, so the family has no sample operation beyond the two control
+    stores.
+    """
+    store = f"_4.Store({65536 + 4 * k}u, gl_WorkGroupID.y);"
+    if not conditional:
+        return f"    {store}\n"
+    return (f"    if (((gl_WorkGroupID.x + {k}u) & 1u) != 0u)\n"
+            f"    {{\n"
+            f"        {store}\n"
+            f"    }}\n")
+
+
+def condstore_source(n):
+    """N conditional stores to the UAV, the minimal shape that keeps the GVN cost."""
+    return _wrap(FIXTURE_HEADER, "".join(_store_region(k, True) for k in range(n))
+                 + CONTROL_STORES)
+
+
+def stores_source(n):
+    """The condstore_N stores with their branches removed; nothing else changes."""
+    return _wrap(FIXTURE_HEADER, "".join(_store_region(k, False) for k in range(n))
+                 + CONTROL_STORES)
+
+
 def variant_info(name):
     """Return (family, size, source) for a generated variant name."""
     if name == "control":
@@ -173,12 +210,14 @@ def variant_info(name):
     match = VARIANT_RE.fullmatch(name)
     if not match:
         raise ValueError(
-            f"unknown variant {name!r}; use control, samples_N, branches_N or samplebranch_N")
+            f"unknown variant {name!r}; use control, samples_N, branches_N, "
+            "samplebranch_N, condstore_N or stores_N")
     family, size = match.group(1), int(match.group(2))
     if size > MAX_SIZE:
         raise ValueError(f"variant size {size} exceeds the {MAX_SIZE} guard")
     source = {"samples": samples_source, "branches": branches_source,
-              "samplebranch": samplebranch_source}[family](size)
+              "samplebranch": samplebranch_source, "condstore": condstore_source,
+              "stores": stores_source}[family](size)
     return family, size, source
 
 
@@ -187,7 +226,9 @@ def standard_variants():
     return (["control"]
             + [f"samples_{size}" for size in SAMPLE_SIZES]
             + [f"branches_{size}" for size in BRANCH_SIZES]
-            + [f"samplebranch_{size}" for size in SAMPLEBRANCH_SIZES])
+            + [f"samplebranch_{size}" for size in SAMPLEBRANCH_SIZES]
+            + [f"condstore_{size}" for size in CONDSTORE_SIZES]
+            + [f"stores_{size}" for size in CONDSTORE_SIZES])
 
 
 if os.name == "nt":
@@ -286,7 +327,10 @@ def run_once(dxc, hlsl, cso, flags, timeout_s, sample_interval=0.005):
     except subprocess.TimeoutExpired:
         timed_out = True
         proc.kill()
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = b"", b""
     elapsed = time.perf_counter() - start
     stop.set()
     if thread:
@@ -319,7 +363,7 @@ def parse_ftime(text):
         match = FTIME_RE.match(line)
         if not match:
             continue
-        _user, _system, combined, wall, name = match.groups()
+        _user, _system, combined, wall, name = match.groups()  # _system may be None
         row = {"name": name, "combined_s": float(combined), "wall_s": float(wall)}
         if name == "Total":
             total = row
@@ -453,19 +497,52 @@ def print_table(records):
             print(f"    passes: {top_passes_text(record['passes'])}")
 
 
-def write_report(path, payload, records):
+def _same_path(left, right):
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_paths(dxc, out_path, work_dir):
+    if out_path is not None:
+        if out_path.exists() and out_path.is_dir():
+            raise ValueError(f"--out path is an existing directory: {out_path}")
+        if _same_path(out_path, dxc):
+            raise ValueError(f"--out path collides with --dxc: {out_path}")
+        if work_dir is not None and _same_path(out_path, work_dir):
+            raise ValueError(f"--out path collides with --work-dir: {out_path}")
+    if work_dir is not None and work_dir.exists() and not work_dir.is_dir():
+        raise ValueError(f"--work-dir path is an existing regular file: {work_dir}")
+
+
+def _atomic_write_stage(path, write_fn):
     path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        write_fn(staged)
+        os.replace(staged, path)
+
+
+def write_report(path, payload, records):
+    path = Path(path)
+    if path.exists() and path.is_dir():
+        raise ValueError(f"--out path is an existing directory: {path}")
     if path.suffix.lower() == ".json":
-        path.write_text(json.dumps({**payload, "variants": records}, indent=1) + "\n",
-                        encoding="utf-8")
+        content = json.dumps({**payload, "variants": records}, indent=1) + "\n"
+        _atomic_write_stage(path, lambda staged: staged.write_text(content, encoding="utf-8"))
     else:
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(csv_row(record) for record in records)
+        rows = [csv_row(record) for record in records]
+
+        def write_csv(staged):
+            with staged.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+
+        _atomic_write_stage(path, write_csv)
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dxc", type=Path,
@@ -475,8 +552,9 @@ def main(argv=None):
     parser.add_argument("--entry", default=DEFAULT_ENTRY,
                         help=f"entry point passed to DXC (default: {DEFAULT_ENTRY})")
     parser.add_argument("--variants", default=DEFAULT_VARIANTS,
-                        help="comma-separated variant names; control, samples_N, branches_N "
-                             f"or samplebranch_N (default: {DEFAULT_VARIANTS})")
+                        help="comma-separated variant names; control, samples_N, branches_N, "
+                             "samplebranch_N, condstore_N or stores_N "
+                             f"(default: {DEFAULT_VARIANTS})")
     parser.add_argument("--repeat", type=int, default=1,
                         help="measured DXC runs per variant; the median is recorded "
                              "(default: 1)")
@@ -507,8 +585,8 @@ def main(argv=None):
         parser.error("--repeat must be at least 1")
     if args.timeout is None:
         parser.error("--timeout is required; pass the local policy value, for example 90")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a finite positive number")
     if args.dxc is None:
         parser.error("--dxc is required unless --list-variants is given")
     if not args.dxc.is_file():
@@ -526,46 +604,51 @@ def main(argv=None):
     except ValueError as exc:
         parser.error(str(exc))
 
-    flags = ["-T", args.target, "-E", args.entry, "-enable-16bit-types", *args.extra_arg]
-    if args.ftime_report:
-        flags.append("-ftime-report")
-    print(f"DXC: {args.dxc}")
-
-    temporary = None
-    if args.work_dir:
-        args.work_dir.mkdir(parents=True, exist_ok=True)
-        work = args.work_dir
-    else:
-        temporary = tempfile.TemporaryDirectory(prefix="dxc-compile-time-")
-        work = Path(temporary.name)
-
-    records = []
     try:
-        for name in names:
-            print(f"{name}:")
-            records.append(measure_variant(name, args.dxc, work, flags, args.repeat,
-                                           args.timeout, args.ftime_report))
-    finally:
-        if temporary:
-            temporary.cleanup()
+        _validate_paths(args.dxc, args.out, args.work_dir)
+        flags = ["-T", args.target, "-E", args.entry, "-enable-16bit-types", *args.extra_arg]
+        if args.ftime_report:
+            flags.append("-ftime-report")
+        print(f"DXC: {args.dxc}")
 
-    print_table(records)
-    payload = {
-        "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "dxc": str(args.dxc),
-        "dxc_version": dxc_version(args.dxc),
-        "target": args.target,
-        "entry": args.entry,
-        "flags": flags,
-        "repeat": args.repeat,
-        "timeout_s": args.timeout,
-        "ftime_report": args.ftime_report,
-    }
-    if args.out:
-        write_report(args.out, payload, records)
-        print(f"\nwrote {args.out}")
-    else:
-        print("\nNo --out given; nothing written. Use --out measurements.csv or .json.")
+        temporary = None
+        if args.work_dir is not None:
+            args.work_dir.mkdir(parents=True, exist_ok=True)
+            work = args.work_dir
+        else:
+            temporary = tempfile.TemporaryDirectory(prefix="dxc-compile-time-")
+            work = Path(temporary.name)
+
+        records = []
+        try:
+            for name in names:
+                print(f"{name}:")
+                records.append(measure_variant(name, args.dxc, work, flags, args.repeat,
+                                               args.timeout, args.ftime_report))
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+
+        print_table(records)
+        payload = {
+            "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "dxc": str(args.dxc),
+            "dxc_version": dxc_version(args.dxc),
+            "target": args.target,
+            "entry": args.entry,
+            "flags": flags,
+            "repeat": args.repeat,
+            "timeout_s": args.timeout,
+            "ftime_report": args.ftime_report,
+        }
+        if args.out is not None:
+            write_report(args.out, payload, records)
+            print(f"\nwrote {args.out}")
+        else:
+            print("\nNo --out given; nothing written. Use --out measurements.csv or .json.")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"dxc_compile_time: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

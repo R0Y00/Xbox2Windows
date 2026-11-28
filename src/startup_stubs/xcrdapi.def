@@ -1,0 +1,5 @@
+LIBRARY XCRDAPI
+EXPORTS
+    DStorageGetFactory
+    x2w_xcrdapi_live_objects
+    x2w_xcrdapi_live_workers

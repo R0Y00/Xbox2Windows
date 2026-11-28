@@ -1,6 +1,29 @@
 LIBRARY xmem
 EXPORTS
-    XMemAlloc
-    XMemFree
-    XMemVirtualQuery
-    XMemGetWorkingSetStatistics
+    XMemAlloc @1
+    XMemAllocDefault=XMemAlloc @5
+    XMemFree @2
+    XMemFreeDefault=XMemFree @6
+    XMemVirtualQuery @4
+    XMemGetWorkingSetStatistics @3
+    XMemAllocatePhysicalPages @7
+    XMemFreePhysicalPages @8
+    XMemIsToolsMemAvailable @9
+    XMemMapPhysicalPages @10
+    XMemMapPhysicalPagesScatter @11
+    XMemVirtualAlloc @12
+    XMemTransferMemory @13
+    x2w_xmem_write_physical @14
+    x2w_xmem_page_stats @15
+    x2w_xmem_slab_stats @16
+    x2w_xmem_commit_range @17
+    x2w_xmem_commit_block @18
+    x2w_xmem_lease_section @19
+    x2w_xmem_release_section @20
+    x2w_xmem_match_section @21
+    X2WMapPageBatch @22
+    x2w_xmem_copy_to_destination @23
+    x2w_xmem_copy_counts @24
+    x2w_xmem_map_counts @25
+    x2w_xmem_stable_call @26
+    x2w_xmem_alias_counts @27

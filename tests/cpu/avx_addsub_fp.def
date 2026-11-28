@@ -1,0 +1,15 @@
+EXPORTS
+    vaddsubps_xmm_reg_op
+    vaddsubpd_xmm_reg_op
+    vaddsubps_xmm_mem_op
+    vaddsubpd_xmm_mem_op
+    vaddsubps_ymm_reg_op
+    vaddsubpd_ymm_reg_op
+    vaddsubps_ymm_mem_op
+    vaddsubpd_ymm_mem_op
+    vaddsubps_ymm_alias_dst_src1_op
+    vaddsubpd_ymm_alias_dst_src2_op
+    vaddsubps_ymm_alias_src1_src2_op
+    vaddsubpd_ymm_alias_all_op
+    vaddsubps_xmm_alias_dst_src2_op
+    vaddsubpd_xmm_alias_dst_src1_op

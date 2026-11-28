@@ -1,4 +1,4 @@
-"""Recompile Windows x64 leaf functions that use VEX.128 16-bit packed-integer forms.
+"""Recompile Windows x64 leaf functions that use VEX.128 packed-integer word and byte forms.
 
 Profile: RCX and RDX hold the addresses of two 16-byte inputs and R8 the address of a 16-byte
 output; there is no return value. Memory operands are exactly [RCX], [RDX] or [R8] with a 16-byte
@@ -35,17 +35,27 @@ YMM = {getattr(R, f"YMM{i}") for i in range(16)}
 POINTERS = {R.RCX: "rcx", R.RDX: "rdx", R.R8: "r8"}
 
 # Three-operand forms: name of the C++ helper that combines two 16-byte values.
+UNARY = {
+    M.VPABSW: "pabsw",
+}
 BINARY = {
     M.VPADDW: "paddw", M.VPSUBW: "psubw", M.VPMAXSW: "pmaxsw", M.VPMINSW: "pminsw",
     M.VPMULHW: "pmulhw", M.VPAVGW: "pavgw", M.VPXOR: "pxor", M.VPAND: "pand", M.VPOR: "por",
     M.VPUNPCKLBW: "punpcklbw", M.VPUNPCKHBW: "punpckhbw", M.VPUNPCKLWD: "punpcklwd",
     M.VPUNPCKHWD: "punpckhwd", M.VPACKUSWB: "packuswb",
+    M.VPADDSW: "paddsw", M.VPADDUSW: "paddusw", M.VPSUBSW: "psubsw", M.VPSUBUSW: "psubusw",
+    M.VPMULLW: "pmullw", M.VPMULHUW: "pmulhuw", M.VPMAXUW: "pmaxuw", M.VPMINUW: "pminuw",
+    M.VPCMPEQW: "pcmpeqw", M.VPCMPGTW: "pcmpgtw",
+    M.VPSIGNW: "psignw", M.VPMULHRSW: "pmulhrsw", M.VPHADDW: "phaddw",
+    M.VPANDN: "pandn", M.VPAVGB: "pavgb", M.VPMADDUBSW: "pmaddubsw", M.VPSHUFB: "pshufb",
+    M.VPADDB: "paddb", M.VPSUBB: "psubb", M.VPCMPEQB: "pcmpeqb", M.VPCMPGTB: "pcmpgtb",
 }
 SHIFTS = {M.VPSRAW: "psraw", M.VPSLLW: "psllw", M.VPSRLW: "psrlw"}
 MOVES = {M.VMOVDQU, M.VMOVDQA}
 
 PRELUDE = r"""#include <cstdint>
 #include <cstring>
+#include <intrin.h>
 
 namespace {
 struct V { std::uint8_t b[16]; };
@@ -70,11 +80,81 @@ WORDWISE(pminsw, word(a, i) < word(b, i) ? word(a, i) : word(b, i))
 WORDWISE(pmulhw, (static_cast<std::int32_t>(word(a, i)) * word(b, i)) >> 16)
 // Unsigned average, rounded up: (a + b + 1) >> 1 without overflow.
 WORDWISE(pavgw, (static_cast<std::uint32_t>(uword(a, i)) + uword(b, i) + 1) >> 1)
+// Saturating add and subtract: clamp the exact result to the signed or unsigned word range.
+std::int32_t sat_s16(std::int32_t x) { return x < -32768 ? -32768 : x > 32767 ? 32767 : x; }
+std::int32_t sat_u16(std::int32_t x) { return x < 0 ? 0 : x > 65535 ? 65535 : x; }
+WORDWISE(paddsw, sat_s16(word(a, i) + word(b, i)))
+WORDWISE(psubsw, sat_s16(word(a, i) - word(b, i)))
+WORDWISE(paddusw, sat_u16(static_cast<std::int32_t>(uword(a, i)) + uword(b, i)))
+WORDWISE(psubusw, sat_u16(static_cast<std::int32_t>(uword(a, i)) - uword(b, i)))
+// The low 16 bits of the product are the same for signed and unsigned inputs; the high 16 bits
+// of the unsigned 32-bit product need an unsigned multiply.
+WORDWISE(pmullw, static_cast<std::int32_t>(word(a, i)) * word(b, i))
+WORDWISE(pmulhuw, (static_cast<std::uint32_t>(uword(a, i)) * uword(b, i)) >> 16)
+// Unary packed signed word abs: INT16_MIN (0x8000) wraps to 0x8000 without signed negation UB.
+V pabsw(const V& a) {
+    V r{};
+    for (int i = 0; i < 8; ++i) {
+        const std::int16_t w = word(a, i);
+        const std::uint16_t u = static_cast<std::uint16_t>(w);
+        set_word(r, i, w < 0 ? static_cast<std::int32_t>(static_cast<std::uint16_t>(0u - u)) : w);
+    }
+    return r;
+}
+// Sign mask, rounding multiply-high ((a*b + 0x4000) >> 15) and pairwise horizontal word add.
+WORDWISE(psignw, word(b, i) < 0 ? static_cast<std::int32_t>(static_cast<std::uint16_t>(0u - uword(a, i)))
+                                : word(b, i) == 0 ? 0 : word(a, i))
+WORDWISE(pmulhrsw, (static_cast<std::int32_t>(word(a, i)) * word(b, i) + 0x4000) >> 15)
+V phaddw(const V& a, const V& b) {
+    V r{};
+    for (int i = 0; i < 4; ++i) {
+        set_word(r, i, word(a, 2 * i) + word(a, 2 * i + 1));
+        set_word(r, 4 + i, word(b, 2 * i) + word(b, 2 * i + 1));
+    }
+    return r;
+}
+// Unsigned word maximum and minimum.
+WORDWISE(pmaxuw, uword(a, i) > uword(b, i) ? uword(a, i) : uword(b, i))
+WORDWISE(pminuw, uword(a, i) < uword(b, i) ? uword(a, i) : uword(b, i))
+// Compares set a lane to all ones or all zeros; pcmpgtw compares as signed words.
+WORDWISE(pcmpeqw, word(a, i) == word(b, i) ? -1 : 0)
+WORDWISE(pcmpgtw, word(a, i) > word(b, i) ? -1 : 0)
 #undef WORDWISE
 
 V pxor(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] ^ b.b[i]; return r; }
 V pand(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] & b.b[i]; return r; }
+V pandn(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>((~a.b[i]) & b.b[i]); return r; }
 V por(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = a.b[i] | b.b[i]; return r; }
+// Wraparound byte add/subtract and byte-lane equality / signed greater-than compares.
+#define BYTEWISE(name, expr) \
+    V name(const V& a, const V& b) { V r; for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>(expr); return r; }
+BYTEWISE(paddb, a.b[i] + b.b[i])
+BYTEWISE(psubb, a.b[i] - b.b[i])
+BYTEWISE(pcmpeqb, a.b[i] == b.b[i] ? 0xFFu : 0u)
+BYTEWISE(pcmpgtb, static_cast<std::int8_t>(a.b[i]) > static_cast<std::int8_t>(b.b[i]) ? 0xFFu : 0u)
+#undef BYTEWISE
+// Unsigned byte average rounded up: (a + b + 1) >> 1 without 8-bit overflow.
+V pavgb(const V& a, const V& b) {
+    V r;
+    for (int i = 0; i < 16; ++i) r.b[i] = static_cast<std::uint8_t>((static_cast<unsigned>(a.b[i]) + b.b[i] + 1u) >> 1);
+    return r;
+}
+// Unsigned byte * signed byte pairwise products added and saturated to signed 16-bit [-32768, 32767].
+V pmaddubsw(const V& a, const V& b) {
+    V r{};
+    for (int i = 0; i < 8; ++i) {
+        const std::int32_t lo = static_cast<std::int32_t>(a.b[2 * i]) * static_cast<std::int8_t>(b.b[2 * i]);
+        const std::int32_t hi = static_cast<std::int32_t>(a.b[2 * i + 1]) * static_cast<std::int8_t>(b.b[2 * i + 1]);
+        set_word(r, i, sat_s16(lo + hi));
+    }
+    return r;
+}
+// Byte shuffle: mask bit 7 zeroes the output byte, otherwise selects a[mask & 0x0f].
+V pshufb(const V& a, const V& b) {
+    V r;
+    for (int i = 0; i < 16; ++i) r.b[i] = (b.b[i] & 0x80u) ? 0u : a.b[b.b[i] & 0x0Fu];
+    return r;
+}
 
 // Interleave bytes or words from the low or high half of each source, first source first.
 V punpcklbw(const V& a, const V& b) { V r; for (int i = 0; i < 8; ++i) { r.b[2*i] = a.b[i]; r.b[2*i+1] = b.b[i]; } return r; }
@@ -86,11 +166,26 @@ V punpckhwd(const V& a, const V& b) { V r{}; for (int i = 0; i < 4; ++i) { set_w
 std::uint8_t sat_u8(std::int16_t w) { return w < 0 ? 0 : w > 255 ? 255 : static_cast<std::uint8_t>(w); }
 V packuswb(const V& a, const V& b) { V r; for (int i = 0; i < 8; ++i) { r.b[i] = sat_u8(word(a, i)); r.b[8+i] = sat_u8(word(b, i)); } return r; }
 
-// Immediate shifts: a count above 15 fills arithmetic shifts with the sign and clears logical ones.
+// Shifts: a count above 15 fills arithmetic shifts with the sign and clears logical ones.
 V psraw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, word(a, i) >> (n > 15 ? 15 : n)); return r; }
 V psllw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, n > 15 ? 0 : uword(a, i) << n); return r; }
 V psrlw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, n > 15 ? 0 : uword(a, i) >> n); return r; }
+// The count of the XMM or 16-byte memory form is the low 64 bits of the operand as one unsigned
+// integer; the upper quadword is ignored. Any count above 15, however large, saturates to 16, so
+// no bit of the quadword is lost to a narrower type.
+unsigned shift_count(const V& c) {
+    std::uint64_t q; std::memcpy(&q, c.b, 8);
+    return q > 15 ? 16u : static_cast<unsigned>(q);
+}
 }  // namespace
+
+extern "C" __declspec(dllexport) std::uint32_t host_has_avx() {
+    int info[4]{};
+    __cpuid(info, 1);
+    const int need = (1 << 27) | (1 << 28);
+    if ((info[2] & need) != need) return 0u;
+    return (_xgetbv(0) & 6u) == 6u ? 1u : 0u;
+}
 """
 
 
@@ -163,15 +258,21 @@ def lift(start, code):
                 lines.append(f"store(r8, {source});")
             else:
                 lines.append(f"{destination(instruction, rva)} = {operand(instruction, 1, rva)};")
+        elif op in UNARY and instruction.op_count == 2:
+            lines.append(f"{destination(instruction, rva)} = {UNARY[op]}({operand(instruction, 1, rva)});")
         elif op in BINARY and instruction.op_count == 3:
             lines.append(f"{destination(instruction, rva)} = {BINARY[op]}("
                          f"{operand(instruction, 1, rva)}, {operand(instruction, 2, rva)});")
         elif op in SHIFTS and instruction.op_count == 3 and instruction.op2_kind == K.IMMEDIATE8:
             lines.append(f"{destination(instruction, rva)} = {SHIFTS[op]}("
                          f"{operand(instruction, 1, rva)}, {instruction.immediate8}u);")
+        elif op in SHIFTS and instruction.op_count == 3 and instruction.op2_kind in (K.REGISTER, K.MEMORY):
+            # The count is an XMM register or a 16-byte memory operand, read as one 16-byte value.
+            lines.append(f"{destination(instruction, rva)} = {SHIFTS[op]}("
+                         f"{operand(instruction, 1, rva)}, shift_count({operand(instruction, 2, rva)}));")
         else:
             raise ValueError(f"unsupported instruction {instruction} at RVA {rva:#x}")
-        if op in MOVES or op in BINARY or op in SHIFTS:
+        if op in MOVES or op in UNARY or op in BINARY or op in SHIFTS:
             zeroing = (op == M.VPXOR and instruction.op1_kind == K.REGISTER
                        and instruction.op2_kind == K.REGISTER
                        and instruction.op1_register == instruction.op2_register)

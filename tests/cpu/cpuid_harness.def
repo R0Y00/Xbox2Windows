@@ -1,0 +1,4 @@
+EXPORTS
+    cpuid_raw
+    has_osxsave
+    xgetbv_raw

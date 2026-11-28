@@ -1,0 +1,5 @@
+LIBRARY xmem
+EXPORTS
+    XMemIsToolsMemAvailable
+    get_tools_mem_call_count
+    reset_tools_mem_call_count

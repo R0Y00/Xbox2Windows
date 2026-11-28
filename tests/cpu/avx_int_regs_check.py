@@ -62,6 +62,7 @@ EXPORTS = (
     "op_palignr_69", "op_mpsadbw_6", "op_pshuflw_1b", "op_psllq_imm_129",
     "op_pextrw_reg_2", "op_pextrd_reg_2", "op_pinsrb_reg_upper", "op_pinsrw_reg_3",
     "op_zeroupper_ymm1", "op_movdqu_load128",
+    "op_palignr_255", "op_pmovsxbq_wide_src", "op_zeroupper_ymm2",
 )
 
 ALL_EXPORTS = EXPORTS + ("op_zeroall",)
@@ -423,6 +424,10 @@ def reference(name, a, b, altered=False):
         return a[:16] + ZERO16
     if name == "op_movdqu_load128":
         return a[:16] + ZERO16
+    if name == "op_palignr_255": return ref_palignr(a, b, 255)
+    if name == "op_pmovsxbq_wide_src": return pack_s64(s8s(a)[:2])
+    if name == "op_zeroupper_ymm2":
+        return a[:16] + ZERO16
     raise ValueError(f"unknown export {name}")
 
 
@@ -581,6 +586,9 @@ def inputs_for(name):
         return extend_pairs() + general_pairs()
     if name == "op_pmulhrsw":
         return mulhrsw_pairs() + general_pairs()
+    if name == "op_pmaddwd":
+        min_pair = pad32(struct.pack("<2h12x", -32768, -32768))
+        return general_pairs() + [(min_pair, min_pair)]
     return general_pairs()
 
 
@@ -698,33 +706,29 @@ def check_rejections(original_path):
     ret_ins = Instruction.create(Code.RETNQ)
 
     # 1) VEX.L=1 (256-bit) packed-integer encodings of surviving forms must be rejected explicitly (AVX2, not AVX1).
+    # The 256-bit add, subtract, saturating add and subtract, compare, minimum, maximum, absolute value,
+    # sign, word shuffle, horizontal, pack, cross-lane extend, and dword/qword unpack forms are lowered and
+    # covered by avx_int_ymm_addsub_check.py, avx_int_ymm_sat_check.py, avx_int_ymm_minmax_check.py,
+    # avx_int_ymm_abs_sign_shuf_check.py, avx_int_ymm_horizontal_check.py, avx_int_ymm_pack_check.py,
+    # and avx_int_ymm_widen_unpack_check.py.
     vex256_int_cases = [
-        ("vpaddq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPADDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpaddsb_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPADDSB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpsubb_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSUBB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpabsd_ymm", Instruction.create_reg_reg(Code.VEX_VPABSD_YMM_YMMM256, R.YMM0, R.YMM1)),
-        ("vpackssdw_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPACKSSDW_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
+        ("vpmulhuw_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMULHUW_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
+        ("vpsrld_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSRLD_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpalignr_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPALIGNR_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 4)),
         ("vpblendvb_ymm", Instruction.create_reg_reg_reg_reg(Code.VEX_VPBLENDVB_YMM_YMM_YMMM256_YMM, R.YMM0, R.YMM1, R.YMM2, R.YMM3)),
         ("vpblendw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPBLENDW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0xAA)),
-        ("vpcmpeqd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPCMPEQD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpmaxsd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMAXSD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vphaddd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPHADDD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmaddwd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMADDWD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmulld_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMULLD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vmpsadbw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VMPSADBW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0)),
-        ("vpshufhw_ymm", Instruction.create_reg_reg_u32(Code.VEX_VPSHUFHW_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, 0x1B)),
-        ("vpshuflw_ymm", Instruction.create_reg_reg_u32(Code.VEX_VPSHUFLW_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, 0x4E)),
-        ("vpsignd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSIGND_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpmovsxbw_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVSXBW_YMM_XMMM128, R.YMM0, R.XMM1)),
-        ("vpmovzxdq_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVZXDQ_YMM_XMMM128, R.YMM0, R.XMM1)),
-        ("vpunpckldq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPUNPCKLDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
+        ("vpsrld_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSRLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
+        ("vpsllq_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSLLQ_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
+        ("vpsrlq_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSRLQ_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
         ("vpslld_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSLLD_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpslld_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSLLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
         ("vpsrlq_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSRLQ_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpmovmskb_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVMSKB_R32_YMM, R.EAX, R.YMM1)),
-        ("vpsubd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSUBD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
     ]
+    vex256_by_label = dict(vex256_int_cases)
 
     # Alternate valid encodings: r64/W1 GPR bridge forms MASM may not emit by default.
     alt_accept = [
@@ -878,6 +882,9 @@ def check_rejections(original_path):
         ("segment_prefix_pinsr", (ld_xmm1, seg_pinsr, ret_ins), "unsupported instruction prefix"),
         ("missing_ret", (ld_xmm0,), "missing terminal ret"),
         ("after_ret", (ret_ins, ld_xmm0), "unreachable instruction after ret"),
+        ("undef_blend_mask", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg_reg(
+            Code.VEX_VPBLENDVB_XMM_XMM_XMMM128_XMM, R.XMM0, R.XMM1, R.XMM2, R.XMM3), ret_ins),
+         "undefined vector register ymm3"),
     ]
 
     all_unit = [
@@ -918,9 +925,9 @@ def check_rejections(original_path):
         max_len = orig_end - entry
 
     pe_patches = [
-        ("pe_vpaddq_ymm", encode_seq(ld_ymm1, ld_ymm2, vex256_int_cases[0][1], ret_ins),
+        ("pe_vpmulhuw_ymm", encode_seq(ld_ymm1, ld_ymm2, vex256_by_label["vpmulhuw_ymm"], ret_ins),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
-        ("pe_vpslld_ymm_xmm", encode_seq(ld_ymm1, ld_xmm2, vex256_int_cases[21][1], ret_ins),
+        ("pe_vpslld_ymm_xmm", encode_seq(ld_ymm1, ld_xmm2, vex256_by_label["vpslld_ymm_xmm"], ret_ins),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
         ("pe_vpaddq_mem", encode_seq(ld_xmm1, reg_only_mem_cases[2][1], ret_ins),
          "unsupported memory operand for register-domain AVX integer instruction"),

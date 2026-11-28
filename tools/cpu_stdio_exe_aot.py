@@ -15,6 +15,8 @@ IMPORTS = {
     (STDIO, b"putchar"): HostImport("host_putchar", (4,), 4),
     (STDIO, b"fflush"): HostImport("host_fflush", (8,), 4),
 }
+# Called only by the shared native startup wrapper, which stays outside a lifted entry export.
+STARTUP_ONLY = ("cpu_exe_io.dll", b"finish_exe")
 HOST = """
 #include <cstdio>
 static word host_getchar() { return static_cast<unsigned>(std::getchar()); }
@@ -49,7 +51,7 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
                 binding = bindings.get(key)
                 # The native startup wrapper is outside the lifted body. A call
                 # from the body still fails when this slot has no binding.
-                if binding is None and entry_export is not None and key == ("cpu_exe_io.dll", b"finish_exe"):
+                if binding is None and entry_export is not None and key == STARTUP_ONLY:
                     continue
                 if binding is None:
                     symbol = imp.name.decode("ascii") if imp.name else f"#{imp.ordinal}"
@@ -72,13 +74,18 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
                           "int main() { return static_cast<int>(process_entry()); }", ""])
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--entry-export", help="Lift a returning entry exported separately from PE startup")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         args.output.write_text(translate(args.image, entry_export=args.entry_export), encoding="ascii")
     except (ValueError, OSError, pefile.PEFormatError) as exc:
         parser.exit(1, f"{exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

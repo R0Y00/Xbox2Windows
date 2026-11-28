@@ -111,9 +111,9 @@ def aligned_buffer(data_bytes):
 
 
 def check(native_path, lifted_path):
-    # Rejection controls: reject YMM 256-bit width, memory operands, untracked registers, and non-zero rounding mode immediates.
+    # Keep EVEX forms, legacy memory operands, untracked registers, and unsupported rounding immediates refused.
     unsupported_hex = (
-        "c5 fd 5b c1",     # vcvtps2dq ymm0, ymm1 (YMM 256-bit width)
+        "62 f1 7c 29 5b c1 c3",  # EVEX vcvtdq2ps ymm0{k1}, ymm1; ret
         "0f 5b 01",        # cvtdq2ps xmm0, [rcx] (memory operand)
         "0f 5b c3",        # cvtdq2ps xmm0, xmm3 (untracked XMM register operand 1)
         "0f 5b d8",        # cvtdq2ps xmm3, xmm0 (untracked XMM register destination)

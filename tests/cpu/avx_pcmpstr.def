@@ -1,0 +1,25 @@
+LIBRARY cpu_avx_pcmpstr
+EXPORTS
+    vpcmpestri_ub_eqany_pos_lsb
+    vpcmpestri_sw_ranges_neg_msb
+    vpcmpestri_sb_eqeach_mpos_msb
+    vpcmpestri_uw_eqord_mneg_lsb
+    vpcmpestri_mem_ub_eqany_pos_lsb
+    vpcmpestri_alias_xmm0
+    vpcmpestrm_ub_eqany_pos_bit
+    vpcmpestrm_sb_ranges_neg_exp
+    vpcmpestrm_uw_eqeach_mpos_exp
+    vpcmpestrm_sw_eqord_mneg_bit
+    vpcmpestrm_mem_ub_eqany_exp
+    vpcmpestrm_xmm0_self
+    vpcmpistri_ub_eqord_pos_lsb
+    vpcmpistri_sb_ranges_mneg_msb
+    vpcmpistri_uw_eqany_neg_msb
+    vpcmpistri_sw_eqeach_mpos_lsb
+    vpcmpistri_mem_ub_eqany_pos_lsb
+    vpcmpistrm_ub_eqeach_pos_exp
+    vpcmpistrm_sw_eqany_mneg_exp
+    vpcmpistrm_uw_ranges_mpos_bit
+    vpcmpistrm_sb_eqord_neg_bit
+    vpcmpistrm_mem_ub_eqord_exp
+    vpcmpistrm_discarded_read

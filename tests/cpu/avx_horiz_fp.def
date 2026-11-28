@@ -1,0 +1,23 @@
+EXPORTS
+    vhaddps_xmm_reg_op
+    vhaddpd_xmm_reg_op
+    vhsubps_xmm_reg_op
+    vhsubpd_xmm_reg_op
+    vhaddps_xmm_mem_op
+    vhaddpd_xmm_mem_op
+    vhsubps_xmm_mem_op
+    vhsubpd_xmm_mem_op
+    vhaddps_ymm_reg_op
+    vhaddpd_ymm_reg_op
+    vhsubps_ymm_reg_op
+    vhsubpd_ymm_reg_op
+    vhaddps_ymm_mem_op
+    vhaddpd_ymm_mem_op
+    vhsubps_ymm_mem_op
+    vhsubpd_ymm_mem_op
+    vhaddps_ymm_alias_dst_src1_op
+    vhaddpd_ymm_alias_dst_src2_op
+    vhsubps_ymm_alias_src1_src2_op
+    vhsubpd_ymm_alias_all_op
+    vhaddps_xmm_alias_dst_src2_op
+    vhsubps_xmm_alias_dst_src1_op

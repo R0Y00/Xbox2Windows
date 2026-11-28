@@ -1,0 +1,3 @@
+EXPORTS
+    xgetbv_op
+    xgetbv_unused

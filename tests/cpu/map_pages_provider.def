@@ -1,0 +1,16 @@
+LIBRARY xmem
+EXPORTS
+    XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
+    get_map_pages_call_count
+    get_map_pages_unmap_count
+    get_scatter_map_call_count
+    get_scatter_unmap_count
+    get_argument_mismatch_count
+    get_recorded_map_address
+    get_recorded_map_count
+    get_recorded_map_page
+    get_recorded_scatter_address
+    get_recorded_scatter_count
+    get_recorded_scatter_page
+    reset_map_pages_records

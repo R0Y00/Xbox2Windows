@@ -7,10 +7,12 @@
 #include <windows.h>
 
 #include <bcrypt.h>
+#include <intrin.h>
 #include <psapi.h>
 #include <sddl.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +122,51 @@ bool writable_section(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva, std::uint
             return true;
     }
     return false;
+}
+
+// Windows x64 seeds the default /GS cookie from a load-config directory whose
+// legacy prefix includes SEHandlerCount. A shorter prefix or an unused cookie
+// leaves initialization to the image. Call after relocation and before guest code.
+const char* seed_security_cookie(const Image& image, const IMAGE_NT_HEADERS64* nt, MapStatus& status) {
+    const auto& dir = directory(nt, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG);
+    constexpr auto minimum = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer);
+    constexpr auto guard_offset = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags);
+    constexpr std::uint64_t default_cookie = 0x2b992ddfa232ull;
+    constexpr std::uint64_t value_mask = (1ull << 48) - 1;
+    if (!dir.VirtualAddress || dir.Size < minimum) return nullptr;
+    const auto* config = image.at<std::uint8_t>(dir.VirtualAddress, dir.Size);
+    status = MAP_FORMAT;
+    if (!config) return "load config outside image";
+    DWORD declared_size;
+    std::memcpy(&declared_size, config, sizeof(declared_size));
+    if (declared_size < minimum) return nullptr;
+    if (guard_offset + sizeof(DWORD) <= dir.Size && guard_offset + sizeof(DWORD) <= declared_size) {
+        DWORD flags;
+        std::memcpy(&flags, config + guard_offset, sizeof(flags));
+        if (flags & IMAGE_GUARD_SECURITY_COOKIE_UNUSED) return nullptr;
+    }
+    std::uint64_t address;
+    std::memcpy(&address, config + offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(address));
+    if (!address) return nullptr;
+    const auto base = reinterpret_cast<std::uint64_t>(image.base);
+    if (address < base || address % alignof(std::uint64_t))
+        return "security cookie must be aligned and inside a writable image section";
+    const auto rva = address - base;
+    auto* target = image.at<std::uint64_t>(rva);
+    if (!target || !writable_section(nt, rva, sizeof(*target)))
+        return "security cookie must be aligned and inside a writable image section";
+    if (*target != default_cookie) return nullptr;
+    std::uint64_t random;
+    do {
+        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&random), sizeof(random),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            status = MAP_INIT_FAILED;
+            return "cannot initialize the security cookie";
+        }
+        random &= value_mask;
+    } while (!random || random == default_cookie);
+    *target = random;
+    return nullptr;
 }
 
 // True if every page of [address, address + size) is committed and currently allows reads.
@@ -242,7 +289,8 @@ BOOL notify(const Image& image, const IMAGE_NT_HEADERS64* nt, const std::vector<
 //
 // Differences from a Windows load of the guest: the template is copied once, when the image is
 // mapped, so a later write to the template in the image does not reach threads created afterwards;
-// and code that assumes index 0 without reading AddressOfIndex cannot be served.
+// and code that assumes index 0 without reading AddressOfIndex (/GA) is served only when the image is
+// started as the main image (pe_map_run_main), on the threads that participate in it.
 constexpr std::uint64_t MAX_TLS_TEMPLATE = 16ull << 20;
 
 // One map call's carrier and everything it owns. Nothing else is ever deleted: cleanup goes through
@@ -586,6 +634,7 @@ struct Mapped {
     volatile LONG references;
     volatile LONG released;  // set by pe_map_release; notifiers skip the image from then on
     TlsCarrier carrier;      // holds the image's implicit TLS blocks; empty without a template
+    volatile LONG started = 0;  // set by pe_map_run for an EXE; its TLS callbacks then see thread notifications
 };
 
 struct SharedLock {
@@ -607,9 +656,327 @@ std::vector<Mapped*>& mapped_images() {
     return images;
 }
 
+// Main-image TLS slot 0 (pe_map_run_main). Code compiled with /GA reads an EXE's thread-locals through
+// slot 0 of ThreadLocalStoragePointer without loading _tls_index, because Windows gives the process's EXE
+// index 0. An EXE started as the main image needs its block, which Windows keeps at the carrier's index,
+// in slot 0 of each thread that runs its code. Only participating threads get it, and every thread swaps
+// its own slot 0, never another thread's:
+// - the thread that calls pe_map_run_main, until pe_map_release on that thread;
+// - threads enrolled through pe_map_main_create_thread, from their DLL_THREAD_ATTACH, before any image
+//   is notified, to their DLL_THREAD_DETACH, after every image was notified;
+// - host threads between their own pe_map_main_thread_enter and pe_map_main_thread_leave.
+// A participant keeps its previous slot 0 in a pe_map TLS slot reserved at the start (TlsAlloc below
+// TLS_MINIMUM_AVAILABLE, so setting it never allocates) and gets it back on leave, detach or release.
+// The detach restore precedes ntdll's freeing of the thread's blocks, which would otherwise free the
+// image's block twice (as slot 0's and as the carrier's). Each participant's thread handle goes into a
+// fixed table. pe_map_release refuses the main image, returning 0 and changing nothing (the status
+// API reports the refusal), while any participant other than the calling thread may still run the
+// image's code: its handle is not signaled or cannot be waited on, or it has no handle (the table was
+// full or the handle could not be duplicated). The image, its unwind data, its carrier and every participant's slot
+// stay as they are, and the caller may retry once those participants have left or exited. A release that
+// is accepted gives the calling thread its saved slot 0 back, counts participants whose handle is
+// signaled as exited (they ended without a detach; their blocks went with them), ends the mode so that
+// no thread joins any more, and then unregisters and frees the image once, as for any image. Threads
+// that do not participate are never touched: neither their slot 0 nor their notifications, since the
+// main image's TLS callbacks receive DLL_THREAD_ATTACH and DLL_THREAD_DETACH only on participating
+// threads (a /GA callback on another thread would read the host's block). Other images, and EXEs
+// started with pe_map_run, are notified as before.
+// Guest threads are enrolled explicitly; no thread is classified by inspecting it. The host binds the main
+// image's CreateThread imports to pe_map_main_create_thread, which reserves an entry in a fixed enrollment
+// table, creates the thread suspended at a pe_map start routine and records its thread ID before the thread
+// can run. Only a thread found in that table installs the image's block at its DLL_THREAD_ATTACH; every
+// other thread, whatever its start address, is left alone and never ends the process. Enrollment fails
+// without guest code running: when no entry can be reserved or the thread cannot be watched,
+// pe_map_main_create_thread returns null with the last error set and no thread exists; when the block
+// cannot be installed on the new thread, the pe_map start routine returns ENROLL_FAILED_EXIT without
+// calling the guest's start routine, and the main image's callbacks were not notified because the thread
+// does not participate. Both are counted in pe_map_main_tls_stats. An enrolled thread that has not yet
+// passed its start routine counts as one that may run the image's code, so release refuses while it lives.
+// Not enrolled, and so running with the host's slot 0: threads the image creates by any other route (a
+// CreateThread address it looked up itself, CreateRemoteThread(Ex), NtCreateThreadEx, thread-pool work, a
+// CRT's _beginthreadex in another DLL), and host threads that call the image without entering.
+// On a participating thread the host's own index-0 code reads the image's block, so a host that owns
+// slot 0 must not touch its thread-locals there.
+// Rule and measurements: MoonYueya on #870.
+constexpr std::size_t TEB_TLS_POINTER = 0x58;  // TEB.ThreadLocalStoragePointer on x64
+constexpr int MAIN_TRACKED = 64;
+constexpr ULONG_PTR UNTRACKED = 0x10000;   // participation value of an installed thread without a handle
+constexpr int MAIN_ENROLLING = 64;
+constexpr DWORD ENROLL_FAILED_EXIT = 0xE0000201u;  // exit code of an enrolled thread whose block could not be installed
+
+// A thread enrolled by pe_map_main_create_thread, until its pe_map start routine has passed it on.
+struct Enrollment {
+    // CANCELLED: pe_map_main_create_thread refused the thread after creating it (ResumeThread failed) and is
+    // ending it; the entry stays until its handle is signaled.
+    enum State { FREE, RESERVED, READY, INSTALLED, FAILED, CANCELLED } state = FREE;
+    DWORD thread = 0;         // its thread ID, recorded before it can run
+    HANDLE handle = nullptr;  // SYNCHRONIZE, to tell an enrolled thread that ended before its start routine
+    LPTHREAD_START_ROUTINE start = nullptr;
+    void* parameter = nullptr;
+};
+
+struct MainImage {
+    std::uint8_t* base = nullptr;  // the image started as the main image, or null
+    std::size_t size = 0;
+    DWORD index = 0;  // the carrier's TLS index, kept after release for late restores
+    HANDLE tracked[MAIN_TRACKED] = {};
+    std::int64_t untracked = 0;  // installed participants without a handle
+    std::int64_t installed = 0, restored = 0, exited = 0, refusals = 0;
+    std::int64_t last_release = -1;  // -1 none yet, 1 accepted, 2 refused (participants may still run the image)
+    Enrollment enrolling[MAIN_ENROLLING];
+    std::int64_t enroll_refused = 0;  // pe_map_main_create_thread returned null: no thread was created
+    std::int64_t enroll_failed = 0;   // an enrolled thread ended without the guest's start routine
+    int inject = 0;                   // pe_map_main_tls_inject: the next enrollment (1) or installation (2) fails
+};
+
+// Guards main_image(). Taken without mapped_lock held, and mapped_lock is never taken under it.
+SRWLOCK slot_lock = SRWLOCK_INIT;
+
+struct SlotLock {
+    SlotLock() { AcquireSRWLockExclusive(&slot_lock); }
+    ~SlotLock() { ReleaseSRWLockExclusive(&slot_lock); }
+    SlotLock(const SlotLock&) = delete;
+    SlotLock& operator=(const SlotLock&) = delete;
+};
+
+MainImage& main_image() {
+    static MainImage image;
+    return image;
+}
+
+// The main image's base while it is started, read without slot_lock by the notification path.
+std::uint8_t* volatile g_main_base = nullptr;
+
+// Process image (pe_map_run_main). Under a Windows launch the EXE is the process image: the PEB's
+// ImageBaseAddress holds its base, and GetModuleHandle(NULL), and with it FindResource(NULL, ...), return
+// that base. pe_map_run_main makes the mapped EXE the process image in the same field until its accepted
+// pe_map_release, which restores the host's value. Guarded by slot_lock. Only one image at a time; the
+// PEB's loader list (GetModuleFileName(NULL), GetModuleHandleEx on an image address) is not changed.
+struct ProcessImage {
+    std::uint8_t* base = nullptr;  // the mapped EXE reported as the process image, or null
+    void* saved = nullptr;         // the host's ImageBaseAddress, written back on release
+};
+ProcessImage g_process_image;
+
+void* volatile* peb_image_base() {
+    // x64 PEB: ImageBaseAddress follows the four flag bytes and the Mutant handle.
+    return reinterpret_cast<void* volatile*>(__readgsqword(0x60) + 0x10);
+}
+
+// Call with slot_lock held.
+void report_process_image(std::uint8_t* base) {
+    g_process_image.saved = InterlockedExchangePointer(peb_image_base(), base);
+    g_process_image.base = base;
+}
+
+// Call with slot_lock held. Restores the host's value only if base is the reported process image.
+void restore_process_image(std::uint8_t* base) {
+    if (!base || g_process_image.base != base) return;
+    InterlockedExchangePointer(peb_image_base(), g_process_image.saved);
+    g_process_image = {};
+}
+
+// Entries in main_image().enrolling that are not FREE, read without slot_lock by DLL_THREAD_ATTACH. An entry
+// becomes READY before its thread is resumed, so the thread itself always sees a nonzero count.
+volatile LONG g_enrolling = 0;
+
+// pe_map's own TLS slots: the calling thread's participation (0 none, 1..MAIN_TRACKED its table entry,
+// UNTRACKED) and its saved slot 0. Allocated once under slot_lock and never freed.
+DWORD g_participation = TLS_OUT_OF_INDEXES, g_saved = TLS_OUT_OF_INDEXES;
+
+bool reserve_slots() {
+    if (g_participation != TLS_OUT_OF_INDEXES) return true;
+    const DWORD participation = TlsAlloc(), saved = TlsAlloc();
+    if (participation < TLS_MINIMUM_AVAILABLE && saved < TLS_MINIMUM_AVAILABLE) {
+        g_saved = saved;
+        g_participation = participation;
+        return true;
+    }
+    if (participation != TLS_OUT_OF_INDEXES) TlsFree(participation);
+    if (saved != TLS_OUT_OF_INDEXES) TlsFree(saved);
+    return false;
+}
+
+void** current_slots() {
+    return *reinterpret_cast<void***>(reinterpret_cast<std::uint8_t*>(NtCurrentTeb()) + TEB_TLS_POINTER);
+}
+
+std::int64_t pending(const MainImage& main) {
+    std::int64_t count = main.untracked;
+    for (HANDLE handle : main.tracked) count += handle != nullptr;
+    for (const auto& entry : main.enrolling) count += entry.state != Enrollment::FREE;
+    return count;
+}
+
+// Takes a one-shot injected fault (pe_map_main_tls_inject). Caller holds slot_lock.
+bool take_fault(MainImage& main, int fault) {
+    if (main.inject != fault) return false;
+    main.inject = 0;
+    return true;
+}
+
+// Caller holds slot_lock.
+void free_entry(Enrollment& entry) {
+    if (entry.handle) CloseHandle(entry.handle);
+    entry = {};
+    InterlockedDecrement(&g_enrolling);
+}
+
+// A suspended worker can be cancelled before the wrapper gets a chance to consume its entry.
+// Caller holds slot_lock. Keep live (including still-suspended) workers registered.
+void reap_ended_enrollments(MainImage& main) {
+    for (auto& entry : main.enrolling) {
+        if (!entry.handle || WaitForSingleObject(entry.handle, 0) != WAIT_OBJECT_0) continue;
+        // A cancelled thread was already counted as a refused enrollment when the guest got null.
+        if (entry.state != Enrollment::CANCELLED) ++main.enroll_failed;
+        free_entry(entry);
+    }
+}
+
+// Installs the image's block in the calling thread's slot 0. Caller holds slot_lock, main.base is set.
+// Nothing here allocates: the table is fixed and the TLS slots are below TLS_MINIMUM_AVAILABLE.
+bool install_current(MainImage& main) {
+    if (TlsGetValue(g_participation)) return true;
+    void** slots = current_slots();
+    if (!slots || !slots[main.index]) return false;
+    TlsSetValue(g_saved, slots[0]);
+    ULONG_PTR participation = UNTRACKED;
+    for (int i = 0; i < MAIN_TRACKED; ++i) {
+        if (main.tracked[i]) continue;
+        HANDLE handle = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle, SYNCHRONIZE, FALSE,
+                            0)) {
+            main.tracked[i] = handle;
+            participation = static_cast<ULONG_PTR>(i) + 1;
+        }
+        break;
+    }
+    if (participation == UNTRACKED) ++main.untracked;
+    TlsSetValue(g_participation, reinterpret_cast<void*>(participation));
+    slots[0] = slots[main.index];
+    ++main.installed;
+    return true;
+}
+
+// Gives the calling thread its saved slot 0 back if it participates. Caller holds slot_lock. A slot 0
+// that no longer holds the image's block is left as it is and the thread still stops participating.
+bool restore_current(MainImage& main) {
+    if (g_participation == TLS_OUT_OF_INDEXES) return false;
+    const auto participation = reinterpret_cast<ULONG_PTR>(TlsGetValue(g_participation));
+    if (!participation) return false;
+    void** slots = current_slots();
+    const bool holds = slots && slots[0] == slots[main.index];
+    if (holds) {
+        slots[0] = TlsGetValue(g_saved);
+        ++main.restored;
+    }
+    if (participation == UNTRACKED) {
+        --main.untracked;
+    } else if (HANDLE& handle = main.tracked[participation - 1]) {
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+    TlsSetValue(g_participation, nullptr);
+    return holds;
+}
+
+// Whether the calling thread participates in the main image.
+bool participates() {
+    return g_participation != TLS_OUT_OF_INDEXES && TlsGetValue(g_participation) != nullptr;
+}
+
+// DLL_THREAD_ATTACH: a thread enrolled by pe_map_main_create_thread participates. Any other thread returns
+// at once and is never touched. A failed installation only marks the entry; the thread's pe_map start
+// routine then ends it without running guest code.
+void install_enrolled_thread() {
+    if (!InterlockedCompareExchange(&g_enrolling, 0, 0)) return;
+    const SlotLock hold;
+    auto& main = main_image();
+    const DWORD self = GetCurrentThreadId();
+    for (auto& entry : main.enrolling) {
+        if (entry.state != Enrollment::READY || entry.thread != self ||
+            WaitForSingleObject(entry.handle, 0) != WAIT_TIMEOUT) continue;
+        const bool installed = main.base && !take_fault(main, 2) && install_current(main);
+        entry.state = installed ? Enrollment::INSTALLED : Enrollment::FAILED;
+        return;
+    }
+}
+
+// The start routine of every enrolled thread: runs the guest's start routine only on a thread whose slot 0
+// was installed at its attach.
+DWORD WINAPI enrolled_thread_start(void* parameter) {
+    LPTHREAD_START_ROUTINE start = nullptr;
+    void* guest_parameter = nullptr;
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        auto& entry = main.enrolling[reinterpret_cast<ULONG_PTR>(parameter)];
+        if (entry.state == Enrollment::INSTALLED) {
+            start = entry.start;
+            guest_parameter = entry.parameter;
+        } else {
+            ++main.enroll_failed;  // FAILED, or a thread whose attach pe_map never saw
+        }
+        free_entry(entry);
+    }
+    return start ? start(guest_parameter) : ENROLL_FAILED_EXIT;
+}
+
+// DLL_THREAD_DETACH, after every image was notified.
+void restore_current_thread() {
+    if (g_participation == TLS_OUT_OF_INDEXES || !TlsGetValue(g_participation)) return;
+    const SlotLock hold;
+    restore_current(main_image());
+}
+
+// Ends main-image mode for base before pe_map_release unregisters it, or refuses: returns false and
+// changes nothing while a participant other than the calling thread may still run the image's code (a
+// handle that is not signaled or cannot be waited on, or a participant without a handle). Checking and
+// ending under one slot_lock hold means no participant can join in between. Returns true for any other
+// pointer.
+bool end_main(std::uint8_t* base) {
+    const SlotLock hold;
+    auto& main = main_image();
+    if (main.base != base) return true;
+    const auto self = g_participation == TLS_OUT_OF_INDEXES
+                          ? ULONG_PTR{0}
+                          : reinterpret_cast<ULONG_PTR>(TlsGetValue(g_participation));
+    bool live = main.untracked > (self == UNTRACKED ? 1 : 0);
+    for (int i = 0; i < MAIN_TRACKED && !live; ++i) {
+        if (main.tracked[i] && static_cast<ULONG_PTR>(i) + 1 != self)
+            live = WaitForSingleObject(main.tracked[i], 0) != WAIT_OBJECT_0;
+    }
+    // An enrolled thread that has not passed its start routine may still call into the image.
+    for (int i = 0; i < MAIN_ENROLLING && !live; ++i) {
+        const auto& entry = main.enrolling[i];
+        if (entry.state != Enrollment::FREE)
+            live = !entry.handle || WaitForSingleObject(entry.handle, 0) != WAIT_OBJECT_0;
+    }
+    if (live) {
+        ++main.refusals;
+        main.last_release = 2;
+        return false;
+    }
+    restore_current(main);
+    for (HANDLE& handle : main.tracked) {
+        if (!handle) continue;
+        ++main.exited;  // ended without a detach; its blocks went with it
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+    reap_ended_enrollments(main);
+    main.base = nullptr;
+    g_main_base = nullptr;
+    main.last_release = 1;
+    return true;
+}
+
 // Notify a mapped image, re-reading its callback list as Windows does; if the list was
-// overwritten or made unreadable, the entry point is still notified.
-void notify_mapped(std::uint8_t* base, DWORD reason) {
+// overwritten or made unreadable, the entry point is still notified. An EXE is notified only after
+// pe_map_run started it (`started`), and only its TLS callbacks receive thread attach and detach, as
+// under a Windows launch where the EXE's entry point is the program and is never called again. An EXE
+// never receives process detach here, so its release (finalize) calls none of its code.
+void notify_mapped(std::uint8_t* base, DWORD reason, bool started = false) {
     const auto* nt = Image{base, 0}.headers();
     const Image image{base, nt->OptionalHeader.SizeOfImage};
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
@@ -619,6 +986,11 @@ void notify_mapped(std::uint8_t* base, DWORD reason) {
         // Never let an allocation failure escape DllMain or pe_map_release; the entry point is
         // still notified.
         callbacks.clear();
+    }
+    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+        if (started && (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH))
+            for (auto callback : callbacks) callback(image.base, reason, nullptr);
+        return;
     }
     notify(image, nt, callbacks, reason);
 }
@@ -643,15 +1015,16 @@ void drop_reference(Mapped* record) {
 
 }  // namespace
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
+namespace {
+void notify_thread(DWORD reason) {
+    {
         std::vector<Mapped*> snapshot;
         {
             const SharedLock hold;
             try {
                 snapshot.reserve(mapped_images().size());
             } catch (const std::bad_alloc&) {
-                return TRUE;  // no references were taken, so nothing is left pending
+                return;  // no references were taken, so nothing is left pending
             }
             for (auto* record : mapped_images()) {
                 InterlockedIncrement(&record->references);
@@ -661,7 +1034,10 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         // Guest callbacks run without mapped_lock. An image released meanwhile is still mapped
         // until its last reference is dropped here.
         auto notify_one = [reason](Mapped* record) {
-            if (!InterlockedCompareExchange(&record->released, 0, 0)) notify_mapped(record->base, reason);
+            // The main image is notified only on threads that participate in it.
+            const bool main_image_elsewhere = record->base == g_main_base && !participates();
+            if (!InterlockedCompareExchange(&record->released, 0, 0) && !main_image_elsewhere)
+                notify_mapped(record->base, reason, InterlockedCompareExchange(&record->started, 0, 0) != 0);
             drop_reference(record);
         };
         if (reason == DLL_THREAD_ATTACH) {
@@ -669,6 +1045,20 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         } else {
             for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) notify_one(*it);
         }
+    }
+}
+}  // namespace
+
+// A thread enrolled for the main image gets the image's block in slot 0 before any image is notified of
+// its attach, and every participant gets its saved slot 0 back after every image was notified of its
+// detach (see "Main-image TLS slot 0").
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason == DLL_THREAD_ATTACH) {
+        install_enrolled_thread();
+        notify_thread(reason);
+    } else if (reason == DLL_THREAD_DETACH) {
+        notify_thread(reason);
+        restore_current_thread();
     }
     return TRUE;
 }
@@ -766,7 +1156,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         std::uint64_t end = (raw_end + 0x1ff) & ~std::uint64_t{0x1ff};
         if (end > raw.size()) end = raw.size();
         if (first >= end) continue;
-        const std::uint64_t length = end - first < span ? end - first : span;
+        // Windows maps the section in whole pages: raw data past VirtualSize stays visible up to the
+        // end of the section's last page, and never reaches the next page. The section starts on a
+        // page and its span lies inside SizeOfImage, so the rounded window stays in the allocation.
+        const std::uint64_t page = system.dwPageSize;
+        const std::uint64_t window = (std::uint64_t{span} + page - 1) & ~(page - 1);
+        const std::uint64_t length = end - first < window ? end - first : window;
         std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
     }
 
@@ -945,8 +1340,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
                 if (!*word) break;
                 const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL64(*word);
                 const auto ordinal = by_ordinal ? static_cast<std::uint32_t>(IMAGE_ORDINAL64(*word)) : 0u;
-                const auto* hint = by_ordinal ? nullptr : image.at<WORD>(*word & 0x7fffffff);
-                const char* name = hint ? image.string((*word & 0x7fffffff) + sizeof(WORD)) : nullptr;
+                // Bits 31..62 of a named thunk must be zero: masking them could alias a valid low RVA.
+                const std::uint64_t name_rva = by_ordinal ? 0 : *word;
+                const auto* hint = by_ordinal || name_rva >> 31 ? nullptr : image.at<WORD>(name_rva);
+                const char* name = hint ? image.string(name_rva + sizeof(WORD)) : nullptr;
                 if (!by_ordinal && !name) return release(fail(MAP_FORMAT, "import name for %s outside image", dll));
                 void* bound = resolve(dll, name, ordinal);
                 if (!bound && name) return release(fail(MAP_UNRESOLVED_IMPORT, "unresolved import %s!%s", dll, name));
@@ -957,6 +1354,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             }
         }
     }
+
+    MapStatus cookie_status = MAP_OK;
+    if (const char* reason = seed_security_cookie(image, nt, cookie_status))
+        return release(fail(cookie_status, "%s", reason));
 
     // Record the actual base in the mapped headers, as the Windows loader does.
     reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew)->OptionalHeader.ImageBase =
@@ -1102,6 +1503,30 @@ bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* n
 
 }  // namespace
 
+// Return an address from the export address table by its public ordinal, including
+// NONAME entries. An ordinal is Base + address-table index, not a name index.
+// Like pe_map_export, this deliberately refuses forwarders and holes; the package
+// runner resolves forwarder chains before asking the mapper for their final target.
+// The caller keeps the mapping returned by pe_map_image live throughout lookup.
+extern "C" __declspec(dllexport) void* pe_map_export_ordinal(void* mapped, std::uint32_t ordinal) {
+    if (!mapped || !ordinal || ordinal > 65535) return nullptr;
+    const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
+    const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
+    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY)
+        || !inside(exports.VirtualAddress, exports.Size, image.size)) return nullptr;
+    const auto* dir = image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress);
+    if (!dir || !readable(dir, sizeof(*dir)) || ordinal < dir->Base) return nullptr;
+    const std::uint64_t index = std::uint64_t{ordinal} - dir->Base;
+    if (index >= dir->NumberOfFunctions || dir->NumberOfFunctions > image.size / sizeof(DWORD)) return nullptr;
+    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
+    if (!functions || !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return nullptr;
+    const DWORD rva = functions[index];
+    if (!rva || rva >= image.size ||
+        (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size)) return nullptr;
+    return accessible(image.base + rva) ? image.base + rva : nullptr;
+}
+
 // Only valid for a base returned by pe_map_image, whose headers were validated and are read-only.
 extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* name) {
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
@@ -1147,7 +1572,15 @@ extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, cons
 // Returns 1 after unregistering an image that pe_map_image returned, and 0 for null, for any
 // other pointer and for a second release. Process detach and unmapping follow the protocol above:
 // at once if no thread notification for the image is in flight, otherwise when the last one ends.
+// Returns 0 without changing anything for the image started with pe_map_run_main while another
+// participant may still run its code (see end_main); pe_map_main_tls_stats then reports the refusal
+// and the caller may retry later.
 extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
+    if (!end_main(static_cast<std::uint8_t*>(mapped))) return 0;
+    {
+        const SlotLock hold;
+        restore_process_image(static_cast<std::uint8_t*>(mapped));
+    }
     Mapped* record = nullptr;
     {
         const ExclusiveLock hold;
@@ -1185,16 +1618,231 @@ extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
 // an entry point, for a null exit_code and for an unreadable TLS callback list. The PEB argument that
 // Windows passes to the entry point is not forwarded, and no process-detach notification follows because
 // the process goes on.
-extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
-    auto* base = static_cast<std::uint8_t*>(mapped);
-    const auto* nt = Image{base, 0}.headers();
-    if (!exit_code || (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) || !nt->OptionalHeader.AddressOfEntryPoint)
-        return 0;
-    const Image image{base, nt->OptionalHeader.SizeOfImage};
-    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
-    if (tls_callbacks(image, nt, callbacks)) return 0;
+// Once the process-attach callbacks have returned, and until pe_map_release, threads that attach or detach
+// call the EXE's TLS callbacks with DLL_THREAD_ATTACH or DLL_THREAD_DETACH, never its entry point, as under
+// a Windows launch. That covers the threads the entry point starts. A thread that attaches during the
+// process-attach callbacks is not notified, whoever started it; Windows instead holds such a thread until
+// process initialization ends, which pe_map does not reproduce. Release sends the EXE no process detach.
+// Measured on Windows 10 build 19045 with tests/cpu/exe_tls.cpp.
+namespace {
+bool startable(const IMAGE_NT_HEADERS64* nt, const std::uint32_t* exit_code) {
+    return exit_code && !(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && nt->OptionalHeader.AddressOfEntryPoint;
+}
+
+int start_exe(std::uint8_t* base, const IMAGE_NT_HEADERS64* nt, std::vector<PIMAGE_TLS_CALLBACK>& callbacks,
+              std::uint32_t* exit_code) {
     for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
+    {
+        // Thread notifications become eligible only now: after every process-attach callback has
+        // returned and before the entry point runs (see notify_mapped). A thread that attaches while
+        // the process-attach callbacks run, whether a callback or the host started it, is not notified.
+        const SharedLock hold;
+        for (auto* record : mapped_images())
+            if (record->base == base) InterlockedExchange(&record->started, 1);
+    }
     using Entry = DWORD(WINAPI*)(void*);
     *exit_code = reinterpret_cast<Entry>(base + nt->OptionalHeader.AddressOfEntryPoint)(nullptr);
     return 1;
+}
+}  // namespace
+
+extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
+    auto* base = static_cast<std::uint8_t*>(mapped);
+    const auto* nt = Image{base, 0}.headers();
+    if (!startable(nt, exit_code)) return 0;
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    return start_exe(base, nt, callbacks, exit_code);
+}
+
+// pe_map_run for the image the host treats as its main executable (see "Main-image TLS slot 0"): the
+// image's TLS block goes into the calling thread's slot 0 before the process-attach callbacks, into the
+// slot 0 of each thread enrolled through pe_map_main_create_thread (the host binds the image's
+// CreateThread imports to it), and into that of host threads that call pe_map_main_thread_enter. Same preconditions and results as pe_map_run, and in addition returns 0
+// without running anything when another image is started as the main image, when a participant of an
+// earlier one is still pending, or when pe_map's own TLS slots cannot be reserved. An image without a TLS
+// template has no block to install and simply starts. Either way the image becomes the process image (see
+// "Process image") before its process-attach callbacks, until its accepted pe_map_release.
+extern "C" __declspec(dllexport) int pe_map_run_main(void* mapped, std::uint32_t* exit_code) {
+    auto* base = static_cast<std::uint8_t*>(mapped);
+    const auto* nt = Image{base, 0}.headers();
+    if (!startable(nt, exit_code)) return 0;
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    bool carrier = false;
+    {
+        const SharedLock hold;
+        for (auto* record : mapped_images())
+            if (record->base == base) carrier = record->carrier.module != nullptr;
+    }
+    {
+        const SlotLock hold;
+        if (g_process_image.base) return 0;  // another image is the process image
+        if (carrier) {
+            auto& main = main_image();
+            if (main.base || pending(main) || !reserve_slots()) return 0;
+            const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
+            const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
+            std::memcpy(&main.index, reinterpret_cast<const void*>(t->AddressOfIndex), sizeof(main.index));
+            main.base = base;
+            main.size = nt->OptionalHeader.SizeOfImage;
+            if (!install_current(main)) {
+                main.base = nullptr;
+                return 0;
+            }
+            g_main_base = base;
+        }
+        report_process_image(base);
+    }
+    return start_exe(base, nt, callbacks, exit_code);
+}
+
+// A host thread joins the main image: its slot 0 gets the image's block until it calls
+// pe_map_main_thread_leave. Returns 1 when installed, 0 when no image is started as the main image or the
+// thread has no TLS array.
+extern "C" __declspec(dllexport) int pe_map_main_thread_enter() {
+    const SlotLock hold;
+    auto& main = main_image();
+    return main.base && install_current(main) ? 1 : 0;
+}
+
+// The calling thread leaves the main image. Returns 1 when its saved slot 0 was put back, 0 when it did
+// not participate or slot 0 no longer held the image's block (slot left alone; the thread stops participating).
+extern "C" __declspec(dllexport) int pe_map_main_thread_leave() {
+    const SlotLock hold;
+    return restore_current(main_image()) ? 1 : 0;
+}
+
+// CreateThread for the main image: the host binds the image's CreateThread imports here. Same parameters,
+// results and last error as CreateThread. While an image is started as the main image the new thread is
+// enrolled: it is created suspended at a pe_map start routine, its thread ID is recorded before it can run,
+// it gets the image's block in slot 0 at its DLL_THREAD_ATTACH, and only then is the guest's start routine
+// called; it is resumed here unless flags has CREATE_SUSPENDED. Returns null with ERROR_NOT_ENOUGH_MEMORY and
+// creates no thread when the enrollment table is full or the thread cannot be watched. When ResumeThread
+// fails, it returns null with ResumeThread's last error, never a suspended handle: the thread is ended before
+// it ran anything, and its entry stays reserved until the thread has exited. When the block
+// cannot be installed, the thread ends with ENROLL_FAILED_EXIT (0xE0000201) without running the guest's start
+// routine. Both failures are counted in pe_map_main_tls_stats. With no main image it is CreateThread.
+extern "C" __declspec(dllexport) HANDLE WINAPI pe_map_main_create_thread(LPSECURITY_ATTRIBUTES attributes,
+                                                                          SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                                                                          LPVOID parameter, DWORD flags,
+                                                                          LPDWORD thread_id) {
+    int slot = -1;
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        if (main.base) {
+            reap_ended_enrollments(main);
+            if (!take_fault(main, 1)) {
+                for (int i = 0; i < MAIN_ENROLLING && slot < 0; ++i)
+                    if (main.enrolling[i].state == Enrollment::FREE) slot = i;
+            }
+            if (slot < 0) {
+                ++main.enroll_refused;
+                SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                return nullptr;
+            }
+            auto& entry = main.enrolling[slot];
+            entry.state = Enrollment::RESERVED;
+            entry.start = start;
+            entry.parameter = parameter;
+            InterlockedIncrement(&g_enrolling);
+        }
+    }
+    if (slot < 0) return CreateThread(attributes, stack, start, parameter, flags, thread_id);
+    DWORD id = 0;
+    HANDLE thread = CreateThread(attributes, stack, enrolled_thread_start,
+                                 reinterpret_cast<void*>(static_cast<ULONG_PTR>(slot)), flags | CREATE_SUSPENDED, &id);
+    DWORD error = thread ? ERROR_SUCCESS : GetLastError();
+    HANDLE watch = nullptr;
+    if (thread && !DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(), &watch, SYNCHRONIZE, FALSE, 0)) {
+        // Never resumed, so it has run nothing; without a handle release could not tell when it ends.
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        TerminateThread(thread, ENROLL_FAILED_EXIT);
+        CloseHandle(thread);
+        thread = nullptr;
+    }
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        auto& entry = main.enrolling[slot];
+        if (!thread) {
+            free_entry(entry);
+            ++main.enroll_refused;
+        } else {
+            entry.thread = id;
+            entry.handle = watch;
+            entry.state = Enrollment::READY;
+        }
+    }
+    if (!thread) {
+        SetLastError(error);
+        return nullptr;
+    }
+    if (thread_id) *thread_id = id;  // before the thread can run, as the entry's thread ID
+    if (flags & CREATE_SUSPENDED) return thread;
+    DWORD resumed = DWORD(-1);
+    {
+        const SlotLock hold;
+        if (take_fault(main_image(), 3))
+            SetLastError(ERROR_ACCESS_DENIED);  // as if ResumeThread had failed
+        else
+            resumed = 0;
+    }
+    if (resumed == 0) resumed = ResumeThread(thread);
+    if (resumed != DWORD(-1)) return thread;
+    // The thread is still suspended at the pe_map start routine and has run nothing, guest code included.
+    // Refuse the creation: end the thread and keep its entry and watch handle until the handle is signaled,
+    // so release keeps refusing and the slot is not reused while the thread could still exist.
+    error = GetLastError();
+    {
+        const SlotLock hold;
+        auto& main = main_image();
+        main.enrolling[slot].state = Enrollment::CANCELLED;
+        ++main.enroll_refused;
+    }
+    TerminateThread(thread, ENROLL_FAILED_EXIT);
+    // The enrollment reaper can close watch as soon as the worker is signaled.
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    {
+        const SlotLock hold;
+        reap_ended_enrollments(main_image());  // frees the entry now if the thread has ended
+    }
+    if (thread_id) *thread_id = 0;
+    SetLastError(error);
+    return nullptr;
+}
+
+// Test-only fault injection for the main-image enrollment: 1 makes the next pe_map_main_create_thread fail
+// to enroll, 2 makes the next installation on an enrolled thread fail, 3 makes the next ResumeThread in
+// pe_map_main_create_thread fail with ERROR_ACCESS_DENIED, 0 clears. One shot.
+extern "C" __declspec(dllexport) void pe_map_main_tls_inject(int fault) {
+    const SlotLock hold;
+    main_image().inject = fault;
+}
+
+// Main-image slot 0 counters since the process started, for tests: out[0] installs, out[1] restores,
+// out[2] participants confirmed exited at a release, out[3] refused releases, out[4] participants and
+// enrolled threads still pending, out[5] 1 while an image is started as the main image, out[6] the last
+// release (-1 none, 1 accepted, 2 refused), out[7] installed participants without a handle, out[8]
+// enrollments refused (null returned to the caller), out[9] enrolled threads ended without the guest's
+// start routine.
+// out must hold 10 entries.
+extern "C" __declspec(dllexport) void pe_map_main_tls_stats(std::int64_t* out) {
+    if (!out) return;
+    const SlotLock hold;
+    const auto& main = main_image();
+    out[0] = main.installed;
+    out[1] = main.restored;
+    out[2] = main.exited;
+    out[3] = main.refusals;
+    out[4] = pending(main);
+    out[5] = main.base != nullptr;
+    out[6] = main.last_release;
+    out[7] = main.untracked;
+    out[8] = main.enroll_refused;
+    out[9] = main.enroll_failed;
 }
