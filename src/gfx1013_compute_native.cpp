@@ -244,10 +244,25 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     } else if (direct && !graphics && encoded.form == gfx1013::Form::mtbuf) {
         i.b = take();
         i.op = encoded.opcode;
-        if (i.op > 3 || (a & 0xe000u) || (i.b & 0xe00000u))
-            refuse(pc, "MTBUF requires a non-D16 load without index, cache modifiers or TFE");
+        if (i.op >= 0x0c) {
+            constexpr unsigned half_formats[] = {13, 29, 0, 71};
+            const unsigned count = i.op & 3;
+            const unsigned format = (a >> 19) & 127;
+            if (!half_formats[count] || format != half_formats[count])
+                refuse(pc, "MTBUF D16 store requires an exact-width FLOAT format");
+            // Keep IDXEN (bit 13). Opcode bit 3 sits in the second word's bit 21.
+            if ((a & 0xdfffu) || (i.b & 0xc00000u) || (i.b >> 24) != 128)
+                refuse(pc, "MTBUF D16 store requires index or the first element and zero byte offsets");
+            // The chosen typed UAV implements the explicit FLOAT conversion.
+            // Use the same packed data and element addressing as the MUBUF store.
+            i.op = 0x84 + count;
+            i.name = "buffer_store_format";
+        } else {
+            if (i.op > 3 || (a & 0xe000u) || (i.b & 0xe00000u))
+                refuse(pc, "MTBUF requires a non-D16 load without index, cache modifiers or TFE");
+            i.name = encoded.name;
+        }
         i.enc = Encoding::Mubuf;
-        i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
     } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
         // FLAT encoding, segment 2 (GLOBAL), with an SGPR-pair base:

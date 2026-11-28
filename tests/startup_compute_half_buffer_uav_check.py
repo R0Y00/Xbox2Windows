@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from native_dpp_mirror_check import vop2
 from native_gather_lod_check import render
-from native_scalar_lds_check import scalar, sop1
+from native_scalar_lds_check import scalar, sop1, vmove
 from startup_compute_dispatch_check import dispatch, lines, prepare_case
 from startup_compute_translate_check import state_a, write_request
 from startup_gfx2hlsl_compute_check import SENTINEL, TGID_X, TGID_Y, TGID_Z, USER7, WORDS, root_blob
@@ -19,10 +19,16 @@ OFFSET = 8
 RECORDS = 13
 MODE = 'dispatch-records32-output-offset'
 STATE = state_a((32, 1, 1), USER7 | TGID_X | TGID_Y | TGID_Z)
+D16_FORMAT = dict(FORMAT_WIDTHS)
 
 
-def program(channels):
-    opcode = 0x84 + channels - 1
+def mtbuf_store(channels, *, indexed=True):
+    opcode = 0x0c + channels - 1
+    return (0xe8000000 | D16_FORMAT[channels] << 19 | (opcode & 7) << 16 | (0x2000 if indexed else 0),
+            0x80280100 | (8 if indexed else 0))  # opcode high bit, s[32:35], v1 data, inline zero soffset
+
+
+def program(channels, *, mtbuf=False, indexed=True, store=None):
     words = [
         sop1(3, 20, 6), sop1(3, 21, 128),
         0xf408080a, 0xfa000020,                  # output descriptor s[32:35], table byte 32
@@ -34,15 +40,23 @@ def program(channels):
         vop2(0x25, 8, 11, 0),                  # v8 = element index within the view
         vop2(0x1d, 1, 255, 0), 0xc0003c00,     # v1 = packed [-2, 1 + lane/1024]
         0x7e0402ff, 0xbc003800,                 # v2 = packed [-1, 0.5]
-        0xe0002000 | (opcode << 18), 0x80080108,
-        0xbf810000,
     ]
+    if not indexed:
+        words += [vmove(0, 131),                # a mistaken vaddr read indexes element 3 instead of 0
+                  0xbf06800b, 0xbf840003,        # s_cmp_eq_u32 s11, 0; s_cbranch_scc0 to s_endpgm
+                  sop1(3, 126, 129)]           # one writer in group zero
+    if store is None:
+        if mtbuf:
+            store = mtbuf_store(channels, indexed=indexed)
+        else:
+            store = (0xe2102000 | ((channels - 1) << 18), 0x80080108)
+    words += [*store, 0xbf810000]
     return struct.pack('<%dI' % len(words), *words)
 
 
-def expected(channels):
+def expected(channels, *, indexed=True):
     data = bytearray(struct.pack('<%dI' % WORDS, *([SENTINEL] * WORDS)))
-    for lane in range(RECORDS):
+    for lane in range(RECORDS if indexed else 1):
         halves = (0x3c00 + lane, 0xc000, 0x3800, 0xbc00)
         struct.pack_into('<%dH' % channels, data, OFFSET + lane * channels * 2, *halves[:channels])
     return list(struct.unpack('<%dI' % WORDS, data))
@@ -67,18 +81,37 @@ def publish(compile_dxil, sdk, cache, key, stride):
 
 def check_compiler(compile_dxil, sdk):
     with TemporaryDirectory() as directory:
+        work = Path(directory)
         for channels, _ in FORMAT_WIDTHS:
-            cache = Path(directory) / str(channels)
+            for mtbuf, indexed in ((False, True), (True, True), (True, False)):
+                cache = work / f'{channels}-{mtbuf}-{indexed}'
+                cache.mkdir()
+                key = write_request(cache, program(channels, mtbuf=mtbuf, indexed=indexed), STATE,
+                                    root=root_blob(table_range=True))
+                publish(compile_dxil, sdk, cache, f'{key:016x}', channels * 2)
+        a, b = mtbuf_store(2)
+        for index, (store, reason) in enumerate((
+            ((a | 2, b), 'MTBUF D16 store requires index or the first element and zero byte offsets'),
+            ((a | 0x1000, b), 'MTBUF D16 store requires index or the first element and zero byte offsets'),
+            ((a, b | 0x400000), 'MTBUF D16 store requires index or the first element and zero byte offsets'),
+            ((a, b | 0x01000000), 'MTBUF D16 store requires index or the first element and zero byte offsets'),
+            (((a & ~(127 << 19)) | 23 << 19, b), 'MTBUF D16 store requires an exact-width FLOAT format'),
+            (((a & ~(7 << 16)) | 6 << 16, b), 'MTBUF D16 store requires an exact-width FLOAT format'),
+        )):
+            cache = work / f'bad-{index}'
             cache.mkdir()
-            key = write_request(cache, program(channels), STATE, root=root_blob(table_range=True))
-            publish(compile_dxil, sdk, cache, f'{key:016x}', channels * 2)
+            write_request(cache, program(2, store=store), STATE, root=root_blob(table_range=True))
+            result = subprocess.run([compile_dxil, sdk, work / 'native', 'gfx1013-direct-cs@0',
+                                     '--requests', cache, cache], capture_output=True, text=True, timeout=30)
+            assert result.returncode and reason in result.stdout + result.stderr, (store, result.stdout, result.stderr)
+            assert not list(cache.glob('*.cs.cso')) and not list(cache.glob('*.txt')), list(cache.iterdir())
 
 
-def check(compile_dxil, consumer, sdk, work, adapter, channels, format_code):
+def check(compile_dxil, consumer, sdk, work, adapter, channels, format_code, *, mtbuf=False, indexed=True):
     cache, env = prepare_case(work, adapter)
     env.pop('X2W_NATIVE_SHADERS', None)
     env.pop('X2W_NATIVE_SHADERS_ONLY', None)
-    (work / 'program').write_bytes(program(channels))
+    (work / 'program').write_bytes(program(channels, mtbuf=mtbuf, indexed=indexed))
     (work / 'state').write_bytes(STATE)
     fields = work / 'fields.bin'
     env['X2W_TEST_DISPATCH_FIELDS'] = str(fields)
@@ -97,12 +130,14 @@ def check(compile_dxil, consumer, sdk, work, adapter, channels, format_code):
     key = request.stem.removeprefix('req_')
     publish(compile_dxil, sdk, cache, key, stride)
     got, result = run()
-    check_words(got, expected(channels), f'{channels} channels')
+    check_words(got, expected(channels, indexed=indexed), f'{channels} channels')
     assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused:'), result.stderr[-3000:]
     assert not [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
     layers = lines(result, 'x2w-d3d12 debug layer: ')
     layer = 'enabled' if layers and '0x00000000' in layers[0] else 'unavailable'
-    print(f'{channels} channels: {RECORDS} typed records at byte {OFFSET} and all guards match on {adapter} '
+    profile = 'MUBUF' if not mtbuf else 'MTBUF indexed' if indexed else 'MTBUF first element'
+    print(f'{profile}, {channels} channels: {RECORDS if indexed else 1} typed records at byte {OFFSET} '
+          f'and all guards match on {adapter} '
           f'(debug layer {layer})')
 
     wrong_shape = 'a half buffer store requires matching format, stride and structured bounds'
@@ -125,7 +160,9 @@ def main(compile_dxil, consumer, renderer, sdk, adapter):
     assert wave.returncode == 0, wave.stdout + wave.stderr
     with TemporaryDirectory() as directory:
         for channels, format_code in FORMAT_WIDTHS:
-            check(compile_dxil, consumer, sdk, Path(directory) / str(channels), adapter, channels, format_code)
+            for mtbuf, indexed in ((False, True), (True, True), (True, False)):
+                work = Path(directory) / f'{channels}-{mtbuf}-{indexed}'
+                check(compile_dxil, consumer, sdk, work, adapter, channels, format_code, mtbuf=mtbuf, indexed=indexed)
 
 
 if __name__ == '__main__':
