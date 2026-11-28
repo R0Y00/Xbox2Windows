@@ -1126,8 +1126,12 @@ inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
     return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool rect, bool indexed_rect)
 {
+    // A direct rectangle needs the geometry stage only while the translation keeps a
+    // fixed vertex stream. A disk fallback may drop that stream, so derive the flag
+    // from the translation the caller now holds rather than the pre-fallback one.
+    const bool geometry_rect = indexed_rect || (rect && !tr.fixed_stream.empty());
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
@@ -1136,7 +1140,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
     if (use_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     if (bound.has_rasterizer) key = fnv_bytes(&bound.rasterizer, sizeof(bound.rasterizer), key);
-    key = fnv_bytes(&indexed_rect, sizeof(indexed_rect), key);
+    key = fnv_bytes(&geometry_rect, sizeof(geometry_rect), key);
     if (tr.revision) key = fnv_bytes(&tr.revision, sizeof(tr.revision), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
@@ -1145,7 +1149,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.InputLayout = {tr.fixed_stream.data(), static_cast<UINT>(tr.fixed_stream.size())};
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
-    if (indexed_rect) {
+    if (geometry_rect) {
         if (!tr.indexed_rect_geometry_attempted) {
             tr.indexed_rect_geometry_attempted = true;
             x2w_startup::ComPtr<ID3DBlob> errors;
@@ -1235,9 +1239,11 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
             load_translation(fallback, tr.rtv_request, {}, false);
             if (fallback.state == 1) {
                 fallback.revision = tr.revision + 1;
+                if (tr.vs) tr.vs->Release();
+                if (tr.ps) tr.ps->Release();
                 tr = std::move(fallback);
                 log("x2w-draw native graphics %016llx published disk pair recovered", tr.key);
-                ID3D12PipelineState* recovered = pipeline_for(bound, tr, pass, indexed_rect);
+                ID3D12PipelineState* recovered = pipeline_for(bound, tr, pass, rect, indexed_rect);
                 if (!recovered)
                     log("x2w-draw native graphics %016llx published disk pair pipeline failed", tr.key);
                 return recovered;
@@ -2567,18 +2573,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     // pipeline_for may replace the native candidate with the published disk translation.
     // Create the PSO first, then derive every binding from the translation it leaves in tr.
-    bool fixed_stream = !tr->fixed_stream.empty();
-    bool geometry_rect = indexed_rect || (rect && fixed_stream);
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, geometry_rect) : nullptr;
-    if (pipeline) {
-        const bool recovered_fixed_stream = !tr->fixed_stream.empty();
-        const bool recovered_geometry_rect = indexed_rect || (rect && recovered_fixed_stream);
-        if (recovered_geometry_rect != geometry_rect) {
-            pipeline = pipeline_for(*bound, *tr, pass, recovered_geometry_rect);
-            geometry_rect = recovered_geometry_rect;
-        }
-        fixed_stream = recovered_fixed_stream;
-    }
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, rect, indexed_rect) : nullptr;
+    const bool fixed_stream = !tr->fixed_stream.empty();
+    const bool geometry_rect = indexed_rect || (rect && fixed_stream);
     if (indirect && indexed_rect && !pipeline) {
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
