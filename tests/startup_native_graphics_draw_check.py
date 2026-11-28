@@ -226,6 +226,31 @@ def check(folder, consumer, sdk, adapter, compiler):
     finally:
         ps_cso.unlink()
         held_ps.rename(ps_cso)
+    # Native candidate fails, then a valid manifest with an uncreatable PS is made ready:
+    # the fallback must run and name the failed disk PSO.
+    held_manifest = Path(str(manifest) + ".pso-hold")
+    held_ps = Path(str(ps_cso) + ".pso-hold")
+    manifest.rename(held_manifest)
+    ps_cso.rename(held_ps)
+    Path(str(manifest) + ".pending").write_bytes(held_manifest.read_bytes())
+    ps_cso.write_bytes(b"not a DXIL container")
+    try:
+        pixels.unlink(missing_ok=True)
+        fallback_env = dict(pso_env, X2W_TEST_MANIFEST_BEFORE_FALLBACK=str(manifest))
+        run = subprocess.run(args, env=fallback_env, capture_output=True, text=True, timeout=45)
+        assert run.returncode == 0, run.stderr
+        assert "candidate pipeline failed 0x80004005 (injected)" in run.stderr, run.stderr[-8000:]
+        assert "published disk pair pipeline failed" in run.stderr, run.stderr[-8000:]
+        assert "-> drawn;" not in run.stderr, run.stderr[-8000:]
+        assert pixels.read_bytes() == clear * 32, pixels.read_bytes().hex()
+        print(f"{adapter} PSO: fallback loaded the pair, then named its failed PSO")
+    finally:
+        for path in (manifest, Path(str(manifest) + ".pending")):
+            if path.exists():
+                path.unlink()
+        ps_cso.unlink(missing_ok=True)
+        held_manifest.rename(manifest)
+        held_ps.rename(ps_cso)
     ps.write_bytes(patched_pixel(1, [0xffffffff], export=(0xf800180f, 0x01000001)))
     run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
     assert run.returncode == 0 and "refused:" in run.stderr and "-> drawn;" not in run.stderr, run.stderr

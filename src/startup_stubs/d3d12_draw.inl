@@ -1265,19 +1265,16 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         entry->key = key;
         entry->rtv_request = request;
         load_translation(*entry, request);
-    }
-    if (entry->manifest_retry.due(GetTickCount64()))
-        load_translation(*entry, request);
-    if (entry->state != 1) {
-        const bool published = publish_shader_request(key, L".rtv", request.data(), request.size());
+        if (entry->state != 1) {
+            const bool published = publish_shader_request(key, L".rtv", request.data(), request.size());
 #ifdef X2W_NATIVE_SHADERS
-        if (published && (entry->manifest_retry.pending() || native_shaders_only()) &&
-            !entry->native_graphics_attempted) {
-            entry->native_graphics_attempted = true;
-            if (try_native_graphics(*entry, true)) return entry;
-        }
+            if (published && (entry->manifest_retry.pending() || native_shaders_only()) &&
+                try_native_graphics(*entry, true)) return entry;
 #endif
-        log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
+            log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
+        }
+    } else if (entry->manifest_retry.due(GetTickCount64())) {
+        load_translation(*entry, request);
     }
     return entry;
 }
