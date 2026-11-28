@@ -102,11 +102,13 @@ if ($watchShaders) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$windowArgs = @()
+if ($Render) { $windowArgs = @("--managed-window", "1") }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 try {
     & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs *> "$LogDir.out"
+        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs @windowArgs *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.

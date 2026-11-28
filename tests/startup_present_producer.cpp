@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "startup_stubs/overlay_window.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
@@ -30,6 +31,7 @@ int main(int argc, char** argv)
     const bool use_magenta = argc >= 2 && std::strcmp(argv[1], "auto-magenta") == 0;
     const bool automatic = use_magenta || (argc >= 2 && std::strcmp(argv[1], "auto") == 0);
     const bool barriers = argc >= 2 && std::strcmp(argv[1], "barriers") == 0;
+    const bool close_test = GetEnvironmentVariableW(L"X2W_TEST_WINDOW_CLOSE", nullptr, 0) != 0;
     const bool hardware = argc == 3 && std::strcmp(argv[2], "hardware") == 0;
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
@@ -109,6 +111,31 @@ int main(int argc, char** argv)
         call(queue, 10, 1, arg(lists));
         return finish();
     };
+    if (close_test) {
+        if (!emit(blue) || !present()) return 18;
+        HWND window = nullptr;
+        EnumWindows([](HWND candidate, LPARAM found) -> BOOL {
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            wchar_t name[64]{};
+            if (owner != GetCurrentProcessId() || !GetClassNameW(candidate, name, ARRAYSIZE(name)) ||
+                lstrcmpW(name, x2w_startup::presenter_class) != 0) return TRUE;
+            *reinterpret_cast<HWND*>(found) = candidate;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&window));
+        if (!window) return 19;
+        DWORD_PTR result;
+        if (!SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_MINIMIZE, 0, SMTO_ABORTIFHUNG, 5000, &result) ||
+            !IsIconic(window) ||
+            !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_ABORTIFHUNG, 5000, &result) ||
+            IsIconic(window) ||
+            !SendMessageTimeoutW(window, WM_SYSCOMMAND, SC_CLOSE, 0, SMTO_ABORTIFHUNG, 5000, &result)) return 20;
+        if (GetEnvironmentVariableW(L"X2W_SESSION_CLOSE_EVENT", nullptr, 0)) {
+            Sleep(10000);
+            return 21;  // The job owner must end the process before it reaches here.
+        }
+        return !IsWindowVisible(window) && !IsIconic(window) && present() ? 0 : 22;
+    }
     if (barriers) {
         D3D12_RESOURCE_DESC uav_desc = desc;
         uav_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
