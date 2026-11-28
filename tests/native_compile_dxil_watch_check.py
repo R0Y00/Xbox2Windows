@@ -136,6 +136,20 @@ def main(argv: list[str]) -> int:
         assert not (d_lost / f"{lost_key:016x}.txt").exists()
         assert (d_lost / f"{lost_key:016x}.fail").is_file()
 
+        # A copied slot-57 sidecar can be older than the published stream manifest.
+        conflict_dir = work / "copied_pixel_sidecar"
+        conflict_dir.mkdir()
+        conflict_key = put_graphics_request(conflict_dir, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        assert run_once(cli, sdk, frontend, conflict_dir, jobs=1).returncode == 0
+        conflict_manifest = conflict_dir / f"{conflict_key:016x}.txt"
+        assert conflict_manifest.is_file()
+        packed = conflict_dir / f"req_{conflict_key:016x}.ps57in"
+        packed.write_bytes(b"PSI1" + bytes(8))
+        touch(packed, mtime=conflict_manifest.stat().st_mtime - 10)
+        conflict = run_once(cli, sdk, frontend, conflict_dir, jobs=1)
+        assert "conflicting stream and slot-57 pixel entry records" in conflict.stdout, conflict.stdout
+        assert not conflict_manifest.exists()
+
         # Parallel --once --jobs 2 matches serial --once --jobs 1.
         d_serial = work / "cmp_serial"
         d_parallel = work / "cmp_parallel"

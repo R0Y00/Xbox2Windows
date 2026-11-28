@@ -50,6 +50,9 @@ struct PipelineInfo {
     mutable std::vector<x2w_startup::Mesh57BufferRead> mesh57_reads; // Host SRV register order.
 };
 struct ViewRecord {
+    // Capture the guest descriptor layout, independent of the desktop SDK.
+    static constexpr std::size_t srv_desc_bytes = 40;
+    static constexpr std::size_t uav_desc_bytes = 40;
     std::uint32_t id, slot;          // slot: 17 CBV, 18 SRV, 19 UAV, 20 RTV, 21 DSV, 22 sampler
     u64 resource, counter;           // title-side wrapper pointers (or 0)
     u64 dest_title, dest_desktop;

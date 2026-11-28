@@ -218,8 +218,9 @@ def main():
             marker = folder / "sample.cdx"
             marker.write_bytes(compute(words(*code, 0xbf810000), table=True))
             raise SystemExit(subprocess.run([probe, "--sampler", sdk, marker, folder/"cache"]).returncode)
-    if len(sys.argv)==5 and sys.argv[1]=="--rect-pso":
-        exe,sdk,probe=sys.argv[2:]
+    if len(sys.argv) in (5, 6) and sys.argv[1]=="--rect-pso":
+        exe,sdk,probe=sys.argv[2:5]
+        rect_geometry=sys.argv[5] if len(sys.argv)==6 else None
         with tempfile.TemporaryDirectory() as tmp:
             folder=pathlib.Path(tmp)
             source=folder/"inputs"
@@ -230,7 +231,21 @@ def main():
             root=b"DXBC"+bytes(16)+words(1,68,1,36)+b"RTS0"+words(24,2,0,24,0,24,0)
             stem=publish(source,vs,interpolated_pixel(),root)
             subprocess.run([exe,sdk,folder/"cache","gfx1013-container-rect","--requests",source,out],check=True)
-            raise SystemExit(subprocess.run([probe,*(out/f"{stem}.{stage}.cso" for stage in ("vs","gs","ps"))]).returncode)
+            result=subprocess.run([probe,*(out/f"{stem}.{stage}.cso" for stage in ("vs","gs","ps"))])
+            if result.returncode or not rect_geometry:
+                raise SystemExit(result.returncode)
+            # A second pair exports only SV_Position, matching the standalone geometry fixture's HLSL
+            # VS/PS. Draw the same rotated scenes through that native GS instead of the HLSL stage.
+            native_source=folder/"native-inputs"
+            native_out=folder/"native-compiled"
+            from startup_stream_draw_check import vop1
+            native_ps=patched_pixel(2,[vop1(1,0,128),vop1(1,1,242)],export=(0xf800180f,0x01000001))
+            native_stem=publish(native_source,vertex(fetch=True),native_ps,root,
+                                b"ia1 1\nPOSITION 0 6 0 4 0 0\n")
+            subprocess.run([exe,sdk,folder/"cache","gfx1013-container-rect","--requests",native_source,native_out],check=True)
+            native_stages=[str(native_out/f"{native_stem}.{stage}.cso") for stage in ("vs","ps","gs")]
+            raise SystemExit(subprocess.run([rect_geometry,"--native-vs",native_stages[0],
+                                             "--native-ps",native_stages[1],"--native-gs",native_stages[2]]).returncode)
     exe, sdk = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         folder = pathlib.Path(tmp)
@@ -329,6 +344,16 @@ def main():
         check("descriptor-saveexec-bypass", cs,
               compute(words(*address_field, 0xbf880001, saveexec, read_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        pair_zero = [0xbe960380, 0xbe970380]  # s_mov_b32 s22, 0 / s23, 0 (both preserve SCC)
+        ff1_pair = 0xbe8e1416  # s_ff1_i32_b64 s14, s[22:23]
+        brev = 0xbe8f0b0e  # s_brev_b32 s15, s14
+        use_scan = 0x7e00020f  # v_mov_b32 v0, s15
+        select_scc = 0x85198e80  # s_cselect_b32 s25, 0, s14
+        check("descriptor-sop1-preserves-scc", cs,
+              compute(words(*address_field, *pair_zero, ff1_pair, brev, use_scan, end), table=True))
+        check("descriptor-sop1-before-scc-read", cs,
+              compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
+              "numeric SCC from a symbolic descriptor field")
         # The previous symbolic SCC is dead at WQM. Reading it before WQM
         # must still refuse. The nonzero high word supplies the new SCC.
         numeric_wqm = [0xbe9a0380, 0xbe9b0381, 0xbe980a1a]  # s[24:25] = WQM(s[26:27])
@@ -407,6 +432,14 @@ def main():
         check("compare-select-subword", cs, compute(words(*cmp_sdwa, *choose_byte, end)))
         check("cmpx-explicit-destination", cs, compute(words(cmp_sdwa[0] | (0x10 << 17),
               cmp_sdwa[1] | 0x8000, end)), "invalid SDWA compare destination")
+        for name, opcode, ext, error in (
+            ("class", 0x7d100af9, 0x0396eb80, "invalid SDWA class modifiers or mask destination"),
+            ("ne", 0x7d0a0cf9, 0x0086eb6b, "invalid SDWA compare destination"),
+        ):
+            check(f"sdwa-{name}-vcc-hi-wave64", cs, compute(words(opcode, ext, end), 64, wave32=False), error)
+            check(f"sdwa-{name}-sdst-108", cs, compute(words(opcode, (ext & ~0x7f00) | (108 << 8), end)), error)
+        check("sdwa-cmpx-vcc-hi", cs, compute(words(0x7d2a0cf9, 0x0086eb6b, end)),
+              "invalid SDWA compare destination")
         check("atomic-x2", cs, atomic_program((0xe1445000, 0x80020000)),
               "unsupported buffer atomic width")
         check("bad-container", cs, compute(ds)[:-1], "invalid DXBC length")
@@ -423,6 +456,22 @@ def main():
         root_vs = vertex(constants=(0,2,1), program=[*root_load, 0x7e00020f, 0xf80008cf, 0, end])
         check("address-vs", "gfx1013-container-vs", root_vs)
         check("address-cs", cs, compute(words(*root_load, end), root_descriptor=True))
+        for offset in (106, 107):
+            check(f"wave64-smem-offset-{offset}", cs,
+                  compute(words(0xf4000200, offset << 25, end), threads=64,
+                          root_descriptor=True, wave32=False), "unsupported scalar memory addressing")
+        check("wave64-smem-vcc-dst", cs,
+              compute(words(0xf4000000 | 107 << 6, 125 << 25, end), threads=64,
+                      root_descriptor=True, wave32=False), "unsupported scalar memory destination range")
+        check("wave32-smem-cross-vcc", cs,
+              compute(words(0xf40c0000 | 104 << 6, 125 << 25, end), root_descriptor=True),
+              "unsupported scalar memory destination range")
+        # A descriptor into s[104:107] must tag both VCC words as nonnumeric.
+        for offset in (106, 107):
+            check(f"wave32-smem-symbolic-offset-{offset}", cs,
+                  compute(words(0xbe810380, 0xf4080000 | 104 << 6, 125 << 25,
+                                0xf4080200, offset << 25, end), table=True),
+                  f"unbound numeric SGPR s{offset}")
         wrong_high = [root_load[0], 0xbe830380, *root_load[1:], end]
         check("bad-address-cs", cs, compute(words(*wrong_high), root_descriptor=True), "mismatched root address high half")
         # Build a zero-stride byte-address descriptor in s[4:7]. The x8

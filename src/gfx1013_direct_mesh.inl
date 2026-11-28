@@ -111,7 +111,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
     string vertex_count, primitive_count, export_limit;
     std::map<string,unsigned> upper_bound;
     auto bound=[&](const Inst &op,unsigned source) {
-        if (auto c=DirectCompute::constant32(op,source)) return *c;
+        if (auto c=constant32(op,source)) return *c;
         auto it=alu.graphics_registers.find(source);
         if (it!=alu.graphics_registers.end() && upper_bound.count(it->second)) return upper_bound.at(it->second);
         return ~0u;
@@ -174,7 +174,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             const auto inst=decode(code,at,true,true);
             const bool vector=inst.dst>=256 && (inst.enc==Encoding::Vop1 || inst.enc==Encoding::Vop2 || inst.enc==Encoding::Vop3);
             const bool compare=inst.enc==Encoding::Vopc && inst.dst==106 && inst.name.substr(0,6)=="v_cmp_";
-            const bool literal=inst.name=="s_mov_b32" && inst.dst<106 && DirectCompute::constant32(inst,inst.src[0]);
+            const bool literal=inst.name=="s_mov_b32" && inst.dst<106 && constant32(inst,inst.src[0]);
             if ((!vector && !compare && !literal && inst.name!="s_nop") || inst.next<=at || inst.next>end)
                 return false;
             at=inst.next;
@@ -537,7 +537,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
         std::optional<unsigned> result_bound;
         if (i.name=="s_and_b32") result_bound=(std::min)(bound(i,i.src[0]),bound(i,i.src[1]));
         if (i.name=="s_bfe_u32") {
-            if (auto field=DirectCompute::constant32(i,i.src[1]); field && ((*field>>16)&127)<32)
+            if (auto field=constant32(i,i.src[1]); field && ((*field>>16)&127)<32)
                 result_bound=(1u<<((*field>>16)&127))-1;
         }
         if (i.name=="s_add_u32") {
@@ -665,7 +665,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                 refuse(pc,"mesh scalar memory needs a verified guest root mapping: "+string(op.name));
             if (i.op<8 && offset_reg!=125 && state[i.src[0]].value!=compute_resource_heap)
                 refuse(pc,"indexed mesh descriptor table lacks a binding contract");
-            auto next=transfer(i,state,!layout.wave32,true);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             const bool global=state[i.src[0]].value==compute_resource_heap && state[i.src[0]].type==Symbol::Type::table;
             if (global && layout.validate_uint_heap_reads) {
                 if (i.op!=2 || offset_reg>=106 || (i.b&0xfffff) ||
@@ -729,7 +729,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             }
         } else if (i.enc==Encoding::Vopc && i.name.substr(0,6)=="v_cmp_" && i.dst<=106 &&
                    !i.dpp_control && !i.scale && !i.clamp && (full_exec || !lane_active.empty())) {
-            auto next=transfer(i,state,!layout.wave32,true);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto pred=alu.comparison(i);
             if (!full_exec) pred=ir.value("and i1 "+pred+", "+lane_active);
             const auto bit=ir.value("zext i1 "+pred+" to i32");
@@ -775,7 +775,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                 alu.write(vcc_words,word); alu.write(vcc_words+1,word); alu.write(vcc_nonempty,word);
                 state[106]={}; state[107]={};
             } else {
-                auto next=transfer(i,state,!layout.wave32,true);
+                auto next=transfer(i, state, !layout.wave32, true, false, true);
                 const auto word=ir.binary("sub","0",bit);
                 alu.write(i.dst,word); alu.write(i.dst+1,word);
                 alu.write(1024+i.pc,bit);
@@ -925,7 +925,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
         } else if (i.name=="s_mov_b64" && i.dst==106 && i.src[0]<=104 && !(i.src[0]&1)) {
             const auto src=i.src[0];
             const auto old=state;
-            const auto next=transfer(i,state,!layout.wave32,true);
+            const auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto physical=[&](unsigned r) {
                 auto it=alu.graphics_registers.find(r); return it==alu.graphics_registers.end() ? string{} : it->second;
             };
@@ -966,7 +966,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             full_exec=mask->full; lane_active=mask->lane; wave_active=mask->wave;
             exec_value[0]=mask->lo; exec_value[1]=mask->hi;
         } else if (i.name=="s_mov_b64" && i.dst<=104 && !(i.dst&1) && i.src[0]<=104 && !(i.src[0]&1)) {
-            auto next=transfer(i,state,!layout.wave32,true);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             auto src=alu.graphics_registers.find(i.src[0]), high=alu.graphics_registers.find(i.src[0]+1);
             auto lo=src==alu.graphics_registers.end() ? string{} : src->second;
             auto hi=high==alu.graphics_registers.end() ? string{} : high->second;
@@ -974,16 +974,16 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
             alu.write(i.dst+1,hi);
             state=next;
         } else if (i.name=="s_mov_b64" && i.dst<=104 && !(i.dst&1) && i.src[0]>=128 && i.src[0]<=208) {
-            auto next=transfer(i,state,!layout.wave32,true);
+            auto next=transfer(i, state, !layout.wave32, true, false, true);
             alu.write(i.dst,to_string(next[i.dst].value)); alu.write(i.dst+1,to_string(next[i.dst+1].value));
             state=next;
-        } else if (i.name=="s_mov_b32" && i.dst==125 && DirectCompute::constant32(i,i.src[0])) {
+        } else if (i.name=="s_mov_b32" && i.dst==125 && constant32(i,i.src[0])) {
             // NULL discards the scalar move; MOV does not write SCC.
         } else if (i.name=="s_mov_b32" && i.dst==124) {
-            allocation_word=DirectCompute::constant32(i,i.src[0]);
+            allocation_word=constant32(i,i.src[0]);
         } else if (i.name=="s_mov_b32" && i.dst<106) {
             const auto provenance=source(i,i.src[0],state);
-            if (auto value=DirectCompute::constant32(i,i.src[0])) alu.write(i.dst,to_string(*value));
+            if (auto value=constant32(i,i.src[0])) alu.write(i.dst,to_string(*value));
             else if (i.src[0]<=107) {
                 const auto source=alu.graphics_registers.find(i.src[0]<106 ? i.src[0] : vcc_words+i.src[0]-106);
                 alu.write(i.dst,source==alu.graphics_registers.end() ? string{} : source->second);
@@ -1017,7 +1017,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
         } else if (i.enc==Encoding::Sop2 && i.dst<106 && (i.name=="s_lshr_b32" || i.name=="s_lshl_b32" ||
                    i.name=="s_or_b32" || i.name=="s_and_b32")) {
             const auto known=[&](unsigned r) {
-                return DirectCompute::constant32(i,r).has_value() ||
+                return constant32(i,r).has_value() ||
                     (alu.graphics_registers.count(r) && !alu.graphics_registers.at(r).empty());
             };
             if (known(i.src[0]) && known(i.src[1])) {
@@ -1025,10 +1025,10 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                 const bool shift=i.name=="s_lshl_b32" || i.name=="s_lshr_b32";
                 const auto value=ir.binary(i.name=="s_lshl_b32" ? "shl" : i.name=="s_lshr_b32" ? "lshr" :
                                            i.name=="s_or_b32" ? "or" : "and",a,shift ? ir.binary("and",b,"31") : b);
-                if (i.name=="s_lshl_b32" && a==wave_number && DirectCompute::constant32(i,i.src[1])==(layout.wave32 ? 5u : 6u))
+                if (i.name=="s_lshl_b32" && a==wave_number && constant32(i,i.src[1])==(layout.wave32 ? 5u : 6u))
                     wave_bases.insert(value);
                 const auto bits=root_values.find(a);
-                const auto imm=DirectCompute::constant32(i,i.src[1]);
+                const auto imm=constant32(i,i.src[1]);
                 if (bits!=root_values.end() && imm && !bits->second.shift) {
                     auto out=bits->second;
                     if (i.name=="s_and_b32") { out.mask&=*imm; root_values.emplace(value,out); }
@@ -1036,7 +1036,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                         out.shift=5; root_values.emplace(value,out);
                     }
                 }
-                const auto next=transfer(i,state,!layout.wave32,true);
+                const auto next=transfer(i, state, !layout.wave32, true, false, true);
                 alu.write(i.dst,value);
                 state[i.dst]=next[i.dst];
                 alu.write(128,ir.value("zext i1 "+alu.cmp("ne",value,"0")+" to i32"));
@@ -1062,7 +1062,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                    !i.dpp_control && (full_exec || exec_skip)) {
             // RDNA V_PERM_B32: selectors 0..3 index src1, 4..7 index src0,
             // 8..11 replicate the sign of each halfword; 12 zero-fills.
-            const auto selectors=DirectCompute::constant32(i,i.src[2]);
+            const auto selectors=constant32(i,i.src[2]);
             if (!selectors) refuse(pc,"dynamic mesh byte permutation");
             const auto a=alu.operand32(i,i.src[0]), b=alu.operand32(i,i.src[1]);
             string result="0";
@@ -1091,7 +1091,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                     i.name=="v_xor_b32" || i.name=="v_lshl_add_u32" || i.name=="v_cvt_f32_u32" || i.name=="v_cvt_f32_i32" ||
                     i.name=="v_mul_f32" || i.name=="v_add_f32" || i.name=="v_fma_f32")) {
             const bool flat=i.name=="v_lshl_add_u32" && alu.operand32(i,i.src[0])==wave_number &&
-                            DirectCompute::constant32(i,i.src[1])==(layout.wave32 ? 5u : 6u) &&
+                            constant32(i,i.src[1])==(layout.wave32 ? 5u : 6u) &&
                             whole_lane.count(alu.operand32(i,i.src[2]));
             alu.arithmetic(i,state);
             if (flat) linear_threads.insert(alu.read(i.dst));

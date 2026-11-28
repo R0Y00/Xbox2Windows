@@ -4,7 +4,7 @@
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs) named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels 4` outputs) named
-// by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
+// by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
 // count of an output (`uav_descword3`, `uav_stride`, `uav_numrecords`). Any other manifest line makes the translation
@@ -39,6 +39,7 @@ struct ComputeTranslation {
         unsigned half_typed_bytes = 0;
         bool packed_d16_x = false;
         unsigned scalar_window = 0;
+        bool atomic_uint_texture = false;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -172,6 +173,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.srvs.push_back({c, d, false, true, a, b, x, y});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
+                 whole() && i == tr.uavs.size()) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            tr.uavs.back().atomic_uint_texture = true;
+        }
         else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels 4%n", &i, name, &a, &b, &used) == 4 && whole() &&
                  i == tr.uavs.size() && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
             tr.uavs.push_back({a, b, true});
@@ -179,12 +186,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
-        // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
-        // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
-        else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
+        // A static sampler, decoded as the draw path does: plain (smp), with the descriptor's LOD clamp (smpl) or a
+        // comparison one (smpc). Not modelled here: the run-time sampler heap table (smpheap).
         else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
         else if ((std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
-                  std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
+                  std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
+                  std::sscanf(line.c_str(), "smpc %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
@@ -472,12 +479,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         ID3D12Resource* resource;
         u64 offset, bytes;
         bool transition, texture, described;
-        unsigned char desc[40];  // a texture view's description, as the title gave it with a desktop format
+        union {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+        } desc;  // a texture view's description, as the title gave it with a desktop format
         Wrapper* wrapper;
         std::uint32_t words[4];  // a buffer's descriptor words as it was bound from, and its stride
         UINT stride;
     } views[40]{};
-    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
+    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) >= ViewRecord::srv_desc_bytes);
+    static_assert(sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) >= ViewRecord::uav_desc_bytes);
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
     ComputeTranslation* const tr = &compute_translations()[key];
@@ -580,8 +591,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
             if (!output) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
-                const bool described = record.desc_bytes >= sizeof(desc);
-                if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+                const bool described = record.desc_bytes >= ViewRecord::srv_desc_bytes;
+                if (described) std::memcpy(&desc, record.desc, ViewRecord::srv_desc_bytes);
                 if (desc.Format) desc.Format = desktop_format(desc.Format);
                 words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
                 if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
@@ -593,13 +604,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
                 else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
                 views[i] = {texture, 0, 0, true, true, described};
-                std::memcpy(views[i].desc, &desc, sizeof(desc));
+                views[i].desc.srv = desc;
                 views[i].wrapper = wrapper;
                 continue;
             }
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
-            const bool described = record.desc_bytes >= sizeof(desc);
-            if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+            const bool described = record.desc_bytes >= ViewRecord::uav_desc_bytes;
+            if (described) std::memcpy(&desc, record.desc, ViewRecord::uav_desc_bytes);
             if (desc.Format) desc.Format = desktop_format(desc.Format);
             const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
             words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
@@ -638,13 +649,16 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
-            if (!reason && !float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
+                reason = "an image atomic requires an R32_UINT UAV";
+            if (!reason && !slot.atomic_uint_texture && !float_output_format(format))
+                reason = "an output texture format is not a float or normalized one";
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
             for (std::size_t input = 0; input < inputs && !reason; ++input)
                 if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
-            std::memcpy(views[i].desc, &desc, sizeof(desc));
+            views[i].desc.uav = desc;
             views[i].wrapper = wrapper;
             continue;
         }
@@ -717,7 +731,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             views[i] = {token.resource, token.offset, token.bytes, true};
             if (!reason && slot.half_typed_bytes) {
                 views[i].described = true;
-                std::memcpy(views[i].desc, &token.view, sizeof(token.view));
+                views[i].desc.uav = token.view;
             }
             continue;
         }
@@ -804,7 +818,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
-                view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
+                view.described ? &view.desc.srv : nullptr, dest);
             continue;
         }
         if (i < inputs) {
@@ -815,7 +829,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (view.texture || view.described) {
             device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
-                view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
+                view.described ? &view.desc.uav : nullptr, dest);
             continue;
         }
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};

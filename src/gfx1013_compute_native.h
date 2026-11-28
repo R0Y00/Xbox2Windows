@@ -37,6 +37,11 @@ enum class ComputeViewKind {
     d16_sample_srv,
     byte_window_srv,
     heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    // The directly indexed sampler heap; entry n = title byte offset 16 * n (index parity); the runtime fills entries with
+    // dynamic_sampler() (LOD clamp applied, valid for the explicit-LOD forms translated here); entry 2047 is the runtime
+    // fallback and never read.
+    heap_sampler,
+    uint_texture_uav,
     packed_d16_x_uav, // Single low-halfword payload; desktop buffer view determines the element size.
     indexed_raw_srv // Fixed-stride record read. required_bytes is one complete record and its checked stride.
 };
@@ -44,6 +49,8 @@ inline bool accepts_cbv_window(ComputeViewKind kind) {
     return kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::byte_window_srv;
 }
 inline constexpr unsigned compute_resource_heap = ~0u;
+// the directly indexed sampler heap; entry n is title byte offset 16 * n
+inline constexpr unsigned compute_sampler_heap = ~0u - 1;
 // A binding of the whole descriptor heap: it has no table register and no root parameter.
 inline bool compute_heap_binding(ComputeViewKind kind) { return kind == ComputeViewKind::heap_buffer_srv; }
 inline bool compute_buffer_uav(ComputeViewKind kind) {
@@ -56,7 +63,8 @@ struct IndexedAtomicView {
 };
 inline bool compute_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::texture_uav || kind == ComputeViewKind::half_scalar_uav ||
-           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav || compute_buffer_uav(kind);
+           kind == ComputeViewKind::half2_texture_uav || kind == ComputeViewKind::half4_texture_uav ||
+           kind == ComputeViewKind::uint_texture_uav || compute_buffer_uav(kind);
 }
 struct ComputeViewBinding {
     ComputeViewKind kind;

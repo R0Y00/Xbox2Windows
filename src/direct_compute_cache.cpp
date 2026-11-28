@@ -134,8 +134,10 @@ NativeComputeShader decode(std::string_view bytes) {
         auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::indexed_raw_srv)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
+        const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
         if (!b.array_count || b.array_position >= b.array_count ||
-            (b.root_parameter >= 16 && b.root_parameter != compute_resource_heap))
+            (sampler_heap ? b.root_parameter != compute_sampler_heap
+                          : b.root_parameter >= 16 && b.root_parameter != compute_resource_heap))
             throw std::runtime_error("invalid cached binding");
         shader.bindings.push_back(b);
     }
@@ -922,6 +924,9 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
+                uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
+                          << b.byte_offset << " channels 1\n";
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
                        (b.image_dimension == 1 || b.image_dimension == 5 ||
                         (b.kind == ComputeViewKind::texture_uav && b.image_dimension == 2)) && b.array_count == 1) {
@@ -1025,6 +1030,14 @@ std::optional<std::string> format_graphics_runtime_manifest(const DirectGraphics
         const auto &b = bindings.views[bindings.srv_count + j];
         if (b.root_parameter >= 16 || b.array_count != 1)
             return std::nullopt;
+        if (b.kind == ComputeViewKind::raw_buffer_uav) {
+            // First slice: one pixel UAV with no other resource views. Vertex stores,
+            // mixed views and aliases need their own runtime acceptance.
+            if (uav_count != 1 || bindings.srv_count || !pair.vertex.bindings.empty())
+                return std::nullopt;
+            uav_lines << "uav " << j << " raw table " << b.root_parameter << ' ' << b.byte_offset << '\n';
+            continue;
+        }
         if (b.kind != ComputeViewKind::texture_uav && b.kind != ComputeViewKind::half4_texture_uav)
             return std::nullopt;
         if (b.image_dimension != 1 && b.image_dimension != 5)

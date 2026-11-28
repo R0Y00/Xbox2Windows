@@ -128,6 +128,10 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
               <<" request_and_translation_ms="<<elapsed_ms(start)<<"\n";
         for (const auto &b : program.bindings) {
             using Table = x2w::ComputeViewBinding::ScalarTable;
+            if (b.kind == x2w::ComputeViewKind::heap_sampler) {
+                report << "sampler_heap span=" << b.required_bytes << '\n';
+                continue;
+            }
             report << (x2w::compute_uav(b.kind) ? "u" : "t") << b.shader_register << " root=" << b.root_parameter
                    << " bytes=" << b.byte_offset << " min_size=" << b.required_bytes;
             if (b.scalar_table == Table::reflected_cbv) report << " table_view=reflected-cbv";
@@ -700,22 +704,37 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     const fs::path psdep_path = fs::path(stem) += L".psdep";
 
     std::optional<fs::file_time_type> psin_mtime;
-    bool lost = false;
+    bool dependency_changed = false;
     if (!req.compute) {
         if (const auto psin_path = graphics_psin_path(req.marker)) {
-            for (const auto& path : {*psin_path, fs::path(*psin_path).replace_extension(L".ps57in")}) {
-                if (fs::is_regular_file(path, ec)) {
-                    const auto t = fs::last_write_time(path, ec);
-                    if (!ec && (!psin_mtime || t > *psin_mtime))
-                        psin_mtime = t;
-                }
+            const auto packed_path = fs::path(*psin_path).replace_extension(L".ps57in");
+            const bool stream = fs::is_regular_file(*psin_path, ec);
+            const bool packed = fs::is_regular_file(packed_path, ec);
+            std::ifstream dependency(psdep_path, std::ios::binary);
+            char previous[13]{};
+            dependency.read(previous, sizeof(previous));
+            const auto previous_size = dependency.gcount();
+            const bool was_packed = previous_size >= 4 && std::memcmp(previous, "PSI1", 4) == 0;
+            if (packed) {
+                // A copied sidecar may carry a timestamp older than the published manifest.
+                std::ifstream input(packed_path, std::ios::binary);
+                char current[13]{};
+                input.read(current, sizeof(current));
+                dependency_changed = stream || !was_packed || previous_size != 12 || input.gcount() != 12 ||
+                    std::memcmp(current, previous, 12) != 0;
+            } else {
+                dependency_changed = was_packed || (stream != (previous_size != 0));
             }
-            lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
+            if (stream || packed) {
+                const auto time = fs::last_write_time(stream ? *psin_path : packed_path, ec);
+                if (!ec)
+                    psin_mtime = time;
+            }
         }
     }
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
-    if (has_manifest && !lost) {
+    if (has_manifest && !dependency_changed) {
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
         if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
@@ -729,7 +748,7 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
         }
     }
 
-    const bool recheck = lost && has_manifest;
+    const bool recheck = dependency_changed && has_manifest;
     if (skip_failed && !recheck && fs::is_regular_file(fail_path, ec)) {
         const auto fail_mtime = fs::last_write_time(fail_path, ec);
         const auto latest_input =

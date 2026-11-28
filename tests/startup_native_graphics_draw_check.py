@@ -55,6 +55,15 @@ def check(folder, consumer, sdk, adapter, compiler):
     manifest = cache / (marker.stem.removeprefix("req_") + ".txt")
     published = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in
                  (manifest, manifest.with_suffix(".vs.cso"), manifest.with_suffix(".ps.cso"))}
+    published_draw = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
+    assert published_draw.returncode == 0 and "-> drawn;" in published_draw.stderr, published_draw.stderr
+    assert "native graphics " not in published_draw.stderr, published_draw.stderr
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    changed = [(path.name, path.read_bytes(), expected[0]) for path, expected in published.items()
+               if path.read_bytes() != expected[0]]
+    assert not changed, [(name, len(got), len(expected), got[:48].hex(), expected[:48].hex())
+                         for name, got, expected in changed]
+    print(f"{adapter} existing disk pair takes precedence with native enabled")
     for fault, diagnostic in (("MANIFEST", "unsupported manifest version"), ("ROOT", "failed 0x80004005")):
         manifest.rename(str(manifest) + ".pending")
         first = Path(str(pixels) + ".first")
@@ -134,7 +143,8 @@ def check(folder, consumer, sdk, adapter, compiler):
 
     # The native path still creates its own pipeline when no fault is injected.
     pixels.unlink()
-    run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
+    native_env = dict(env, X2W_TEST_NATIVE_GRAPHICS_PREFER_NATIVE="1")
+    run = subprocess.run(args, env=native_env, capture_output=True, text=True, timeout=45)
     assert run.returncode == 0, run.stderr
     assert "native graphics" in run.stderr and "ready=1 cache(frontend,vs,ps)=1,1,1" in run.stderr, run.stderr[-8000:]
     assert "candidate pipeline failed" not in run.stderr and "refused:" not in run.stderr, run.stderr[-8000:]
