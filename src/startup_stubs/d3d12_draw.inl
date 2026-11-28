@@ -1148,10 +1148,11 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
-// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+// Only the depth view actually bound to this pass determines the draw format: a pipeline created with a DSVFormat
+// draws with DSVFormat UNKNOWN when the pass binds no depth view (a PSO/DSV format mismatch is a debug-layer error).
 inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
 {
-    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    return x2w_startup::draw_dsv_format(pass.bound_depth != nullptr, pass.dsv_format, bound.dsv_format);
 }
 
 // Called under draw_lock. The fallback uses only the bound attachments and
@@ -1306,8 +1307,8 @@ bool replay_pso_recipes(BoundPipeline& bound, Translation& tr, const Pass& pass,
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, bool indexed_rect)
 {
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
-    // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
-    const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
+    // No depth or stencil state is meaningful without a bound depth view; with none the pass keeps the desktop default.
+    const bool use_depth_stencil = x2w_startup::draw_depth_state_enabled(bound.has_depth_stencil, dsv_format);
     const u64 key = x2w_startup::pso_state_key(pass.target_count, pass.target_formats, dsv_format, use_depth_stencil,
                                                bound.depth_stencil, bound.has_rasterizer, bound.rasterizer, indexed_rect);
     const auto found = bound.pipelines.find(key);
