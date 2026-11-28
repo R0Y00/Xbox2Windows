@@ -101,7 +101,7 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
                                               const fs::path& input_path, const fs::path& destination,
                                               const fs::path& cache, std::ostream& report,
                                               const x2w::NativeComputeShader *linked=nullptr,
-                                              bool emit_manifest=false) {
+                                              bool emit_manifest=false, std::string *manifest_reason=nullptr) {
     Clock::time_point start;
     std::string source;
     std::optional<std::string> manifest;
@@ -145,7 +145,7 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
             }
             report<<"global_srv select="<<views.request.selected<<" need="<<x2w_startup::global_srv_type_name(views.request.needed)<<'\n';
         }
-        if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program);
+        if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program, manifest_reason);
         source=direct?std::move(program.dxil_ir):std::move(program.hlsl);profile=L"cs_6_6";
     } else if (profile.compare(0,clear_prefix.size(),clear_prefix)==0) {
         auto offset=profile.substr(clear_prefix.size());
@@ -236,6 +236,11 @@ static std::string format_fail_line(std::string_view message) {
         out = "unknown refusal";
     out.push_back('\n');
     return out;
+}
+
+// A compute program that translates but has no runtime manifest: the runtime cannot dispatch it translated.
+static std::string manifest_refusal(const std::string &reason) {
+    return "unsupported startup runtime manifest bindings: " + reason;
 }
 
 static bool is_ident_char(unsigned char c) { return std::isalnum(c) != 0 || c == '_'; }
@@ -481,7 +486,9 @@ static int run_refusals(int argc, wchar_t** argv) {
                     try {
                         if (task.compute) {
                             auto req = x2w::read_compute_request(compute_inputs[task.index]);
-                            (void)x2w::translate_compute(req, 0, true);
+                            std::string reason;
+                            if (!x2w::format_compute_runtime_manifest(x2w::translate_compute(req, 0, true), &reason))
+                                throw std::runtime_error(manifest_refusal(reason));
                         } else {
                             auto input = x2w::read_graphics_request(graphics_inputs[task.index]);
                             bool hit = false;
@@ -734,9 +741,10 @@ static const char* compile_watch_item(x2w::ShaderDxilCompiler& compiler, const f
         fs::remove(fs::path(stem) += L".cs.hlsl", ignored);
         bool hit = false;
         auto program = x2w::prepare_direct_compute(req.marker, 0, false, cache_dir, hit, x2w::HeapViewContract::none);
-        auto manifest = x2w::format_compute_runtime_manifest(program);
+        std::string reason;
+        auto manifest = x2w::format_compute_runtime_manifest(program, &reason);
         if (!manifest)
-            throw std::runtime_error("unsupported startup runtime manifest bindings");
+            throw std::runtime_error(manifest_refusal(reason));
         auto cs_dxil = compile_to_dxil(compiler, program.dxil_ir, L"cs_6_6", cache_dir, true, sink);
         publish_atomic(fs::path(stem) += L".cs.cso", cs_dxil.data(), cs_dxil.size());
         publish_atomic(manifest_path, manifest->data(), manifest->size());
@@ -1019,8 +1027,12 @@ int wmain(int argc, wchar_t** argv) {
                 std::error_code ignored;
                 fs::remove(manifest_path, ignored);
                 fs::remove(fs::path(stems[i]) += L".cs.hlsl", ignored);  // see compile_watch_item
-                auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true);
+                std::string reason;
+                auto manifest = compile_one(compiler, job_profile(i), inputs[i], outputs[i], argv[2], report, nullptr, true, &reason);
                 if (manifest) publish_atomic(manifest_path, manifest->data(), manifest->size());
+                // Not a .fail: that file is the watchers' retry marker, and this compile succeeded.
+                if (!manifest && !reason.empty())
+                    report << "no_manifest input=" << inputs[i].filename().string() << ' ' << manifest_refusal(reason) << '\n';
                 fs::remove(fs::path(stems[i]) += L".fail", ignored);
                 return;
             }

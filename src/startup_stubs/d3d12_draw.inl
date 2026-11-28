@@ -2345,14 +2345,24 @@ struct IndirectBufferView {
     u64 offset = 0, bytes = 0;
     UINT stride = 0;
     bool upload = false;
+    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
 };
+
+// X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
+// (a committed default buffer that holds zeros) is read from title memory, snapshotted into its own recycled pool.
+bool title_input_snapshot_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT");
+    return enabled;
+}
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
-                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP)
+                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
+                                         bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2410,12 +2420,23 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
+    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
+    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
+    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+        u64 zero_offset = 0;
+        ID3D12Resource* zero_ring = nullptr;
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring, true);
+        if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
+        std::memset(zero_bytes, 0, 16);
+        return {zero_ring, zero_offset, 16, 0, true, 3};
+    }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
     if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
         ? "an input buffer range is over 16 MiB or not whole dwords"
         : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
+    int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
@@ -2436,8 +2457,24 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
-            return refuse("an input is in a placed buffer that does not alias title memory");
+        if (!placed.alias) {
+            if (native && list_copied_gpu_range(self, native, offset, bytes)) {
+                input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
+            } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+                // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
+                // bytes the title wrote are only in title memory: snapshot the range into the snapshot pool now. A later
+                // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
+                u64 ring_offset = 0;
+                ID3D12Resource* ring = nullptr;
+                if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
+                    return refuse("an input range in title memory is not readable");
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring, true) || !ring)
+                    return refuse("an input range could not be copied from title memory");
+                return {ring, ring_offset, bytes, stride, true, 2};
+            } else {
+                return refuse("an input is in a placed buffer that does not alias title memory");
+            }
+        }
     } else if (own_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
     } else if (owner && !owner->own().title_memory) {
@@ -2461,7 +2498,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload};
+    return {native, offset, bytes, stride, upload, input_source};
 }
 
 struct FormattedBufferDescriptor {

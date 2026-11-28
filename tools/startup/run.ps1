@@ -21,6 +21,7 @@ param(
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [int]$AssertSites = 0,                     # distinct main-image int3 sites whose every hit is stepped over
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
+    [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
@@ -103,6 +104,8 @@ if ($watchShaders) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$mapArgs = @()
+if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 try {
@@ -111,7 +114,7 @@ try {
     & {
         $ErrorActionPreference = "Continue"
         & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @traceArgs @captureArgs
+            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs
         $script:debuggerExit = $LASTEXITCODE
     } *> "$LogDir.out"
 } finally {

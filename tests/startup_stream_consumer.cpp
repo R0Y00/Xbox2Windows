@@ -7,6 +7,7 @@
 #include <cstring>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <iterator>
@@ -219,6 +220,7 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // Input descriptors the dispatch refuses, one reason each: dispatch-input-empty has zero records (a nonzero base,
 // word 3 zero), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
+// dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
 // Output descriptors the dispatch refuses, one reason each: dispatch-output-texture-token, -unplaced and -copied do
 // to the output what dispatch-input-token, -unplaced and -copied do to the input, dispatch-output-unaligned starts
@@ -226,10 +228,19 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
 // names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
 // record count (word 2) and word 3, which are otherwise 4, 320 and 0.
+// (The long case puts its input at 0x28000, not at a 64 KiB multiple like 0x20000: there the placed buffer would alias title memory
+// and the input would be read in place, never snapshotted, which is how an earlier version of this case passed without a snapshot.)
+// dispatch-input-snapshot-long: dispatch-input-snapshot with an 8 MiB input range (the descriptor declares 2M records; the program
+// reads the first 320 words) dispatched in 48 frames, 384 MiB of snapshots in all, with the queue completed between frames. The
+// snapshot pool holds 128 MiB, so every frame after the sixteenth reuses chunks the GPU is done with; a pool that is not recycled
+// refuses them. Every frame must translate and give the first frame's words.
 // Table controls bind away from the heap start or change the root/view heap after slot 35 without rebinding.
 static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
+    const bool keep_closed = mode == "dispatch-input-snapshot-long-keep";
+    const bool long_run = keep_closed || mode == "dispatch-input-snapshot-long";
+    constexpr UINT long_records = 2u << 20, long_frames = 48;
     const bool shared_uav = mode == "dispatch-read-write-uav";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
@@ -237,7 +248,8 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool root_srv = mode.rfind("dispatch-root-srv", 0) == 0;
     const UINT groups = mode == "dispatch-indirect-zero" || write_zero || mode == "dispatch-indirect-pixel-omit" ? 0u :
                         mode == "dispatch-indirect-2" || mode == "dispatch-indirect-pixel-2" ? 2u : 5u;
-    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, (indirect || root_srv) ? 0x30000 : 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, long_run ? 0x28000 + long_records * sizeof(UINT) : (indirect || root_srv) ? 0x30000 : 0x20000,
+                                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!memory) return 70;
     UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
     UINT* const buffer2 = memory + 0x20000 / sizeof(UINT);
@@ -245,7 +257,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
         buffers[1][i] = 0xc5c5c5c5u;
     }
-    UINT fields[2][3] = {{4, words, 0}, {4, words, 0}};
+    UINT fields[2][3] = {{4, long_run ? long_records : words, 0}, {4, words, 0}};
     const auto from_file = [](const char* variable, void* data, std::streamsize bytes) {
         char path[MAX_PATH];
         const DWORD n = GetEnvironmentVariableA(variable, path, MAX_PATH);
@@ -269,7 +281,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
-    const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
+    const UINT64 between = reinterpret_cast<UINT64>(memory) + (long_run ? 0x28000 : 0x8000);
     void* placed2 = nullptr;
     if (root_srv) {
         for (UINT i = 0; i < words; ++i) buffer2[i] = 0x3c6ef372u + i * 0x19660du;
@@ -282,8 +294,13 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffer2), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed2))))) return 71;
     }
-    if (mode == "dispatch-input-copied" || mode == "dispatch-root-srv-copied" || mode == "dispatch-output-copied") {
-        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+    // dispatch-input-snapshot: the input words are written into the memory the third buffer is placed over, so they
+    // exist only in title memory (the desktop copy of a buffer that does not alias holds zeros); dispatch-input-copied
+    // leaves that memory zero.
+    if (mode == "dispatch-input-snapshot" || long_run) std::memcpy(reinterpret_cast<void*>(between), input, sizeof(input));
+    if (mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot" || long_run || mode == "dispatch-root-srv-copied" ||
+        mode == "dispatch-output-copied") {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, long_run ? long_records * sizeof(UINT) : words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
         void* copied = nullptr;
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(reinterpret_cast<void*>(between)), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
@@ -292,9 +309,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (mode == "dispatch-input-empty") {
         const UINT view[4] = {0x32c, 0, 0, 0};
         std::memcpy(descriptors[0], view, sizeof(view));
+    } else if (mode == "dispatch-input-null") {
+        std::memset(descriptors[0], 0, sizeof(descriptors[0]));  // an unbound buffer: all four words zero
     } else if (mode == "dispatch-input-past") {
         descriptors[0][2] = words + 4;
-    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied") {
+    } else if (mode == "dispatch-input-unplaced" || mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot" || long_run) {
         descriptors[0][0] = static_cast<UINT>(between);
         descriptors[0][1] = static_cast<UINT>(between >> 32) | 4u << 16;
     } else if (mode == "dispatch-output-unplaced" || mode == "dispatch-output-copied") {
@@ -525,6 +544,34 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     if (indirect && !pixel && !record.check_record(groups)) return 80;
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
+    if (long_run) {
+        UINT first[words];
+        std::memcpy(first, buffers[1], sizeof(first));
+        for (UINT frame = 1; frame < long_frames; ++frame) {
+            std::fill_n(buffers[1], words, 0xc5c5c5c5u);
+            if (FAILED(static_cast<HRESULT>(invoke(allocator, 8)))) return 84;
+            // Keep each submitted list alive and closed so only fenced submit can drop its snapshot hold.
+            if (keep_closed && FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0,
+                    word(&__uuidof(ID3D12GraphicsCommandList)), word(&list))))) return 72;
+            if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+            bind();
+            invoke(list, 37, 0, constants[0], 0);
+            invoke(list, 40, 0, 2, word(graphics), 0);
+            invoke(list, 39, 0, 1, word(&constants[1]), 1);
+            invoke(list, 35, 1, gpu);
+            invoke(list, 14, 3, 2, 2);
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+            invoke(queue, 10, 1, word(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), frame + 1)))) return 76;
+            for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < frame + 1;) {
+                if (GetTickCount64() >= deadline) return 78;
+                Sleep(1);
+            }
+            if (std::memcmp(first, buffers[1], sizeof(first)) != 0) return 85;  // a frame gave other words than the first
+            for (UINT i = 0; i < words; ++i)
+                if (buffers[0][i] != input[i]) return 79;
+        }
+    }
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);

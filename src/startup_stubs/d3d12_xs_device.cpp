@@ -183,7 +183,7 @@ struct alignas(16) WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
-    UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
+    UploadChunkMask upload_chunks;    // Ring and snapshot chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool unplaced_srv_backing;  // Resource: synthetic backing for an address-only buffer SRV.
     bool exact_copy;            // Resource: synthetic backing that starts at the view address.
@@ -1479,6 +1479,7 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+std::vector<UploadRingChunk> snapshot_chunks;  // the title input snapshot pool: same rules, its own chunks and budget
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (allocator_lock): chunks each closed list released at a fenced submit, until its Reset.
 std::unordered_map<Wrapper*, ReleasedUploadChunks> released_upload_chunks;
 LONG upload_resubmits_refused;  // closed lists submitted again after a released chunk was reused; not executed
@@ -1488,7 +1489,7 @@ LONG allocator_swaps, allocator_creates;
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
-    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data(), snapshot_chunks.data());
     released_upload_chunks.erase(list);
     ReleaseSRWLockExclusive(&allocator_lock);
 }
@@ -1718,13 +1719,13 @@ bool released_chunks_recycled(Wrapper* list)
     const auto released = released_upload_chunks.find(list);
     if (released == released_upload_chunks.end()) return false;
     UploadChunkMask recycled = 0;
-    resubmitted_upload_chunks(released->second, upload_chunks.data(), recycled);
+    resubmitted_upload_chunks(released->second, upload_chunks.data(), recycled, snapshot_chunks.data());
     if (!recycled) return false;
     InterlockedIncrement(&upload_resubmits_refused);
     static LONG logged;
     if (first_calls(logged, 8))
-        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
-            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned>(recycled));
+        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%llx were reused; "
+            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned long long>(recycled));
     return true;
 }
 
@@ -1750,7 +1751,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         if (released == released_upload_chunks.end()) continue;
         // A list with a reused chunk was refused before the execute, under the same locks: all of them are intact.
         UploadChunkMask reused = 0;
-        chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused);
+        chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused, snapshot_chunks.data());
     }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
@@ -1760,7 +1761,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             if (!list->own().upload_chunks) continue;
             try {
                 release_upload_chunks_at_submit(list->own().upload_chunks, upload_chunks.data(),
-                                                released_upload_chunks[list]);
+                                                released_upload_chunks[list], snapshot_chunks.data());
             } catch (const std::bad_alloc&) {
                 // Keep the holds: the list then pins its chunks until its Reset, as without the switch.
             }
@@ -1899,7 +1900,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
-            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            discard_upload_chunks(state.upload_chunks, upload_chunks.data(), snapshot_chunks.data());
             released_upload_chunks.erase(self);
             state.list_uploads = nullptr;
             state.list_scratch = nullptr;
@@ -1942,7 +1943,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
-        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        discard_upload_chunks(state.upload_chunks, upload_chunks.data(), snapshot_chunks.data());
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2691,30 +2692,37 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
 // 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
 // no recording can submit its bytes and every queue that used it has finished. With
-// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 every chunk is 16 MiB, up to 512 MiB, and a fenced submit releases its lists.
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 the ring uses 16 MiB chunks (larger for oversized reservations),
+// up to 512 MiB. A fenced submit releases the list's holds in both pools.
 
 volatile LONG64 upload_ring_reserved_bytes, upload_ring_capacity_bytes;
 volatile LONG upload_ring_reservations, upload_ring_refusals;
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
+// snapshot = true takes the reservation from the title input snapshot pool (128 MiB, chunks numbered after the ring's).
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool snapshot = false)
 {
-    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
+    const u64 max_pool_bytes = snapshot ? max_snapshot_pool_bytes : max_upload_ring_bytes;
+    const unsigned base = snapshot ? snapshot_chunk_base : 0;
+    const u64 max_alloc_bytes = max_pool_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
-    const auto note_reserved = [](u64 reserved) {
+    const auto note_reserved = [snapshot](u64 reserved) {
+        if (snapshot) return;
         InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(reserved));
         InterlockedIncrement(&upload_ring_reservations);
     };
 
-    auto& chunks = upload_chunks;
-    static unsigned active = 0;
-    static u64 total_bytes = 0;
+    auto& chunks = snapshot ? snapshot_chunks : upload_chunks;
+    static unsigned actives[2] = {0, 0};
+    static u64 totals[2] = {0, 0};
+    unsigned& active = actives[snapshot ? 1 : 0];
+    u64& total_bytes = totals[snapshot ? 1 : 0];
 
     AcquireSRWLockExclusive(&allocator_lock);
     const auto finish = [&](unsigned index) {
         active = index;
-        chunks[index].hold(list->own().upload_chunks, index);
+        chunks[index].hold(list->own().upload_chunks, base + index);
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
@@ -2726,11 +2734,11 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
         }
     }
 
-    const bool release_at_submit = ring_release_at_submit();
-    const u64 ring_bytes = release_at_submit ? max_released_upload_ring_bytes : max_upload_ring_bytes;
-    const u64 remaining = total_bytes < ring_bytes ? ring_bytes - total_bytes : 0;
+    const bool grow_released_ring = !snapshot && ring_release_at_submit();
+    const u64 budget_bytes = grow_released_ring ? max_released_upload_ring_bytes : max_pool_bytes;
+    const u64 remaining = total_bytes < budget_bytes ? budget_bytes - total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() || release_at_submit ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = chunks.empty() || grow_released_ring ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
@@ -2753,7 +2761,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
-                        InterlockedAdd64(&upload_ring_capacity_bytes, static_cast<LONG64>(chunk_bytes));
+                        if (!snapshot) InterlockedAdd64(&upload_ring_capacity_bytes, static_cast<LONG64>(chunk_bytes));
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
                         note_reserved(rounded);
                         return finish(static_cast<unsigned>(chunks.size() - 1));
@@ -2779,7 +2787,7 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
-        reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
+        reservation = reuse_upload_chunk(chunks[index], base + index, rounded, queue_submits);
         if (reservation.mapped) {
             note_reserved(rounded);
             return finish(index);
@@ -2787,27 +2795,28 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     }
 
     ReleaseSRWLockExclusive(&allocator_lock);
-    InterlockedIncrement(&upload_ring_refusals);
-    static LONG refused;
-    if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+    if (!snapshot) InterlockedIncrement(&upload_ring_refusals);
+    static LONG refused[2];
+    if (first_calls(refused[snapshot ? 1 : 0], 8))
+        log(snapshot ? "x2w-draw snapshot pool reservation refused: no unused capacity"
+                     : "x2w-draw upload ring reservation refused: no unused capacity");
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource, bool snapshot = false)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(list, bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes, snapshot);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, bool snapshot = false)
 {
-    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource, snapshot);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
@@ -7438,9 +7447,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, capacity %llu MiB",
             static_cast<unsigned long long>(upload_ring_reserved_bytes) >> 20, upload_ring_reservations, upload_ring_refusals,
             static_cast<unsigned long long>(upload_ring_capacity_bytes) >> 20);
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld",
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
-            compute_builder_gate_refusals);
+            compute_builder_gate_refusals, compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
     }
     if (render_mode() && frame % 300 == 0) {
