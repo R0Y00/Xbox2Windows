@@ -140,6 +140,11 @@ FETCH_FORMATS = {
     'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
     # Three 10-bit fields and a 2-bit one in one dword, lowest bits first: x, y, z, then w.
     'BUF_FMT_2_10_10_10_UNORM': ('ldu({0}, a)', ['U((w & 1023) / 1023.0)', 'U(((w >> 10) & 1023) / 1023.0)', 'U(((w >> 20) & 1023) / 1023.0)', 'U((w >> 30) / 3.0)']),
+    # Fields are listed most significant first: x is the 2-bit field in bits 1:0, y, z and w are 10 bits each.
+    # Each field is sign-extended and converted to a float as is (no division). No DXGI typed view has this
+    # layout, so only a hardware descriptor reaches it (FORMAT 47, see DESC_FORMAT_CODES).
+    'BUF_FMT_10_10_10_2_SSCALED': ('ldu({0}, a)', ['U(float(int(w << 30) >> 30))', 'U(float(int(w << 20) >> 22))',
+                                                   'U(float(int(w << 10) >> 22))', 'U(float(int(w) >> 22))']),
     'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
     # Two unsigned 16-bit fields, x in the low half (LLVM 15: BUF_DATA_FORMAT_16_16 with BUF_NUM_FORMAT_UINT,
     # gfx10 unified format 27); a missing W of an integer format reads 1.
@@ -165,10 +170,12 @@ FETCH_FORMATS = {
 # Selectors for constants still return constants, so the caller must validate FORMAT before submission.
 DESC_FORMAT_UNKNOWN = 0x7fc0f0f0
 DESC_FORMAT_CODES = {
-    'BUF_FMT_8_UNORM': 1, 'BUF_FMT_8_UINT': 5, 'BUF_FMT_8_8_UNORM': 14, 'BUF_FMT_32_FLOAT': 22,
+    'BUF_FMT_8_UNORM': 1, 'BUF_FMT_8_UINT': 5, 'BUF_FMT_10_10_10_2_SSCALED': 47, 'BUF_FMT_8_8_UNORM': 14, 'BUF_FMT_32_FLOAT': 22,
     'BUF_FMT_2_10_10_10_UNORM': 50, 'BUF_FMT_16_16_UNORM': 23, 'BUF_FMT_16_16_SNORM': 24, 'BUF_FMT_16_16_UINT': 27, 'BUF_FMT_16_16_FLOAT': 29, 'BUF_FMT_8_8_8_8_UNORM': 56, 'BUF_FMT_8_8_8_8_UINT': 60,
     'BUF_FMT_32_32_FLOAT': 64, 'BUF_FMT_16_16_16_16_FLOAT': 71, 'BUF_FMT_32_32_32_FLOAT': 74,
     'BUF_FMT_32_32_32_32_FLOAT': 77}
+# Formats only a hardware descriptor reaches: no DXGI typed view has their layout.
+DESCRIPTOR_ONLY_FORMATS = frozenset({'BUF_FMT_10_10_10_2_SSCALED'})
 DESC_FORMAT_SHIFT, DESC_FORMAT_MASK = 12, 127
 # Integer formats read a DST_SEL constant 1 as the integer 1, every other format as 1.0.
 DESC_ONE_INTEGER = ('BUF_FMT_8_UINT', 'BUF_FMT_16_16_UINT', 'BUF_FMT_8_8_8_8_UINT')

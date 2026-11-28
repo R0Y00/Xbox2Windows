@@ -34,7 +34,7 @@ def main(header=ROOT / 'src' / 'startup_stubs' / 'buffer_format_word3.h'):
     assert set(mapped) == set(EXPECTED), sorted(set(mapped) ^ set(EXPECTED))
     for dxgi, code in mapped.items():
         assert code == codes[EXPECTED[dxgi]], (dxgi, code, EXPECTED[dxgi])
-    assert set(EXPECTED.values()) == set(codes), 'every decoded format has a DXGI view format'
+    assert set(EXPECTED.values()) | gfx2hlsl.DESCRIPTOR_ONLY_FORMATS == set(codes), 'every decoded format has a DXGI view format'
     return len(mapped)
 
 
