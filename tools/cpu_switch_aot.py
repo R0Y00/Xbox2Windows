@@ -1489,10 +1489,11 @@ WRITE_ACCESS = {OpAccess.WRITE, OpAccess.READ_WRITE, OpAccess.COND_WRITE, OpAcce
 
 
 class Frame:
-    """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction accesses.
+    """RSP as entry RSP + a constant at each instruction, and the stack bytes each instruction uses.
 
     offsets: RVA -> RSP - entry RSP before the instruction. accesses: RVA -> (offset of the first byte from entry
-    RSP, width, reads, writes). released: RVA -> (RSP before, RSP after) for an ADD RSP, POP or LEAVE, which leaves
+    RSP, width, reads, writes), including (False, False) bounds records for host-output and frame-pointer LEAs.
+    released: RVA -> (RSP before, RSP after) for an ADD RSP, POP or LEAVE, which leaves
     those bytes below RSP, where their contents may change. The frame array starts at entry RSP + start, the lowest offset rounded down to
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
@@ -1508,6 +1509,10 @@ class Frame:
         self.output_calls = {}
         self.output_addresses = {}
         self.outputs = {}
+        self.ptr_candidates = {}
+        self.ptr_addresses = set()
+        self.ptr_offsets = {}
+        self.ptr_calls = {}
         for ip, host in function.host_calls.items():
             if host.output is None:
                 continue
@@ -1531,6 +1536,31 @@ class Frame:
                 before = ins.ip
             if ip not in self.output_calls:
                 raise ValueError(f"stack output call at RVA {ip:#x} needs a proven frame address")
+        raw_ptr_candidates = {}
+        self.candidate_leas = set()
+        for ip in sorted(function.calls):
+            if ip in function.host_calls or function.calls[ip] is None:
+                continue
+            found = []
+            for register in ARGUMENT_REGISTERS:
+                before = ip
+                while before not in edges and before != function.entry:
+                    ins = function.ending.get(before)
+                    if ins is None or ins.flow_control != FlowControl.NEXT:
+                        break
+                    if (ins.mnemonic == M.LEA and ins.op0_kind == OpKind.REGISTER and ins.op0_register == register
+                            and ins.memory_base in (R.RSP, R.RBP) and ins.memory_index == R.NONE
+                            and not ins.has_segment_prefix):
+                        found.append((ins, register))
+                        self.candidate_leas.add(ins.ip)
+                        break
+                    if any(RegisterExt.full_register(used.register) == register
+                           or RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
+                           for used in INFO.info(ins).used_registers()):
+                        break
+                    before = ins.ip
+            if found:
+                raw_ptr_candidates[ip] = found
         anchors, self.set_anchor = {function.entry: None}, set()
         work = [function.entry]
         while work:
@@ -1553,6 +1583,10 @@ class Frame:
                                      f"{self.offsets[successor]:+#x} and entry RSP{after:+#x}")
                 elif anchors[successor] != anchor:
                     raise ValueError(f"frame pointer differs at join RVA {successor:#x}")
+        for ip, found in raw_ptr_candidates.items():
+            matched = [(ins, register) for ins, register in found if ins.ip in self.ptr_addresses]
+            if matched:
+                self.ptr_candidates[ip] = matched
         for ip in sorted(self.offsets):
             if function.instructions[ip].mnemonic == M.RET and self.offsets[ip]:
                 raise ValueError(f"stack not balanced at RET RVA {ip:#x}: RSP is entry RSP{self.offsets[ip]:+#x}")
@@ -1561,12 +1595,21 @@ class Frame:
             if offset < self.offsets[ip] + HOME_SIZE or offset % width:
                 raise ValueError(f"misaligned stack output or overlap with callee home space at RVA {ip:#x}")
             self.outputs[ip] = (offset, width)
+        self._update_stack_layout()
+
+    def _update_stack_layout(self):
         # Per stack argument slot: the low bytes that some read reaches, 0 for a slot only written.
         slots = {}
         for offset, width, reads, _ in self.accesses.values():
             if offset >= HOME_END:
                 slot = (offset - HOME_END) // 8
                 slots[slot] = max(slots.get(slot, 0), offset + width - HOME_END - 8 * slot if reads else 0)
+        for ptr_map in self.ptr_calls.values():
+            for _, offset, param in ptr_map.values():
+                if offset >= HOME_END:
+                    slot = (offset - HOME_END) // 8
+                    slots[slot] = max(slots.get(slot, 0),
+                                      offset + param.width - HOME_END - 8 * slot if param.reads_before_write else 0)
         self.stack = tuple(slots.get(slot, 0) for slot in range(max(slots, default=-1) + 1))
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
@@ -1574,6 +1617,35 @@ class Frame:
         self.size = self.end - self.start
         if self.size > self.frame_limit:
             raise ValueError(f"frame of {self.size} bytes exceeds the {self.frame_limit}-byte bound")
+
+    def resolve_pointer_calls(self, callees, program, stacks):
+        """Validate frame-slot pointer arguments against resolved non-recursive internal callees."""
+        for call_ip, candidates in self.ptr_candidates.items():
+            callee = callees[call_ip]
+            if not program.committed(callee) or getattr(callee, "recursive", False):
+                raise ValueError(f"frame-slot pointer passed to recursive callee at RVA {call_ip:#x}")
+            min_offset = self.offsets[call_ip] + HOME_SIZE + 8 * len(stacks.get(call_ip, ()))
+            resolved = {}
+            for lea_ins, register in candidates:
+                param = callee.frame_ptr_params.get(register)
+                if param is None:
+                    raise ValueError(f"frame-slot pointer in {NAMES[register]} escapes or is unsupported by "
+                                     f"callee at RVA {call_ip:#x}")
+                offset = self.ptr_offsets[lea_ins.ip]
+                if offset < min_offset:
+                    raise ValueError(f"frame-slot pointer overlaps callee home space or stack arguments "
+                                     f"at RVA {call_ip:#x}")
+                self.access(lea_ins, self.offsets[call_ip], offset, param.width, False, False)
+                resolved[register] = (lea_ins, offset, param)
+            items = list(resolved.items())
+            for i, (reg1, (_, off1, p1)) in enumerate(items):
+                for reg2, (_, off2, p2) in items[i + 1:]:
+                    if off1 < off2 + p2.width and off2 < off1 + p1.width:
+                        raise ValueError(f"aliased frame-slot pointers in {NAMES[reg1]} and {NAMES[reg2]} "
+                                         f"at RVA {call_ip:#x}")
+            self.ptr_calls[call_ip] = resolved
+        if self.ptr_calls:
+            self._update_stack_layout()
 
     def access(self, ins, rsp, offset, width, reads, writes):
         if offset < rsp:
@@ -1641,6 +1713,12 @@ class Frame:
             displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
             self.access(ins, rsp, base + displacement, self.output_addresses[ip], False, False)
             return rsp, anchor
+        if ip in self.candidate_leas and (ins.memory_base == R.RSP or anchor is not None):
+            base = rsp if ins.memory_base == R.RSP else anchor
+            displacement = ins.memory_displacement - ((ins.memory_displacement >> 63) << 64)
+            self.ptr_addresses.add(ip)
+            self.ptr_offsets[ip] = base + displacement
+            return rsp, anchor
         if any(RegisterExt.full_register(used.register) == R.RSP and used.access in WRITE_ACCESS
                for used in info.used_registers()):
             raise ValueError(f"dynamic frame at RVA {ip:#x}: {ins}")
@@ -1706,7 +1784,8 @@ def prove_frame(function, order, effects, frame, stacks=None):
             # The callee may write its home space, the 32 bytes at RSP. The CALL's return address and the
             # callee's frame lie below RSP, where every byte is already 0: no access is below RSP, and the
             # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
-            # function's own home space above entry RSP, is kept.
+            # function's own home space above entry RSP, is kept except for any pointed-to frame-slot
+            # targets (marked defined on must_write, or cleared to 0 if holding saved-register/unwritten bytes on may_write).
             # It may also write the stack arguments above that home space.
             index = frame.offsets[ip] - frame.start
             size = HOME_SIZE + 8 * len(stacks.get(ip, ()))
@@ -1715,6 +1794,14 @@ def prove_frame(function, order, effects, frame, stacks=None):
                 offset, width = frame.outputs[ip]
                 index = offset - frame.start
                 data = data[:index] + b"\1" * width + data[index + width:]
+            for _, offset, param in frame.ptr_calls.get(ip, {}).values():
+                p_idx = offset - frame.start
+                if param.must_write:
+                    data = data[:p_idx] + b"\1" * param.width + data[p_idx + param.width:]
+                elif param.may_write:
+                    existing = data[p_idx:p_idx + param.width]
+                    replacement = existing if existing == b"\1" * param.width else bytes(param.width)
+                    data = data[:p_idx] + replacement + data[p_idx + param.width:]
             return status, data
         status, restored = dict(zip(NONVOLATILE, status)), None
         if ip in frame.accesses:
@@ -1771,6 +1858,16 @@ def prove_frame(function, order, effects, frame, stacks=None):
                 raise ValueError(f"undefined stack byte at entry RSP{offset + got.index(0):+#x} at RVA {ip:#x}")
             raise ValueError(f"stack bytes at entry RSP{offset:+#x} hold the saved "
                              f"{NAMES[NONVOLATILE[(max(got) - 2) // 8]]}, read as data at RVA {ip:#x}")
+        for _, ptr_offset, param in frame.ptr_calls.get(ip, {}).values():
+            if param.reads_before_write:
+                p_idx = ptr_offset - frame.start
+                ptr_got = data[p_idx:p_idx + param.width]
+                if ptr_got != b"\1" * param.width:
+                    if 0 in ptr_got:
+                        raise ValueError(f"undefined stack byte at entry RSP{ptr_offset + ptr_got.index(0):+#x} "
+                                         f"at RVA {ip:#x}")
+                    raise ValueError(f"stack bytes at entry RSP{ptr_offset:+#x} hold the saved "
+                                     f"{NAMES[NONVOLATILE[(max(ptr_got) - 2) // 8]]}, read as data at RVA {ip:#x}")
         if ins.mnemonic == M.RET or ip in function.tails:
             site = "tail jump" if ip in function.tails else "RET"
             for register, value in status.items():
@@ -1870,6 +1967,14 @@ class Assumed(NamedTuple):
     return_width: int
     demands: dict
     stack: tuple = ()
+
+
+class PointerParam(NamedTuple):
+    """Summary of an internal callee argument register proven to hold a non-escaping scalar pointer."""
+    width: int
+    reads_before_write: bool
+    must_write: bool
+    may_write: bool
 
 
 def parameters(registers, stack=()):
@@ -1982,6 +2087,10 @@ class Program:
         del self.pending[start:]
         cyclic = [self.assumed.pop(entry, None) for entry, _, _ in members]
         if any(cyclic) or len(members) > 1:
+            for _, _, member in members:
+                member.recursive = True
+                # Deliberate redundancy for clarity: recursive members never expose pointer parameters.
+                member.frame_ptr_params = {}
             self.sources.append("\n".join(f"static word fn_{entry:x}({parameters(ARGUMENT_REGISTERS, member.stack)});"
                                           for entry, _, member in sorted(members, key=lambda m: m[0])))
         for entry, text, member in members:
@@ -2018,6 +2127,272 @@ def argument_demands(function, order, effects):
     return demands
 
 
+def _check_ptr_mem(ins, cur):
+    """Validate memory operands against tracked pointer registers (0=dead, 1=proven, 2=possibly-pointer).
+
+    Returns (ok, access_tuple_or_None) where access_tuple is (width, reads, must_write, may_write)."""
+    base = full(ins.memory_base) if ins.memory_base not in (R.NONE, R.RIP, R.EIP) else R.NONE
+    idx = full(ins.memory_index) if ins.memory_index != R.NONE else R.NONE
+    if idx != R.NONE and cur.get(idx, 0) != 0:
+        return False, None
+    if base == R.NONE or cur.get(base, 0) == 0:
+        return True, None
+    # Uses BIT_TESTS (BT/BTS/BTR/BTC defined above): register-indexed bit tests are rejected.
+    if (cur.get(base, 0) != 1 or not RegisterExt.is_gpr64(ins.memory_base)
+            or ins.memory_index != R.NONE or ins.memory_displacement != 0
+            or ins.has_segment_prefix
+            or (ins.mnemonic in BIT_TESTS and ins.op1_kind == OpKind.REGISTER)):
+        return False, None
+    info = INFO.info(ins)
+    used_mem = list(info.used_memory())
+    if len(used_mem) != 1 or used_mem[0].access not in (OpAccess.READ, OpAccess.WRITE, OpAccess.READ_WRITE):
+        return False, None
+    m_acc = used_mem[0].access
+    return True, (_memory_width(ins), m_acc != OpAccess.WRITE, m_acc != OpAccess.READ, m_acc != OpAccess.READ)
+
+
+def _step_ptr_instruction(function, callees, frame, program, loads, skipped, ip, state_map):
+    """Abstractly step one instruction in the 3-state pointer-parameter lattice.
+
+    State map tracks registers holding a parameter-derived pointer:
+      0 (absent) = dead / not derived from arg_reg,
+      1          = proven exact copy of arg_reg,
+      2          = possibly-pointer (e.g. conditional/joined value; dereference or escape is rejected).
+    Returns (next_state_map, access_or_None) or "escape". Uses CMOVCC, STRING_TRANSFERS,
+    and SIGN_EXTENSIONS defined above in this module."""
+    cur = dict(state_map)
+    ins = function.instructions[ip]
+    mnemonic = ins.mnemonic
+    if ip in callees:
+        callee = callees[ip]
+        if ip in function.tails:
+            if any(cur.get(r, 0) != 0 for r in ARGUMENT_REGISTERS):
+                return "escape"
+            return {}, None
+        if isinstance(callee, HostImport):
+            if any(cur.get(r, 0) != 0 for r in callee.demands):
+                return "escape"
+            access = None
+        elif callee is None:
+            if any(cur.get(r, 0) != 0 for r in ARGUMENT_REGISTERS):
+                return "escape"
+            access = None
+        else:
+            live_args = [r for r in ARGUMENT_REGISTERS if cur.get(r, 0) != 0
+                         and (r in callee.demands or getattr(callee, "frame_ptr_params", {}).get(r) is not None)]
+            if len(live_args) > 1:
+                return "escape"
+            if live_args:
+                r = live_args[0]
+                if cur[r] != 1 or not program.committed(callee) or getattr(callee, "recursive", False):
+                    return "escape"
+                nested = callee.frame_ptr_params.get(r)
+                if nested is None:
+                    return "escape"
+                access = (nested.width, nested.reads_before_write, nested.must_write, nested.may_write)
+            else:
+                access = None
+        for v in VOLATILE:
+            cur.pop(v, None)
+        return cur, access
+    if mnemonic == M.RET:
+        if cur.get(R.RAX, 0) != 0:
+            return "escape"
+        return cur, None
+    if ip in function.dispatches:
+        if cur.get(function.dispatches[ip][0], 0) != 0:
+            return "escape"
+        cur.pop(function.dispatches[ip][4], None)
+        return cur, None
+    if ip in skipped:
+        if ip in loads and cur.get(loads[ip], 0) != 0:
+            return "escape"
+        cur.pop(full(ins.op0_register), None)
+        return cur, None
+    if ip in frame.set_anchor:
+        cur.pop(R.RBP, None)
+        return cur, None
+    if ip in frame.output_addresses or ip in frame.ptr_addresses:
+        cur.pop(full(ins.op0_register), None)
+        return cur, None
+    if mnemonic == M.LEA:
+        dst = full(ins.op0_register)
+        w_reg = RegisterExt.size(ins.op0_register)
+        if ins.is_ip_rel_memory_operand:
+            if w_reg < 4 and cur.get(dst, 0) != 0:
+                return "escape"
+            cur.pop(dst, None)
+            return cur, None
+        base = full(ins.memory_base) if ins.memory_base != R.NONE else R.NONE
+        idx = full(ins.memory_index) if ins.memory_index != R.NONE else R.NONE
+        if idx != R.NONE and cur.get(idx, 0) != 0:
+            return "escape"
+        if base != R.NONE and cur.get(base, 0) != 0:
+            if (cur.get(base, 0) == 1 and w_reg == 8
+                    and ins.memory_index == R.NONE and ins.memory_displacement == 0
+                    and not ins.has_segment_prefix):
+                cur[dst] = 1
+                return cur, None
+            return "escape"
+        if w_reg < 4 and cur.get(dst, 0) != 0:
+            return "escape"
+        cur.pop(dst, None)
+        return cur, None
+    if (mnemonic == M.MOV and ins.op0_kind == OpKind.REGISTER and ins.op1_kind == OpKind.REGISTER
+            and RegisterExt.size(ins.op0_register) == 8):
+        dst, src = full(ins.op0_register), full(ins.op1_register)
+        val = cur.get(src, 0)
+        if val:
+            cur[dst] = val
+        else:
+            cur.pop(dst, None)
+        return cur, None
+    if mnemonic in CMOVCC:
+        dst = full(ins.op0_register)
+        w_reg = RegisterExt.size(ins.op0_register)
+        if ins.op1_kind == OpKind.MEMORY:
+            ok, access = _check_ptr_mem(ins, cur)
+            if not ok:
+                return "escape"
+            if cur.get(dst, 0) != 0:
+                if w_reg != 8:
+                    return "escape"
+                cur[dst] = 2
+            return cur, access
+        src_live = cur.get(full(ins.op1_register), 0)
+        dst_live = cur.get(dst, 0)
+        if (src_live or dst_live) and w_reg != 8:
+            return "escape"
+        if src_live and dst_live:
+            cur[dst] = 1 if src_live == 1 and dst_live == 1 else 2
+        elif src_live or dst_live:
+            cur[dst] = 2
+        return cur, None
+    if mnemonic == M.LEAVE:
+        cur.pop(R.RBP, None)
+        return cur, None
+    if ins.code in STRING_TRANSFERS or mnemonic == M.CLZERO:
+        kind = STRING_TRANSFERS[ins.code][0] if ins.code in STRING_TRANSFERS else "clzero"
+        checked = {R.RDI} | ({R.RSI} if kind == "movs" else set())
+        if kind in ("stos", "clzero"):
+            checked.add(R.RAX)
+        if ins.has_rep_prefix:
+            checked.add(R.RCX)
+        if any(cur.get(r, 0) != 0 for r in checked):
+            return "escape"
+        for r in implicit_writes(ins):
+            cur.pop(r, None)
+        return cur, None
+    if (mnemonic in (M.XOR, M.SUB) and ins.op0_kind == ins.op1_kind == OpKind.REGISTER
+            and ins.op0_register == ins.op1_register):
+        dst = full(ins.op0_register)
+        if RegisterExt.size(ins.op0_register) < 4 and cur.get(dst, 0) != 0:
+            return "escape"
+        cur.pop(dst, None)
+        return cur, None
+    access = None
+    if any(ins.op_kind(n) == OpKind.MEMORY for n in range(ins.op_count)):
+        ok, access = _check_ptr_mem(ins, cur)
+        if not ok:
+            return "escape"
+    info = INFO.info(ins)
+    for n in range(ins.op_count):
+        if ins.op_kind(n) == OpKind.REGISTER and info.op_access(n) in READS:
+            if cur.get(full(ins.op_register(n)), 0) != 0:
+                return "escape"
+    if mnemonic in SIGN_EXTENSIONS and cur.get(full(SIGN_EXTENSIONS[mnemonic][0]), 0) != 0:
+        return "escape"
+    if mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
+        w_mul = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else _memory_width(ins)
+        if cur.get(R.RAX, 0) != 0 or (mnemonic in (M.DIV, M.IDIV) and cur.get(R.RDX, 0) != 0):
+            return "escape"
+        if w_mul == 2 and cur.get(R.RDX, 0) != 0:
+            return "escape"
+        cur.pop(R.RAX, None)
+        if w_mul >= 4:
+            cur.pop(R.RDX, None)
+        return cur, access
+    if ins.op_count and ins.op0_kind == OpKind.REGISTER and info.op_access(0) in WRITES:
+        dst = full(ins.op0_register)
+        op0_acc = info.op_access(0)
+        if op0_acc in (OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE) and cur.get(dst, 0) != 0:
+            return "escape"
+        if RegisterExt.size(ins.op0_register) < 4 and cur.get(dst, 0) != 0:
+            return "escape"
+        cur.pop(dst, None)
+    for r in implicit_writes(ins):
+        cur.pop(r, None)
+    return cur, access
+
+
+def analyze_pointer_param(function, order, callees, frame, program, loads, skipped, arg_reg):
+    """Return PointerParam if arg_reg is a bounded non-escaping scalar pointer parameter, else None."""
+    if getattr(function, "recursive", False):
+        return None
+
+    ptr_in = {function.entry: {arg_reg: 1}}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        res = _step_ptr_instruction(function, callees, frame, program, loads, skipped, ip, ptr_in[ip])
+        if res == "escape":
+            return None
+        out, _ = res
+        for succ in function.successors[ip]:
+            if succ not in ptr_in:
+                ptr_in[succ] = dict(out)
+                work.append(succ)
+            else:
+                old = ptr_in[succ]
+                merged = {}
+                for r in set(old) | set(out):
+                    v1, v2 = old.get(r, 0), out.get(r, 0)
+                    if v1 == v2:
+                        if v1:
+                            merged[r] = v1
+                    else:
+                        merged[r] = 2
+                if merged != old:
+                    ptr_in[succ] = merged
+                    work.append(succ)
+
+    accesses = {}
+    for ip in order:
+        if ip not in ptr_in:
+            continue
+        res = _step_ptr_instruction(function, callees, frame, program, loads, skipped, ip, ptr_in[ip])
+        if res == "escape":
+            return None
+        _, access = res
+        if access is not None:
+            accesses[ip] = access
+    # Deliberate early-out before checking widths == {width}.
+    if not accesses:
+        return None
+    widths = {acc[0] for acc in accesses.values()}
+    if len(widths) != 1:
+        return None
+    width = next(iter(widths))
+
+    written_in = {function.entry: False}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        w_out = written_in[ip] or (ip in accesses and accesses[ip][2])
+        for succ in function.successors[ip]:
+            merged = w_out if succ not in written_in else (written_in[succ] and w_out)
+            if succ not in written_in or merged != written_in[succ]:
+                written_in[succ] = merged
+                work.append(succ)
+    exits = [ip for ip in order if function.instructions[ip].mnemonic == M.RET or ip in function.tails]
+    if not exits:
+        return None
+    reads_before_write = any(accesses[ip][1] and not written_in[ip] for ip in accesses)
+    must_write = all(written_in[ip] or (ip in accesses and accesses[ip][2]) for ip in exits)
+    may_write = any(accesses[ip][3] for ip in accesses)
+    return PointerParam(width, reads_before_write, must_write, may_write)
+
+
 def lift_function(program, entry, symbol, arguments, internal):
     """Translate the function at entry. An internal function takes all four argument registers, and
     its demands record how many low bytes of each one it may read before writing it."""
@@ -2045,8 +2420,6 @@ def lift_function(program, entry, symbol, arguments, internal):
             raise ValueError(f"{what} in a function without unwind data at RVA {moved[0]:#x}")
     check_call_sites(function, frame.offsets)
     prove_direction(function)
-    lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
-    lifter.adjustments = frame.adjustments
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
     sets_flags = {producer.ip for producer in producers.values()}
@@ -2054,6 +2427,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     callees = {ip: (function.host_calls[ip] if ip in function.host_calls
                     else program.callee(target, ip))
                for ip, target in sorted({**function.calls, **function.tails}.items())}
+    function.recursive = any(not program.committed(c) for c in callees.values())
     for ip in sorted(function.tails):
         if not program.committed(callees[ip]):
             # The original runs a cycle of tail jumps in constant stack; the host call does not.
@@ -2066,6 +2440,9 @@ def lift_function(program, entry, symbol, arguments, internal):
             raise ValueError(f"tail jump to a function with stack arguments at RVA {ip:#x}")
         if frame.offsets[ip] + HOME_SIZE + 8 * len(stack) > 0:
             raise ValueError(f"stack arguments of the call at RVA {ip:#x} reach the return address")
+    frame.resolve_pointer_calls(callees, program, stacks)
+    lifter.frame = {ip: access[0] - frame.start for ip, access in frame.accesses.items()}
+    lifter.adjustments = frame.adjustments
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -2083,9 +2460,11 @@ def lift_function(program, entry, symbol, arguments, internal):
                              for r in callee.demands]
                 call = f"{callee.symbol}({', '.join(call_args)})"
             else:
-                # Stack arguments are passed by value from the bytes above the callee's home space. A slot
-                # that the callee never reads is passed as 0; the caller then need not have a frame.
-                passed = [lifter.reg(r) for r in ARGUMENT_REGISTERS] + [
+                # Bounded frame-slot pointer arguments (frame.ptr_calls) pass their slot host address via
+                # lifter.slot(...); remaining register arguments and stack arguments pass by value.
+                ptr_args = frame.ptr_calls.get(ip, {})
+                passed = [lifter.slot(ptr_args[r][0]) if r in ptr_args else lifter.reg(r)
+                          for r in ARGUMENT_REGISTERS] + [
                     f"load<word>(reinterpret_cast<word>(frame + {frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start}))"
                     if width else "0" for slot, width in enumerate(stacks.get(ip, ()))]
                 call = f"fn_{callee.entry:x}({', '.join(passed)})"
@@ -2098,6 +2477,8 @@ def lift_function(program, entry, symbol, arguments, internal):
             reads = dict(callee.demands)
             if ip in frame.output_calls:
                 del reads[frame.output_calls[ip][1]]
+            for r in frame.ptr_calls.get(ip, {}):
+                reads.pop(r, None)
             effects[ip] = (reads, {}, set())
         elif ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
@@ -2124,7 +2505,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         elif ip in frame.set_anchor:
             # Only the frame proof observes the anchor. No host pointer stands in for RBP.
             effects[ip] = ({}, {R.RBP: 8}, set())
-        elif ip in frame.output_addresses:
+        elif ip in frame.output_addresses or ip in frame.ptr_addresses:
             effects[ip] = ({}, {}, {full(ins.op0_register)})
         elif (ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register)
               and (not image_data or (ins.op0_register, ins.ip_rel_memory_address) in bases)):
@@ -2205,6 +2586,13 @@ def lift_function(program, entry, symbol, arguments, internal):
     stack = frame.stack + (0,) * max(0, len(assumed.stack) - len(frame.stack)) if assumed else frame.stack
     function.stack = tuple(max(width, assumed.stack[slot] if assumed and slot < len(assumed.stack) else 0)
                            for slot, width in enumerate(stack))
+    if internal and not function.recursive:
+        function.frame_ptr_params = {
+            reg: param for reg in ARGUMENT_REGISTERS
+            if (param := analyze_pointer_param(function, order, callees, frame, program, loads, skipped, reg)) is not None
+        }
+    else:
+        function.frame_ptr_params = {}
 
     labels = set(edges)
     if order[0] != entry:
