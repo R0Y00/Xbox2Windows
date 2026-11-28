@@ -910,6 +910,11 @@ int main(int argc, char** argv)
         if (!MoveFileW((std::wstring(manifest) + L".pending").c_str(), manifest)) return 61;
         Sleep(1100);
     }
+    if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_TWICE", nullptr, 0)) {
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        return check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
         extern void release_placed_vertices(bool);
         const std::string first = std::string(argv[5]) + ".first";

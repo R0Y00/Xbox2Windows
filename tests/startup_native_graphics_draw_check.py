@@ -49,6 +49,13 @@ def check(folder, consumer, sdk, adapter, compiler):
         print(run.stdout.strip())
         assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
         print(f"{adapter} {name}: cache={hits}, 16 red and 16 clear pixels")
+    twice_env = dict(env, X2W_TEST_DRAW_TWICE="1", X2W_TEST_BUMP_TRANSLATION_REVISION="1")
+    run = subprocess.run(args, env=twice_env, capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stderr
+    assert run.stderr.count("desktop pipeline for") >= 2, run.stderr[-8000:]
+    assert Path(str(pixels) + ".first").read_bytes() == (red * 4 + clear * 4) * 4
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    print(f"{adapter} revision bump: two draws created two PSOs")
     # Publish a verified disk pair, then hold back its ready marker until after the first draw.
     subprocess.run([compiler, "--watch", sdk, cache, cache, "--once"], check=True, timeout=45)
     marker, = cache.glob("req_*.a")

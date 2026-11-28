@@ -2929,6 +2929,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
+    if (x2w_local::env_on("X2W_TEST_BUMP_TRANSLATION_REVISION"))
+        ++tr->revision;
     // pipeline_for may replace the native candidate with the published disk translation.
     // Create the PSO first, then derive every binding from the translation it leaves in tr.
     ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, rect, indexed_rect) : nullptr;
