@@ -40,7 +40,10 @@ import os
 import re
 import struct
 import sys
+import tempfile
+import zlib
 from collections import Counter, namedtuple
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gfx2hlsl as G  # noqa: E402  (also puts tools/ on sys.path)
@@ -59,6 +62,9 @@ Contract = namedtuple('Contract', 'live_in ij_pairs split16 ambiguous', defaults
 # Forms whose operands are all sources even though the first one may be a vector register.
 ALL_SOURCE_PREFIXES = ('v_cmp', 'ds_write', 'v_nop')
 READ_WRITE = ('v_swap_b32', 'v_swaprel_b32')
+# Forms that also read their destination: the multiply-accumulate and dot-accumulate forms add to it, and
+# v_writelane_b32 keeps every other lane of it.
+DESTINATION_READ_PREFIXES = ('v_mac_', 'v_fmac_', 'v_pk_fmac_', 'v_dot2c_', 'v_dot4c_', 'v_dot8c_', 'v_writelane_b32')
 UNKNOWN_FLOW = ('s_setpc_b64', 's_swappc_b64', 's_rfe_b64', 's_call_b64')
 
 
@@ -108,7 +114,7 @@ def parse_instruction(asm):
         ops[0] = ops[0].partition(' ')[2]
     destination = operand_vregs(ops[0]) if ops else None
     has_destination = destination is not None and not all_source(base) and base not in READ_WRITE
-    sources = ops[1:] if has_destination else ops
+    sources = ops[1:] if has_destination and not base.startswith(DESTINATION_READ_PREFIXES) else ops
     if base in READ_WRITE:   # both operands are read, then both are rewritten
         writes = [span for span in map(operand_vregs, ops) if span]
     else:
@@ -116,35 +122,81 @@ def parse_instruction(asm):
     return mnemonic, base, ops, mods, destination if has_destination else None, sources, writes
 
 
+def branch_of(name, asm):
+    """-> (target byte offset or None, falls through, unknown) for one instruction. `unknown` is set
+    for a branch whose target the text does not give and for indirect forms."""
+    base = base_name(name)
+    if base == 's_branch' or base.startswith('s_cbranch'):
+        m = re.search(r'label_0x([0-9a-f]+)', asm)
+        if m is None or 'fork' in base or 'join' in base:
+            return None, base != 's_branch', True
+        return int(m.group(1), 16), base != 's_branch', False
+    if base in UNKNOWN_FLOW:
+        return None, base in ('s_swappc_b64', 's_call_b64'), True
+    return None, not base.startswith('s_endpgm'), False
+
+
 def control_flow(decoded):
-    """-> (branch targets, backward spans (target, source), unknown): offsets from the label text.
-    `unknown` is set for a branch whose target the text does not give and for indirect forms."""
+    """-> (branch targets, backward spans (target, source), unknown): offsets from the label text."""
     targets, spans, unknown = set(), [], False
     for off, _, name, asm in decoded:
-        base = base_name(name)
-        if base == 's_branch' or base.startswith('s_cbranch'):
-            m = re.search(r'label_0x([0-9a-f]+)', asm)
-            if m is None or 'fork' in base or 'join' in base:
-                unknown = True
-            else:
-                target = int(m.group(1), 16)
-                targets.add(target)
-                if target <= off:
-                    spans.append((target, off))
-        elif base in UNKNOWN_FLOW:
-            unknown = True
+        target, _, indirect = branch_of(name, asm)
+        unknown |= indirect
+        if target is not None:
+            targets.add(target)
+            if target <= off:
+                spans.append((target, off))
     return targets, spans, unknown
+
+
+def must_defined(decoded, writes):
+    """-> per instruction, a bit set of the vector registers written on every path from the entry
+    to it (the definitions available on all incoming edges, intersected at each join).
+
+    `writes[i]` lists the spans instruction i writes. A branch with an unknown target may reach any
+    instruction, so its state joins every instruction. An instruction no path reaches keeps every
+    bit set (-1), which leaves the linear rule in charge there."""
+    count = len(decoded)
+    index = {off: i for i, (off, _, _, _) in enumerate(decoded)}
+    gen = [sum(((1 << (last + 1)) - (1 << first)) for first, last in spans) for spans in writes]
+    preds, anywhere = [[] for _ in range(count)], []
+    for i, (_, _, name, asm) in enumerate(decoded):
+        target, falls, indirect = branch_of(name, asm)
+        if indirect:
+            anywhere.append(i)
+        if target in index:
+            preds[index[target]].append(i)
+        if falls and i + 1 < count:
+            preds[i + 1].append(i)
+    state, out = [-1] * count, [-1] * count
+    changed = True
+    while changed:   # the sets only lose bits, so this ends
+        changed = False
+        everywhere = -1
+        for u in anywhere:
+            everywhere &= out[u]
+        for i in range(count):
+            value = 0 if i == 0 else everywhere
+            for p in preds[i]:
+                value &= out[p]
+            if value != state[i]:
+                state[i], out[i], changed = value, value | gen[i], True
+    return state
 
 
 def contract_of_decoded(decoded):
     """Scan decoded instructions, (offset, length, name, asm) as gfx2hlsl.decode returns them.
 
-    A register first read before any write is live-in, unless the read sits inside a loop (a
-    backward branch spans it) and the register is written later in program order: then the value may
-    be loop-carried, the register is `ambiguous` and takes no part in any rule. Evidence taken from
-    a read that is unsafe in that sense is dropped, and aliases do not cross basic blocks."""
+    A register read where it may still hold its entry value is live-in: it is not written earlier in
+    program order, or it is not written on every path to the read (a forward branch can skip the
+    write, so the definitions of the incoming edges are intersected at each join). The exception is
+    a read inside a loop (a backward branch spans it) of a register written later in program order:
+    then the value may be loop-carried, the register is `ambiguous` and takes no part in any rule.
+    Evidence taken from a read that is unsafe in that sense is dropped, and aliases do not cross
+    basic blocks."""
     parsed = [(off,) + parse_instruction(asm) for off, _, _, asm in decoded]
     targets, spans, unknown = control_flow(decoded)
+    defined = must_defined(decoded, [item[-1] for item in parsed])
     last_write = {}
     for item in parsed:
         for first, last in item[-1]:
@@ -163,12 +215,13 @@ def contract_of_decoded(decoded):
         span = operand_vregs(token)
         return span[0] if span and span[0] == span[1] else None
 
-    for off, mnemonic, base, ops, mods, destination, sources, writes in parsed:
+    for position, (off, mnemonic, base, ops, mods, destination, sources, writes) in enumerate(parsed):
         if off in targets:
             holds.clear()
         if not ops:
             continue
         in_loop = unknown or any(t <= off <= s for t, s in spans)
+        everywhere = defined[position]
 
         def unsafe(register):
             later = last_write.get(register)
@@ -178,7 +231,7 @@ def contract_of_decoded(decoded):
             span = operand_vregs(token)
             if span:
                 for register in range(span[0], span[1] + 1):
-                    if register not in written:
+                    if register not in written or not everywhere >> register & 1:
                         (ambiguous if unsafe(register) else live_in).add(register)
 
         fields = {}
@@ -1001,7 +1054,45 @@ def run(directory, capture_path, pixel_dir, top, limit, listing):
     return lines, result
 
 
-def main(argv=None):
+def _same_path(left, right):
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_json_path(json_path, request_dir, pixel_dir, capture_path):
+    json_resolved = json_path.resolve()
+    if capture_path:
+        cap_path = Path(capture_path)
+        if _same_path(json_path, cap_path):
+            raise ValueError('--json path collides with --capture: %s' % json_path)
+        if cap_path.resolve() in json_resolved.parents:
+            raise ValueError('--json path cannot be inside --capture: %s' % json_path)
+    for label, dir_arg in (('request directory', request_dir), ('--pixel-dir', pixel_dir)):
+        if dir_arg and _same_path(json_path, Path(dir_arg)):
+            raise ValueError('--json path collides with %s: %s' % (label, json_path))
+    if json_path.exists() and json_path.is_dir():
+        raise ValueError('--json path is an existing directory: %s' % json_path)
+    for label, dir_arg in (('request directory', request_dir), ('--pixel-dir', pixel_dir)):
+        if not dir_arg:
+            continue
+        dir_path = Path(dir_arg)
+        if dir_path.resolve() in json_resolved.parents:
+            raise ValueError('--json path cannot be inside %s: %s' % (label, json_path))
+        if json_path.exists() and any(_same_path(json_path, child) for child in dir_path.iterdir()):
+            raise ValueError('--json path collides with file in %s: %s' % (label, json_path))
+
+
+def _atomic_write_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        staged.write_text(text, encoding='utf-8')
+        os.replace(staged, path)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('request_dir', nargs='?', help='directory with req_<key>.a/.b/.root files')
     parser.add_argument('--capture', help='capture.bin whose path-57 PSOs are scanned')
@@ -1021,13 +1112,17 @@ def main(argv=None):
         parser.error('--capture is not a file')
     if args.top < 1 or args.region_limit < 8:
         parser.error('--top must be positive and --region-limit at least 8')
-    lines, result = run(args.request_dir, args.capture, args.pixel_dir, args.top, args.region_limit, args.list)
+    try:
+        if args.json is not None:
+            _validate_json_path(Path(args.json), args.request_dir, args.pixel_dir, args.capture)
+        lines, result = run(args.request_dir, args.capture, args.pixel_dir, args.top, args.region_limit, args.list)
+        if args.json is not None:
+            _atomic_write_text(args.json, json.dumps(result, indent=1))
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        parser.error(str(exc))
     print('\n'.join(lines))
-    if args.json:
-        with open(args.json, 'w', encoding='utf-8') as file:
-            json.dump(result, file, indent=1)
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())

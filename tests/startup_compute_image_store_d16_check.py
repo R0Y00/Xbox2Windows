@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 
 import compute_mimg_float_store_d16_check as fixture
+import startup_compute_image_store_check as A
 from startup_gfx2hlsl_compute_check import G, TGID_X, TGID_Y, assemble, refused, root_blob, tidig
 
 
@@ -14,6 +15,50 @@ MASK = bytes.fromhex('8002a47d')  # v_cmpx_eq_u32_e32 0, v1
 PARTS = ('f16tof32(v14 & 0xffffu)', 'f16tof32(v14 >> 16)',
          'f16tof32(v15 & 0xffffu)', 'f16tof32(v15 >> 16)')
 LINE = f'w0[uint2(v8, v9)] = float4({", ".join(PARTS)});'
+
+
+# Reuse the assembled FP32 array x/y/layer prologue. The packed values
+# are four distinct finite nonzero half encodings, low half first.
+ARRAY_VALUES = (0x3c00, 0xc000, 0x3800, 0x7bff)
+ARRAY_DATA = bytes.fromhex('7fc08cbf ff021c7e003c00c0 ff021e7e0038ff7b')
+ARRAY_STORE = bytes.fromhex('280f20f0080e0680')
+ARRAY_LINE = LINE.replace('uint2(v8, v9)', 'uint3(v8, v9, v10)')
+ARRAY_SOURCE = A.ARRAY_SOURCE.split('s_waitcnt', 1)[0] + """\
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v14, 0xc0003c00
+v_mov_b32_e32 v15, 0x7bff3800
+{mask}image_store v[14:15], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY d16
+s_endpgm
+"""
+
+
+def array_program(layer, masked=False):
+    return A.ARRAY_PROLOGUE + A.ARRAY_SLICE[layer] + ARRAY_DATA + (MASK if masked else b'') + ARRAY_STORE + A.ARRAY_END
+
+
+def array_controls(llvm_mc):
+    for layer in (1, 3):
+        for masked in (False, True):
+            code = array_program(layer, masked)
+            if llvm_mc:
+                source = ARRAY_SOURCE.format(layer=layer, mask='v_cmpx_eq_u32_e32 0, v1\n' if masked else '')
+                assert assemble(llvm_mc, source) == code, (layer, masked)
+            pipe = G.ComputePipeline(code, root_blob(3), RSRC2, fixture.GROUP)
+            hlsl = pipe.hlsl_cs()
+            assert 'RWTexture2DArray<float4> w0 : register(u0);' in hlsl
+            assert ('if (exec & 1) ' if masked else '') + ARRAY_LINE in hlsl
+            assert ('if (exec & 1) ' + ARRAY_LINE in hlsl) == masked
+            assert f'v10 = 0x{layer:08x}u;' in hlsl
+            assert 'uav 0 tex2da float table 1 64 channels 4' in pipe.manifest().splitlines()
+    mods = ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D_ARRAY', 'd16']
+    for data in ('v14', 'v[14:16]', 'v[14:17]', 'v[255:256]'):
+        refused('two VGPRs expected', lambda: pipe.cs.op_image_store([data, 'v[8:10]', 's[24:31]'], mods))
+    for addr in ('v[8:9]', 'v[8:11]'):
+        refused('x, y and layer expected', lambda: pipe.cs.op_image_store(['v[14:15]', addr, 's[24:31]'], mods))
+    refused('fixed table image descriptor', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[28:35]'], mods))
+    refused('typed UAV store writes all four channels', lambda: pipe.cs.op_image_store(['v14', 'v[8:10]', 's[24:31]'], ['dmask:0x3', *mods[1:]]))
+    refused('modifier a16', lambda: pipe.cs.op_image_store(['v[14:15]', 'v[8:10]', 's[24:31]'], mods + ['a16']))
+    print('Compute packed D16 array translation and refusal checks passed' + ('; LLVM assembly matched' if llvm_mc else ''))
 
 
 def pipeline(body):
@@ -44,9 +89,6 @@ def controls(llvm_mc):
         (fixture.STORE.replace('v[14:15]', 'v14').replace('dmask:0xf', 'dmask:0x3'),
          '080320f0080e0680', 'typed UAV store writes all four channels'),
         (fixture.STORE.replace('v[8:9]', 'v8').replace(' d16', ' a16 d16'), '080f20f0080e06c0', 'modifier a16'),
-        (fixture.STORE.replace('v[8:9]', 'v[8:10]').replace('IMG_2D', 'IMG_3D'),
-         '100f20f0080e0680', 'only 2D images'),
-        (fixture.STORE.replace('v[14:15]', 'v[14:17]').removesuffix(' d16'), '080f20f0080e0600', 'requires d16'),
     ):
         instruction = encoded(asm, code)
         refused(reason, lambda: pipeline(instruction))
@@ -75,6 +117,7 @@ def controls(llvm_mc):
         if offset == 64:
             for body in (read + STORE, STORE + read):
                 refused('used for a load and a store', lambda: pipeline(load + wait + body))
+    array_controls(llvm_mc)
     print('Compute D16 store, EXEC, raw/texture binding order, alias and refusal checks passed')
 
 

@@ -26,15 +26,21 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array = false, UINT levels = 1,
                             bool one_dimensional = false, bool two_dimensional = false,
-                            UINT first_mip = 0, UINT view_levels = 0);
+                            UINT first_mip = 0, UINT view_levels = 0, UINT mip_base = 4);
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64]);
+                                  bool depth16, std::uint32_t words[64], bool array = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
-                              const std::uint32_t expected[4]);
+                              const std::uint32_t expected[4], unsigned coverage = 1);
+// Queries colour formats and returns "typed_uav_load_refused" when one has no typed UAV load, before any draw.
+// Returns nullptr only when the refusal helper itself accepts a cleared UAV_TYPED_LOAD bit.
+const char* check_startup_image_store_typed_load(ID3D12Device* device);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
-                              UINT vertices = 3);
+                              UINT vertices = 3, const std::uint32_t* constants = nullptr);
+void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                               const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
+                               UINT width = 1, UINT height = 1);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
@@ -42,7 +48,13 @@ void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
-                        bool dpp_case = false, bool sized_views = false);
+                        bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
+struct ComputeReadbackProgram {
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> signature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+};
+ComputeReadbackProgram load_compute_store_program(ID3D12Device* device, const char* shader);
+void check_compute_store_reference(ID3D12Device* device, const ComputeReadbackProgram& program, const char* reference);
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
@@ -69,6 +81,7 @@ bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*,
                            const char* amplification = nullptr);
 bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
                                const char* pixel, const char* fixture);
+bool check_mesh_shader_pipeline(ID3D12Device* device, bool force_fallback);
 bool check_mesh_heap_sampler_draw(ID3D12Device*, const char* mesh, const char* pixel, const char* fixture);
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
                               const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
@@ -77,8 +90,11 @@ void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
-struct PixelMismatch : std::runtime_error {
-    PixelMismatch() : std::runtime_error("AOT color export differs from CPU reference") {}
+struct ReadbackMismatch : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+struct PixelMismatch : ReadbackMismatch {
+    PixelMismatch() : ReadbackMismatch("AOT color export differs from CPU reference") {}
 };
 
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
@@ -90,7 +106,7 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* 
                          bool allowUpperRawLodStep = false);
 void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
 void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
-void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
+void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference, bool twoMips = false);
 void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference);
 void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const char* reference,
                                 const char* sampler_line, const char* vsPath = nullptr);
@@ -133,6 +149,9 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
 struct ComputeCommands {
     ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline,
                     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_COMPUTE);
+    // Records on a new list for an existing queue of the list's type. Releasing the commands then
+    // leaves that queue alive.
+    ComputeCommands(ID3D12Device* device, ID3D12CommandQueue* existing, ID3D12PipelineState* pipeline);
     void submit_and_wait(ID3D12Device* device);
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;

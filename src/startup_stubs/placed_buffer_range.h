@@ -22,6 +22,8 @@
 #include <windows.h>
 #include <cstdint>
 
+#include "startup_stubs/local_log.h"
+
 namespace x2w_startup {
 
 struct PlacedBufferRange {
@@ -58,11 +60,21 @@ inline QueryRegion query_region()
 }
 } // namespace placed_detail
 
-// False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
-// exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
-// full walk measures.
-inline bool measure_placed_buffer(const void* address, std::uint64_t width, PlacedBufferRange& out,
-                                  PlacedProof proof = PlacedProof::exact)
+// Size of the whole allocation holding address, from one region-information call (no page-table scan);
+// 0 when the call is missing or fails.
+inline std::uint64_t allocation_bytes(const void* address)
+{
+    placed_detail::RegionInformation info{};
+    SIZE_T returned = 0;
+    const placed_detail::QueryRegion query = placed_detail::query_region();
+    if (!address || !query || !query(GetCurrentProcess(), address, 0 /* MemoryRegionInfo */, &info, sizeof(info), &returned))
+        return 0;
+    return info.RegionSize;
+}
+
+namespace placed_detail {
+// One pass of measure_placed_buffer; out is reset first, so a second pass replaces the first.
+inline bool measure_once(const void* address, std::uint64_t width, PlacedBufferRange& out, PlacedProof proof)
 {
     out = PlacedBufferRange{};
     if (!address) return false;
@@ -105,6 +117,48 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
     }
     out.covered = true;
     return true;
+}
+} // namespace placed_detail
+
+// False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
+// exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
+// full walk measures. The queries run outside xmem's run breaks (x2w_local::outside_run_breaks): inside
+// one, pages of a shared-view run read as reserved, and the buffer would be refused although it is mapped.
+inline bool measure_placed_buffer(const void* address, std::uint64_t width, PlacedBufferRange& out,
+                                  PlacedProof proof = PlacedProof::exact)
+{
+    bool committed = false;
+    unsigned queries = 0;  // over every pass: a pass run again after a break replaces out
+    x2w_local::outside_run_breaks([&] {
+        committed = placed_detail::measure_once(address, width, out, proof);
+        queries += out.queries;
+    });
+    out.queries = queries;
+    return committed;
+}
+
+// True when an uncovered buffer at [address, address + width) lies inside a MEM_PRIVATE
+// reservation at a 64 KiB-aligned offset, fits within its whole allocation size (nonzero and at
+// most max_allocation_bytes when nonzero), and has nonzero width. Used before committing a lazy
+// startup block (X2W_XMEM_LAZY_STARTUP) and re-measuring so an aligned nonzero offset with a
+// MEM_RESERVE prefix can still alias an eligible small block without committing ineligible or
+// out-of-bounds blocks.
+inline bool can_commit_lazy_placed_buffer(const void* address, std::uint64_t width,
+                                          std::uint64_t max_allocation_bytes)
+{
+    if (!address || !width) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT ||
+        info.Type != MEM_PRIVATE || !info.AllocationBase)
+        return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const auto base = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+    if (start < base) return false;
+    const std::uint64_t offset = start - base;
+    if (offset & 0xFFFF) return false;
+    const std::uint64_t alloc_bytes = allocation_bytes(info.AllocationBase);
+    if (!alloc_bytes || (max_allocation_bytes && alloc_bytes > max_allocation_bytes)) return false;
+    return offset <= alloc_bytes && width <= alloc_bytes - offset;
 }
 
 } // namespace x2w_startup

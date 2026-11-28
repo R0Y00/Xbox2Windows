@@ -46,6 +46,15 @@ def v_mov(vdst, inline):
     return struct.pack('<I', 0x7e000000 | (vdst << 17) | (1 << 9) | (128 + inline))
 
 
+SOP2 = {'s_add_u32': 0x00, 's_max_u32': 0x09, 's_and_b32': 0x0e, 's_or_b32': 0x10, 's_mul_i32': 0x26, 's_bfe_u32': 0x27}
+
+
+def sop2(op, sdst, ssrc0, ssrc1, literal=None):
+    """SOP2 word (operand numbers: SGPR n is n, inline integer n is 128 + n, 255 takes the literal)."""
+    word = struct.pack('<I', (0b10 << 30) | (op << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0)
+    return word if literal is None else word + struct.pack('<I', literal)
+
+
 # One descriptor table at s[8:9] with an SRV/UAV range of two entries (the same layout the buffer address check uses).
 RTS0 = b''.join((struct.pack('<6I', 2, 1, 24, 0, 0, 0), struct.pack('<3I', 0, 0, 36),
                  struct.pack('<2I', 1, 44), struct.pack('<6I', 0, 2, 0, 0, 0, 0)))
@@ -113,6 +122,61 @@ def main():
         check('store through a modified descriptor is refused', result.startswith('unsupported') and 'modified' in fail_reason(name),
               '%s %s' % (result, fail_reason(name)))
 
+        # 3c. The descriptor modifications a compute store accepts (#2320, #2546): the stride clear and the
+        # structured-to-raw conversion (stride DW1[29:16] extracted, optionally clamped to 1, NUM_RECORDS in DW2
+        # scaled by it, OOB_SELECT DW3[29:28] set to 3, stride cleared). The store is the plain one, so the HLSL and
+        # manifest are those of the unmodified descriptor; everything else stays refused.
+        plain_store = encode_mubuf(STORE_OPS['dwordx3'], imm=8, soffset=13)
+        set_s13 = struct.pack('<I', 0xbe800000 | (13 << 16) | (3 << 8) | 128)  # SOP1 s_mov_b32 s13, 0
+        plain, name = request(folder, LOAD_DESCRIPTOR + set_s13 + DEFINE_V + plain_store + EXPORT_POSITION)
+        check('plain store with a scalar offset translates', plain == 'ok', '%s %s' % (plain, fail_reason(name)))
+        plain_hlsl = name.with_suffix('.vs.hlsl').read_text() if plain == 'ok' else None
+        plain_manifest = name.with_suffix('.txt').read_text() if plain == 'ok' else None
+        extract = sop2(SOP2['s_bfe_u32'], 12, 33, 255, 0xe0010)
+        clamp = sop2(SOP2['s_max_u32'], 12, 12, 129)
+        clear = sop2(SOP2['s_and_b32'], 33, 33, 255, 0xc000ffff)
+        oob_clear = sop2(SOP2['s_and_b32'], 35, 35, 255, 0xcfffffff)
+        scale = sop2(SOP2['s_mul_i32'], 34, 34, 12)
+        oob_raw = sop2(SOP2['s_or_b32'], 35, 35, 255, 0x30000000)
+        check('conversion decodes as captured', [a for (_, _, _, a) in G.decode(extract + clamp + clear + oob_clear + scale + oob_raw)] == [
+            's_bfe_u32 s12, s33, 0xe0010', 's_max_u32 s12, s12, 1', 's_and_b32 s33, s33, 0xc000ffff',
+            's_and_b32 s35, s35, 0xcfffffff', 's_mul_i32 s34, s34, s12', 's_or_b32 s35, s35, 0x30000000'])
+        for label, mod in (('clamped raw conversion', extract + clamp + clear + oob_clear + scale + oob_raw),
+                           ('raw conversion', extract + clear + scale + oob_raw),
+                           ('stride clear', clear)):
+            result, name = request(folder, LOAD_DESCRIPTOR + set_s13 + mod + DEFINE_V + plain_store + EXPORT_POSITION)
+            check('%s translates as the plain store' % label, result == 'ok' and plain_hlsl is not None
+                  and name.with_suffix('.vs.hlsl').read_text() == plain_hlsl
+                  and name.with_suffix('.txt').read_text() == plain_manifest, '%s %s' % (result, fail_reason(name)))
+        # Captured programs set the high word of the 32-bit table pointer to 0 before loading; a second load through
+        # the same untouched pointer and high word reads the same words, so its stride is the same value.
+        table_hi = struct.pack('<I', 0xbe800000 | (9 << 16) | (3 << 8) | 128)  # SOP1 s_mov_b32 s9, 0
+        reload = struct.pack('<3I', 0xf4080904, 0xfa000010, 0xbf8cc07f)  # s_load_dwordx4 s[36:39], s[8:9], 0x10
+        result, name = request(folder, table_hi + LOAD_DESCRIPTOR + set_s13 + reload + sop2(SOP2['s_bfe_u32'], 12, 37, 255, 0xe0010)
+                               + clear + scale + oob_raw + DEFINE_V + plain_store + EXPORT_POSITION)
+        reference, ref_name = request(folder, table_hi + LOAD_DESCRIPTOR + set_s13 + DEFINE_V + plain_store + EXPORT_POSITION)
+        check('stride of a second load through the same pointer translates as the plain store', result == reference == 'ok'
+              and name.with_suffix('.vs.hlsl').read_text() == ref_name.with_suffix('.vs.hlsl').read_text(),
+              '%s %s' % (result, fail_reason(name)))
+        # After an add on the table pointer, a second load reads other words under the same table offset.
+        add_pointer = sop2(SOP2['s_add_u32'], 8, 8, 255, 32)
+        refused_mods = {
+            'clamp other than 1': extract + sop2(SOP2['s_max_u32'], 12, 12, 130) + clear + oob_clear + scale + oob_raw,
+            'NUM_RECORDS not scaled': extract + clamp + clear + oob_clear + oob_raw,
+            'NUM_RECORDS scaled by a constant': clear + sop2(SOP2['s_mul_i32'], 34, 34, 132) + oob_raw,
+            'OOB_SELECT 2': extract + clamp + clear + oob_clear + scale + sop2(SOP2['s_or_b32'], 35, 35, 255, 0x20000000),
+            'stride not cleared': extract + clamp + oob_clear + scale + oob_raw,
+            'another bit field': sop2(SOP2['s_bfe_u32'], 12, 33, 255, 0xe0011) + clear + scale + oob_raw,
+            'stride of a load after a pointer add': table_hi + add_pointer + reload + sop2(SOP2['s_bfe_u32'], 12, 37, 255, 0xe0010)
+            + clear + scale + oob_raw,
+            'NUM_RECORDS of a load after a pointer add': table_hi + add_pointer + reload + extract + clear
+            + sop2(SOP2['s_mul_i32'], 34, 38, 12) + oob_raw,
+        }
+        for label, mod in refused_mods.items():
+            result, name = request(folder, LOAD_DESCRIPTOR + set_s13 + mod + DEFINE_V + plain_store + EXPORT_POSITION)
+            check('%s is refused' % label, result.startswith('unsupported')
+                  and fail_reason(name) == 'buffer store through a modified descriptor', '%s %s' % (result, fail_reason(name)))
+
         # 4. Control: a program with only a load keeps manifest version 1 and no writable view.
         load = encode_mubuf(MUBUF_LOAD_DWORD, vdata=6, srsrc=32)
         result, name = request(folder, LOAD_DESCRIPTOR + load + EXPORT_POSITION)
@@ -148,8 +212,8 @@ def main():
               '%s %s' % (result, fail_reason(name)))
 
         # 8. The cache revision moved, so a translation from before the store lowering is never loaded.
-        check('cache key uses revision 14', G.pipeline_key(b'a', b'b', ROOT) ==
-              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-14')))))
+        check('cache key uses revision 29', G.pipeline_key(b'a', b'b', ROOT) ==
+              G.fnv(ROOT, G.fnv(b'b', G.fnv(b'a', G.fnv(b'x2w-startup-shader-29')))))
 
     if failures:
         print('FAILED: ' + ', '.join(failures))

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 RUN_PS1 = Path(__file__).resolve().parent.parent / "tools" / "startup" / "run.ps1"
@@ -30,7 +31,8 @@ import sys
 import time
 from pathlib import Path
 
-record = [sys.argv[1:], os.environ.get("X2W_TRACE_API")]
+record = [sys.argv[1:], os.environ.get("X2W_TRACE_API"), os.environ.get("X2W_NATIVE_SHADERS"),
+          os.environ.get("X2W_TITLE_ID"), os.environ.get("X2W_STORAGE_MB")]
 Path(__file__).with_name("debugger.json").write_text(json.dumps(record), encoding="utf-8")
 # Under -Translate, wait until the watcher stub has started so run.ps1 cannot stop it before then.
 watch = Path(__file__).with_name("watch.json")
@@ -54,6 +56,8 @@ sys.exit({code})
 # workers are, records the PIDs and arguments, then waits to be stopped. The early-exit case
 # publishes just the watcher's PID and arguments and returns without spawning a child.
 WATCH_STUB = """\
+# The revisions the launcher compares with the cache: fnv(b'x2w-startup-shader-90'), b'x2w-startup-shader-90cs',
+# b'x2w-startup-mesh-57-9' (synthetic, as gfx2hlsl.py spells them).
 import json
 import os
 import subprocess
@@ -92,6 +96,19 @@ WARNING_PROBE = "x2w warning prefix probe"
 WARNING_PREFIXES = {}
 
 
+def unwrap_first_line(printed, want):
+    """Join the leading lines of `printed` that PowerShell wrapped at its host width back into `want`.
+
+    The host wraps a long Write-Warning at the console width it finds (80 columns when it is not
+    attached to a wide console, which depends on load and on the parent), so the one warning can
+    arrive as two lines. Only a split of exactly `want` is joined; any other text is left as printed.
+    """
+    for count in range(1, len(printed) + 1):
+        if " ".join(printed[:count]) == want:
+            return [want, *printed[count:]]
+    return printed
+
+
 def warning_prefix(shell, env):
     """Return the prefix this shell puts before a Write-Warning message, such as "WARNING: ".
 
@@ -121,13 +138,22 @@ def alive(pid):
     return f'"{pid}"' in out.stdout
 
 
+# A shader cache of an older build (#2815): its revision.txt and one request, against the stub's revisions.
+OLDER_CACHE = {"revision.txt": b"graphics x2w-startup-shader-89\ncompute x2w-startup-shader-89cs\n",
+               "req_0123456789abcdef.a": b""}
+REVISION_PHRASES = ("was written by stand-ins of revision graphics x2w-startup-shader-89",
+                    "but the translator", "is revision graphics x2w-startup-shader-90", "Fix: rebuild the stand-ins")
+
+
 def run_case(shell, script, code, work, translate=False, switches=(), passed=(), fake_user_env=False,
-             early_exit=False, trace_api_env=None):
+             early_exit=False, trace_api_env=None, absolute_build=False, missing_build=False,
+             native=False, manifest="absent", cache_files=None):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong.
 
     `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add.
     `translate` exercises -Render -Translate and requires the watcher to stop with its child.
     With `early_exit` the watcher has no child and exits before the debugger finishes.
+    `native` passes -Render -NativeShaders <dir>: the stand-in gets the directory and no watcher starts.
     This checks the log head and debugger exit code. The live watcher case checks worker cleanup.
     """
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
@@ -136,17 +162,32 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     (startup / "run.ps1").write_bytes(script.encode("utf-8"))
     (startup / "debug_launch.py").write_text(STUB.format(code=code, early_exit=early_exit), encoding="utf-8")
     (startup / "gfx2hlsl.py").write_text(WATCH_STUB.format(early_exit=early_exit), encoding="utf-8")
-    (root / "bld").mkdir()
+    shutil.copyfile(RUN_PS1.with_name("shader_cache_revision.py"), startup / "shader_cache_revision.py")
+    if cache_files is not None:  # a shader cache left by an earlier run
+        (root / "cache").mkdir()
+        for name, data in cache_files.items():
+            (root / "cache" / name).write_bytes(data)
+    build = root / ("build [with spaces]" if absolute_build else "bld")
+    build.mkdir()
     for dll in DLLS:  # the stand-ins the script copies next to the executable
-        (root / "bld" / f"{dll}.dll").write_bytes(b"")
-    exe, data, log = root / "run" / "t.exe", root / "data", root / "log"
+        (build / f"{dll}.dll").write_bytes(b"")
+    exe, data, log = root / "run" / "t.exe", root / ("data [test]" if manifest.startswith("bracket") else "data"), root / "log"
     exe.parent.mkdir()
     exe.write_bytes(b"")
     data.mkdir()
+    if manifest in ("normal", "bracket"):
+        (data / "MicrosoftGame.config").write_text("<TitleId>1234</TitleId><SizeMB>42</SizeMB>", encoding="utf-8")
+    if manifest.startswith("bracket"):
+        decoy = root / "data t"
+        decoy.mkdir()
+        (decoy / "MicrosoftGame.config").write_text("<TitleId>9999</TitleId><SizeMB>99</SizeMB>", encoding="utf-8")
     env = dict(os.environ)
+    env.pop("X2W_TITLE_ID", None)
+    env.pop("X2W_STORAGE_MB", None)
     # Compare PowerShell's warning text consistently on hosts that enable ANSI colors.
     env["NO_COLOR"] = "1"
     env.pop("X2W_FAKE_USER", None)
+    env.pop("X2W_NATIVE_SHADERS", None)
     if trace_api_env is None:
         env.pop("X2W_TRACE_API", None)
     else:
@@ -156,9 +197,17 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
     # In this tree run.ps1 finds `python` through PATH. This interpreter's directory
     # goes first so the stub runs under the Python that runs this check.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    build_arg = str(build) if absolute_build else "bld"
+    if missing_build:
+        build_arg = str(root / "missing build")
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
-               "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log), "-BuildDir", "bld",
+               "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log),
+               "-BuildDir", build_arg,
                "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
+    sdk = root / "dxc"
+    if native:
+        sdk.mkdir()
+        command += ["-Render", "-NativeShaders", str(sdk), "-ShaderCache", "cache"]
     if translate:
         command += ["-Render", "-Translate", "-ShaderCache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
@@ -175,11 +224,22 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
         printed = [line.strip() for line in stdout if line.strip()]
         error_text = stderr.read().strip()
     found = []
+    for dll in DLLS:
+        if not (exe.parent / f"{dll}.dll").is_file():
+            found.append(f"stand-in {dll}.dll was not copied")
     if out.returncode != code:
         found.append(f"stub debugger exited {code}, run.ps1 exited {out.returncode}")
     want_output = STUB_LINES[:HEAD_LINES]
+    if cache_files is not None:
+        # One warning with both revisions and the fixes; PowerShell may wrap it, so compare without whitespace.
+        flat = re.sub(r"\s", "", " ".join(printed))
+        missing = [phrase for phrase in REVISION_PHRASES if re.sub(r"\s", "", phrase) not in flat]
+        if missing or flat.count("Fix:rebuildthestand-ins") != 1:
+            found.append(f"stale shader cache: no single revision warning with {missing} (printed {printed})")
+        printed = [line for line in printed if line in STUB_LINES]  # the case runs with -FakeUser: no other warning
     if not fake_user_env and "-FakeUser" not in switches:
         want_output = [warning_prefix(shell, env) + FAKE_USER_WARNING, *want_output]
+        printed = unwrap_first_line(printed, want_output[0])
     if printed != want_output:
         found.append(f"stub exit {code}: printed {printed}, expected {want_output} "
                      f"(stderr: {error_text!r})")
@@ -192,9 +252,12 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             "--trace-files", "1", "--continue-asserts", "4", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
-    expected = [want, "1" if "-TraceApi" in switches else trace_api_env]
+    expected = [want, "1" if "-TraceApi" in switches else trace_api_env,
+                str(sdk) if native else None,
+                "1234" if manifest in ("normal", "bracket") else None,
+                "42" if manifest in ("normal", "bracket") else None]
     if got != expected:
-        found.append(f"stub exit {code}: debugger [argv, X2W_TRACE_API] was {got}, expected {expected}")
+        found.append(f"stub exit {code}: debugger [argv, trace, native shaders, title ID, storage MB] was {got}, expected {expected}")
     watch = startup / "watch.json"
     if translate:
         started = json.loads(watch.read_text(encoding="utf-8")) if watch.is_file() else None
@@ -218,17 +281,25 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, code, work)
         if found and first_only:
             return found
+    found += run_case(shell, script, 7, work, absolute_build=True)
+    for manifest in ("normal", "bracket", "bracket_missing"):
+        found += run_case(shell, script, 0, work, manifest=manifest)
+    if found and first_only:
+        return found
     found += run_case(shell, script, 0, work, switches=["-FakeUser"])
     found += run_case(shell, script, 0, work, fake_user_env=True)
     if found and first_only:
         return found
     # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
     found += run_case(shell, script, 0, work, switches=["-TraceCalls"], passed=["--trace-calls", "1"])
+    found += run_case(shell, script, 0, work, switches=["-CaptureEvery", "5"], passed=["--capture-every", "5"])
     found += run_case(shell, script, 0, work, switches=["-TraceApi"], trace_api_env="0")
     found += run_case(shell, script, 0, work, trace_api_env="1")
+    found += run_case(shell, script, 0, work, native=True)
     if found and first_only:
         return found
     found += run_case(shell, script, 7, work, translate=True)
+    found += run_case(shell, script, 7, work, translate=True, switches=["-FakeUser"], cache_files=OLDER_CACHE)
     for code in (0, 7):
         found += run_case(shell, script, code, work, translate=True, early_exit=True)
     return found
@@ -267,6 +338,8 @@ def text_problems(script):
     if not re.search(r"""^if\s*\(\s*\$TraceApi\s*\)\s*\{\s*\$env:X2W_TRACE_API\s*=\s*["']1["']\s*\}""",
                      before, re.I | re.M):
         found.append("missing -TraceApi environment opt-in before launch")
+    if not re.search(r"\$env:X2W_NATIVE_SHADERS\s*=", before):
+        found.append("missing -NativeShaders directory hand-over before launch")
     if not WATCH_CLEANUP.search("\n".join(after)):
         found.append("tree cleanup lacks taskkill /T, the live-watcher guard or the local Continue scope")
     return found
@@ -288,11 +361,65 @@ def mutants_of(script):
         "fixed exit 2": ["exit 2" if is_exit(line) else line for line in lines],
         "exit before the log head": early,
         "no FakeUser warning": no_fake_warn,
+        "no X2W_NATIVE_SHADERS": [line for line in lines if "$env:X2W_NATIVE_SHADERS" not in line],
         # The same text without the warning prefix: the run must still see Write-Warning's prefix.
         "FakeUser warning printed with Write-Host": [
             line.replace(FAKE_USER_WARN_LINE, f'Write-Host "{FAKE_USER_WARNING}"') for line in lines],
     }
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
+
+
+def shell_failures(shell, script, tmp):
+    """Every failure for one shell (None: the text-only checks), in a fixed order."""
+    failures = []
+    name = Path(shell).stem.lower() if shell else "text"
+    bad = run_problems(shell, script, tmp, False)
+    failures += [f"{name}: {item}" for item in bad]
+    if bad:
+        return failures
+    for label, mutant in mutants_of(script).items():
+        if mutant is None or not run_problems(shell, mutant, tmp, True):
+            failures.append(f"{name}: mutant '{label}' was not detected")
+    if shell:
+        missing = run_case(shell, script, 7, tmp, missing_build=True)
+        if not any("debugger [argv" in item and "was None" in item for item in missing):
+            failures.append(f"{name}: missing build directory did not prevent debugger startup")
+        # Expire the live fixture tree after HasExited has been read. The launcher's
+        # own taskkill then hits the missing PID and writes native stderr.
+        kill = f"& {STOP} 2>&1 | Out-Null"
+        expire = kill + '\nif (-not $translator.WaitForExit(5000)) { throw "fixture watcher still alive" }\n'
+        race = script.replace(kill, expire + kill)
+        if race == script:
+            failures.append(f"{name}: could not exercise the watcher exit during cleanup")
+        else:
+            failures += [f"{name}: watcher exit during cleanup: {item}"
+                         for item in run_case(shell, race, 7, tmp, translate=True)]
+        stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
+        parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
+        for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
+            problems = run_case(shell, mutant, 7, tmp, translate=True)
+            if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
+                failures.append(f"{name}: expected a surviving {who}, got {problems}")
+    else:
+        for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
+            if not text_problems(script.replace(removed, '')):
+                failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
+    return failures
+
+
+def unwrap_problems():
+    """Controls for unwrap_first_line: a wrapped warning joins, any other text is left alone."""
+    want = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime (docs/x.md)."
+    head = "WARNING: Without -FakeUser, user API calls go to the host gaming runtime"
+    cases = [
+        ("one line", [want, "a"], [want, "a"]),
+        ("wrapped at 80 columns", [head, "(docs/x.md).", "a"], [want, "a"]),
+        ("different text", [head, "(docs/other.md).", "a"], [head, "(docs/other.md).", "a"]),
+        ("missing warning", ["a"], ["a"]),
+    ]
+    return [f"unwrap_first_line {name}: got {got}, expected {expected}"
+            for name, printed, expected in cases
+            if (got := unwrap_first_line(printed, want)) != expected]
 
 
 def main():
@@ -309,38 +436,13 @@ def main():
         mode = "executed with " + ", ".join(Path(shell).stem.lower() for shell in shells)
         if not shells:
             mode = "text only: no PowerShell found"
-    failures = []
+    failures = unwrap_problems()
     with tempfile.TemporaryDirectory() as tmp:
-        for shell in shells or [None]:
-            name = Path(shell).stem.lower() if shell else "text"
-            bad = run_problems(shell, script, tmp, False)
-            failures += [f"{name}: {item}" for item in bad]
-            if bad:
-                continue
-            for label, mutant in mutants_of(script).items():
-                if mutant is None or not run_problems(shell, mutant, tmp, True):
-                    failures.append(f"{name}: mutant '{label}' was not detected")
-            if shell:
-                # Expire the live fixture tree after HasExited has been read. The launcher's
-                # own taskkill then hits the missing PID and writes native stderr.
-                kill = f"& {STOP} 2>&1 | Out-Null"
-                expire = kill + '\nif (-not $translator.WaitForExit(5000)) { throw "fixture watcher still alive" }\n'
-                race = script.replace(kill, expire + kill)
-                if race == script:
-                    failures.append(f"{name}: could not exercise the watcher exit during cleanup")
-                else:
-                    failures += [f"{name}: watcher exit during cleanup: {item}"
-                                 for item in run_case(shell, race, 7, tmp, translate=True)]
-                stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
-                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
-                for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
-                    problems = run_case(shell, mutant, 7, tmp, translate=True)
-                    if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
-                        failures.append(f"{name}: expected a surviving {who}, got {problems}")
-            else:
-                for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
-                    if not text_problems(script.replace(removed, '')):
-                        failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
+        # Each shell works in its own scratch dirs, so PowerShell 5.1 and 7 run side by side.
+        with ThreadPoolExecutor(max_workers=len(shells) or 1) as pool:
+            jobs = [pool.submit(shell_failures, shell, script, tmp) for shell in shells or [None]]
+            for job in jobs:
+                failures += job.result()
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")

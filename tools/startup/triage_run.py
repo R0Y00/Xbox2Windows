@@ -44,8 +44,15 @@ SLOT70_REASONS = {
     "unsupported_description",
     "destination_outside_view_heaps",
     "gpu_written_resource",
+    # the acceleration-structure holds of publish_as_srv (memory_srv_as.h, as_srv_refusal_name)
+    "as_unaligned",
+    "as_not_placed",
+    "as_wrong_state",
     "buffer_unavailable",
     "texture_unavailable",
+    "texture_no_resource",
+    "texture_unreadable",
+    "texture_over_64mib",
     # the partial-tile holds of device_memory_srv
     "partial_tile_xg_rows",
     "partial_tile_beyond_xg_size",
@@ -85,6 +92,10 @@ RE_GPU_BUDGET = re.compile(
     rf"\+(?P<retained>{BUDGET_DECIMAL})/(?P<objects>{BUDGET_DECIMAL})"
     + "".join(rf" {name}={BUDGET_CATEGORY}" for name in ("buffer", "upload", "readback", "heap"))
     + rf" unmeasured={BUDGET_DECIMAL}"
+    # Added with the system commit and pool counters (absent in older logs): commit=<used>/<limit> avail=<free> in MiB.
+    + rf"(?: commit=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a) avail=(?:{BUDGET_DECIMAL}|n/a)"
+    + rf" sections=(?:{BUDGET_DECIMAL}|n/a) slabs=(?:{BUDGET_DECIMAL}|n/a) slots=(?:{BUDGET_DECIMAL}/{BUDGET_DECIMAL}|n/a)"
+    + rf" job_peak=(?:{BUDGET_DECIMAL}|n/a) job_limit=(?:{BUDGET_DECIMAL}|none|n/a))?"
 )
 OTHER = "other (text omitted)"
 RE_DEC = re.compile(r"[0-9]{1,10}\Z")
@@ -94,6 +105,21 @@ RE_SLOT = re.compile(r"(?:[A-Za-z0-9_]+!)?(?:([A-Za-z0-9_]+)::)?slot(\d{1,4})\b"
 RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
 SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported instruction " + MNEMONIC_FAMILY + r"\b"),
+     r"\1_* instruction"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported opcode\b"), "unsupported opcode"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unsupported pixel entry VGPR\b"), "unsupported pixel entry VGPR"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unproven resource descriptor\b"), "unproven resource descriptor"),
+    (re.compile(r"native compute \+0x[0-9a-fA-F]+: unbound numeric SGPR\b"), "unbound numeric SGPR"),
+    (re.compile(r"(?:unknown gfx1013 instruction format|truncated or misaligned gfx1013 instruction|"
+                r"reserved FLAT segment) at byte \d+\Z"), "undecodable word"),
+    (re.compile(r"graphics request key mismatch\b"), "graphics request key mismatch"),
+    (re.compile(r"compute request key mismatch\b"), "compute request key mismatch"),
+    (re.compile(r"stale pixel input description\b"), "stale pixel input description"),
+    (re.compile(r"pixel input description names another pipeline\Z"), "pixel input description names another pipeline"),
+    (re.compile(r"contradictory pixel input enable/address masks\Z"), "contradictory pixel input enable/address masks"),
+    (re.compile(r"pixel input (?:enable|address) mask missing\b"), "invalid pixel input description"),
+    (re.compile(r"invalid pixel input description\Z"), "invalid pixel input description"),
     (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
     (re.compile(r"buffer_load_format_(?:x|xy|xyz|xyzw) requires descriptor FORMAT and DST_SEL\Z"),
      "buffer_* instruction"),
@@ -833,6 +859,20 @@ def triage_run(
     )
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if not args.logdir.exists():
+        raise FileNotFoundError(f"log path not found: {args.logdir}")
+    if not (args.logdir.is_file() or args.logdir.is_dir()):
+        raise ValueError(f"log path must be a regular file or directory: {args.logdir}")
+    if args.shader_cache is not None:
+        if not args.shader_cache.exists():
+            raise FileNotFoundError(f"shader cache directory not found: {args.shader_cache}")
+        if not args.shader_cache.is_dir():
+            raise NotADirectoryError(f"shader cache path is not a directory: {args.shader_cache}")
+    if args.max_items < 1:
+        raise ValueError(f"--max-items must be at least 1, got {args.max_items}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Summarize startup logs and optional shader cache into allowlisted Markdown."
@@ -851,9 +891,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum rows per summary table (default: 16)",
     )
     args = parser.parse_args(argv)
-    print(triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items))
+    try:
+        _validate_args(args)
+        report = triage_run(args.logdir, shader_cache=args.shader_cache, max_items=args.max_items)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(report)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -3,6 +3,10 @@
 // --mutate height: expect a buffer description with Height 2 to be accepted.
 // --mutate exact-fit: expect a view that ends exactly at the end of the buffer to be refused.
 // --mutate first-32: expect a resolved FirstElement above 4 Gi elements to be cut to 32 bits.
+// --mutate unplaced-extent: expect page span calculation crossing a 64 KiB boundary to return a single page.
+// --mutate unplaced-covers: expect a buffer range past the end of the cached page to be accepted as covered.
+// --mutate unplaced-heap-limit: expect a 2 GiB allocation to be wrapped as an existing heap for an unplaced buffer.
+// --mutate exact-start: expect a page-start base to be kept for a view address that is not a whole number of elements in.
 // Each mutated run is a negative control and must fail.
 #include "startup_stubs/memory_srv_buffer.h"
 
@@ -81,10 +85,12 @@ int main(int argc, char** argv)
 {
     if (argc == 3 && std::strcmp(argv[1], "--mutate") == 0 &&
         (std::strcmp(argv[2], "height") == 0 || std::strcmp(argv[2], "exact-fit") == 0 ||
-         std::strcmp(argv[2], "first-32") == 0)) {
+         std::strcmp(argv[2], "first-32") == 0 ||
+         std::strcmp(argv[2], "unplaced-extent") == 0 || std::strcmp(argv[2], "unplaced-covers") == 0 ||
+         std::strcmp(argv[2], "unplaced-heap-limit") == 0 || std::strcmp(argv[2], "exact-start") == 0)) {
         mutation = argv[2];
     } else if (argc != 1) {
-        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32]\n");
+        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32|unplaced-extent|unplaced-covers|unplaced-heap-limit|exact-start]\n");
         return 2;
     }
     const auto buf = buffer_desc(1024);
@@ -263,6 +269,71 @@ int main(int argc, char** argv)
           x2w_startup::resolve_buffer_srv_desc(0x200000000, 0x200000000, 0x200000000,
                                                typed_view(DXGI_FORMAT_R8_UINT, 0x100000000, 0x10), resolved) &&
               resolved.Buffer.FirstElement == (mutated("first-32") ? 0 : 0x100000000));
+
+    // Unplaced buffer extent calculation and page alignment.
+    std::uint64_t page_start = 0, page_span = 0;
+    check("unplaced extent zero address", !x2w_startup::unplaced_buffer_extent(0, 1024, page_start, page_span));
+    check("unplaced extent zero span", !x2w_startup::unplaced_buffer_extent(0x10000, 0, page_start, page_span));
+    check("unplaced extent 48B aligned",
+          x2w_startup::unplaced_buffer_extent(0x10000, 48, page_start, page_span) &&
+              page_start == 0x10000 && page_span == 65536);
+    check("unplaced extent interior 128B",
+          x2w_startup::unplaced_buffer_extent(0x10800, 128, page_start, page_span) &&
+              page_start == 0x10000 && page_span == 65536);
+    const std::uint64_t expected_cross_span = mutated("unplaced-extent") ? 65536 : 131072;
+    check("unplaced extent crossing page",
+          x2w_startup::unplaced_buffer_extent(0x1fff0, 32, page_start, page_span) &&
+              page_start == 0x10000 && page_span == expected_cross_span);
+    check("unplaced extent 128 KiB",
+          x2w_startup::unplaced_buffer_extent(0x10000, 128 * 1024, page_start, page_span) &&
+              page_start == 0x10000 && page_span == 128 * 1024);
+    check("unplaced extent overflow address",
+          !x2w_startup::unplaced_buffer_extent(~std::uint64_t{0} - 15, 32, page_start, page_span));
+    check("unplaced extent overflow span",
+          !x2w_startup::unplaced_buffer_extent(0x10000, ~std::uint64_t{0}, page_start, page_span));
+    check("unplaced extent exceeds 256 MiB",
+          !x2w_startup::unplaced_buffer_extent(0x10000, (256ull << 20) + 1, page_start, page_span));
+
+    // Unplaced buffer cache coverage checks.
+    check("unplaced covers interior", x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x10200, 128));
+    check("unplaced covers start exact", x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x10000, 65536));
+    check("unplaced covers end exact", x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x1ff00, 256));
+    check("unplaced covers past end",
+          x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x1ff00, 257) == mutated("unplaced-covers"));
+    check("unplaced covers before start", !x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x0fff0, 32));
+    check("unplaced covers zero cached span", !x2w_startup::unplaced_buffer_covers(0x10000, 0, 0x10000, 48));
+    check("unplaced covers zero requested span", !x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x10000, 0));
+
+    // Shapes of the three structured views the title published at sub-allocated addresses (low 16 bits of the address, stride).
+    const std::uint64_t shapes[3][2] = {{0x6200, 2048}, {0x1c80, 320}, {0x6a00, 180}};
+    for (const auto& shape : shapes) {
+        const std::uint64_t address = 0x7f0000000000ull + shape[0];
+        const std::uint64_t page = address & ~0xffffull;
+        D3D12_SHADER_RESOURCE_VIEW_DESC structured{};
+        structured.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        structured.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        structured.Buffer.NumElements = 1;
+        structured.Buffer.StructureByteStride = static_cast<UINT>(shape[1]);
+        D3D12_SHADER_RESOURCE_VIEW_DESC out{};
+        check("page-start base cannot name a sub-allocated structured view",
+              !x2w_startup::resolve_buffer_srv_desc(page, 65536, address, structured, out));
+        const bool exact = x2w_startup::unplaced_view_needs_exact_start(address, page, shape[1], false) && !mutated("exact-start");
+        const std::uint64_t base = exact ? address : page;
+        check("exact-start base names a sub-allocated structured view",
+              x2w_startup::resolve_buffer_srv_desc(base, shape[1], address, structured, out) && out.Buffer.FirstElement == 0);
+    }
+    check("aligned address keeps the page base", !x2w_startup::unplaced_view_needs_exact_start(0x14000, 0x10000, 2048, false));
+    check("raw view keeps the page base",
+          !(x2w_startup::unplaced_view_needs_exact_start(0x10001, 0x10000, 4, true) || mutated("raw-exact")));
+
+    // Existing-heap wrap of the allocation holding an unplaced buffer: up to the 256 MiB span limit only.
+    check("unplaced heap 64 KiB allocation", x2w_startup::unplaced_existing_heap_allowed(65536));
+    check("unplaced heap 256 MiB allocation", x2w_startup::unplaced_existing_heap_allowed(256ull << 20));
+    check("unplaced heap 256 MiB + 64 KiB allocation",
+          !x2w_startup::unplaced_existing_heap_allowed((256ull << 20) + 65536));
+    check("unplaced heap 2 GiB allocation",
+          x2w_startup::unplaced_existing_heap_allowed(2ull << 30) == mutated("unplaced-heap-limit"));
+    check("unplaced heap unknown allocation size", !x2w_startup::unplaced_existing_heap_allowed(0));
 
     if (failures) return 1;
     std::printf("slot 70 buffer memory SRV validation: all checks passed\n");

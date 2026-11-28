@@ -35,6 +35,7 @@ constexpr HRESULT reading_too_old = static_cast<HRESULT>(0x838A0004);
 constexpr std::uint32_t kind_keyboard = 0x00000010;
 constexpr std::uint32_t kind_gamepad = 0x00040000, kind_controller_bits = 0x0000000E;
 constexpr std::uint32_t status_connected = 0x47;  // connected, input enabled, output enabled, synchronized
+constexpr std::uint32_t family_xbox_one = 1;      // GameInputFamilyXboxOne (GameInputDeviceFamily)
 constexpr std::size_t max_keys = 32;
 constexpr std::size_t history_capacity = 64;
 
@@ -220,8 +221,79 @@ bool read_signal(x2w_input_script::Signal& out)
     return true;
 }
 
+// X2W_INPUT_TRACE=1: one "x2w-input-trace" line per resolved gamepad state change, plus at most one
+// every 250 ms while the state stays the same. The resolved state is what capture_current() records,
+// after keyboard, XInput, the shared block, X2W_INPUT_PRESS and the script have been merged.
+bool trace_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_INPUT_TRACE");
+    return on;
+}
+
+void trace_state(const GamepadState& state, bool scripted, double script_time, bool present, std::uint64_t present_number)
+{
+    constexpr u64 interval_ms = 250;
+    static SRWLOCK trace_lock = SRWLOCK_INIT;
+    static GamepadState last{};
+    static bool have_last = false;
+    static u64 last_ms = 0;
+    const u64 now = process_milliseconds();
+    bool log = false;
+    AcquireSRWLockExclusive(&trace_lock);
+    if (!have_last || std::memcmp(&state, &last, sizeof(state)) != 0 || now < last_ms || now - last_ms >= interval_ms) {
+        log = true;
+        last = state;
+        have_last = true;
+        last_ms = now;
+    }
+    ReleaseSRWLockExclusive(&trace_lock);
+    if (!log) return;
+    char script[24], present_text[24];
+    if (scripted)
+        std::snprintf(script, sizeof(script), "%.3f", script_time);
+    else
+        std::snprintf(script, sizeof(script), "off");
+    if (present)
+        std::snprintf(present_text, sizeof(present_text), "%llu", static_cast<unsigned long long>(present_number));
+    else
+        std::snprintf(present_text, sizeof(present_text), "none");
+    x2w_local::logf("x2w-input-trace state buttons=0x%08x lt=%.3f rt=%.3f lx=%.3f ly=%.3f rx=%.3f ry=%.3f script=%s present=%s",
+                    static_cast<unsigned>(state.buttons), state.left_trigger, state.right_trigger, state.left_x, state.left_y,
+                    state.right_x, state.right_y, script, present_text);
+}
+
+void trace_event(const x2w_input_script::Event& e)
+{
+    using x2w_input_script::Event;
+    switch (e.type) {
+    case Event::wait_begun:
+    case Event::wait_changed:
+    case Event::wait_done:
+        x2w_local::logf("x2w-input-trace wait event=%s item=%zu at=%.3f elapsed=%.3f signal=%d",
+                        e.type == Event::wait_begun ? "begun" : e.type == Event::wait_changed ? "changed" : "done", e.item, e.at,
+                        e.elapsed, e.signal ? 1 : 0);
+        break;
+    case Event::wait_timeout:
+        x2w_local::logf("x2w-input-trace wait event=timeout item=%zu at=%.3f elapsed=%.3f signal=%d stopped=%d group=%s",
+                        e.item, e.at, e.elapsed, e.signal ? 1 : 0, e.stopped ? 1 : 0, e.label.empty() ? "-" : e.label.c_str());
+        break;
+    case Event::mark:
+        if (e.signal)
+            x2w_local::logf("x2w-input-trace mark label=%s item=%zu at=%.3f present=%llu", e.label.c_str(), e.item, e.at,
+                            static_cast<unsigned long long>(e.present));
+        else
+            x2w_local::logf("x2w-input-trace mark label=%s item=%zu at=%.3f present=none", e.label.c_str(), e.item, e.at);
+        break;
+    case Event::group_skipped:
+        x2w_local::logf("x2w-input-trace group label=%s items=%zu-%zu failed_item=%zu at=%.3f", e.label.c_str(), e.group_item,
+                        e.end_item, e.item, e.at);
+        break;
+    }
+}
+
 void log_event(const x2w_input_script::Event& e)
 {
+    if (trace_enabled()) trace_event(e);
     using x2w_input_script::Event;
     switch (e.type) {
     case Event::wait_begun:
@@ -338,8 +410,12 @@ GamepadState sample()
     // Waits and marks (wait=..., mark=..., @+<s>) go through the timeline; other scripts as before.
     const x2w_input_script::Script& script = input_script();
     const bool timeline = !script.waits.empty() || !script.marks.empty();
+    bool scripted = false;
+    double script_time = 0;
     if (!script.entries.empty() || timeline) {
         const double t = script_seconds(script);
+        scripted = true;
+        script_time = t;
         double end = -1;
         const x2w_input_script::Output out = timeline ? play_timeline(script, t, end) : x2w_input_script::play(script, t);
         s.buttons |= out.buttons;
@@ -352,6 +428,11 @@ GamepadState sample()
         if (end >= 0 && t >= end && InterlockedExchange(&finished, 1) == 0)
             x2w_local::logf("x2w-input script time passed its last entry (%zu entries, ended at %.3f s on the script time base)",
                             script.entries.size(), end);
+    }
+    if (trace_enabled()) {
+        x2w_input_script::Signal signal;
+        const bool present = read_signal(signal);
+        trace_state(s, scripted, script_time, present, present ? signal.present : 0);
     }
     return s;
 }
@@ -859,7 +940,9 @@ void build()
     std::memcpy(device_info + 4, ids, 4);
     for (int i = 0; i < 32; ++i) device_info[0x20 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceId
     for (int i = 0; i < 32; ++i) device_info[0x40 + i] = static_cast<unsigned char>(0xA0 + i);  // deviceRootId
-    const std::uint32_t tail[4] = {2 /* family: Xbox One */, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
+    // GameInputDeviceFamily: Virtual -1, XboxOne 1 (XboxGIP / XInputHID), Xbox360 2 (XUSB22), Hid 3, I8042 4. The
+    // vendor/product above name an Xbox Series pad, a GIP device, so the family is XboxOne.
+    const std::uint32_t tail[4] = {family_xbox_one, 0, kind_gamepad | kind_controller_bits, 0xF /* rumble motors */};
     std::memcpy(device_info + 0x60, tail, sizeof(tail));
     // Virtual keyboard device info.
     std::memcpy(keyboard_device_info, &size, 4);

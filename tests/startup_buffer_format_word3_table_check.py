@@ -15,7 +15,7 @@ import gfx2hlsl  # noqa: E402
 
 # Public DXGI_FORMAT values (dxgiformat.h) for the names the header uses.
 DXGI = {'R32G32B32A32_FLOAT': 2, 'R32G32B32_FLOAT': 6, 'R16G16B16A16_FLOAT': 10, 'R32G32_FLOAT': 16,
-        'R8G8B8A8_UNORM': 28, 'R16G16_FLOAT': 34, 'R16G16_UNORM': 35, 'R16G16_UINT': 36, 'R16G16_SNORM': 37, 'R8G8B8A8_UINT': 30, 'R32_FLOAT': 41,
+        'R8G8B8A8_UNORM': 28, 'R10G10B10A2_UNORM': 24, 'R16G16_FLOAT': 34, 'R16G16_UNORM': 35, 'R16G16_UINT': 36, 'R16G16_SNORM': 37, 'R8G8B8A8_UINT': 30, 'R32_FLOAT': 41,
         'R8G8_UNORM': 49, 'R8_UNORM': 61, 'R8_UINT': 62}
 # The buffer format each DXGI format reads as: FETCH_DXGI, plus the three formats it does not list.
 EXPECTED = {**{dxgi: name for dxgi, (name, _) in gfx2hlsl.FETCH_DXGI.items()},

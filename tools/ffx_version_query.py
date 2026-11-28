@@ -47,6 +47,11 @@ _RESERVED_NOP_CODES = frozenset(
     for opcode in ("0F19", "0F1D", "0F1E", "0F1F")
 )
 
+# CET indirect-branch tracking markers (F3 0F 1E FA = ENDBR64, F3 0F 1E FB = ENDBR32).
+# Intel SDM Vol. 2A documents no register, flag, or memory side effects; x64_zen2 has no CET-IBT so both
+# execute as NOPs. Selected by exact iced Code so RDSSPD/RDSSPQ (F3 0F 1E /1) remain refused.
+_ENDBR_CODES = frozenset((C.ENDBR64, C.ENDBR32))
+
 INTEGER_HEADER = """#include <array>
 #include <cmath>
 #include <cstdint>
@@ -594,6 +599,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.SHUFPS, M.UNPCKHPS, M.UNPCKLPS, M.MOVHLPS, M.MOVLHPS, M.MOVMSKPS, M.MOVUPS, M.MOVAPS,
         M.RCPPS, M.RCPSS, M.RSQRTPS, M.RSQRTSS,
         M.SHUFPD, M.UNPCKHPD, M.UNPCKLPD, M.MOVMSKPD, M.MOVUPD, M.MOVAPD, M.MOVDQA,
+        M.MOVNTPS, M.MOVNTPD, M.MOVNTDQ,
         M.VSHUFPS, M.VUNPCKHPS, M.VUNPCKLPS, M.VSHUFPD, M.VUNPCKHPD, M.VUNPCKLPD,
         M.VPSHUFD, M.VPSHUFHW, M.VPSHUFLW, M.VMOVHLPS, M.VMOVLHPS, M.VMOVMSKPS, M.VMOVMSKPD,
         M.VMOVAPS, M.VMOVAPD, M.VMOVDQA, M.VPMOVMSKB, M.VRCPPS, M.VRCPSS, M.VRSQRTPS, M.VRSQRTSS,
@@ -918,6 +924,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 stmt = f"{decrement} if ({count} != 0{condition}) goto block_{target:x};"
         elif op in (M.MOV, M.MOVZX):
             stmt = write(operand(1))
+        elif op == M.MOVNTI and i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER:
+            # A non-temporal store of a 32- or 64-bit register, with no alignment requirement and no flag change.
+            if MemorySizeExt.size(i.memory_size) == 8:
+                stmt = f"_mm_stream_si64(reinterpret_cast<long long*>({address()}), static_cast<long long>({operand(1)}));"
+            else:
+                stmt = f"_mm_stream_si32(reinterpret_cast<int*>({address()}), static_cast<int>({operand(1)}));"
         elif op == M.MOVSXD:
             stmt = write(f"int64_t(int32_t({operand(1)}))")
         elif op == M.MOVSX:
@@ -2559,6 +2571,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                         f"memcpy(reinterpret_cast<void*>(target), {wide_xmm[i.op1_register]}.data(), 16); }}")
             else:
                 raise ValueError(f"unsupported aligned SSE move form at {i.ip:#x}: {i}")
+        elif op in (M.MOVNTPS, M.MOVNTPD, M.MOVNTDQ) and i.encoding == EncodingKind.LEGACY and has_wide:
+            # Non-temporal stores of a whole XMM register. Like MOVAPS, a target that is not 16-byte aligned
+            # raises #GP(0) before anything is written. The streaming store keeps the non-temporal hint; its weak
+            # ordering is the guest's own (only an SFENCE, MFENCE or locked instruction orders it).
+            if i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = (f"{{ const word target = {address()}; if (target & 15u) raise_aligned_m128_fault(); "
+                        f"__m128i value; memcpy(&value, {wide_xmm[i.op1_register]}.data(), 16); "
+                        f"_mm_stream_si128(reinterpret_cast<__m128i*>(target), value); }}")
+            else:
+                raise ValueError(f"unsupported non-temporal SSE store form at {i.ip:#x}: {i}")
         elif op in (M.MOVUPS, M.MOVUPD) and has_wide:
             is_vex = i.encoding == EncodingKind.VEX
             if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
@@ -3086,15 +3108,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             suffix, host = {1: ("8", "char"), 2: ("16", "short"), 4: ("", "long"), 8: ("64", "__int64")}[size]
             stmt = write_register(register, f"_InterlockedExchange{suffix}(reinterpret_cast<{host} volatile*>({address()}), "
                                             f"static_cast<{host}>({operand(n)}))")
-        elif op == M.NOP or i.code in _RESERVED_NOP_CODES or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
-            # The reserved/hint NOP space: 0F 19 /r, 0F 1D /r, 0F 1E /r and 0F 1F /r. The APM documents them as
-            # reserved hint NOPs that take a ModRM but access no memory, so lowering to ";" is exact: the operand
-            # is not evaluated, so no address is computed, nothing is loaded and nothing faults. Selection is by
+        elif op == M.NOP or i.code in _RESERVED_NOP_CODES or i.code in _ENDBR_CODES or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+            # The reserved/hint NOP space (0F 19 /r, 0F 1D /r, 0F 1E /r, 0F 1F /r) and ENDBR64/ENDBR32
+            # (F3 0F 1E FA/FB). The AMD APM documents the hint NOPs as taking a ModRM without accessing memory,
+            # and Intel SDM Vol. 2A documents ENDBR64/ENDBR32 as affecting no registers, flags, or memory (and
+            # executing as NOPs on x64_zen2 without CET-IBT), so lowering to ";" is exact. Selection is by
             # iced code rather than by mnemonic because iced also decodes 0F 0D (Group P, which aliases PREFETCH
             # Exclusive), 0F 18 (PREFETCHT0-T2/PREFETCHNTA, with /6-/7 being PREFETCHIT1/0 under CPUID
             # Fn8000_0021_EAX), 0F 1A, 0F 1B and 0F 1C as RESERVEDNOP; a mnemonic test would have lowered every
             # one of those to a no-op. They stay refused here, as do CLDEMOTE (0F 1C /0), RDSSPD/RDSSPQ
-            # (F3 0F 1E /1), ENDBR64/ENDBR32 (F3 0F 1E FA/FB) and the MPX forms.
+            # (F3 0F 1E /1) and the MPX forms.
             stmt = ";"
         elif (op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE) or
               (x87_depth is None and op in (M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO))):

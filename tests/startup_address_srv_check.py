@@ -9,7 +9,7 @@ import tempfile
 from startup_stream_draw_check import gfx2hlsl, pixel, vertex
 
 
-def prepare_draw_cache(directory, consumer, hlsl, modes, binding):
+def prepare_draw_cache(directory, consumer, hlsl, modes, binding, *, vertex_hlsl=None):
     cache = directory / "cache"
     cache.mkdir()
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
@@ -20,19 +20,24 @@ def prepare_draw_cache(directory, consumer, hlsl, modes, binding):
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
-    manifest, = cache.glob("*.txt")
+    manifest, = (path for path in cache.glob("*.txt") if path.name != "revision.txt")
     with manifest.open("a", encoding="ascii") as file:
         file.write(f"\n{binding}\n")
     source = manifest.with_suffix(".ps.hlsl")
     source.write_text(hlsl)
     subprocess.run([env["X2W_FXC"], "/nologo", "/T", "ps_5_0", "/E", "main", "/Fo",
                     manifest.with_suffix(".ps.cso"), source], check=True)
+    if vertex_hlsl is not None:
+        source = manifest.with_suffix(".vs.hlsl")
+        source.write_text(vertex_hlsl, encoding="ascii")
+        subprocess.run([env["X2W_FXC"], "/nologo", "/T", "vs_5_0", "/E", "main", "/Fo",
+                        manifest.with_suffix(".vs.cso"), source], check=True)
     return env, args, output
 
 
-def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *, binding=None):
+def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *, binding=None, vertex_hlsl=None):
     binding = binding or f"srv 0 {view_kind} table 0 0"
-    env, args, output = prepare_draw_cache(directory, consumer, hlsl, modes, binding)
+    env, args, output = prepare_draw_cache(directory, consumer, hlsl, modes, binding, vertex_hlsl=vertex_hlsl)
     result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
     print(result.stdout, end="")
     if result.returncode == 77:
@@ -54,9 +59,9 @@ def check_refusal_lines(log):
         # zero address, wrong width, interior address, buffer view, destination off the heap
         prefix + r"unsupported memory SRV arguments: reason=null_address " + R8_RESOURCE % 2 + " " + R8_VIEW
         + rf" dest={HEX} dest_in_view_heap=1 address=0x0 address_readable=0",
-        prefix + r"unavailable texture at the supplied base and layout: reason=texture_unavailable " + R8_RESOURCE % 1
+        prefix + r"unavailable texture at the supplied base and layout: reason=texture_no_resource " + R8_RESOURCE % 1
         + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
-        prefix + r"unavailable texture at the supplied base and layout: reason=texture_unavailable " + R8_RESOURCE % 2
+        prefix + r"unavailable texture at the supplied base and layout: reason=texture_no_resource " + R8_RESOURCE % 2
         + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
         prefix + r"unavailable buffer at the supplied address: reason=buffer_unavailable "
         + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "

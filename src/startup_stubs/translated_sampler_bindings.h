@@ -3,6 +3,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "startup_stubs/local_log.h"
+
 #include <array>
 #include <bitset>
 #include <cstdint>
@@ -47,7 +49,12 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
         s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
         s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
     }
-    s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    // SQ_IMG_SAMP_WORD3 bits 31:30 (BORDER_COLOR_TYPE, Mesa gfx10-rsrc.json): 0 = TRANS_BLACK, 1 = OPAQUE_BLACK,
+    // 2 = OPAQUE_WHITE. Value 3 (REGISTER, indexed by BORDER_COLOR_PTR) has no palette here and falls back to 0.
+    const UINT border_type = (words[3] >> 30) & 3u;
+    s.BorderColor = border_type == 2u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE
+                  : border_type == 1u ? D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
+                                      : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
     if (lod_limits) {
         s.MinLOD = static_cast<float>(words[1] & 0xfffu) / 256.0f;
@@ -105,20 +112,25 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
     return statics;
 }
 
-inline UINT sampler_root_parameter(UINT srvs) { return srvs ? 2u : 1u; }
+// views: the SRVs and UAVs of the view table together.
+inline UINT sampler_root_parameter(UINT views) { return views ? 2u : 1u; }
 
+// Parameter 1, when there are views, is one table: SRVs t0.. first, then UAVs u0.. right after them.
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
-                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out)
+                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = constants;
-    const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0};
+    // A compute program's outputs (u0..) follow its resources in the same table.
+    const D3D12_DESCRIPTOR_RANGE view_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0},
+                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs}};
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable = {1, &srv_range};
+    // A range of no descriptors does not serialize: a program without resources starts the table at its outputs.
+    parameters[1].DescriptorTable = {(srvs ? 1u : 0u) + (uavs ? 1u : 0u), srvs ? view_ranges : view_ranges + 1};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
-    UINT count = sampler_root_parameter(srvs);
+    UINT count = sampler_root_parameter(srvs + uavs);
     if (samplers.heap) {
         parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[count].DescriptorTable = {1, &sampler_range};
@@ -168,10 +180,15 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
         const UINT room = static_cast<UINT>((page_size - address % page_size) / title_sampler_stride);
         const UINT available = snapshot.count - i;
         const UINT run = room ? (room < available ? room : available) : 1;
-        SIZE_T copied = 0;
         const SIZE_T bytes = SIZE_T{run} * title_sampler_stride;
-        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes, &copied) &&
-            copied == bytes) {
+        // Outside xmem's run breaks, where a mapped page of the title's heap would read as missing.
+        bool whole = false;
+        x2w_local::outside_run_breaks([&] {
+            SIZE_T copied = 0;
+            whole = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes,
+                                      &copied) && copied == bytes;
+        });
+        if (whole) {
             for (UINT j = i; j < i + run; ++j) snapshot.readable.set(j);
         } else {
             // ReadProcessMemory can copy part of a record on failure.
@@ -184,10 +201,13 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
 
 inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
 {
-    // A heap entry is the title's own descriptor, so its MIN_LOD and MAX_LOD apply (#2221).
+    // A heap entry is the title's own descriptor, so its MIN_LOD, MAX_LOD (#2221) and fixed border color apply.
     const auto s = decode_sampler(words, 0, false, true);
+    const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
+    const float alpha = (s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
+                         s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK) ? 1.0f : 0.0f;
     return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
-            {}, s.MinLOD, s.MaxLOD};
+            {rgb, rgb, rgb, alpha}, s.MinLOD, s.MaxLOD};
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
