@@ -1798,9 +1798,15 @@ struct DirectCompute {
                 if (!j && permuted) {
                     bits = ir.binary("and", *permuted, "65535");
                 } else if (i.subword) {
-                    // A DWORD selection reads the low half for binary16 arithmetic.
+                    auto inline_word = packed_f16_inline_constant(r);
+                    auto word = inline_word ? to_string(*inline_word) : operand32(i, r);
+                    // Select from the full operand word. DWORD reads the low half.
                     const unsigned sel = i.src_select[j];
-                    bits = subword(operand32(i, r), sel == 6 ? 4 : sel, false);
+                    // Only the binary16 value of an inline constant is modelled; its other
+                    // half under SDWA is not documented here, so a high-half pick stays refused.
+                    if (inline_word && sel != 4 && sel != 6)
+                        refuse(i.pc, "unsupported SDWA binary16 inline constant selection");
+                    bits = subword(word, sel == 6 ? 4 : sel, false);
                 } else if (r >= 240 && r <= 248) {
                     // Inline floats are f32 patterns. The f16 operation consumes the
                     // binary16 rounding of that value.

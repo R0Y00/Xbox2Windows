@@ -124,12 +124,9 @@ def refusals():
     add = fixture.OP_CODE['add']
     dest_error = 'unsupported SDWA destination modifier'
     src_error = 'invalid SDWA source modifier'
-    vgpr_error = 'SDWA binary16 source must be a VGPR'
     return [
         (sdwa(add, DWORD, PAD, WORD_0, WORD_0), dest_error),
         (sdwa(add, WORD_0, PAD, BYTE_1, WORD_0), src_error),
-        (sdwa(add, WORD_0, PAD, WORD_0 | SCALAR, WORD_0), vgpr_error),
-        (sdwa(add, WORD_0, PAD, WORD_0, WORD_0 | SCALAR, reg1=242), vgpr_error),
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0 | 8), src_error),
         (sdwa(add, WORD_0, SEXT, WORD_0, WORD_0), dest_error),
         (sdwa(add, WORD_0, PAD, WORD_0, WORD_0, dst_mod=1 << 13), dest_error),

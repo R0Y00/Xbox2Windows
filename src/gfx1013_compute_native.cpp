@@ -347,8 +347,6 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 const unsigned control = (ext >> (16 + 8*j)) & 255;
                 i.src_select[j] = control & 7;
                 i.src_sext[j] = (control & 8) != 0;
-                if (half_alu && (control & 128))
-                    refuse(pc, "SDWA binary16 source must be a VGPR");
                 if (half_alu && i.src_select[j] < 4)
                     refuse(pc, "invalid SDWA source modifier");
                 if (i.src_select[j] == 7 || (control & 64) || (fp_input && i.src_sext[j]) || (!fp_input && (control & 0x30)))
