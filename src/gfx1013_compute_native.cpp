@@ -1734,11 +1734,11 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
-    // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
-    // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
-    const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
-                              word(request.sa,4)==0x6c090102;
-    const bool wave64 = stage ? !stage->wave32 : packed_state && !(word(request.sa,16)&(1u<<20));
+    // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
+    // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
+    // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
+    // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
+    const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);

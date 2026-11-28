@@ -43,7 +43,7 @@ struct ComputeTranslation {
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
-    x2w_startup::ManifestRetry manifest_retry;  // only an absent manifest can become ready later
+    x2w_startup::ManifestRetry manifest_retry;  // absent and stale manifests can become ready later
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
@@ -114,6 +114,21 @@ const char* load_compute_translation(ComputeTranslation& tr)
         tr.manifest_retry.missed(GetTickCount64());
         return nullptr;
     }
+    // A native manifest from another compiler revision, or an unmarked one without the Python translator's
+    // <key>.cs.hlsl, is stale: it is looked for again on the same schedule as an absent one.
+    const auto output = x2w::native_compute_output(manifest);
+    if (output == x2w::NativeComputeOutput::incompatible) {
+        tr.manifest_retry.missed(GetTickCount64());
+        return "native translation from another compiler revision; rebuild it";
+    }
+    if (output == x2w::NativeComputeOutput::unmarked) {
+        const DWORD attributes = cache_path(path, L"", tr.key, L".cs.hlsl")
+            ? GetFileAttributesW(path) : INVALID_FILE_ATTRIBUTES;
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            tr.manifest_retry.missed(GetTickCount64());
+            return "native translation without a revision; rebuild it";
+        }
+    }
     tr.manifest_retry.found();
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
@@ -130,6 +145,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (line != "stage cs") return "not a compute manifest";
             continue;
         }
+        if (line.compare(0, 7, "native ") == 0) continue;
         unsigned i = 0, x = 0, y = 0, z = 0, w = 0;
         int a = 0, b = 0, c = 0, d = 0, used = 0;
         char name[16] = "";
@@ -698,68 +714,27 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             std::memcpy(views[i].words, words, sizeof(views[i].words));
             continue;
         }
-        if (words[0] == view_token_magic) {
-            ComputeTokenOutput token{};
-            reason = compute_token_output(self, words, token);
-#ifdef X2W_NATIVE_SHADERS
-            if (!reason && slot.half_typed_bytes) {
-                const auto kind = slot.packed_d16_x ? x2w::ComputeViewKind::packed_d16_x_uav : x2w::ComputeViewKind::half_buffer_uav;
-                const x2w::ComputeViewBinding binding{kind, 0, 0, 0, slot.half_typed_bytes};
-                token.view.Format = desktop_format(token.view.Format);
-                if (!x2w::native_buffer_store_view(binding, token.view, token.backing.Width))
-                    reason = "formatted D16 write has an incompatible typed buffer UAV";
-            }
-#endif
-            if (reason && token.placement == Placement::copied_buffer &&
-                trace_copied_compute_output(key, token.guest_resource, token.guest_base, token.offset, token.bytes)) {
-                log("x2w-compute-output-watch key=%016llx groups=%u,%u,%u indirect=%u owner=0x%llx gpuva=0x%llx",
-                    key, x, y, z, dispatch.signature != nullptr, token.guest_resource, token.desktop_gpuva);
-                for (const auto& ud : tr->uds)
-                    if (ud.source == ComputeTranslation::root_constant)
-                        log("x2w-compute-output-constant key=%016llx root=%d word=%d value=0x%08x", key, ud.a, ud.b,
-                            pass.compute_constants.word(ud.a, ud.b));
-            }
-            for (const auto& ud : tr->uds)
-                if (ud.source >= ComputeTranslation::output_word3 && ud.a == static_cast<int>(i - inputs) && !reason)
-                    reason = "an output token has no original ISA descriptor words for entry constants";
-            for (std::size_t input = 0; input < inputs && !reason; ++input)
-                if (views[input].resource == token.resource) reason = "an output buffer is also an input";
-            if (!reason && !retain_with_recording(self, x2w_startup::ComPtr<ID3D12Resource>(token.resource)))
-                reason = "an output token's backing could not be retained with the recording";
-            if (!tr->logged_token_output || (!reason && !tr->logged_bound_token_output)) {
-                tr->logged_token_output = true;
-                if (!reason) tr->logged_bound_token_output = true;
-                log("x2w-draw compute UAV %016llx table=%d+%d entry=0x%llx token=%u created=%u dim=%u fmt=%u "
-                    "first=%llu elements=%u stride=%u flags=%u backing-dim=%u backing-bytes=%llu backing-flags=%u "
-                    "placement=%u owner=0x%llx guest-base=0x%llx counter=0x%llx desc-bytes=%u offset=%llu bytes=%llu result=%s",
-                    key, slot.a, slot.b, entry, words[1], token.created, token.view.ViewDimension, token.view.Format,
-                    token.view.Buffer.FirstElement, token.view.Buffer.NumElements, token.view.Buffer.StructureByteStride,
-                    token.view.Buffer.Flags, token.backing.Dimension, token.backing.Width, token.backing.Flags,
-                    static_cast<unsigned>(token.placement), token.guest_resource, token.guest_base, token.counter,
-                    token.description_bytes, token.offset, token.bytes, reason ? reason : "bound");
-            }
-            views[i] = {token.resource, token.offset, token.bytes, true};
-            if (!reason && slot.half_typed_bytes) {
-                views[i].described = true;
-                views[i].desc.uav = token.view;
-            }
-            continue;
-        }
-        if (slot.half_typed_bytes) {
-            reason = "formatted D16 write needs the original typed buffer view";
-            break;
-        }
-        // Hardware descriptors address guest memory directly and must name a unique writable alias.
+        // An output is written by the GPU: only a placed buffer that aliases the title's memory shows the result
+        // to the title. shortcut: view tokens and copied placements are refused, add them with their first user.
+        // Each refused condition has its own reason.
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const auto placed = !bytes || bytes % 4 || bytes > (16u << 20)
-            ? PlacedVertexView{} : placed_buffer_range(self->own().list_device, address, bytes);
+        const bool sized = words[0] != view_token_magic && bytes && bytes % 4 == 0 && bytes <= (16u << 20);
+        const auto placed = sized ? placed_buffer_range(self->own().list_device, address, bytes) : PlacedVertexView{};
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
-        if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON || offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT ||
-            !(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-            reason = "an output is not an aliased placed buffer range with unordered access";
+        if (words[0] == view_token_magic) reason = "an output buffer descriptor is a view token";
+        else if (!bytes) reason = "an output buffer descriptor has zero records";
+        else if (!sized) reason = "an output buffer range is over 16 MiB or not whole dwords";
+        else if (placed.reject) reason = "an output range crosses the end of a placed buffer";
+        else if (!placed.owner) reason = "an output is in title memory outside any placed buffer";
+        else if (!placed.alias) reason = "an output is in a placed buffer that does not alias title memory";
+        else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+            reason = "an output buffer's resource was not created in the common state";
+        else if (offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an output buffer range is not 16-byte aligned in its resource";
+        else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            reason = "an output buffer has no unordered access";
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         if (reason && !tr->first_refusal)

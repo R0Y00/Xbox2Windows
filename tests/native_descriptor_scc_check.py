@@ -60,7 +60,10 @@ def main(compile_dxil, replay, sdk, backend):
                                     capture_output=True, text=True)
             assert result.returncode == 0 and f"frontend_cache_hit={hit}" in result.stdout, result.stdout + result.stderr
             [manifest] = published.glob("*.txt")
-            assert manifest.read_text().splitlines() == [
+            # The native output revision line (#3006) is checked separately; the binding lines stay exact.
+            lines = manifest.read_text().splitlines()
+            assert sum(line.startswith("native ") for line in lines) == 1, manifest.read_text()
+            assert [line for line in lines if not line.startswith("native ")] == [
                 "x2w-manifest 2", "stage cs", "group 32 1 1", "ud 2",
                 "udsrc 0 rootconst 1 0", "udsrc 1 stride 0",
                 "srv 0 buf table 0 32", "uav 0 table 0 64",

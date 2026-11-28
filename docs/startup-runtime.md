@@ -983,6 +983,13 @@ wave size 32, so an adapter without 32-lane waves refuses every program by that 
 translation is tried once per key and before a published `<key>.txt`. It covers compute only; graphics
 pipelines still need a published translation.
 
+Published compute translations from `compile_dxil --requests` and `--watch` carry a `native 1` line in the
+`x2w-manifest 2` manifest. The stand-in requires the current native output revision. An unmarked manifest
+is accepted with a `<key>.cs.hlsl` sidecar, which identifies a Python translation. `compile_dxil --watch`
+rebuilds stale native outputs and leaves Python publications in place. The stand-in retries a stale or
+absent manifest on subsequent dispatches on the ManifestRetry schedule (1 s, doubling up to 32 s), so a running process can
+pick up a rebuilt output (by the code path; no test covers the reload). Compute request keys stay at `29cs`, and revision-28 archives are still read.
+
 Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
 ([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
 [route, controls and results](experiments/startup-compute-native-dispatch.md)).

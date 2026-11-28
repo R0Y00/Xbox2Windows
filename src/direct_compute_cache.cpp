@@ -3,6 +3,7 @@
 #include "gfx1013_isa.h"
 #include "native_graphics_bindings.h"
 #include "shader_compute_request.h"
+#include "native_compute_output.h"
 #include "native_shader_revision.h"
 #include "shader_dxil_compiler.h"
 #include <atomic>
@@ -970,7 +971,8 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             return std::nullopt;
         out << "udsrc " << ud_index++ << " stride " << srv << '\n';
     }
-    out << srv_lines.str() << uav_lines.str() << sampler_lines.str();
+    out << srv_lines.str() << uav_lines.str() << sampler_lines.str()
+        << "native " << native_compute_output_revision << '\n';
     return out.str();
 }
 

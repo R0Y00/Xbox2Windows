@@ -244,18 +244,14 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     constexpr char revision[] = "x2w-startup-shader-29cs";
     if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
-    ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
-    validate_compute_request_shape(request);
-    return request;
-}
-
-void x2w::validate_compute_request_shape(const ComputeRequest &r) {
-    check_compute_extents(r.description, r.code.size(), r.data.size(), r.sa.size(), r.sb.size());
-    if (r.root.size() > (16u << 20) || r.code.size() > (1u << 20) ||
-        r.data.size() > (1u << 20) || r.sa.size() > 4096 || r.sb.size() > 4096)
-        throw std::runtime_error("inconsistent compute request");
-    if (r.root.empty() || r.sa.size() != 28 || r.code.empty() || r.data.empty() || r.code.size() % 4)
-        throw std::runtime_error(r.sa.size() != 28 ? "compute state block A is not 28 bytes" : "inconsistent compute request");
+    if (root.empty() || sa.size() != 28 || code.empty() || data.empty() || code.size() % 4)
+        throw std::runtime_error(sa.size() != 28 ? "compute state block A is not 28 bytes"
+                                                 : "inconsistent compute request");
+    // Bit 20 of dword 4 (bits 15:0 are Z): set for wave32, clear for wave64. Inferred from captured requests
+    // (docs/experiments/native-slot67-wave-size.md).
+    const bool wave32 = (static_cast<unsigned char>(sa[18]) & 0x10) != 0;
+    return {std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected,
+            wave32};
 }
 
 std::string x2w::read_shader_container_bytes(const fs::path &file) {

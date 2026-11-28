@@ -1450,6 +1450,19 @@ struct DirectCompute {
         return select(nan, "32256",
             select(product_inf, ir.binary("or", product_sign, "31744"), select(c_inf, c, finite)));
     }
+    static std::optional<uint32_t> packed_f16_inline_constant(unsigned r) {
+        if (r >= 240 && r <= 248) {
+            // On gfx1013 (RDNA 2), inline binary16 float constants occupy bits [15:0] with bits [31:16] zeroed.
+            constexpr uint32_t halves[]{0x3800u, 0xb800u, 0x3c00u, 0xbc00u, 0x4000u,
+                                        0xc000u, 0x4400u, 0xc400u, 0x3118u};
+            return halves[r - 240];
+        }
+        if (r >= 128 && r <= 192)
+            return r - 128u;
+        if (r >= 193 && r <= 208)
+            return static_cast<uint32_t>(192u - r);
+        return std::nullopt;
+    }
     void packed_f16_alu(const Inst &i) {
         const bool fused = i.name == "v_pk_fma_f16";
         if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4))))
@@ -1459,9 +1472,12 @@ struct DirectCompute {
         std::array<string, 3> words;
         for (unsigned j = 0; j < (fused ? 3u : 2u); ++j) {
             unsigned r = i.src[j];
-            if (r > 105 && r < 256 && r != 128 && r != 255)
+            if (auto inline_word = packed_f16_inline_constant(r))
+                words[j] = to_string(*inline_word);
+            else if (r <= 105 || r == 255 || (r >= 256 && r < 512))
+                words[j] = operand32(i, r);
+            else
                 refuse(i.pc, "unsupported packed binary16 arithmetic source");
-            words[j] = operand32(i, r);
         }
         auto lane = [&](unsigned selectors, unsigned negate) {
             auto operand = [&](unsigned j) {
@@ -1826,8 +1842,13 @@ struct DirectCompute {
                 refuse(i.pc, "unsupported " + string(n) + " SDWA form");
             if (i.scale)
                 refuse(i.pc, "unsupported " + string(n) + " omod");
-            if (i.wide && (i.a & 0x7800))
+            const unsigned op_sel = i.wide ? (i.a >> 11) & 15u : 0;
+            if (op_sel && (n != "v_fma_f16" || i.enc != Encoding::Vop3 || i.clamp))
                 refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            for (unsigned j = 0; j < 3; ++j) {
+                if ((op_sel & (1u << j)) && i.src[j] < 256)
+                    refuse(i.pc, "unsupported v_fma_f16 high-half op_sel on non-VGPR source");
+            }
             if (n == "v_fmac_f16" && i.wide && (((i.abs | i.neg) & 4) || i.src[2]))
                 refuse(i.pc, "unsupported v_fmac_f16 third-source modifier");
             if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
@@ -1835,7 +1856,9 @@ struct DirectCompute {
             auto half_bits = [&](unsigned j) {
                 const unsigned r = i.src[j];
                 string bits;
-                if (r >= 240 && r <= 248) {
+                if (op_sel & (1u << j)) {
+                    bits = ir.binary("lshr", operand32(i, r), "16");
+                } else if (r >= 240 && r <= 248) {
                     constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
                                                 0xc000, 0x4400, 0xc400, 0x3118};
                     bits = to_string(halves[r - 240]);
@@ -1865,8 +1888,10 @@ struct DirectCompute {
                 auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
                 result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
             }
-            auto kept = ir.binary("and", read(i.dst), "4294901760");
-            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            const bool dst_high = (op_sel & 8u) != 0;
+            auto kept = ir.binary("and", read(i.dst), dst_high ? "65535" : "4294901760");
+            auto placed = dst_high ? ir.binary("shl", result, "16") : ir.binary("and", result, "65535");
+            vector_write(i.dst, ir.binary("or", kept, placed));
             return true;
         }
         const auto rule = alu_rules.find(n);
@@ -2339,10 +2364,16 @@ struct DirectCompute {
         if (floating && (!half_mode_known || (mode_bits & 0xc0u) != 0xc0u))
             refuse(i.pc, "unsupported packed binary16 min/max denormal mode");
         auto source = [&](unsigned src) {
+            if (floating) {
+                if (auto inline_word = packed_f16_inline_constant(src))
+                    return to_string(*inline_word);
+            } else if (src >= 128 && src <= 208) {
+                return operand32(i, src);
+            }
             if (src <= 105) {
                 if (state[src].type == Symbol::Type::masked || state[src].type == Symbol::Type::uniform_mask)
                     refuse(i.pc, "packed 16-bit min/max uses a lane mask");
-            } else if (src < 256 && src != 128 && src != 255) {
+            } else if (src < 256 && src != 255) {
                 refuse(i.pc, "unsupported packed 16-bit min/max source");
             }
             return operand32(i, src);
