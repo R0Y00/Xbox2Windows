@@ -1382,6 +1382,28 @@ target_sources(startup_stream_consumer PRIVATE tests/startup_pixel_uav.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_rect_gap.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_slot67_indirect.cpp tests/desktop_gpu.cpp)
 
+# Replay (docs/startup-runtime.md#d3d12-replay-record): the player, next to the stand-in it loads, and the scene the
+# replay test records (tests/cmake/startup_replay.cmake).
+enable_language(ASM_MASM)
+add_executable(x2w_replay src/replay/x2w_replay.cpp src/replay/replay_invoke.asm)
+target_compile_features(x2w_replay PRIVATE cxx_std_17)
+# Delay-loaded: the recording's settings (XENV) are in the environment before the stand-in reads any.
+target_link_libraries(x2w_replay PRIVATE d3d12_xs_shim d3d12 dxgi delayimp psapi)
+target_link_options(x2w_replay PRIVATE /DELAYLOAD:d3d12_xs.dll)
+add_executable(startup_replay_quad tests/startup_replay_quad.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_replay_quad PRIVATE cxx_std_17)
+target_link_libraries(startup_replay_quad PRIVATE d3d12_xs_shim d3d12 dxgi)
+
+# Record + replay page store (pure C++, no D3D): a range captured twice is rebuilt byte for byte; each mutant stream must fail.
+add_executable(startup_replay_pages tests/startup_replay_pages.cpp)
+target_compile_features(startup_replay_pages PRIVATE cxx_std_17)
+add_test(NAME startup_replay_pages COMMAND startup_replay_pages)
+set_tests_properties(startup_replay_pages PROPERTIES TIMEOUT 60)
+foreach(mutant drop-map drop-page corrupt)
+    add_test(NAME startup_replay_pages_mutant_${mutant} COMMAND startup_replay_pages ${mutant})
+    set_tests_properties(startup_replay_pages_mutant_${mutant} PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+endforeach()
+
 # The shared indexed rectangle-expansion stage (startup_stubs/indexed_rect_geometry.h) drawn on its own, with
 # back-face culling on: the axis order, a swung order of the same corners and a rotated rectangle (#3131).
 # tests/cmake/startup_rect_gap.cmake registers its tests and the runtime draw.
