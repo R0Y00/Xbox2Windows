@@ -4,7 +4,8 @@
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
+// (`srv <i> <tex1d|tex2d|tex2da|tex3d> table <param> <byte>` inputs,
+// `uav <i> <dimension> <float|half> table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record

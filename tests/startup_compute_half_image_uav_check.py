@@ -42,9 +42,13 @@ def state(height):
     return state_a((4, 1 if height == 1 else 2, 1), RSRC2)
 
 
+def compile_request(cli, sdk, cache):
+    return subprocess.run([cli, sdk, cache.parent / 'compiler-cache', 'gfx1013-direct-cs@0',
+                           '--requests', cache, cache], capture_output=True, text=True, timeout=30)
+
+
 def publish(cli, sdk, cache, key, channels, dimension):
-    result = subprocess.run([cli, sdk, cache.parent / 'compiler-cache', 'gfx1013-direct-cs@0',
-                             '--requests', cache, cache], capture_output=True, text=True, timeout=30)
+    result = compile_request(cli, sdk, cache)
     manifest = cache / f'{key}.txt'
     assert result.returncode == 0 and manifest.is_file(), result.stdout + result.stderr
     expected = f'uav 0 {dimension} half table 1 64 channels {channels}'
@@ -58,6 +62,15 @@ def controls(cli, sdk):
             cache.mkdir()
             key = write_request(cache, program(channels, dimension), state(height), root=ROOT)
             publish(cli, sdk, cache, f'{key:016x}', channels, view)
+        cache = Path(directory) / 'unsupported-1d-array'
+        cache.mkdir()
+        key = f'{write_request(cache, program(2, 4), state(8), root=ROOT):016x}'
+        result = compile_request(cli, sdk, cache)
+        reason = 'unsupported startup runtime manifest bindings: UAV kind half2_texture_uav 1d-array'
+        assert result.returncode == 0 and reason in result.stdout, result.stdout + result.stderr
+        assert (cache / f'{key}.cs.cso').read_bytes().startswith(b'DXBC')
+        assert not (cache / f'{key}.txt').exists()
+        print('1D-array D16 store compiled and was refused at manifest publication')
 
 
 def compare(got, expected, label, result):
@@ -65,6 +78,16 @@ def compare(got, expected, label, result):
         word = next(i for i, (a, b) in enumerate(zip(got, expected)) if a != b)
         raise AssertionError(f'{label}: component {word} expected {expected[word]:04x}, '
                              f'read {got[word]:04x}\n{result.stderr[-3000:]}')
+
+
+def stored(initial, channels, height, layer, start):
+    expected = initial.copy()
+    values = [0x3c00, 0xc000][:channels]
+    for y in range(min(height, 2)):
+        for x in (0, 2, 4, 6):
+            i = start + ((layer * height + y) * 32 + x) * channels
+            expected[i:i + channels] = values
+    return expected
 
 
 def check(directory, cli, sdk, consumer, adapter, case):
@@ -81,7 +104,8 @@ def check(directory, cli, sdk, consumer, adapter, case):
     (directory / 'data').write_bytes(DATA)
     (directory / 'state').write_bytes(state(height))
     mode = 'texture-exact-half-' + name
-    initial = [0x5000 + i for i in range(layers * 32 * height * channels)]
+    base_mip = [0x7000 + i for i in range(64 * 16)] if name == 'r' else []
+    initial = base_mip + [0x5000 + i for i in range(layers * 32 * height * channels)]
     layout = f'<{len(initial)}H'
 
     got, result = run(directory, consumer, env, mode, layout)
@@ -90,17 +114,23 @@ def check(directory, cli, sdk, consumer, adapter, case):
     key = lines(result, 'x2w-draw compute request')[0].split()[3]
     publish(cli, sdk, cache, key, channels, view)
 
-    expected = initial.copy()
-    values = [0x3c00, 0xc000][:channels]
-    for y in range(min(height, 2)):
-        for x in (0, 2, 4, 6):
-            i = (((2 if layers > 1 else 0) * height + y) * 32 + x) * channels
-            expected[i:i + channels] = values
+    expected = stored(initial, channels, height, 2 if layers > 1 else 0, len(base_mip))
     got, result = run(directory, consumer, env, mode, layout)
     compare(got, expected, name, result)
     assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr
     layer = clean(result)
-    print(f'{adapter} {name}: all {len(expected)} halfwords match at mip 1 (debug layer {layer})')
+    print(f'{adapter} {name}: all {len(expected)} halfwords match including mip 1 (debug layer {layer})')
+
+    if name == 'r-volume':
+        got, result = run(directory, consumer, env, mode + '-shifted-w', layout)
+        compare(got, stored(initial, channels, height, 1, 0), 'shifted volume W range', result)
+        assert len(lines(result, 'Dispatch(2, 1, 1) translated')) == 1, result.stderr
+        clean(result)
+        changed = [i for i, (a, b) in enumerate(zip(got, expected)) if a != b]
+        assert len(changed) == 16, changed
+        first = changed[0]
+        print(f'{adapter} shifted W control: {len(changed)} differences, first component {first} '
+              f'expected {expected[first]:04x}, read {got[first]:04x}')
 
     if name in ('r', 'rg'):
         # Same channel count, but an R32/R32G32 view is from a different format family.

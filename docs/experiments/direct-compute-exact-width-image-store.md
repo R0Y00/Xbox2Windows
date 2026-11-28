@@ -41,6 +41,9 @@ an R16 typeless backing resource. The layered tests bind a view that starts
 at physical slice 1 and write relative slice 1. All other pixels and slices
 keep their original halfwords. The R32_FLOAT and R32G32_FLOAT controls
 exercise the format refusal with the same channel counts.
+The scalar 2D fixture also verifies mip 0 remains untouched. Shifting the
+3D view's first W slice from 1 to 0 moves the writes to the adjacent slice.
+A compiled 1D-array D16 store is refused at manifest publication.
 
 The translated descriptor follows the [D3D12 UAV contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_unordered_access_view_desc),
 including the [W range of 3D views](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_tex3d_uav).

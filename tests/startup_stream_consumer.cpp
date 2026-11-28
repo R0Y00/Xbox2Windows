@@ -692,15 +692,17 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 // texture-store-mips adds a second UAV of the same texture. The swapped mode reverses the two mip views.
 static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
-    constexpr UINT width = 32;
     const bool exact = mode.rfind("texture-exact-", 0) == 0;
     const bool half = mode.rfind("texture-exact-half-", 0) == 0;
+    const bool half_two_mips = mode == "texture-exact-half-r";
     const bool half_rg = mode == "texture-exact-half-rg" || mode == "texture-exact-half-rg-array";
+    const bool shifted_w = mode == "texture-exact-half-r-volume-shifted-w";
     const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume" ||
-                        mode == "texture-exact-half-r-volume";
+                        mode == "texture-exact-half-r-volume" || shifted_w;
     const bool line = mode == "texture-line" || mode == "texture-line-bad-mip" || mode == "texture-exact-half-r-line";
-    const UINT first_mip = volume || line || half ? 1 : 0;
-    const UINT height = line ? 1 : 8;
+    const UINT first_mip = volume || line || (half && !half_two_mips) ? 1 : 0;
+    const UINT width = half_two_mips ? 64 : 32;
+    const UINT height = half_two_mips ? 16 : line ? 1 : 8;
     const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
     const bool atomic_uint = mode == "texture-store-atomic";
     const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ||
@@ -708,11 +710,11 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     const UINT subresources = volume ? 1 : layers;
     const bool swapped = mode == "texture-store-mips-swapped";
     const bool dual = swapped || mode == "texture-store-mips";
-    const UINT mips = dual ? 2 : 1;
+    const UINT mips = dual || half_two_mips ? 2 : 1;
     const UINT pixel_bytes = half ? (half_rg ? 4 : 2) :
                              exact ? (mode == "texture-exact-rg" ? 8 : 4) : atomic_uint ? 4 : fp32 ? 16 : 8;
     const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
-    const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
+    const UINT slice_bytes = pitch * (height + (mips == 2 ? height / 2 : 0)), bytes = slice_bytes * layers;
     const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
@@ -751,13 +753,18 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
     if (half) {
-        const UINT row_halves = width * pixel_bytes / sizeof(UINT16);
-        for (UINT layer = 0; layer < layers; ++layer)
-            for (UINT y = 0; y < height; ++y) {
-                auto* row = reinterpret_cast<UINT16*>(static_cast<char*>(memory) + offset(layer, 0) + y * pitch);
-                for (UINT x = 0; x < row_halves; ++x)
-                    row[x] = static_cast<UINT16>(0x5000 + (layer * height + y) * row_halves + x);
+        for (UINT layer = 0; layer < layers; ++layer) {
+            for (UINT mip = 0; mip < mips; ++mip) {
+                const UINT row_halves = (width >> mip) * pixel_bytes / sizeof(UINT16);
+                const UINT rows = height >> mip;
+                const UINT16 sentinel = half_two_mips && mip == 0 ? 0x7000 : 0x5000;
+                for (UINT y = 0; y < rows; ++y) {
+                    auto* row = reinterpret_cast<UINT16*>(static_cast<char*>(memory) + offset(layer, mip) + y * pitch);
+                    for (UINT x = 0; x < row_halves; ++x)
+                        row[x] = static_cast<UINT16>(sentinel + (layer * rows + y) * row_halves + x);
+                }
             }
+        }
     } else if (exact) {
         for (UINT layer = 0; layer < layers; ++layer)
             for (UINT y = 0; y < height; ++y) {
@@ -806,7 +813,7 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     if (volume) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
         // At mip 1 the depth is six. The bad count fits only if the binder uses the base mip's depth.
-        view.Texture3D = {first_mip, 1, mode == "texture-volume-bad-w" ? layers : ~0u};
+        view.Texture3D = {first_mip, shifted_w ? 0u : 1u, mode == "texture-volume-bad-w" ? layers : ~0u};
     } else if (line) {
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
         view.Texture1D.MipSlice = mode == "texture-line-bad-mip" ? first_mip + 1 : first_mip;
@@ -814,7 +821,7 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
         view.Texture2DArray = {first_mip, 1, 4, 0}; // four selected slices, untouched neighbors on both sides
     } else {
-        view.Texture2D.MipSlice = swapped ? 1 : first_mip;
+        view.Texture2D.MipSlice = swapped || half_two_mips ? 1 : first_mip;
     }
     if (mode != "texture-store-copied") invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
     if (mode == "texture-store-copied") {
