@@ -44,7 +44,9 @@ WQM_TEXT = 's_wqm_b64 exec, exec\n'
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 V_OR = 0x1c
 V_MIN_U32 = 0x13
-NAMES = ('or', 'mov', 'min')
+V_CMP_LT_U32 = 0xc1  # VOPC: v_cmp_lt_u32 (op 0xc0 is the unsigned compare group)
+V_CNDMASK = 0x01
+NAMES = ('or', 'mov', 'min', 'cmp')
 SWAPS = {(1, 0, 3, 2): ('X', 1, 0), (2, 3, 0, 1): ('Y', 0, 1), (3, 2, 1, 0): ('Diagonal', 1, 1)}
 failures = []
 
@@ -75,6 +77,11 @@ def vop2_dpp(op, vdst, src0, vsrc1, perm, bank=0xf, row=0xf, bound=0):
                        src0 | ctrl(perm) << 8 | bound << 19 | bank << 24 | row << 28)
 
 
+def vopc_dpp(op, src0, vsrc1, perm, bank=0xf, row=0xf, bound=0):
+    return struct.pack('<2I', 0x7c000000 | op << 17 | vsrc1 << 9 | 250,
+                       src0 | ctrl(perm) << 8 | bound << 19 | bank << 24 | row << 28)
+
+
 def vop1_mov_flag(vdst):
     return struct.pack('<I', 0x7e000000 | vdst << 17 | 1 << 9 | 244)
 
@@ -97,7 +104,13 @@ def fixture(name, wqm=True):
     text, words = text + FLAG_TEXT, words + vop1_mov_flag(9)
     perms = list(SWAPS)
     for i, perm in enumerate(perms):
-        if name == 'or':
+        if name == 'cmp':
+            # VOPC DPP16: VCC = (the exchanged position < this lane's position); the flag lands where it is true.
+            text += dpp_text('v_cmp_lt_u32_dpp', 'vcc_lo, v0, v0', perm) + '\n'
+            words += vopc_dpp(V_CMP_LT_U32, 0, 0, perm)
+            text += 'v_cndmask_b32_e32 v%d, 0, v9, vcc_lo\n' % (1 + i)
+            words += struct.pack('<I', V_CNDMASK << 25 | (1 + i) << 17 | 9 << 9 | 128)
+        elif name == 'or':
             text += dpp_text('v_or_b32_dpp', 'v%d, v0, v9' % (1 + i), perm) + '\n'
             words += vop2_dpp(V_OR, 1 + i, 0, 9, perm)
         elif name == 'min':
@@ -152,6 +165,9 @@ def pixel_words(x, y, name='or'):
     out = []
     for _, dx, dy in SWAPS.values():
         word = (x ^ dx) | (y ^ dy) << 16
+        if name == 'cmp':
+            out.append(FLAG if word < (x | y << 16) else 0)
+            continue
         out.append((min(word, x | y << 16) if name == 'min' else word) | FLAG)
     return out + [(x | y << 16) | FLAG]
 
@@ -310,6 +326,14 @@ def controls():
     check('the min reference differs from the plain exchange at some pixels in every swap',
           all(any(pixel_words(x, y, 'min')[i] != pixel_words(x, y)[i] for x in range(WIDTH) for y in range(HEIGHT))
               for i in range(3)))
+    # 4d. VOPC DPP16 v_cmp_lt_u32: src0 is the exchanged lane, src1 this lane's own register; the result lands in VCC.
+    line = pipeline(fixture('cmp')[1]).hlsl_ps()
+    check('v_cmp_lt_u32_dpp compares the exchanged src0 with the own src1',
+          all(re.search(r'QuadReadAcross%s\(v0\);\s+vcc = \(\(v256 < v0\)' % n, line) for n in ('X', 'Y', 'Diagonal')))
+    check('v_cmp_lt_u32_dpp with a VGPR result is refused',
+          refused(dpp_text('v_cmp_lt_u32_dpp', 'v5, v0, v0', (1, 0, 3, 2))) is not None)
+    check('the cmp reference is not the plain exchange',
+          any(pixel_words(x, y, 'cmp')[0] != pixel_words(x, y)[0] for x in range(WIDTH) for y in range(HEIGHT)))
     check('the min reference keeps the own position where it is the smaller one',
           pixel_words(0, 2, 'min')[2] == (0 | 2 << 16 | FLAG) and pixel_words(0, 3, 'min')[2] == (1 | 2 << 16 | FLAG))
 
@@ -393,6 +417,11 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             }
             if name == 'min':
                 wrong['unsigned maximum instead of minimum'] = mutate(text, r'\bmin\(', 'max(')
+            if name == 'cmp':
+                wrong['reversed compare (own < exchanged)'] = mutate(text, r'\(v256 < v0\)', '(v256 > v0)')
+            if name == 'cmp':
+                # Positions order by y first, so the Y neighbour and the diagonal one compare alike: not a mutant.
+                del wrong['Y reads the diagonal neighbour']
             for label, source in wrong.items():
                 bad = compile_hlsl(dxc, 'dxc', source, 'bad_%s_%d' % (name, abs(hash(label))), 'ps_6_0', directory)
                 run = draw(renderer, adapter, vs, bad, good)
