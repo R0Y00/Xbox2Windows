@@ -598,21 +598,23 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
 // and its view RGBA16_UINT; texture-store-occupied then asks for a view of a texture without unordered access at the same
 // handle, which keeps the first view; texture-store-self also creates a shader resource view of the texture at table byte 0.
 // texture-store-mips adds a second UAV of the same texture. The swapped mode reverses the two mip views.
-static int texture_slot67(void* device, const std::string& mode)
+static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string& mode)
 {
     constexpr UINT width = 32;
-    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w";
+    const bool exact = mode.rfind("texture-exact-", 0) == 0;
+    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume";
     const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
     const UINT first_mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
     const bool fp32 = volume || line || mode == "texture-array" || mode == "texture-array-2d";
     const bool atomic_uint = mode == "texture-store-atomic";
-    const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ? 6 : 1;
+    const UINT layers = volume || mode == "texture-array" || mode == "texture-array-d16" ||
+                        mode == "texture-exact-array" ? 6 : 1;
     const UINT subresources = volume ? 1 : layers;
     const bool swapped = mode == "texture-store-mips-swapped";
     const bool dual = swapped || mode == "texture-store-mips";
     const UINT mips = dual ? 2 : 1;
-    const UINT pixel_bytes = atomic_uint ? 4 : fp32 ? 16 : 8;
+    const UINT pixel_bytes = exact ? (mode == "texture-exact-rg" ? 8 : 4) : atomic_uint ? 4 : fp32 ? 16 : 8;
     const UINT pitch = (std::max)(width * pixel_bytes, UINT{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT});
     const UINT slice_bytes = pitch * (height + (dual ? height / 2 : 0)), bytes = slice_bytes * layers;
     const auto offset = [&](UINT layer, UINT mip) { return UINT64{layer} * slice_bytes + (mip ? pitch * height : 0); };
@@ -620,8 +622,23 @@ static int texture_slot67(void* device, const std::string& mode)
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const DXGI_FORMAT format = atomic_uint ? DXGI_FORMAT_R32_UINT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+    const DXGI_FORMAT format = mode == "texture-exact-r" ? DXGI_FORMAT_R32_FLOAT :
+        mode == "texture-exact-rg" ? DXGI_FORMAT_R32G32_FLOAT :
+        mode == "texture-exact-rgba" ? DXGI_FORMAT_R8G8B8A8_UNORM :
+        exact ? DXGI_FORMAT_R11G11B10_FLOAT :
+        atomic_uint ? DXGI_FORMAT_R32_UINT : fp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
         mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (exact) {
+        ComPtr<ID3D12Device> desktop;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&desktop))) ||
+            FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) ||
+            (volume && !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE3D))) {
+            std::printf("exact-width image store format %u unavailable\n", static_cast<unsigned>(format));
+            return 77;
+        }
+    }
     const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
         D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     const D3D12_RESOURCE_DESC texture_desc{dimension, 0, width << first_mip, line ? 1 : height << first_mip,
@@ -635,7 +652,15 @@ static int texture_slot67(void* device, const std::string& mode)
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    if (atomic_uint) {
+    if (exact) {
+        for (UINT layer = 0; layer < layers; ++layer)
+            for (UINT y = 0; y < height; ++y) {
+                auto* row = reinterpret_cast<UINT*>(static_cast<char*>(memory) + offset(layer, 0) + y * pitch);
+                const UINT row_words = width * pixel_bytes / sizeof(UINT);
+                for (UINT x = 0; x < row_words; ++x)
+                    row[x] = 0x30000000u + (layer * height + y) * row_words + x;
+            }
+    } else if (atomic_uint) {
         auto* words = static_cast<UINT*>(memory);
         for (UINT y = 0; y < height; ++y)
             for (UINT x = 0; x < width; ++x)
@@ -876,7 +901,7 @@ int main(int argc, char** argv)
         return dispatch_slot67(adapter.Get(), device, argv[8]);
     }
     if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "texture", 7) == 0)
-        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(device, argv[8]) : 10;
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? texture_slot67(adapter.Get(), device, argv[8]) : 10;
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;

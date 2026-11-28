@@ -157,6 +157,9 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+#ifdef X2W_NATIVE_SHADERS
+    bool native_graphics_attempted = false;
+#endif
     x2w_startup::ManifestRetry manifest_retry;  // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
@@ -615,6 +618,8 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         Translation candidate;
         candidate.key = tr.key;
         candidate.rtv_request = request.rtv_request;
+        candidate.manifest_retry = tr.manifest_retry;
+        candidate.native_graphics_attempted = true;
         if (!pair.input_layout.empty()) {
             try { candidate.fixed_rectangle_ir = x2w::native_rectangle_geometry(pair.vertex.outputs, pair.pixel.inputs); }
             catch (const x2w::UnsupportedComputeShader&) {} // Triangle lists and strips still use the original pair.
@@ -623,17 +628,20 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         candidate.ps = ps.Get();
         if (x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_MANIFEST_FAILURE"))
             manifest->append("\nx2w-manifest 999\n");
+        if (GetEnvironmentVariableW(L"X2W_TEST_NATIVE_GRAPHICS_BAD_MANIFEST", nullptr, 0))
+            *manifest = "x2w-manifest 0\n";
         load_translation(candidate, request.rtv_request, std::move(*manifest));
-        if (candidate.state != 1) {
+        const bool ready = candidate.state == 1;
+        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
+            tr.key, ready, frontend_hit, vs_hit, ps_hit);
+        if (!ready) {
             if (candidate.root) candidate.root->Release();
-            throw std::runtime_error("native graphics manifest or root signature refused");
+            return false;
         }
         candidate.vs = vs.Detach();
         candidate.ps = ps.Detach();
         candidate.native_candidate = true;
         tr = std::move(candidate);
-        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
-            tr.key, tr.state == 1, frontend_hit, vs_hit, ps_hit);
         return true;
     } catch (const std::exception& error) {
         log("x2w-draw native graphics %016llx refused: %s", tr.key, error.what());
@@ -1252,6 +1260,12 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
         if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
+#ifdef X2W_NATIVE_SHADERS
+        if (base->manifest_retry.pending() && !base->native_graphics_attempted) {
+            base->native_graphics_attempted = true;
+            try_native_graphics(*base);
+        }
+#endif
         return base;
     }
     std::string request = "rtv1 " + std::to_string(base->key);

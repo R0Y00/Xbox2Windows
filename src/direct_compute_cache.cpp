@@ -135,7 +135,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::uint_texture_uav)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::float3_texture_uav)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
@@ -935,6 +935,11 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";
+            } else if (const auto channels = exact_texture_uav_channels(b.kind); channels && b.array_count == 1 &&
+                       (b.image_dimension == 1 || b.image_dimension == 2 || b.image_dimension == 5)) {
+                const char *dimension = b.image_dimension == 2 ? "tex3d" : b.image_dimension == 5 ? "tex2da" : "tex2d";
+                uav_lines << "uav " << b.shader_register << ' ' << dimension << " float table " << b.root_parameter
+                          << ' ' << b.byte_offset << " channels " << channels << '\n';
             } else if ((b.kind == ComputeViewKind::texture_uav || b.kind == ComputeViewKind::half4_texture_uav) &&
                        (b.image_dimension == 1 || b.image_dimension == 5 ||
                         (b.kind == ComputeViewKind::texture_uav && b.image_dimension == 2)) && b.array_count == 1) {

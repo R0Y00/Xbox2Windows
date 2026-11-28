@@ -829,8 +829,10 @@ Alternatively, stage one executable and its adjacent DLLs with:
 .\tools\startup\stage_package.ps1 -PackageDir <package root> -Exe <title>.exe -RunDir <fresh run folder>
 ```
 
-The destination must be absent or empty and separate from the package. Archives and subdirectories
-are not copied. Keep using the package root as `-DataDir`, then run the staged executable:
+The destination must be absent or empty and separate from the package. The helper checks resolved
+paths as well as their spelling, and stops if Windows cannot resolve an existing path (which can
+occur on some network shares). Archives and subdirectories are not copied. Keep using the package
+root as `-DataDir`, then run the staged executable:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `

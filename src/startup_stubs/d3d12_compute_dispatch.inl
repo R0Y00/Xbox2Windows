@@ -3,7 +3,7 @@
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs) named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels 4` outputs) named
+// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -40,6 +40,7 @@ struct ComputeTranslation {
         bool packed_d16_x = false;
         unsigned scalar_window = 0;
         bool atomic_uint_texture = false;
+        unsigned channels = 4;
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
@@ -65,19 +66,24 @@ struct ComputeTranslation {
     }
 };
 
-// Formats a `float` typed output may be viewed with: the program stores float4.
-bool float_output_format(DXGI_FORMAT format)
+// Component counts of the float and normalized formats accepted for typed outputs.
+unsigned float_output_channels(DXGI_FORMAT format)
 {
     switch (format) {
     case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
-    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
-    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32_FLOAT:
-    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
-    case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
-        return true;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return 4;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return 3;
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM:
+        return 2;
+    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM:
+        return 1;
     default:
-        return false;
+        return 0;
     }
 }
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
@@ -195,10 +201,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             tr.uavs.back().atomic_uint_texture = true;
         }
-        else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels 4%n", &i, name, &a, &b, &used) == 4 && whole() &&
-                 i == tr.uavs.size() && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
+        else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels %u%n", &i, name, &a, &b, &x, &used) == 5 &&
+                 whole() && i == tr.uavs.size() && x >= 1 && x <= 4 && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN &&
+                 (x == 4 || uav_dimension() != D3D12_UAV_DIMENSION_TEXTURE1D)) {
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().uav_dimension = uav_dimension();
+            tr.uavs.back().channels = x;
         }
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
@@ -234,7 +242,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
 // X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>: the first Dispatch of a slot 67 request translates
 // it in this process with the C++ compiler (src/gfx1013_compute_native.cpp), before a published <key>.txt is read
 // and with no offline translator running. The dispatch path below binds the result, so a program is accepted only
-// with root constants, raw table buffers it loads per lane (buffer_load_dword) and raw table buffers it stores to.
+// with root constants, raw table buffers and exact-width typed texture outputs.
 // A refusal is logged and leaves the key to the published translations. draw_lock held. Returns whether tr is ready.
 bool translate_compute_natively(ComputeTranslation& tr)
 {
@@ -293,7 +301,8 @@ bool translate_compute_natively(ComputeTranslation& tr)
             const bool half_typed = packed_x || view.kind == x2w::ComputeViewKind::half_buffer_uav;
             const bool texture_input = view.kind == x2w::ComputeViewKind::texture_srv && view.image_dimension == 1;
             const bool volume = view.kind == x2w::ComputeViewKind::texture_uav && view.image_dimension == 2;
-            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume;
+            const unsigned channels = x2w::exact_texture_uav_channels(view.kind);
+            const bool output = channels || view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume;
             auto& slots = output ? tr.uavs : tr.srvs;
             if ((!output && !texture_input && view.kind != x2w::ComputeViewKind::raw_vector_srv && !x2w::accepts_cbv_window(view.kind)) || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
@@ -301,6 +310,14 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                          " is not bound for a natively translated program");
             slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset), volume || texture_input});
             if (volume) slots.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            if (channels) {
+                auto& slot = slots.back();
+                slot.texture = true;
+                slot.channels = channels;
+                slot.uav_dimension = view.image_dimension == 2 ? D3D12_UAV_DIMENSION_TEXTURE3D :
+                                     view.image_dimension == 5 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY :
+                                                                 D3D12_UAV_DIMENSION_TEXTURE2D;
+            }
             slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
             slots.back().packed_d16_x = packed_x;
             if (x2w::accepts_cbv_window(view.kind))
@@ -677,7 +694,19 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!reason && x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
                 reason = "an image atomic requires an R32_UINT UAV";
-            if (!reason && !slot.atomic_uint_texture && !float_output_format(format))
+            if (!reason && slot.channels < 4) {
+                if (float_output_channels(format) != slot.channels || float_output_channels(resource.Format) != slot.channels)
+                    reason = "an exact-width image store requires a matching output texture channel count";
+                else {
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{resource.Format};
+                    if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                                         sizeof(support))) ||
+                        !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+                        reason = "an exact-width image store requires typed UAV store support";
+                    desc.Format = resource.Format;
+                }
+            }
+            if (!reason && !slot.atomic_uint_texture && !float_output_channels(format))
                 reason = "an output texture format is not a float or normalized one";
             // One state per resource here: a texture read and written by the same call is refused. Two outputs
             // of one texture (two mips) share the unordered access state.
