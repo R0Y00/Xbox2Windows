@@ -795,6 +795,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? &view.desc.srv : nullptr, dest);
+            if (view.wrapper && !view.wrapper->own().tiled_address_srv) retire_hold(self, view.wrapper);
             continue;
         }
         if (i < inputs || i >= count) {
