@@ -1885,6 +1885,64 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, result));
             return true;
         }
+        if (n == "v_cvt_pknorm_i16_f16" || n == "v_cvt_pknorm_u16_f16") {
+            if (graphics_input)
+                return false;
+            if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " encoding");
+            if (i.clamp || i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
+            const unsigned op_sel = (i.a >> 11) & 15u;
+            if ((op_sel & 12u) || ((i.abs | i.neg) & 4) || i.src[2])
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            const bool signed_out = n == "v_cvt_pknorm_i16_f16";
+            const string scale = signed_out ? "32767" : "65535";
+            auto cvt_lane = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                if ((op_sel & (1u << j)) && r < 256)
+                    refuse(i.pc, "unsupported " + string(n) + " high-half op_sel on non-VGPR source");
+                string bits;
+                if (op_sel & (1u << j)) {
+                    bits = ir.binary("lshr", operand32(i, r), "16");
+                } else if (r >= 240 && r <= 248) {
+                    bits = to_string(*packed_f16_inline_constant(r));
+                } else {
+                    bits = ir.binary("and", operand32(i, r), "65535");
+                }
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "32768");
+                auto sign = cmp("ne", ir.binary("and", bits, "32768"), "0");
+                auto mag = ir.binary("and", bits, "32767");
+                auto is_nan = cmp("ugt", mag, "31744");
+                auto is_zero = cmp("eq", mag, "0");
+                auto ge_one = cmp("uge", mag, "15360");
+                auto exp = ir.binary("lshr", mag, "10");
+                auto is_sub = cmp("eq", exp, "0");
+                auto mant = select(is_sub, mag, ir.binary("or", "1024", ir.binary("and", mag, "1023")));
+                auto shift = select(is_sub, "24", select(cmp("ult", exp, "15"), ir.binary("sub", "25", exp), "1"));
+                auto prod = ir.binary("mul", mant, scale);
+                auto q0 = ir.binary("lshr", prod, shift);
+                auto mid = ir.binary("shl", "1", ir.binary("sub", shift, "1"));
+                auto mask = ir.binary("sub", ir.binary("shl", "1", shift), "1");
+                auto rem = ir.binary("and", prod, mask);
+                auto tie_even = ir.value("and i1 " + cmp("eq", rem, mid) + ", " + cmp("ne", ir.binary("and", q0, "1"), "0"));
+                auto round_up = ir.value("or i1 " + cmp("ugt", rem, mid) + ", " + tie_even);
+                auto q_frac = ir.binary("add", q0, select(round_up, "1", "0"));
+                auto q_mag = select(ge_one, scale, q_frac);
+                if (signed_out) {
+                    auto neg_q = ir.binary("and", ir.binary("sub", "0", q_mag), "65535");
+                    auto signed_val = select(sign, neg_q, q_mag);
+                    return select(ir.value("or i1 " + is_nan + ", " + is_zero), "0", signed_val);
+                }
+                auto zero_out = ir.value("or i1 " + is_nan + ", " + ir.value("or i1 " + is_zero + ", " + sign));
+                return select(zero_out, "0", q_mag);
+            };
+            auto low = cvt_lane(0), high = cvt_lane(1);
+            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            return true;
+        }
         if (n == "v_cvt_pknorm_i16_f32" || n == "v_cvt_pknorm_u16_f32") {
             if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted)
                 refuse(i.pc, "unsupported " + string(n) + " encoding");
@@ -4176,7 +4234,9 @@ struct DirectCompute {
             op.name == "v_fmaak_f16" ||
             op.name == "v_fract_f16" ||
             op.name == "v_cvt_norm_i16_f16" ||
-            op.name == "v_cvt_norm_u16_f16")
+            op.name == "v_cvt_norm_u16_f16" ||
+            op.name == "v_cvt_pknorm_i16_f16" ||
+            op.name == "v_cvt_pknorm_u16_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
