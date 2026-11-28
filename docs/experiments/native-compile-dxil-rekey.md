@@ -14,9 +14,11 @@ This mode runs without `SDK_DIRECTORY` or DXC:
 - Scans `OLD_CACHE_DIR` (non-recursively) for `req_<16-hex>` markers (`.a`, `.c67`,
   `.m57`, `.rtv`), counts `.m86` markers, and ignores result/diagnostic files
   (`.txt`, `.fail`, `.cso`, `.psdep`).
-- Validates and recomputes keys in parallel using the current runtime revision
-  strings (`x2w-startup-shader-28`, `x2w-startup-shader-28cs`,
-  `x2w-startup-mesh-57-3` via shared helpers in `src/shader_compute_request.cpp`).
+- Validates and recomputes keys in parallel using the current output revision
+  strings (`x2w-startup-shader-29`, `x2w-startup-shader-29cs`,
+  `x2w-startup-mesh-57-3` via shared helpers in `src/shader_compute_request.cpp`),
+  while the readers retain `x2w-startup-shader-28` and `x2w-startup-shader-28cs`
+  input compatibility.
 - Rewrites `.psin` and `.rtv` payloads under their updated keys while leaving all
   shader bytecode/root/layout parts intact.
 - Fails with exit code `1` before creating or writing `NEW_REQUEST_DIR` if any
