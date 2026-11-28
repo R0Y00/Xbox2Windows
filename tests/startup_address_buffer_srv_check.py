@@ -7,6 +7,10 @@ import tempfile
 from startup_address_srv_check import draw_texture
 
 HEX = r"0x[0-9a-f]+"
+WIDE_BUFFER = (
+    r"res\{dim=1 fmt=0 size=65536x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
+    r"view\{dim=1 fmt=39 map=0x1688 first=0 count=16384 stride=0 flags=0x1 \(buffer views are not supported\)\}"
+)
 
 
 def check_refusal_lines(log):
@@ -30,12 +34,25 @@ def check_refusal_lines(log):
         buffer_unavailable.replace("FIRST", "0"),  # unplaced raw view at page + 1
         buffer_unavailable.replace("FIRST", "0"),  # unplaced raw view before stride-16 publication
     ]
+    expected.extend(
+        prefix + "unavailable buffer at the supplied address: reason=buffer_unavailable "
+        + WIDE_BUFFER + rf" dest=(?P<dest>{HEX}) dest_in_view_heap=1 address=(?P<address>{HEX}) address_readable={readable}"
+        for readable in (0, 1)  # reserved base, live narrow placement
+    )
     lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
     if len(lines) != len(expected):
         raise AssertionError(f"{len(lines)} slot 70 lines, expected {len(expected)}:\n" + "\n".join(lines))
+    writes = [line.rstrip() for line in log.splitlines() if "memory SRV written" in line]
     for line, pattern in zip(lines, expected):
-        if not re.fullmatch(pattern, line):
+        match = re.fullmatch(pattern, line)
+        if not match:
             raise AssertionError(f"slot 70 line does not match\n  line     {line}\n  expected {pattern}")
+        if match.groupdict().get("dest"):
+            dest, address = match["dest"], match["address"]
+            write = rf"x2w-d3d12 memory SRV written \d+: dest={dest} address={address} " + WIDE_BUFFER
+            count = sum(re.fullmatch(write, entry) is not None for entry in writes)
+            if count != 1:
+                raise AssertionError(f"expected one retry write to {dest} from {address}, got {count}")
 
 
 def check(directory, consumer, backend):
@@ -56,13 +73,13 @@ def check(directory, consumer, backend):
     )
     if actual is None:
         return 77
-    values = (17, 63, 141, 141, 99, 17, 201, 201, 55, 77, 55, 201, 201, 173, 173)
+    values = (17, 63, 141, 141, 99, 17, 201, 201, 55, 77, 55, 201, 201, 173, 173, 219, 227)
     row = b"".join(bytes((v, 0, 0, 255)) for v in values)
     expected = row * 4
     if actual != expected:
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
     check_refusal_lines(trap_log.read_text(errors="replace"))
-    print(f"{backend}: buffer memory SRV (raw base, raw interior, unplaced buffer, structured, refused unaligned, refused acceleration structure view, unplaced structured view at a page offset the stride does not divide, unplaced buffer in a large allocation copied) exact")
+    print(f"{backend}: all {len(values) * 4} buffer SRV pixels exact; page move and placement release each published on retry")
     return 0
 
 

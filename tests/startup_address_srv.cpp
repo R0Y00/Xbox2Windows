@@ -848,6 +848,43 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.address = ptr(structured_only + 0x10c);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
     draw(14);
+
+    constexpr UINT half = 65536;
+    auto wide = desc;
+    wide.Width = half;
+    raw.view.Buffer.NumElements = half / sizeof(std::uint32_t);
+
+    // Move the commitment within one reservation. The allocation base, size and committed total stay the same.
+    // Use a fresh destination so the first successful write has its own diagnostic.
+    static auto* const moved = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2 * half, MEM_RESERVE, PAGE_READWRITE));
+    if (!moved || !VirtualAlloc(moved + half, half, MEM_COMMIT, PAGE_READWRITE)) return 57;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    raw.address = ptr(moved);
+    auto start = GetTickCount64();
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    if (!VirtualFree(moved + half, half, MEM_DECOMMIT) || !VirtualAlloc(moved, half, MEM_COMMIT, PAGE_READWRITE))
+        return 58;
+    *reinterpret_cast<std::uint32_t*>(moved) = 219;
+    if (GetTickCount64() - start >= 250) return 59;  // Keep the retry within the refusal cache lifetime.
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    draw(15);
+
+    // A live narrow placement prevents fallback to the full allocation. Its release changes placement
+    // generation while leaving the allocation and the request intact.
+    static auto* const retired = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, half, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!retired) return 60;
+    retired[0] = 227;
+    void* narrow = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(retired), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&narrow)))) || !narrow) return 61;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    raw.address = ptr(retired);
+    start = GetTickCount64();
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    if (invoke(narrow, 2) != 0 || GetTickCount64() - start >= 250) return 62;
+    invoke(guest, 70, ptr(&wide), ptr(&raw), cpu);
+    draw(16);
     return 0;
 }
 
