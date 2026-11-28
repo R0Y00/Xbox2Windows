@@ -154,6 +154,17 @@ class DxilModule {
              << "b, %dx.types.ResourceProperties { i32 " << (kind + (uav ? 4096 : 0)) << ", i32 " << props << " })\n";
         return h;
     }
+    // A sampler taken from the directly indexed sampler heap at a constant index (SM 6.6 SamplerDescriptorHeap[index]).
+    // The handle is annotated as a sampler (resource kind 14). The caller sets the module flag 0x80000000.
+    Text sampler_heap_handle(const Text &index) {
+        heap_used = true;
+        const Text h = "%heap" + std::to_string(sequence++);
+        body << "  " << h << "b = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 " << index
+             << ", i1 true, i1 false)\n"
+             << "  " << h << " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle " << h
+             << "b, %dx.types.ResourceProperties { i32 14, i32 0 })\n";
+        return h;
+    }
     Text finish_compute(unsigned x, unsigned y, unsigned z, const Text &stage = "cs") {
         std::ostringstream out;
         out << "target datalayout = "
