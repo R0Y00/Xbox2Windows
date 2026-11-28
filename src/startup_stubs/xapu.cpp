@@ -6,6 +6,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/audio_telemetry.h"
 #include <timeapi.h>
+#include <cstdlib>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -229,9 +230,10 @@ void drop_decoder(Connection& conn, std::uint32_t slot, bool destroy) noexcept
 }
 
 // Decodes the packet of a type 3 command into a scratch buffer, so a refusal never touches the
-// caller's output. On S_OK, *pcm holds entry.value bytes of float PCM for *dest. `decoded_packet`
+// caller's output. On S_OK, *pcm holds entry.value bytes of float PCM for *dest. Called with
+// connection_lock held, which also guards the scratch and planar buffers. `decoded_packet`
 // distinguishes a libopus decode from the no-packet completion, and `refusal` names the first check
-// that refused the command. Called with connection_lock held, which also guards the scratch buffer.
+// that refused the command.
 long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, const float** pcm, void** dest,
                    bool& decoded_packet, DecodeRefusal& refusal) noexcept
 {
@@ -257,6 +259,8 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
         entry.output = out;
     }
     if (!packet && !packet_bytes) {  // no packet: complete with 0 bytes, as without libopus
+        entry.frames = 0;
+        entry.value = 0;
         return hr_ok;
     }
     if (slot >= max_slots) {
@@ -313,6 +317,7 @@ long decode_packet(Connection& conn, const unsigned char* c, QueueEntry& entry, 
     }
     decoded_packet = true;
     *pcm = kept;
+    decoded_packet = true;
     *dest = reinterpret_cast<void*>(out);
     return hr_ok;
 }

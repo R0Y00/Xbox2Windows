@@ -157,6 +157,9 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    bool native_candidate = false;           // shaders and manifest were prepared in-process; a published disk pair may also exist
+    u64 revision = 0;                        // bumped when a disk pair replaces the native shaders, invalidating created PSOs
+    std::string rtv_request;                 // the RTV variant text this translation was prepared for, else empty
 #ifdef X2W_NATIVE_SHADERS
     bool native_graphics_attempted = false;
 #endif
@@ -447,7 +450,7 @@ bool native_shaders_only()
     return enabled;
 }
 
-void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {})
+void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {}, bool count = true)
 {
     tr.state = 2;
     if (manifest.empty() && native_shaders_only()) {
@@ -458,7 +461,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     const bool provided = !manifest.empty();
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!provided && !read_text(path, manifest)) {
-        if (!tr.manifest_retry.pending()) {
+        if (count && !tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
@@ -580,8 +583,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     }
     tr.state = 1;
     load_pso_recipes(tr);
-    if (previously_missing) InterlockedDecrement(&translation_missing);
-    InterlockedIncrement(&translation_ready);
+    if (count && previously_missing) InterlockedDecrement(&translation_missing);
+    if (count) InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable views, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
@@ -614,6 +617,7 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         auto ps = stage(pair.pixel.dxil_ir, L"ps_6_6", ps_hit);
         Translation candidate;
         candidate.key = tr.key;
+        candidate.rtv_request = request.rtv_request;
         candidate.manifest_retry = tr.manifest_retry;
         candidate.native_graphics_attempted = true;
         if (!pair.input_layout.empty()) {
@@ -631,6 +635,7 @@ static bool try_native_graphics(Translation& tr, bool variant = false)
         }
         candidate.vs = vs.Detach();
         candidate.ps = ps.Detach();
+        candidate.native_candidate = true;
         tr = std::move(candidate);
         log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
             tr.key, tr.state == 1, frontend_hit, vs_hit, ps_hit);
@@ -1258,6 +1263,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (!entry) {
         entry = new Translation;
         entry->key = key;
+        entry->rtv_request = request;
         load_translation(*entry, request);
         if (entry->state != 1) {
             const bool published = publish_shader_request(key, L".rtv", request.data(), request.size());
@@ -1459,8 +1465,9 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     // A state decoded from registers needs a depth view to act on; with none bound the pass keeps the desktop default.
     const bool use_depth_stencil = bound.has_depth_stencil && (!bound.depth_from_registers || dsv_format != DXGI_FORMAT_UNKNOWN);
-    const u64 key = x2w_startup::pso_state_key(pass.target_count, pass.target_formats, dsv_format, use_depth_stencil,
-                                               bound.depth_stencil, bound.has_rasterizer, bound.rasterizer, indexed_rect);
+    u64 key = x2w_startup::pso_state_key(pass.target_count, pass.target_formats, dsv_format, use_depth_stencil,
+                                         bound.depth_stencil, bound.has_rasterizer, bound.rasterizer, indexed_rect);
+    if (tr.revision) key = fnv_bytes(&tr.revision, sizeof(tr.revision), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_BLEND_DESC blend{};
@@ -1492,11 +1499,42 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     X2W_ZONE("desktop pipeline creation");
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
-        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
-        static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
-    check_device("translated CreateGraphicsPipelineState", 0);
+    HRESULT hr = E_FAIL;
+    const bool injected = tr.native_candidate && x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_PSO_FAILURE");
+    if (!injected) {
+        hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
+            pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+            static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
+        check_device("translated CreateGraphicsPipelineState", 0);
+    }
+    if (FAILED(hr) && pipeline) {
+        pipeline->Release();
+        pipeline = nullptr;
+    }
+    if (FAILED(hr) && tr.native_candidate) {
+        // A native candidate whose shaders this device cannot turn into a PSO keeps the published pair usable.
+        log("x2w-draw native graphics %016llx candidate pipeline failed 0x%08lx%s", tr.key,
+            static_cast<unsigned long>(hr), injected ? " (injected)" : "");
+        if (!native_shaders_only()) {
+            Translation fallback;
+            fallback.key = tr.key;
+            fallback.rtv_request = tr.rtv_request;
+            load_translation(fallback, tr.rtv_request, {}, false);
+            if (fallback.state == 1) {
+                fallback.revision = tr.revision + 1;
+                tr = std::move(fallback);
+                log("x2w-draw native graphics %016llx published disk pair recovered", tr.key);
+                ID3D12PipelineState* recovered = pipeline_for(bound, tr, pass, indexed_rect);
+                if (!recovered)
+                    log("x2w-draw native graphics %016llx published disk pair pipeline failed", tr.key);
+                return recovered;
+            }
+            log("x2w-draw native graphics %016llx no valid published disk pair", tr.key);
+        } else {
+            log("x2w-draw native graphics %016llx no published disk pair in native-only mode", tr.key);
+        }
+    }
     bound.pipelines[key] = pipeline;
     if (pipeline) {
         wchar_t path[MAX_PATH];
@@ -2523,7 +2561,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const Wrapper* owner = nullptr;
     bool own_memory = false;
     if (why) *why = nullptr;
-    if (words[0] == view_token_magic) {
+    const bool view_token_input = words[0] == view_token_magic;
+    if (view_token_input) {
         ViewRecord record{};
         AcquireSRWLockShared(&note_lock);
         if (words[1] < view_records().size()) record = view_records()[words[1]];
@@ -2607,7 +2646,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias) {
+        // A view token already names a desktop resource and its range. Reading it does not require the
+        // title-memory alias used for raw guest addresses; the later resource/device/range checks still apply.
+        if (!view_token_input && !placed.alias) {
             if (native && list_copied_gpu_range(self, native, offset, bytes)) {
                 input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
             } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
@@ -2890,20 +2931,47 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         return true;
     }
     if (indirect && tr) indirect->shader_key = tr->key;
-    std::uint32_t d16_unorm16[32] = {};
-    FormattedBufferDescriptor formatted_buffers[32] = {};
-    const bool translation_ok = tr && tr->state == 1;
-    const bool d16_ok = translation_ok && d16_srvs_ready(*tr, pass, d16_unorm16);
-    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
-    if (!formatted_ok) {
-        if (indirect && tr)
-            indirect->refusal_code = !translation_ok ? indirect_refusal_code::translation_not_ready
-                                     : !d16_ok       ? indirect_refusal_code::d16_srv_not_ready
-                                                     : indirect_refusal_code::formatted_buffer_not_ready;
+    if (!tr || tr->state != 1) {
+        if (indirect) indirect->refusal_code = indirect_refusal_code::translation_not_ready;
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
-    const bool fixed_stream = !tr->fixed_stream.empty();
+    // pipeline_for may replace the native candidate with the published disk translation.
+    // Create the PSO first, then derive every binding from the translation it leaves in tr.
+    bool fixed_stream = !tr->fixed_stream.empty();
+    bool geometry_rect = indexed_rect || (rect && fixed_stream);
+    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, geometry_rect) : nullptr;
+    if (pipeline) {
+        const bool recovered_fixed_stream = !tr->fixed_stream.empty();
+        const bool recovered_geometry_rect = indexed_rect || (rect && recovered_fixed_stream);
+        if (recovered_geometry_rect != geometry_rect) {
+            pipeline = pipeline_for(*bound, *tr, pass, recovered_geometry_rect);
+            geometry_rect = recovered_geometry_rect;
+        }
+        fixed_stream = recovered_fixed_stream;
+    }
+    if (indirect && indexed_rect && !pipeline) {
+        indirect->set_refusal("translated indexed rectangle geometry unavailable",
+                              indirect_refusal_code::indexed_rect_unavailable);
+    }
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(self, pass, list, tr->samplers.reserved_fallback))) {
+        if (indirect && !(indexed_rect && !pipeline))
+            indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
+                                               : indirect_refusal_code::sampler_heap_unavailable;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
+    std::uint32_t d16_unorm16[32] = {};
+    FormattedBufferDescriptor formatted_buffers[32] = {};
+    const bool d16_ok = d16_srvs_ready(*tr, pass, d16_unorm16);
+    const bool formatted_ok = d16_ok && formatted_buffers_ready(*tr, pass, formatted_buffers);
+    if (!formatted_ok) {
+        if (indirect)
+            indirect->refusal_code = !d16_ok ? indirect_refusal_code::d16_srv_not_ready
+                                             : indirect_refusal_code::formatted_buffer_not_ready;
+        ReleaseSRWLockExclusive(&draw_lock);
+        return false;
+    }
     D3D12_VERTEX_BUFFER_VIEW fixed_view{};
     ID3D12Resource* fixed_resource = nullptr;
     if (fixed_stream && (indirect || !fixed_vertex_view(self, pass, *tr, indexed, start, count, fixed_view, fixed_resource))) {
@@ -2965,19 +3033,6 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
-    }
-    const bool geometry_rect = indexed_rect || (rect && fixed_stream);
-    ID3D12PipelineState* pipeline = ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass, geometry_rect) : nullptr;
-    if (indirect && indexed_rect && !pipeline) {
-        indirect->set_refusal("translated indexed rectangle geometry unavailable",
-                              indirect_refusal_code::indexed_rect_unavailable);
-    }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(self, pass, list, tr->samplers.reserved_fallback))) {
-        if (indirect && !(indexed_rect && !pipeline))
-            indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
-                                               : indirect_refusal_code::sampler_heap_unavailable;
-        ReleaseSRWLockExclusive(&draw_lock);
-        return false;
     }
     const bool raw_uav = std::any_of(tr->uavs.begin(), tr->uavs.end(), [](const PixelUav& uav) { return uav.raw; });
     // ponytail: prove direct draws with one writable buffer first. SRVs and indexed

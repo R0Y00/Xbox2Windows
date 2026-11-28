@@ -49,8 +49,10 @@ COMMON = {"id", "kind", "why", "remove_when"}
 KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
 # Shader patches, per pipeline: the form of the runtime's key revision (src/startup_stubs/d3d12_draw.inl and
 # mesh86_cache.inl; <n> is the number each revision bump raises), the translation files the runtime reads for one
-# key, and the ones without which it has no translation. The fixed rectangle geometry stage, Python compute
-# source, and mesh86 pixel stage are required only for their specific pipelines or requests.
+# key, and the ones without which it has no translation. A later consumer must check which is current. compute
+# also needs .cs.hlsl when its .txt has no native line, and mesh86 reads .ps.cso only for a request with a pixel
+# shader; this loader reads neither, so both stay optional. graphics reads .gs.cso only for a rectangle geometry
+# program, so it is optional too.
 PIPELINES = {
     "graphics": ("x2w-startup-shader-<n>", (".txt", ".vs.cso", ".ps.cso", ".gs.cso"), (".txt", ".vs.cso", ".ps.cso")),
     "compute": ("x2w-startup-shader-<n>cs", (".txt", ".cs.cso", ".cs.hlsl"), (".txt", ".cs.cso")),

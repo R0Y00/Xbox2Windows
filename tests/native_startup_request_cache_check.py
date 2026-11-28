@@ -304,7 +304,70 @@ def check_controls(cli: Path, sdk: Path) -> int:
         assert not (bad_cs_dir / f"{bad_cs_key:016x}.txt").exists()
         assert not (bad_cs_dir / f"{bad_cs_key:016x}.cs.cso").exists()
 
-    print("native_startup_request_cache controls: current and archived graphics (.psin) + compute (.c67) cache entries and 8 refusal controls passed")
+        # 7. Watch invalidation: sidecar content, not its timestamp, decides whether a published manifest is current.
+        watch_cache = work / "watch-sidecar"
+        watch_cache.mkdir()
+        watch_key = put_graphics_request(watch_cache, VS_WORDS, ps_words(4), g_root, TARGET_MASKS)
+        watch_manifest = watch_cache / f"{watch_key:016x}.txt"
+        watch_psin = watch_cache / f"req_{watch_key:016x}.psin"
+        watch_sidecar = watch_cache / f"req_{watch_key:016x}.ps57in"
+        watch_fail = watch_cache / f"{watch_key:016x}.fail"
+        watch_dep = watch_cache / f"{watch_key:016x}.psdep"
+
+        def run_watch() -> list[str]:
+            result = subprocess.run(
+                [cli, "--watch", sdk, frontend, watch_cache, "--once"],
+                capture_output=True, text=True,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return result.stdout.splitlines()
+
+        first_lines = run_watch()
+        assert any(line.endswith(": compiled graphics") for line in first_lines), first_lines
+        assert watch_manifest.is_file() and watch_dep.is_file()
+        published_ns = watch_manifest.stat().st_mtime_ns
+
+        # Unchanged sidecar bytes: the published manifest is a cache hit and is not rewritten.
+        second_lines = run_watch()
+        assert not any("compiled graphics" in line for line in second_lines), second_lines
+        assert watch_manifest.stat().st_mtime_ns == published_ns
+
+        # A contradictory slot-57 sidecar with an older mtime must withdraw the stale manifest.
+        conflicting = b"PSI1" + struct.pack("<II", 0x8002, 0x8002)
+        watch_sidecar.write_bytes(conflicting)
+        older_ns = published_ns - 3_600_000_000_000
+        os.utime(watch_sidecar, ns=(older_ns, older_ns))
+        older_lines = run_watch()
+        assert any("conflicting stream and slot-57 pixel entry records" in line for line in older_lines), older_lines
+        assert not watch_manifest.exists(), "an older-mtime sidecar kept its stale manifest"
+        older_fail = watch_fail.read_bytes()
+
+        # The same bytes with a newer mtime, from a fresh publication, must withdraw it identically.
+        watch_sidecar.unlink()
+        watch_fail.unlink()
+        republished = run_watch()
+        assert any(line.endswith(": compiled graphics") for line in republished), republished
+        assert watch_manifest.is_file()
+        watch_sidecar.write_bytes(conflicting)
+        os.utime(watch_sidecar, None)
+        newer_lines = run_watch()
+        assert any("conflicting stream and slot-57 pixel entry records" in line for line in newer_lines), newer_lines
+        assert not watch_manifest.exists()
+        assert watch_fail.read_bytes() == older_fail
+
+        # A changed .psin with a preserved mtime is invalidated instead of served from cache.
+        watch_sidecar.unlink()
+        watch_fail.unlink()
+        restored = run_watch()
+        assert any(line.endswith(": compiled graphics") for line in restored), restored
+        preserved_ns = watch_psin.stat().st_mtime_ns
+        watch_psin.write_text(describe_psin(watch_key, DECOY_MASKS), encoding="ascii")
+        os.utime(watch_psin, ns=(preserved_ns, preserved_ns))
+        changed_lines = run_watch()
+        assert any("pixel input description" in line for line in changed_lines), changed_lines
+        assert not watch_manifest.exists(), "a changed sidecar with a preserved mtime kept its stale manifest"
+
+    print("native_startup_request_cache controls: current and archived graphics (.psin) + compute (.c67) cache entries, 8 refusal controls and watch-sidecar invalidation passed")
     return 0
 
 

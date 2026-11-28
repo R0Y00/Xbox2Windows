@@ -893,7 +893,8 @@ static const char *view_kind_name(ComputeViewKind kind) {
         "heap_stride_srv", "raw_buffer_uav", "typed_buffer_uav", "half_buffer_uav", "root_buffer_srv",
         "comparison_texture_srv", "half2_texture_uav", "half4_texture_uav", "cube_sample_srv", "cube_comparison_srv",
         "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "heap_sampler",
-        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav"};
+        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav", "packed_d16_x_uav",
+        "indexed_raw_srv"};
     const auto index = static_cast<size_t>(kind);
     return index < std::size(names) ? names[index] : "unknown";
 }
