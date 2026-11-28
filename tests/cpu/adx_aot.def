@@ -1,0 +1,23 @@
+EXPORTS
+    op_adcx32_c0
+    op_adcx32_c1
+    op_adcx64_c0
+    op_adcx64_c1
+    op_adox32_o0
+    op_adox32_o1
+    op_adox64_o0
+    op_adox64_o1
+    op_adcx32_mem
+    op_adcx64_mem
+    op_adox32_mem
+    op_adox64_mem
+    op_adcx32_flags
+    op_adcx64_flags
+    op_adox32_flags
+    op_adox64_flags
+    op_adcx64_mem_flags
+    op_adox64_mem_flags
+    op_adx_dual64_adcx
+    op_adx_dual64_adox
+    op_adx_dst_alias
+    op_adx_discarded_read

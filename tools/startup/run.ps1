@@ -19,7 +19,9 @@ param(
     [string]$BuildDir = "out/build/release",
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
+    [int]$AssertSites = 0,                     # distinct main-image int3 sites whose every hit is stepped over
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
+    [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: root of the console drive the title sees (it appends x2w-gamesave)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
@@ -102,12 +104,19 @@ if ($watchShaders) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$mapArgs = @()
+if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
 try {
-    & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-        --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs @captureArgs *> "$LogDir.out"
-    $debuggerExit = $LASTEXITCODE
+    # Windows PowerShell 5.1 wraps redirected native stderr as an error record. Keep that
+    # from aborting the launcher before it can report the debugger's exit code.
+    & {
+        $ErrorActionPreference = "Continue"
+        & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
+            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs
+        $script:debuggerExit = $LASTEXITCODE
+    } *> "$LogDir.out"
 } finally {
     # taskkill /T needs a live parent PID to reach the watcher's workers.
     if ($translator -and -not $translator.HasExited) {

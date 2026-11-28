@@ -153,10 +153,13 @@ const char* pixel_uav_view(ID3D12Device* device, const D3D12_RESOURCE_DESC& reso
 }
 
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
+    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture, 5 cube; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+#ifdef X2W_NATIVE_SHADERS
+    bool native_graphics_attempted = false;
+#endif
     x2w_startup::ManifestRetry manifest_retry;  // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
@@ -432,13 +435,13 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-void load_translation(Translation& tr, const std::string& rtv_request = {})
+void load_translation(Translation& tr, const std::string& rtv_request = {}, std::string manifest = {})
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
-    std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
-    if (!read_text(path, manifest)) {
+    const bool provided = !manifest.empty();
+    if (!provided && !read_text(path, manifest)) {
         if (!tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
@@ -484,7 +487,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 :
+                                     !std::strcmp(kind, "texcube") ? 5 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (line.compare(0, 6, "wmask ") == 0) {
@@ -524,8 +528,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             (ud.a < 0 || static_cast<std::size_t>(ud.a) >= tr.srvs.size() || !tr.d16_srvs.requires_exact(static_cast<unsigned>(ud.a))))
             return;
     }
-    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
-    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
+    if (!provided && (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs)))) return;
+    if (!provided && (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps)))) return;
     const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
         static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()));
     if (FAILED(hr)) {
@@ -539,6 +543,58 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu writable views, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.uavs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
+
+#ifdef X2W_NATIVE_SHADERS
+static bool try_native_graphics(Translation& tr)
+{
+    wchar_t sdk[MAX_PATH], path[MAX_PATH];
+    const auto length = GetEnvironmentVariableW(L"X2W_NATIVE_SHADERS", sdk, MAX_PATH);
+    if (!length || length >= MAX_PATH || !cache_path(path, L"req_", tr.key, L".a")) return false;
+    try {
+        const auto request = x2w::read_graphics_request(path);
+        const auto cache = std::filesystem::path(path).parent_path();
+        bool frontend_hit = false;
+        const auto pair = x2w::prepare_direct_graphics(request.a, request.b, cache, frontend_hit,
+            request.root, request.input_layout, request.pixel_entry);
+        auto manifest = x2w::format_graphics_runtime_manifest(pair);
+        if (!manifest) throw std::runtime_error("unsupported graphics binding layout");
+        auto compiler = x2w::ShaderDxilCompiler::runtime_worker(sdk);
+        auto stage = [&](const std::string& ir, const wchar_t* profile, bool& hit) {
+            const auto output = compiler.compile(ir, profile, cache, x2w::ShaderSourceFormat::dxil_ir);
+            hit = output.cache_hit;
+            x2w_startup::ComPtr<ID3DBlob> blob;
+            if (FAILED(D3DCreateBlob(output.dxil.size(), &blob))) throw std::bad_alloc();
+            std::memcpy(blob->GetBufferPointer(), output.dxil.data(), output.dxil.size());
+            return blob;
+        };
+        bool vs_hit, ps_hit;
+        auto vs = stage(pair.vertex.dxil_ir, L"vs_6_6", vs_hit);
+        auto ps = stage(pair.pixel.dxil_ir, L"ps_6_6", ps_hit);
+        Translation candidate;
+        candidate.key = tr.key;
+        candidate.manifest_retry = tr.manifest_retry;
+        candidate.native_graphics_attempted = true;
+        candidate.vs = vs.Get();
+        candidate.ps = ps.Get();
+        // Source-built first-draw fixture: fail after both stages have compiled and
+        // the local candidate holds both blobs. The later disk load stays valid.
+        if (GetEnvironmentVariableW(L"X2W_TEST_NATIVE_GRAPHICS_BAD_MANIFEST", nullptr, 0))
+            *manifest = "x2w-manifest 0\n";
+        load_translation(candidate, {}, std::move(*manifest));
+        const bool ready = candidate.state == 1;
+        log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
+            tr.key, ready, frontend_hit, vs_hit, ps_hit);
+        if (!ready) return false;
+        vs.Detach();
+        ps.Detach();
+        tr = std::move(candidate);
+        return true;
+    } catch (const std::exception& error) {
+        log("x2w-draw native graphics %016llx refused: %s", tr.key, error.what());
+        return false;
+    }
+}
+#endif
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
@@ -586,12 +642,7 @@ u64 fnv_part(const std::vector<unsigned char>& part, u64 key)
 // so a title write in between cannot leave a file that does not match its key.
 bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept
 {
-    __try {
-        std::memcpy(to, from, bytes);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+    return x2w_local::guarded_memcpy(to, from, bytes, true);
 }
 
 // Aligned qwords of a published blob that name committed memory of this process (one VirtualQuery each, so
@@ -1070,6 +1121,12 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
         if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
+#ifdef X2W_NATIVE_SHADERS
+        if (base->manifest_retry.pending() && !base->native_graphics_attempted) {
+            base->native_graphics_attempted = true;
+            try_native_graphics(*base);
+        }
+#endif
         return base;
     }
     std::string request = "rtv1 " + std::to_string(base->key);
@@ -2005,6 +2062,14 @@ void draw_dump_flush()
     log("x2w-draw per-draw dump: %d of %zu completed target copies written to %s", written, completed.size(), folder);
 }
 
+// The view dimension a manifest texture kind declares (Translation::Srv::kind 1 to 5).
+D3D12_SRV_DIMENSION translated_view_dimension(int kind)
+{
+    return kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D : kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+           kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : kind == 5 ? D3D12_SRV_DIMENSION_TEXTURECUBE :
+                       D3D12_SRV_DIMENSION_TEXTURE3D;
+}
+
 bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16_unorm16)[32])
 {
     if (!tr.d16_srvs.any()) return true;
@@ -2019,9 +2084,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         const Translation::Srv& srv = tr.srvs[i];
         if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0)
             return refuse(i, "non-table texture binding", srv.kind);
-        const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                               srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                               srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        const auto dimension = translated_view_dimension(srv.kind);
         const u64 entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
         std::uint32_t words[8] = {};
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), 32))
@@ -2282,14 +2345,24 @@ struct IndirectBufferView {
     u64 offset = 0, bytes = 0;
     UINT stride = 0;
     bool upload = false;
+    int source = 0;  // 0 aliased or any other backing, 1 a GPU copy this list made (X2W_TRANSLATED_INDIRECT_COPY_RANGES), 2 a snapshot of title memory, 3 zeros for a null descriptor
 };
+
+// X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT=1: a translated compute input in a placed buffer that does not alias title memory
+// (a committed default buffer that holds zeros) is read from title memory, snapshotted into its own recycled pool.
+bool title_input_snapshot_enabled()
+{
+    static const bool enabled = x2w_local::env_on("X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT");
+    return enabled;
+}
 
 // For indirect draws, bind the complete descriptor range on a known GPU backing. There is no
 // fallback to copying an unrelated or stale title allocation into the draw upload ring.
 // why, when given, receives the condition an empty result failed on.
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
-                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP)
+                                         u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
+                                         bool allow_title_snapshot = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2347,12 +2420,23 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];
     }
+    // A compute input whose four descriptor words are all zero is an unbound (null) buffer: the hardware reads zeros from
+    // it, so the dispatch gets 16 bytes of zeros instead of being refused. Any other empty range is still refused.
+    if (!bytes && allow_title_snapshot && !words[0] && !words[1] && !words[2] && !words[3]) {
+        u64 zero_offset = 0;
+        ID3D12Resource* zero_ring = nullptr;
+        unsigned char* zero_bytes = reserve_upload_ring(self, 16, &zero_offset, &zero_ring, true);
+        if (!zero_bytes || !zero_ring) return refuse("a null input could not get its zero bytes");
+        std::memset(zero_bytes, 0, 16);
+        return {zero_ring, zero_offset, 16, 0, true, 3};
+    }
     if (!bytes) return refuse("an input buffer descriptor has zero records");
     if (bytes > limit || bytes % 4) return refuse(limit == (16u << 20)
         ? "an input buffer range is over 16 MiB or not whole dwords"
         : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
+    int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
         if (const auto allocation = list_upload_range(self, address, bytes); allocation.resource) {
@@ -2373,8 +2457,24 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         owner = placed.owner;
         native = static_cast<ID3D12Resource*>(owner->own().real);
         offset = address - reinterpret_cast<u64>(owner->own().title_memory);
-        if (!placed.alias && (!native || !list_copied_gpu_range(self, native, offset, bytes)))
-            return refuse("an input is in a placed buffer that does not alias title memory");
+        if (!placed.alias) {
+            if (native && list_copied_gpu_range(self, native, offset, bytes)) {
+                input_source = 1;  // a GPU copy of this list filled the range: the GPU buffer is the truth
+            } else if (allow_title_snapshot && title_input_snapshot_enabled() && bytes <= (u64{16} << 20)) {
+                // The buffer is a committed default buffer that holds zeros (it does not alias title memory), so the
+                // bytes the title wrote are only in title memory: snapshot the range into the snapshot pool now. A later
+                // guest write is not seen (as title_backed_source for copies); data a GPU pass wrote into this buffer is not either.
+                u64 ring_offset = 0;
+                ID3D12Resource* ring = nullptr;
+                if (readable_window(address, static_cast<std::size_t>(bytes)) < bytes)
+                    return refuse("an input range in title memory is not readable");
+                if (!ring_copy(self, address, static_cast<std::size_t>(bytes), &ring_offset, &ring, true) || !ring)
+                    return refuse("an input range could not be copied from title memory");
+                return {ring, ring_offset, bytes, stride, true, 2};
+            } else {
+                return refuse("an input is in a placed buffer that does not alias title memory");
+            }
+        }
     } else if (own_memory) {
         native = static_cast<ID3D12Resource*>(owner->own().real);
     } else if (owner && !owner->own().title_memory) {
@@ -2398,7 +2498,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     const auto desc = native->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
-    return {native, offset, bytes, stride, upload};
+    return {native, offset, bytes, stride, upload, input_source};
 }
 
 struct FormattedBufferDescriptor {
@@ -2540,7 +2640,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             return refuse(i, "the texture is also a render or depth target of this draw", reinterpret_cast<u64>(texture));
         for (std::size_t s = 0; s < tr.srvs.size(); ++s) {
             const Translation::Srv& srv = tr.srvs[s];
-            if (srv.kind < 1 || srv.kind > 4 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
+            if (srv.kind < 1 || srv.kind > 5 || srv.source != 0 || srv.a < 0 || srv.a >= 16 || srv.b < 0) continue;
             const u64 srv_entry = pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32);
             std::uint32_t srv_words[8] = {};
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
@@ -2764,10 +2864,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32));
         if (entry_ok) std::memcpy(words, formatted.entry ? formatted.words : reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
-        if (srv.kind >= 1 && srv.kind <= 4) {
-            const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                                   srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
-                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+        if (srv.kind >= 1 && srv.kind <= 5) {
+            const auto dimension = translated_view_dimension(srv.kind);
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -3239,6 +3337,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::SamplerSource source;
     u64 sampler_wrapper = 0;
     x2w_startup::ViewTable heap_records;
+    UINT heap_entries = 0;
     x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
@@ -3248,9 +3347,11 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
                                                                    heap.increment, heap.desktop_gpu);
+                    if (heap_records.address) heap_entries = heap.logical_count;
+                }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu) {
                     sampler_wrapper = heap.wrapper;
@@ -3269,6 +3370,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.title_samplers = source;
     pass.sampler_heap_wrapper = sampler_wrapper;
     pass.title_view_heap = heap_records;
+    pass.title_view_heap_entries = heap_entries;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
