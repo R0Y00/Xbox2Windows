@@ -2,6 +2,11 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## Slot 67 wave size in direct compute
+
+State block A bit 20 of dword 4 selects the guest wave size.
+[Capture inference and hardware fixture](experiments/native-slot67-wave-size.md)
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
@@ -69,6 +74,8 @@ permutation. The compute shader exchanges the first operand before applying the
 local second operand. A sparse EXEC mask distinguishes fetching an inactive
 source, supplying zero and retaining the destination. The test checks both
 workgroups and the surrounding buffer guards.
+
+Wave32 direct compute lowers `s_or_saveexec_b32`. As with `s_mov_b32 exec_lo`, EXEC keeps bits past the group; a lane runs only if its own bit is set.
 
 The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
 lane writes and reads back lanes in each half of a guest wave64. The compiler
@@ -16599,7 +16606,7 @@ ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_ad
 
 #### Volumes in the 4 KiB standard layout
 
-Slot 70 also reads a single-mip, uncompressed 3D texture whose layout is `0x105`. addrlib lays it
+Slot 70 also reads an uncompressed 3D texture whose layout is `0x105`, at first a single mip. addrlib lays it
 out in thick 4 KiB blocks (`GFX10_SW_4K_S3_PATINFO`). `startup_gfx10_volume` needs no device. It
 checks the address bit of every x, y and z bit against the restated one-pipe rows for the five element
 sizes, the block sizes, and the order of blocks in a 17 by 17 by 17 RGBA8 volume. It also checks that
@@ -16622,6 +16629,26 @@ published.
 Two local mutations were run once and are not registered tests: the layer pitch of the upload set
 to zero, and the hold counting one footprint per layer. Each fails `startup_address_console_warp`:
 the first on the first volume's pixels, the second on the held volume.
+
+Volumes with a mip chain are read too. Each layer of blocks holds that layer of every mip: the tail
+block first, then the mips from the smallest to the largest. A mip at most a block wide and half a
+block high goes in the tail while at most five mips remain, at an origin read from its byte offset
+in the tail block. `startup_gfx10_volume` checks the addresses of a 32 by 32 by 32 RGBA8 volume with
+six mips: 11 blocks to a layer, mip 1 after the tail block, mip 0 after mip 1, and mips 2 to 5 at
+(0,8), (4,4), (4,0) and (0,4) in the tail block. It also checks the distinct bytes and tile/detile
+round trips of every mip of ten chains (a tail from mip 0, a chain with no tail, odd sides, a deep
+volume whose depth allows the mip count), and the mip chains slot 70 takes and the views of them it
+allows. `startup_gfx10_volume_tail_control` puts every tail mip at the start of the tail block and
+must fail. `startup_gfx10_volume_addrlib` now also compares every mip count of four chains for each
+element size: 305 volumes and 12,704,487 element addresses with 0 mismatches.
+
+`startup_address_console_{warp,hardware}` draws four mips of two chains, RGBA8 32 by 32 by 32 with
+six mips (mip 1, and mip 3 in the tail) and 20 by 24 by 16 with five mips (mip 1, and mip 3 in the
+tail), from a backing that holds every mip with its own texels. All 65,536 pixels of each must match.
+A local mutation that drops the tail origins of a volume, run once, fails it on the first tail mip,
+which then reads another mip's texels. A chain whose layout runs past the size the XG stand-in
+reports is held as before: RGBA8 33 by 9 by 18 with six mips takes 135,168 bytes in the layout against
+65,536 reported.
 
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_volume'
@@ -17188,7 +17215,8 @@ Dispatch record in a placed argument buffer. It binds the same translated pipeli
 Dispatch, transitions the argument buffer and records desktop `ExecuteIndirect`. The GPU reads the group counts.
 
 The fixture records a compute producer, a copy of the argument record and the indirect consumer on one list.
-After the queue fence it checks both guard words, all three argument words, the input and all 320 output words.
+After the queue fence it checks the leading guard, the neighboring three-word guard record, all three argument words,
+the input and all 320 output words.
 Counts of 2 and 5 write exactly that many words. Direct Dispatch with the same bindings and counts must produce
 the same outputs. Omitting the producer leaves the zero record and the output sentinel intact. Omitting the
 translation preserves the output and reports the refusal. Other controls exercise multiple commands, a count
@@ -17199,6 +17227,40 @@ cmake --build --preset release --target startup_stream_consumer
 ctest --preset release --no-tests=error -j 1 -R '^startup_slot67_indirect_dispatch_(warp|hardware)$' -V
 python -B tests/startup_slot67_indirect_dispatch_check.py mutation
 ```
+
+#### GPU-written indirect Dispatch to an offscreen pixel (#3209)
+
+The same fixture also records the GPU writer on a first guest DIRECT list submission, waits for guest
+fence value 1, and checks the seven DWORDs (leading guard, 12-byte Dispatch at byte interval [4,16),
+neighboring three-DWORD guard at [16,28)). A second recording on that queue copies the same placed
+resource immediately before guest list slot 61, then submits and waits for value 2 before checking the
+second snapshot. The native resource pointer and GPU virtual address must agree across both boundaries.
+The translated slot 67 shader reads its normal raw-buffer table and XORs one input word per group into
+the aliased output UAV. The check requires a translated dispatch in the census, not just an untouched buffer.
+
+A source-built desktop vertex/pixel shader draws a fullscreen triangle to an 8x4 RGBA8 offscreen target.
+The pixel shader reads the actual output buffer via a root SRV, discards the sentinel, and writes the
+low three bytes of the compute word as RGB. The graphics recording uses the same underlying DIRECT
+queue after the guest consumer fence; no CPU readback is copied into the graphics input. The native
+queue and output resource identities are checked. Separate clear and post-draw copies are checked
+after the graphics fence. The input and all 320 output words are also checked.
+
+| Case | Both argument snapshots | Changed pixels / 32 |
+| --- | --- | ---: |
+| GPU writer, X=2 | (2,1,1) | 8 |
+| GPU writer, X=5 | (5,1,1) | 20 |
+| GPU writer, X=0 | (0,1,1) | 0 |
+| Writer omitted | (0,0,0) | 0 |
+
+The unchanged pixels must match the clear value, and all changed pixels must match their exact RGB
+reference. The stale-SRV control binds the original input instead of the compute output; the unchanged
+positive pixel oracle rejects it, while the independently predicted stale colours match the GPU readback.
+The device-free mutation mode also detects individual changed pixel words and short readbacks.
+The existing outside-record, multi-command, count-buffer, output-alias and manifest refusal controls
+remain in the same test. The observer checks native D3D12 debug errors when the info queue is available.
+The commands above run both the original and extended fixtures; use dev instead of release for Debug.
+This is a synthetic producer-to-pixel proof through translated indirect Compute, with a desktop graphics
+observer; it does not establish a translated graphics shader, a retail-scene producer, or a performance gain.
 
 ### Entry values from a buffer descriptor
 
@@ -17856,3 +17918,14 @@ ctest --preset dev --no-tests=error -j1 -R '^(native_pixel_raw_uav_(warp|hardwar
 ```
 
 Repeat with the release preset. The source-built shader pair goes through request publication, native DXIL, actual PSO/draw and GPU readback. The fixture checks full buffer and color-target contents, nonzero/short/end views, decoy and invalid descriptors; the validator also checks alignment and bounds. Local RX 7900 XT/WARP Debug and Release runs passed 54 cases (3,456 DWORDs and 1,728 pixels); the independent review over main 886a5a28 reproduced the same counts on RTX 4060 Laptop and WARP with the D3D12 debug layer enabled and zero errors. Actual title rendering impact is not established.
+
+## Native pixel raw DWORD atomic add
+
+The native pixel compiler supports raw DWORD buffer atomic add in a proven straight-line guest block, with exact coverage/EXEC, including restoration from whole-quad entry. GLC returns the old value, preserves inactive VGPRs, and returns zero for an active out-of-view access; without GLC the addend is unchanged. The runtime uses the single raw pixel UAV direct non-indexed draw contract above. Indexed atomics, other atomic operations, general CFG and unproven WQM remain refused (#3216, #3217).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer compile_dxil
+ctest --preset dev --no-tests=error -j1 -R '^native_pixel_atomic_(warp|hardware)$' -V
+```
+
+Repeat with the release preset. The source-built fixture verifies 13 actual draws and four refusal controls per adapter/configuration, including contention, guard words, active out-of-view, odd raster edges and real WQM quad-neighbor reads with and without GLC. WQM+GLC records returned old values through a second exact atomic in a private lane slot and checks a valid serialization of the varying addends. Local RX 7900 XT/WARP Debug/Release integration over main 4b0350e passed 52 draws, 3328 DWORD and 1664 pixel comparisons, and 16 refusal controls. The debug layer was unavailable; actual title rendering is not established.

@@ -344,6 +344,10 @@ def main():
         check("descriptor-sop1-before-scc-read", cs,
               compute(words(*address_field, *pair_zero, ff1_pair, select_scc, end), table=True),
               "numeric SCC from a symbolic descriptor field")
+        or_saveexec = 0xbe983dc1  # s_or_saveexec_b32 s24, -1
+        check("descriptor-or-saveexec-kill", cs, compute(words(*address_field, or_saveexec, read_scc, end), table=True))
+        check("or-saveexec-exec-destination", cs, compute(words(0xbefe3dc1, end)),
+              "unsupported wave32 SAVEEXEC destination")
         # The previous symbolic SCC is dead at WQM. Reading it before WQM
         # must still refuse. The nonzero high word supplies the new SCC.
         numeric_wqm = [0xbe9a0380, 0xbe9b0381, 0xbe980a1a]  # s[24:25] = WQM(s[26:27])

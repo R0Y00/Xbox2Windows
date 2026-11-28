@@ -983,6 +983,13 @@ wave size 32, so an adapter without 32-lane waves refuses every program by that 
 translation is tried once per key and before a published `<key>.txt`. It covers compute only; graphics
 pipelines still need a published translation.
 
+Published compute translations from `compile_dxil --requests` and `--watch` carry a `native 1` line in the
+`x2w-manifest 2` manifest. The stand-in requires the current native output revision. An unmarked manifest
+is accepted with a `<key>.cs.hlsl` sidecar, which identifies a Python translation. `compile_dxil --watch`
+rebuilds stale native outputs and leaves Python publications in place. The stand-in retries a stale or
+absent manifest on subsequent dispatches on the ManifestRetry schedule (1 s, doubling up to 32 s), so a running process can
+pick up a rebuilt output (by the code path; no test covers the reload). Compute request keys stay at `29cs`, and revision-28 archives are still read.
+
 Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
 ([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
 [route, controls and results](experiments/startup-compute-native-dispatch.md)).
@@ -1528,7 +1535,15 @@ the two recovery checks are its sole failures),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
-`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
+A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when a debugger is attached or `X2W_PROBE_PRECHECK` is set to anything but `0` (read once; otherwise the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
+region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
+Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
+a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render
+totals line prints `reads refused before a fault <n>` after the textures count. The check adds an unmapped range
+that must return false and 0 with no exception seen by a vectored handler, for the probe and the copy, and counts the
+avoided faults. No GPU is required:
 
 ```powershell
 cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check
@@ -3047,8 +3062,8 @@ are copied from scratch only after the result is queued.
 
 ```powershell
 cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
-cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
-ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check startup_xapu_opus_count_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus|opus_count)$' -V
 ```
 
 `startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
@@ -3057,6 +3072,12 @@ a reference decoder, untouched guard floats past the decoded frames, a malformed
 an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
 starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
 off. It is registered only in the optional build.
+
+`startup_xapu_opus_count` uses the same libopus tones to check the bounded telemetry: decoded
+packets, dequeued completions and each refusal reason. The stand-in writes one
+`x2w-audio XApu opus summary:` line at the last disconnect or at process exit, and the audio sink
+reports `accepted` and `not_open` submissions. See
+[the completion-count note](experiments/startup-opus-completion-count.md).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
@@ -3539,27 +3560,35 @@ texture with that description exists at the address, its view is created as befo
 70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
 BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
 with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
-4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR) or the linear mode `0x100` (rows
+whose pitch is rounded up to 256 bytes, the mips stored from the smallest up), the texels are read from the
 address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
 draw that samples the view copies each mip of each array slice from that layout into desktop
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
 after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
 
-The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+The description must be two-dimensional, or in the linear mode `0x100` one-dimensional and not an array (one row per mip, no block-compressed format), at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
-texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 1D, 2D or 2D-array view must match the texture's dimension and fit the mip and slice ranges. A cube view is taken on a 2D array of exactly six slices (the faces, +X to -Z) and is bound where a translation's manifest declares `texcube`; `tools/startup/gfx2hlsl.py` does not emit that kind yet, because it refuses `dim:SQ_RSRC_IMG_CUBE`. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
 
-A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one mip, one
-sample, at most 2048 texels on each side and an uncompressed format with a known element size,
-viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+
+A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
+at most 2048 texels on each side and an uncompressed format with a known element size, with one mip
+or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit the
+chain. addrlib lays a 3D resource in a standard or display mode out in thick blocks
 (`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
-16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
-every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
-Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
-other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
-swizzle modes and every other layout value. The texels must be readable and span
+16-byte elements, and the volume is stored a layer of blocks (one block deep) at a time. Each layer
+holds that layer of every mip: first the shared tail block when the chain has one, then the mips from
+the smallest to the largest, each in blocks along x, then y, with every side rounded up at each level
+and padded to whole blocks. A mip is in the tail when it is at most a block wide and half a block high
+and at most five mips remain; tail mip k from the end starts at byte k x 256 of the tail block, which,
+read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoMacroTiled`). Each
+depth layer is copied to its own footprint rows.
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
+without a live texture, cube views of other arrays, three-dimensional descriptions in any
+other layout or with a block-compressed format, multisampled textures, the XOR swizzle modes and
+every other layout value. The texels must be readable and span
 at most 64 MiB.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
@@ -3599,8 +3628,9 @@ Limits and choices that are not measured against a console:
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
 - The thick `0x105` volume layout is compared with addrlib itself when the build has it
-  (`startup_gfx10_volume_addrlib`: every element address of 190 volumes). Mip chains, block-compressed
-  volumes and volumes in the other modes are not handled; they stay refused.
+  (`startup_gfx10_volume_addrlib`: every element address of every mip of 305 volumes, 115 of them
+  with a mip chain). Block-compressed volumes and volumes in the other modes are not handled; they
+  stay refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
@@ -3761,7 +3791,8 @@ footprint layout (256-byte row pitch alignment and 512-byte subresource placemen
 `startup_address_volume_srv_*` exercises volume SRVs on a device (WARP and hardware)
 with multiple depth slices and mip levels, where footprint row pitch (256 bytes) exceeds packed row bytes (16 bytes),
 and verifies refusal lines for mismatched view dimensions, short backings, out-of-bounds mips, explicit clamps,
-and console layouts. On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driver 32.0.21045.11001),
+and a console-layout description over the live volume (`overlapping_resource`; before mip chains of `0x105`
+volumes were read, `unsupported_description`). On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driver 32.0.21045.11001),
 `startup_address_volume_srv_hardware` passed with all 32 RGBA pixels exact.
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer|volume)$' -V`

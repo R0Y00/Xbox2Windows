@@ -1025,6 +1025,17 @@ if(X2W_WITH_OPUS)
     add_dependencies(startup_xapu_opus_check startup_stub_xapu)
     add_test(NAME startup_xapu_opus COMMAND startup_xapu_opus_check "$<TARGET_FILE:startup_stub_xapu>")
     set_tests_properties(startup_xapu_opus PROPERTIES TIMEOUT 60)
+
+    # Bounded telemetry for the same optional decode path: decoded packets, dequeued completions and
+    # refusals by reason. Generates its tones with libopus; no captured packet is stored.
+    add_executable(startup_xapu_opus_count_check tests/startup_xapu_opus_count_check.cpp)
+    target_compile_features(startup_xapu_opus_count_check PRIVATE cxx_std_17)
+    target_include_directories(startup_xapu_opus_count_check PRIVATE src)
+    target_link_libraries(startup_xapu_opus_count_check PRIVATE Opus::opus)
+    set_target_properties(startup_xapu_opus_count_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_dependencies(startup_xapu_opus_count_check startup_stub_xapu)
+    add_test(NAME startup_xapu_opus_count COMMAND startup_xapu_opus_count_check "$<TARGET_FILE:startup_stub_xapu>")
+    set_tests_properties(startup_xapu_opus_count PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(startup_chad_check tests/startup_chad_check.cpp)
@@ -1943,9 +1954,27 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(backend IN ITEMS hardware warp)
+        add_test(NAME native_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:native_store_replay>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(native_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_test(NAME startup_compute_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" runtime "$<TARGET_FILE:compile_dxil>"
+            "$<TARGET_FILE:startup_stream_consumer>" "${DXC_BIN_DIR}" ${backend})
+        set_tests_properties(startup_compute_descriptor_scc_${backend} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endforeach()
     add_test(NAME native_direct_container
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py"
         "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(adapter IN ITEMS warp hardware)
+        foreach(case IN ITEMS r rg rgb array volume rgba sparse)
+            add_test(NAME native_image_store_exact_width_${adapter}_${case}
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/native_image_store_exact_width_check.py"
+                "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" "$<TARGET_FILE:startup_stream_consumer>" ${adapter} ${case})
+            set_tests_properties(native_image_store_exact_width_${adapter}_${case} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
+    endforeach()
     add_test(NAME native_dpp_mirror_hardware COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_dpp_mirror_check.py" "$<TARGET_FILE:compile_dxil>"
         "$<TARGET_FILE:native_store_replay>" "$<TARGET_FILE:offscreen_check>" "${DXC_BIN_DIR}")
@@ -2531,6 +2560,8 @@ add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
 target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
+add_test(NAME startup_local_log_precheck_off COMMAND startup_local_log_check --phase precheck-off)
+set_tests_properties(startup_local_log_precheck_off PROPERTIES ENVIRONMENT "X2W_PROBE_PRECHECK=0")
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
