@@ -848,8 +848,12 @@ struct DirectCompute {
         const bool return_old = (i.a & 0x2000u) != 0; // GLC returns the pre-operation value.
         const unsigned coord = i.b & 255, base = ((i.b >> 16) & 31) * 4;
         const unsigned mask = (i.a >> 8) & 15, dim = (i.a >> 3) & 7;
-        if (graphics_input || dim != 1 || (i.a & 0x3c0c6u) || (i.b & 0xffe00000u) ||
-            mask != (compare_exchange ? 3u : 1u) || coord == 255 || (compare_exchange && i.dst == 255) ||
+        const bool volume = dim == 2;
+        // VADDR supplies x. Both dimensions fit their remaining VGPR indices in one NSA dword.
+        const unsigned coords = volume ? 3 : 2, nsa_words = (i.a >> 1) & 3;
+        if (graphics_input || (dim != 1 && !volume) || (i.a & 0x3c0c0u) || (i.b & 0xffe00000u) ||
+            mask != (compare_exchange ? 3u : 1u) || nsa_words > 1 || (!nsa_words && coord + coords > 256) ||
+            (compare_exchange && i.dst == 255) ||
             s.at(base).type != Symbol::Type::descriptor)
             refuse(i.pc, "unsupported typed 2D image atomic operands");
         constexpr auto kind = ComputeViewKind::uint_texture_uav;
@@ -857,11 +861,12 @@ struct DirectCompute {
         const auto &bindings = analysis.result.bindings;
         const auto &descriptor = s.at(base);
         const auto it = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
-            return b.kind == kind && b.root_parameter == descriptor.value && b.byte_offset == descriptor.offset;
+            return b.kind == kind && b.image_dimension == dim && b.root_parameter == descriptor.value &&
+                   b.byte_offset == descriptor.offset;
         });
         if (it == bindings.end())
             throw std::logic_error("missing image atomic binding");
-        const auto handle = ir.handle({1, it->shader_register, 2, 5, 1, 0}); // RWTexture2D<uint>
+        const auto handle = ir.handle({1, it->shader_register, volume ? 4u : 2u, 5, 1, 0});
         const auto label = to_string(label_number++);
         const auto enabled = active();
         ir.body << "  br i1 " << enabled << ", label %imageAtomic" << label << ", label %imageAtomicEnd" << label
@@ -870,8 +875,12 @@ struct DirectCompute {
         if (!compare_exchange)
             args.emplace_back("i32", to_string(image_atomic_binop(i.op)));
         args.emplace_back("i32", read(256 + coord));
-        args.emplace_back("i32", read(257 + coord));
-        args.emplace_back("i32", "undef");
+        for (unsigned j = 1; j < coords; ++j) {
+            const unsigned r = nsa_words ? (i.image_address_words[0] >> (8 * (j - 1))) & 255 : coord + j;
+            args.emplace_back("i32", read(256 + r));
+        }
+        if (!volume)
+            args.emplace_back("i32", "undef");
         if (compare_exchange)
             args.emplace_back("i32", read(257 + i.dst));
         args.emplace_back("i32", read(256 + i.dst));

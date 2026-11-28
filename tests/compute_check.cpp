@@ -631,6 +631,9 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         break;
     case texture_rgba16_float_flag: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
     case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
+    case texture_atomic_uint_flag | texture_volume_flag:
+        dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        [[fallthrough]];
     case texture_atomic_uint_flag:
         format = DXGI_FORMAT_R32_UINT;
         required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |

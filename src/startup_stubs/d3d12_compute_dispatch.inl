@@ -214,10 +214,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b});
             tr.uavs.back().half_buffer_bytes = x;
         }
-        else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
-                 whole() && i == tr.uavs.size()) {
+        else if (std::sscanf(line.c_str(), "uav %u %15s uint table %d %d channels 1%n", &i, name, &a, &b, &used) == 4 &&
+                 whole() && i == tr.uavs.size() && (uav_dimension() == D3D12_UAV_DIMENSION_TEXTURE2D ||
+                                                   uav_dimension() == D3D12_UAV_DIMENSION_TEXTURE3D)) {
             tr.uavs.push_back({a, b, true});
-            tr.uavs.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            tr.uavs.back().uav_dimension = uav_dimension();
             tr.uavs.back().atomic_uint_texture = true;
         }
         else if (std::sscanf(line.c_str(), "uav %u %15s float table %d %d channels %u%n", &i, name, &a, &b, &x, &used) == 5 &&
