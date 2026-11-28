@@ -6,8 +6,8 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
 ## What changed
 
 - The direct compute translation takes a view contract for a GPU-selected heap slot (`x2w::HeapViewContract`:
-  `none`, `raw_buffer`, `other`). An SMEM descriptor load from the resource heap is refused unless the contract is
-  `raw_buffer`; without a contract the existing text stays: "direct resource-heap load requires the selected GPU slot and
+  `none`, `raw_buffer`, `typed_dword`, `raw_and_typed_dword`, `other`). An SMEM descriptor load from the resource heap
+  is refused unless the contract is `raw_buffer`, `typed_dword` or `raw_and_typed_dword`; without a contract the existing text stays: "direct resource-heap load requires the selected GPU slot and
   its view type". A scalar buffer load from the heap base, a heap descriptor load with an immediate offset or a constant
   index (both could address another slot than the captured selection), and a numeric use of a GPU-selected slot's
   stride in the direct path are refused with their own texts. The contract is part of the frontend cache key when it is
@@ -30,6 +30,7 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
   x2w-global-srv-views 2
   select <slot>
   need <type>
+  also <slot> <type>     (zero or more, further selections of the same dispatch; selector word k = selection k)
   slot <n> <type> <stride> <bytes>
   dword <n> <channels>   (after the slot lines; typed buffers of 32-bit channels only, #3023)
   ```
@@ -37,7 +38,8 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
 - `compile_dxil ... gfx1013-container-cs` reads an optional `req_<key>.views` next to the `.cdx` (single file and
   `--requests`). It decodes the file, refuses a selection whose slot holds another view type than `need`, refuses a `need`
   other than `raw_buffer` or a one-channel 32-bit `typed_buffer` (#3023), translates with the matching contract and
-  prints `global_srv select=<n> need=<type>`. Every refusal happens before the `.cso` is published. Without the file a heap-reading shader is refused as before. The
+  prints `global_srv select=<n> need=<type>` (and ` also=<slot>:<type>` for each further selection, which it checks the
+  same way; a slot may be named again with the same view type, not with two). Every refusal happens before the `.cso` is published. Without the file a heap-reading shader is refused as before. The
   `.views` file is not part of the `.cdx`/`.root` content key: it describes one captured dispatch.
 
 ## Meaning of "native recording" and "runtime path" here
@@ -90,6 +92,21 @@ The check runs, in order:
    load (the loop does not contain the load) compiles, and the program with the full rewrite is recorded
    for selections 0 and 1 (output equals the slot's data), compiled by `compile_dxil --requests`, replayed with the
    same result, and replaying selection 0 against the slot 1 reference reports a mismatch.
+10. Typed heap load (`typed_dword`): record, compile, frontend cache hit and replay of a `buffer_load_format_x` heap
+    load of slot 3, refusals of selections 0 and 2, and the compile refusals listed under the typed bullet below.
+11. Mixed reads (`raw_and_typed_dword`, #3023): a program reads selector word 0 as a raw slot and selector word 1 as a
+    typed slot and stores the sum. The selector buffer has two words (programs that read word 0 only get 0 in word 1).
+    Record for raw slot 0 or 1 plus typed slot 3 (`--need raw_buffer --also 3 typed_buffer`), compile with a fresh
+    frontend cache, compile again (cache hit, same bytes), replay against the sum of the two slots' data, a mismatch
+    control against another sum, three replay refusals (`also` slot of another type, unknown slot, texture), a refused
+    record, thirteen compile refusals (the same program under raw-only and typed-only metadata, a texture `also`, a wrong
+    type, an unknown slot, an unreadable line, an `also` line with a trailing field, a slot named with two types
+    (the selected slot and an `also` slot), a second `also` of another type than its slot and a texture second `also`,
+    missing `dword` metadata, a two-channel typed load), and six compile-only cases under the mixed contract (a second `also`, an `also` naming the selected
+    slot again with the same type, the same `also` twice, the byte window by `buffer_load_dword`, by
+    `tbuffer_load_format_x`, and a `tbuffer_load_format_x` through a plain heap descriptor). A raw-only program
+    whose two selector words pick the same raw slot is recorded (`--also` with the selected slot), compiled and replayed
+    against twice that slot's data (`N+N`).
 
 ## Result
 
@@ -139,19 +156,40 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   `/heap-view/typed_dword`). `.views` gains a `dword <slot> <channels>` line for each typed buffer slot of 32-bit
   channels; `compile_dxil` and the fixture derive the contract from `need typed_buffer` when every captured typed
   buffer slot is a one-channel 32-bit buffer (`x2w_startup::global_srv_contract`). `record` takes
-  `--need typed_buffer`. `native_global_srv_heap_replay_hardware` passes with 122 assertions: the typed load is
+  `--need typed_buffer`. `native_global_srv_heap_replay_hardware` passed with 122 assertions at that step: the typed load is
   recorded for slot 3 (`R32_UINT`), compiled, compiled again from the frontend cache, and replayed (output equals the
   slot 3 data); replaying it against slot 0 reports a mismatch; selections 0 and 2 are refused before the dispatch;
   ten compile refusals cover a two-channel load, a raw load and a `tbuffer` load under the typed contract, the typed
   load under the raw contract, and metadata without the `dword` line, with a channel count of 5, with a `dword` line for
   a raw slot, a duplicate or an early `dword` line, or with another selection. On the local capture (counts only) all 906 typed heap loads behind the raw contract have this
   one-channel `idxen` shape; with `typed_dword` forced by an uncommitted switch, 895 of those programs then stop at a
-  raw heap read of another slot: they read the heap both ways, which one captured selection does not cover.
+  raw heap read of another slot: they read the heap both ways, which one captured selection does not cover (the next
+  bullet adds `raw_and_typed_dword` for them).
+- Mixed raw and typed heap reads (#3023): `HeapViewContract::raw_and_typed_dword` (cache identity
+  `/heap-view/raw_and_typed_dword`) lets one program read some heap slots raw and others typed. The kind of each load
+  picks the path: `buffer_load_format_*` (kind `typed_buffer_srv`) is typed, with the one-channel rule of
+  `typed_dword`; every other kind, `tbuffer_load_format_*` through a plain or rewritten heap descriptor included, is
+  raw, with the rules of `raw_buffer` (byte windows included). `.views` gains zero or more `also <slot> <type>` lines
+  (header unchanged; an older decoder refuses the file with `unknown line 'also'`). Selector word order: selection 0 is
+  `select`/`need`, selection k is the k-th `also` line, in file order. The decoder accepts a slot named again among
+  `select` and `also` with the same view type (two selector words can pick the same slot; the order is kept and `replay`
+  writes the repeated slot to its word) and refuses a slot named with two view types
+  (`slot N selected with two view types`). An `also` line with trailing fields is unreadable.
+  `refuse_global_srv_selections` checks every selection in that order, and `global_srv_contract` returns
+  `raw_and_typed_dword` when raw and typed selections are both present. `native_global_srv_heap_replay_hardware`
+  passes with 196 assertions (section 11 above), in 12.5 s against 11.25 s before. On the local capture (counts only),
+  a prototype of this contract moved the compiled requests from 392 to 397; the others stop at general refusals (717
+  `unbound numeric SGPR sN`, 460 `direct indexed descriptor load shape`, 291 `direct descriptor address outside bound
+  table`). That is an upper bound for what translation allows, not evidence that a runtime can meet the contract. Not
+  tested on the GPU: a swapped pairing (the typed selection first, the raw one second) makes the program read a typed
+  view through a raw handle and the reverse, which is undefined on the device and exactly the caller guarantee the
+  translator cannot check, so the GPU cases always record the raw selection first.
 
 ## Limits
 
 - Only raw buffer heap reads (`raw_buffer`) and one-channel 32-bit typed buffer heap reads (`typed_dword`) are
-  translated, one class per program; other view classes are refused with a named diagnostic.
+  translated, per program raw, typed, or both by load kind (`raw_and_typed_dword`); other view classes are refused with
+  a named diagnostic.
 - Under `typed_dword` the translator sees no descriptor values. The caller guarantees that every selectable slot is an
   `R32_UINT`, `R32_SINT` or `R32_FLOAT` buffer view bound as `R32_UINT` over the same element range, that the guest
   descriptor has stride 4, a 32-bit data format, identity `dst_sel_x`, swizzle and `add_tid` disabled, and that its
@@ -178,7 +216,15 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   `max(stride, 1) * num_records` bytes (`indirect_table_buffer`, `src/startup_stubs/d3d12_draw.inl`), the guest
   window's byte count, or of the title's own view size for a view token. No fixture runs this manifest path for a
   window.
-- Multi-channel typed heap loads, typed loads under the raw contract and scalar loads through the rewritten descriptor
+- Under `raw_and_typed_dword` the caller guarantees the `raw_buffer` conditions for every slot a raw load or byte
+  window can select and the `typed_dword` conditions for every slot a typed load can select. The translator cannot tell
+  which heap index feeds which load, does not limit the number of heap loads and checks none of this; a program whose
+  heap loads use more selectors than were captured is outside what the capture proves, under every contract. A
+  `tbuffer_load_format_*` through a heap descriptor counts as raw. No capture-side producer writes `also` lines yet
+  (the runtime is a later stage); only the fixture's `record` does, with at most one `--also` (a non-numeric selector
+  exits 2 like the other usage errors), and its `replay` takes at most one `also` selection.
+- Multi-channel typed heap loads, typed loads under the raw contract (under `raw_and_typed_dword` they are translated)
+  and scalar loads through the rewritten descriptor
   stay refused. The startup runtime
   does not pass a contract yet, so none of this reaches a title run (#3023).
 - The captured `select` must be the slot index the dispatch addresses; producing it from a title capture is outside this

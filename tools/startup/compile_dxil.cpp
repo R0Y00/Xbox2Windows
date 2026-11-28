@@ -70,13 +70,17 @@ static CapturedViews read_captured_views(const fs::path& request_path) {
     if (!x2w_startup::decode_global_srv_request(text, views.request, error)) throw std::runtime_error(error);
     views.present = true;
     const auto& request = views.request;
-    auto refusal = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
+    auto refusal = x2w_startup::refuse_global_srv_selections(request);
     if (!refusal.empty()) throw std::runtime_error(refusal);
-    const auto contract = x2w_startup::global_srv_contract(request, error);
-    if (contract == x2w_startup::GlobalSrvContract::none) throw std::runtime_error(error);
-    views.contract = contract == x2w_startup::GlobalSrvContract::typed_dword ? x2w::HeapViewContract::typed_dword
-                                                                             : x2w::HeapViewContract::raw_buffer;
-    return views;
+    switch (x2w_startup::global_srv_contract(request, error)) {
+    case x2w_startup::GlobalSrvContract::none: throw std::runtime_error(error);
+    case x2w_startup::GlobalSrvContract::raw_buffer: views.contract = x2w::HeapViewContract::raw_buffer; return views;
+    case x2w_startup::GlobalSrvContract::typed_dword: views.contract = x2w::HeapViewContract::typed_dword; return views;
+    case x2w_startup::GlobalSrvContract::raw_and_typed_dword:
+        views.contract = x2w::HeapViewContract::raw_and_typed_dword;
+        return views;
+    }
+    throw std::logic_error("unknown global SRV contract");
 }
 
 static std::vector<unsigned char> compile_to_dxil(x2w::ShaderDxilCompiler& compiler, const std::string& source,
@@ -134,10 +138,13 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
             const bool heap_read=std::any_of(program.bindings.begin(),program.bindings.end(),[](const auto& b){
                 return x2w::compute_heap_binding(b.kind) || b.kind==x2w::ComputeViewKind::heap_stride_srv;});
             if(heap_read){
-                auto refusal=x2w_startup::refuse_global_srv_selection(views.request.views,views.request.selected,views.request.needed);
+                auto refusal=x2w_startup::refuse_global_srv_selections(views.request);
                 if(!refusal.empty())throw std::runtime_error(refusal);
             }
-            report<<"global_srv select="<<views.request.selected<<" need="<<x2w_startup::global_srv_type_name(views.request.needed)<<'\n';
+            report<<"global_srv select="<<views.request.selected<<" need="<<x2w_startup::global_srv_type_name(views.request.needed);
+            for(const auto& selection:views.request.also)
+                report<<" also="<<selection.slot<<':'<<x2w_startup::global_srv_type_name(selection.needed);
+            report<<'\n';
         }
         if (emit_manifest && !container) manifest = x2w::format_compute_runtime_manifest(program);
         source=direct?std::move(program.dxil_ir):std::move(program.hlsl);profile=L"cs_6_6";

@@ -11,10 +11,12 @@
 
 // The view type of a global (descriptor heap) SRV slot that a dispatch can select from GPU data.
 //
-// A shader that picks its slot at run time can only be recorded and replayed if the type of every slot it may pick is
+// A shader that picks its slots at run time can only be recorded and replayed if the type of every slot it may pick is
 // known: the capture keeps {slot, type, stride, bytes} for each slot of the heap (and the 32-bit channel count of a
 // typed buffer slot), and the dispatch is refused, before any shader runs, when the selected slot holds another type
-// than the one the shader reads. No heap-indexed data read is translated here; this header only classifies,
+// than the one the shader reads. Under raw_and_typed_dword each selection's type comes from the capture
+// (`need`/`also`), not from the shader, so this check is necessary but not sufficient: which load reads which slot
+// stays a caller guarantee (HeapViewContract). No heap-indexed data read is translated here; this header only classifies,
 // serializes and checks, and names the heap view contract a request allows (global_srv_contract).
 //
 // A .views file describes the one dispatch it was captured from. It is not part of the .cdx/.root content key of the
@@ -68,10 +70,19 @@ inline bool classify_global_srv_view(unsigned heap_slot, const void *bytes, std:
     return true;
 }
 
+// One selection of a dispatch: the slot a selector word names and the view type the shader reads it as.
+struct GlobalSrvSelection {
+    unsigned slot = 0;
+    GlobalSrvType needed = GlobalSrvType::none;
+};
+
 // One request's view metadata, the text that travels with a captured request (req_<key>.views).
 struct GlobalSrvRequest {
     unsigned selected = 0;
     GlobalSrvType needed = GlobalSrvType::none;
+    // Further selections of the same dispatch. Selector word order: selection 0 is select/need, selection k (k >= 1)
+    // is also[k-1], in file order.
+    std::vector<GlobalSrvSelection> also;
     std::vector<GlobalSrvView> views;
     bool has_selected = false;
 };
@@ -79,6 +90,8 @@ struct GlobalSrvRequest {
 inline std::string encode_global_srv_request(const GlobalSrvRequest &request) {
     std::ostringstream out;
     out << "x2w-global-srv-views 2\nselect " << request.selected << "\nneed " << global_srv_type_name(request.needed) << '\n';
+    for (const auto &selection : request.also)
+        out << "also " << selection.slot << ' ' << global_srv_type_name(selection.needed) << '\n';
     for (const auto &view : request.views)
         out << "slot " << view.slot << ' ' << global_srv_type_name(view.type) << ' ' << view.stride << ' ' << view.bytes << '\n';
     // After the slot lines: the 32-bit channel count of each typed buffer slot that has one.
@@ -115,6 +128,20 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
                 return false;
             }
             has_need = true;
+        } else if (key == "also") {
+            GlobalSrvSelection selection;
+            std::string name;
+            std::string extra;
+            if (!(fields >> selection.slot >> name) || (fields >> extra)) {
+                error = "global SRV view metadata: unreadable also line";
+                return false;
+            }
+            selection.needed = global_srv_type_from_name(name);
+            if (selection.needed == GlobalSrvType::none) {
+                error = "global SRV view metadata: unreadable also line";
+                return false;
+            }
+            request.also.push_back(selection);
         } else if (key == "slot") {
             GlobalSrvView view;
             std::string name;
@@ -150,6 +177,17 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
         error = std::string("global SRV view metadata lacks the ") + (request.has_selected ? "needed view type" : "selected slot");
         return false;
     }
+    // One selection per selector word, so a slot may be named again (two words can pick the same slot) with the same
+    // view type. A slot named with two view types cannot be read as both: refused.
+    for (std::size_t a = 0; a <= request.also.size(); ++a)
+        for (std::size_t b = a + 1; b <= request.also.size(); ++b) {
+            const auto &first = a ? request.also[a - 1] : GlobalSrvSelection{request.selected, request.needed};
+            const auto &second = request.also[b - 1];
+            if (first.slot == second.slot && first.needed != second.needed) {
+                error = "global SRV view metadata: slot " + std::to_string(first.slot) + " selected with two view types";
+                return false;
+            }
+        }
     return true;
 }
 
@@ -166,21 +204,40 @@ inline std::string refuse_global_srv_selection(const std::vector<GlobalSrvView> 
     return "global SRV slot " + std::to_string(selected) + " has no captured view type";
 }
 
+// refuse_global_srv_selection for the select/need pair and then for each also entry in order; the first non-empty text
+// wins. Call this, not the singular function, wherever a request is checked.
+inline std::string refuse_global_srv_selections(const GlobalSrvRequest &request) {
+    auto text = refuse_global_srv_selection(request.views, request.selected, request.needed);
+    for (const auto &selection : request.also) {
+        if (!text.empty()) break;
+        text = refuse_global_srv_selection(request.views, selection.slot, selection.needed);
+    }
+    return text;
+}
+
 // The class of heap reads a request's metadata lets the translator emit (x2w::HeapViewContract::none, raw_buffer,
-// typed_dword). Call after refuse_global_srv_selection accepted the selection. A typed request needs one-channel 32-bit
-// typed buffers: the checks are necessary conditions on the captured resources only; the view's element range and the
-// guest descriptor fields stay the caller's guarantee.
-enum class GlobalSrvContract { none, raw_buffer, typed_dword };
+// typed_dword, raw_and_typed_dword). Call after refuse_global_srv_selections accepted the selections. A request with a
+// typed selection needs one-channel 32-bit typed buffers: the checks are necessary conditions on the captured
+// resources only; the view's element range and the guest descriptor fields stay the caller's guarantee.
+enum class GlobalSrvContract { none, raw_buffer, typed_dword, raw_and_typed_dword };
 
 inline GlobalSrvContract global_srv_contract(const GlobalSrvRequest &request, std::string &error) {
     const auto refuse = [&error](std::string text) {
         error = std::move(text) + "; only raw and one-channel 32-bit typed heap reads are translated";
         return GlobalSrvContract::none;
     };
-    if (request.needed == GlobalSrvType::raw_buffer) return GlobalSrvContract::raw_buffer;
-    if (request.needed != GlobalSrvType::typed_buffer)
+    bool raw = request.needed == GlobalSrvType::raw_buffer;
+    bool typed = request.needed == GlobalSrvType::typed_buffer;
+    if (!raw && !typed)
         return refuse(std::string("GPU-selected heap slot view type ") + global_srv_type_name(request.needed) +
                       " is not raw_buffer or typed_buffer");
+    for (const auto &selection : request.also) {
+        if (selection.needed != GlobalSrvType::raw_buffer && selection.needed != GlobalSrvType::typed_buffer)
+            return refuse(std::string("GPU-selected heap slot view type ") + global_srv_type_name(selection.needed) +
+                          " is not raw_buffer or typed_buffer");
+        (selection.needed == GlobalSrvType::raw_buffer ? raw : typed) = true;
+    }
+    if (!typed) return GlobalSrvContract::raw_buffer;
     // Every captured typed buffer slot, the selected one included, must be a one-channel 32-bit buffer.
     for (const auto &view : request.views) {
         if (view.type != GlobalSrvType::typed_buffer) continue;
@@ -189,6 +246,6 @@ inline GlobalSrvContract global_srv_contract(const GlobalSrvRequest &request, st
                           " is not a one-channel 32-bit typed buffer" +
                           (view.dword_channels ? "" : " (no 32-bit channel metadata)"));
     }
-    return GlobalSrvContract::typed_dword;
+    return raw ? GlobalSrvContract::raw_and_typed_dword : GlobalSrvContract::typed_dword;
 }
 } // namespace x2w_startup

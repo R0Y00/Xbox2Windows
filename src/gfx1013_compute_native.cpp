@@ -437,7 +437,7 @@ Symbol source(const Inst &i, unsigned code, const State &s) {
 unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
 // Derive the rewritten byte-address V# symbolically. Each field carries its
 // source table/slot identity. Numeric consumption still requires real bits.
-// heap_window: the direct path under HeapViewContract::raw_buffer also rewrites a
+// heap_window: the direct path under HeapViewContract::raw_buffer or raw_and_typed_dword also rewrites a
 // descriptor loaded from the GPU-selected heap slot (its words keep the load pc).
 static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s, bool heap_window = false) {
     using T = Symbol::Type;
@@ -1506,8 +1506,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user)
         initial[next] = {Symbol::Type::table, compute_resource_heap};
     const bool wave64 = stage && !stage->wave32;
-    // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
-    const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
+    // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer or raw_and_typed_dword
+    // contract.
+    const bool heap_window = direct_dxil && (heap_view == HeapViewContract::raw_buffer ||
+                                             heap_view == HeapViewContract::raw_and_typed_dword);
     auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
     Emit emit{{}, program,layout->Desc_1_1};
     emit.result.constants = constants;

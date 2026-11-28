@@ -1,13 +1,15 @@
 // Native compute fixture whose shader picks a global (descriptor heap) SRV slot from a GPU input.
 //
 // root    OUT.root                                  writes the root signature the request container carries.
-// record  SDK CACHE REQ.cdx ADAPTER SELECTOR EXPECT [--no-guard]
-//         Native recording path: reads the GPU selector back before the dispatch, captures {select, view types}
-//         into REQ.views, refuses a slot of another view type before the shader runs, otherwise records the
-//         dispatch with x2w_startup::NativeRecording and NativeDispatchStates and compares the fenced output.
+// record  SDK CACHE REQ.cdx ADAPTER SELECTOR EXPECT [--no-guard] [--need T] [--also SELECTOR T]
+//         Native recording path: reads the GPU selector words back before the dispatch (word 0 SELECTOR, word 1 the
+//         --also SELECTOR), captures {select, also, view types} into REQ.views, refuses a slot of another view type
+//         before the shader runs, otherwise records the dispatch with x2w_startup::NativeRecording and
+//         NativeDispatchStates and compares the fenced output.
 // replay  SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER EXPECT REFERENCE_SLOT
 //         Offline request replay: decodes VIEWS, refuses before the dispatch or runs the compiled.cso shader on a
-//         heap rebuilt from the captured slot types and compares with the reference slot data.
+//         heap rebuilt from the captured slot types and compares with the reference slot data. REFERENCE_SLOT is N,
+//         or N+M when the program sums two slots.
 // EXPECT is "ok" or "refused". Exit 0: outcome as expected. 1: output mismatch for an expected-ok case. 3: the
 // outcome differs from the expectation. 4: setup error. 77: capability skip.
 #include "desktop_gpu.h"
@@ -16,11 +18,14 @@
 #include "startup_stubs/native_global_srv.h"
 #include "startup_stubs/native_recording.h"
 #include <dxgi1_4.h>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -165,14 +170,14 @@ struct Rig {
 
     // t0 (the selector, a raw buffer) and u0 (72 words of output) in their page slots.
     void create_io() {
-        selector = make_buffer(device.Get(), 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        selector = make_buffer(device.Get(), 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
         output = make_buffer(device.Get(), output_words * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = DXGI_FORMAT_R32_TYPELESS;
         srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Buffer.NumElements = 1;
+        srv.Buffer.NumElements = 2;
         srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         device->CreateShaderResourceView(selector.Get(), &srv, cpu(selector_page_slot));
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
@@ -233,14 +238,17 @@ struct Rig {
         return view;
     }
 
-    unsigned read_selector(unsigned value) {
-        fill(selector.Get(), {value});
-        return read(selector.Get(), 1)[0];
+    // Both selector words; programs that read word 0 only get 0 in word 1.
+    std::array<unsigned, 2> read_selector(std::array<unsigned, 2> values) {
+        fill(selector.Get(), {values[0], values[1]});
+        const auto words = read(selector.Get(), 2);
+        return {words[0], words[1]};
     }
 
     // Barriers from the views of the dispatch (NativeDispatchStates), the dispatch, the barriers back, the fence.
     // `state` is the pipeline-state object to run (null: the one bind() set).
-    void dispatch(const x2w::NativeComputePipeline &pipeline, ID3D12PipelineState *state, ID3D12Resource *selected) {
+    void dispatch(const x2w::NativeComputePipeline &pipeline, ID3D12PipelineState *state,
+                  const std::vector<ID3D12Resource *> &selected) {
         struct View {
             ComPtr<ID3D12Resource> resource;
             bool write = false;
@@ -250,7 +258,7 @@ struct Rig {
         std::vector<View> views;
         views.push_back({selector, false, {}, {}});
         views.push_back({output, true, {}, {}});
-        views.push_back({selected, false, {}, {}});
+        for (auto *resource : selected) views.push_back({resource, false, {}, {}});
         x2w_startup::NativeDispatchStates states(views);
         std::vector<D3D12_RESOURCE_BARRIER> before, after;
         states.whole_states([&](ID3D12Resource *resource, D3D12_RESOURCE_STATES target) {
@@ -271,23 +279,30 @@ struct Rig {
     }
 };
 
-std::vector<std::uint32_t> reference_output(unsigned slot) {
+// Word i of the data part is the sum (mod 2^32) of word i of every slot; the sentinel words follow.
+std::vector<std::uint32_t> reference_output(const std::vector<unsigned> &slots) {
     std::vector<std::uint32_t> words(output_words, sentinel);
-    for (unsigned i = 0; i < slot_words; ++i) words[i] = slot_word(slot, i);
+    for (unsigned i = 0; i < slot_words; ++i) {
+        words[i] = 0;
+        for (const unsigned slot : slots) words[i] += slot_word(slot, i);
+    }
     return words;
 }
 
 // 0: the 72 words equal the reference; 1 prints the first mismatch.
-int compare_output(Rig &rig, unsigned reference_slot) {
-    const auto expected = reference_output(reference_slot);
+int compare_output(Rig &rig, const std::vector<unsigned> &reference_slots) {
+    const auto expected = reference_output(reference_slots);
+    const std::string label = reference_slots.size() == 2
+                                  ? std::to_string(reference_slots[0]) + "+" + std::to_string(reference_slots[1])
+                                  : std::to_string(reference_slots.at(0));
     const auto actual = rig.read(rig.output.Get(), output_words);
     for (unsigned i = 0; i < output_words; ++i)
         if (actual[i] != expected[i]) {
-            std::printf("mismatch word %u: got 0x%08x expected 0x%08x (reference slot %u)\n", i, actual[i], expected[i],
-                        reference_slot);
+            std::printf("mismatch word %u: got 0x%08x expected 0x%08x (reference slot %s)\n", i, actual[i], expected[i],
+                        label.c_str());
             return 1;
         }
-    std::printf("output matches slot %u data (%u words) and the %u sentinel words are intact\n", reference_slot,
+    std::printf("output matches slot %s data (%u words) and the %u sentinel words are intact\n", label.c_str(),
                 slot_words, output_words - slot_words);
     return 0;
 }
@@ -330,26 +345,46 @@ void check_pipeline_shape(const x2w::NativeComputePipeline &pipeline) {
 
 // The pipeline contract a request's metadata allows; empty error when it is translated.
 x2w::HeapViewContract heap_contract(const x2w_startup::GlobalSrvRequest &request, std::string &error) {
-    const auto contract = x2w_startup::global_srv_contract(request, error);
-    return contract == x2w_startup::GlobalSrvContract::typed_dword ? x2w::HeapViewContract::typed_dword
-                                                                   : x2w::HeapViewContract::raw_buffer;
+    switch (x2w_startup::global_srv_contract(request, error)) {
+    case x2w_startup::GlobalSrvContract::none: return x2w::HeapViewContract::none; // the error is set
+    case x2w_startup::GlobalSrvContract::raw_buffer: return x2w::HeapViewContract::raw_buffer;
+    case x2w_startup::GlobalSrvContract::typed_dword: return x2w::HeapViewContract::typed_dword;
+    case x2w_startup::GlobalSrvContract::raw_and_typed_dword: return x2w::HeapViewContract::raw_and_typed_dword;
+    }
+    throw std::logic_error("unknown global SRV contract");
+}
+
+// A view type name given as a command-line argument: ASCII, anything else names no type.
+GlobalSrvType type_from_argument(const wchar_t *argument) {
+    std::string name;
+    for (const wchar_t c : std::wstring_view(argument)) name += c < 0x80 ? static_cast<char>(c) : '?';
+    return x2w_startup::global_srv_type_from_name(name);
 }
 
 int record(int argc, wchar_t **argv) {
-    if (argc < 8 || argc > 11) return 2;
+    if (argc < 8 || argc > 14) return 2;
     const std::wstring expect = argv[7];
-    bool guard = true, need_given = false;
+    bool guard = true, need_given = false, also_given = false;
     GlobalSrvType needed = GlobalSrvType::raw_buffer;
+    unsigned also_selector = 0;
+    GlobalSrvType also_needed = GlobalSrvType::none;
     for (int a = 8; a < argc; ++a) {
         const std::wstring_view flag = argv[a];
         if (flag == L"--no-guard" && guard) {
             guard = false;
         } else if (flag == L"--need" && a + 1 < argc && !need_given) {
             need_given = true;
-            std::string name;  // a view type name: ASCII, anything else names no type
-            for (const wchar_t c : std::wstring_view(argv[++a])) name += c < 0x80 ? static_cast<char>(c) : '?';
-            needed = x2w_startup::global_srv_type_from_name(name);
+            needed = type_from_argument(argv[++a]);
             if (needed == GlobalSrvType::none) return 2;
+        } else if (flag == L"--also" && a + 2 < argc && !also_given) {
+            also_given = true;
+            try {
+                also_selector = static_cast<unsigned>(std::stoul(argv[++a]));
+            } catch (const std::exception &) {
+                return 2;
+            }
+            also_needed = type_from_argument(argv[++a]);
+            if (also_needed == GlobalSrvType::none) return 2;
         } else {
             return 2;
         }
@@ -370,13 +405,16 @@ int record(int argc, wchar_t **argv) {
         request.views.push_back(rig.add_slot(3, GlobalSrvType::typed_buffer, slot_words * 4));
         rig.fill_sentinel();
         // The selector is GPU data: it is read back (one CPU/GPU sync) before the dispatch is recorded.
-        request.selected = rig.read_selector(selector);
+        const auto words = rig.read_selector({selector, also_selector});
+        request.selected = words[0];
         request.has_selected = true;
+        if (also_given) request.also.push_back({words[1], also_needed});
         auto views_path = cdx;
         views_path.replace_extension(L".views");
         std::ofstream(views_path, std::ios::binary) << x2w_startup::encode_global_srv_request(request);
-        std::printf("captured select=%u need=%s views=%s\n", request.selected,
-                    x2w_startup::global_srv_type_name(request.needed), views_path.string().c_str());
+        std::printf("captured select=%u need=%s also=%zu views=%s\n", request.selected,
+                    x2w_startup::global_srv_type_name(request.needed), request.also.size(),
+                    views_path.string().c_str());
         // The contract depends on the captured views, not on the selection: the shader is translated for every record,
         // a refused selection included.
         std::string error;
@@ -387,14 +425,22 @@ int record(int argc, wchar_t **argv) {
         }
         auto pipeline = x2w::create_native_compute_pipeline(rig.device.Get(), compiler, cdx, 0, argv[3], true, contract);
         check_pipeline_shape(pipeline);
-        const auto diagnostic = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
+        const auto diagnostic = x2w_startup::refuse_global_srv_selections(request);
         if (!diagnostic.empty() && guard) {
             std::printf("refused select=%u: %s\n", request.selected, diagnostic.c_str());
             return refused_path(rig, expect == L"ok");
         }
-        if (request.selected >= slot_count || request.views[request.selected].type != request.needed)
-            throw std::runtime_error("--no-guard only dispatches a slot of the needed view type");
-        rig.dispatch(pipeline, nullptr, rig.slots[request.selected].Get());
+        std::vector<x2w_startup::GlobalSrvSelection> selections{{request.selected, request.needed}};
+        selections.insert(selections.end(), request.also.begin(), request.also.end());
+        std::vector<ID3D12Resource *> selected;
+        std::vector<unsigned> selected_slots;
+        for (const auto &selection : selections) {
+            if (selection.slot >= slot_count || request.views[selection.slot].type != selection.needed)
+                throw std::runtime_error("--no-guard only dispatches a slot of the needed view type");
+            selected.push_back(rig.slots[selection.slot].Get());
+            selected_slots.push_back(selection.slot);
+        }
+        rig.dispatch(pipeline, nullptr, selected);
         if (expect == L"refused") {
             // Discrimination control: without the guard the shader ran, so the output must have changed.
             const bool intact = rig.sentinels_intact();
@@ -402,7 +448,7 @@ int record(int argc, wchar_t **argv) {
                         intact ? "sentinels intact" : "sentinels changed");
             return 3;
         }
-        return compare_output(rig, request.selected);
+        return compare_output(rig, selected_slots);
     } catch (const std::exception &error) {
         std::printf("setup error: %s\n", error.what());
         return 4;
@@ -414,7 +460,14 @@ int replay(int argc, wchar_t **argv) {
     const std::wstring expect = argv[8];
     if (expect != L"ok" && expect != L"refused") return 2;
     const fs::path cdx = argv[4], cso = argv[5], views_path = argv[6];
-    const unsigned reference_slot = static_cast<unsigned>(std::stoul(argv[9]));
+    std::vector<unsigned> reference_slots;
+    {
+        const std::wstring reference = argv[9];
+        const auto plus = reference.find(L'+');
+        reference_slots.push_back(static_cast<unsigned>(std::stoul(reference.substr(0, plus))));
+        if (plus != std::wstring::npos)
+            reference_slots.push_back(static_cast<unsigned>(std::stoul(reference.substr(plus + 1))));
+    }
     Rig rig;
     if (int skip = rig.open(argv[7])) return skip;
     try {
@@ -429,8 +482,7 @@ int replay(int argc, wchar_t **argv) {
             text.assign(std::istreambuf_iterator<char>(file), {});
             x2w_startup::decode_global_srv_request(text, request, error);
         }
-        if (error.empty())
-            error = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
+        if (error.empty()) error = x2w_startup::refuse_global_srv_selections(request);
         auto contract = x2w::HeapViewContract::raw_buffer;
         if (error.empty()) contract = heap_contract(request, error);
         if (!error.empty()) {
@@ -448,13 +500,17 @@ int replay(int argc, wchar_t **argv) {
         pso.CS = {dxil.data(), dxil.size()};
         ComPtr<ID3D12PipelineState> compiled;
         check(rig.device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&compiled)), "compiled shader pipeline");
+        if (request.also.size() > 1)
+            throw std::runtime_error("the fixture replays at most one also selection");
         for (const auto &view : request.views) {
             if (view.slot >= slot_count) throw std::runtime_error("captured slot outside the fixture heap page");
             rig.add_slot(view.slot, view.type, view.bytes);
         }
-        rig.read_selector(request.selected);
-        rig.dispatch(pipeline, compiled.Get(), rig.slots[request.selected].Get());
-        const int result = compare_output(rig, reference_slot);
+        rig.read_selector({request.selected, request.also.empty() ? 0 : request.also[0].slot});
+        std::vector<ID3D12Resource *> selected{rig.slots[request.selected].Get()};
+        for (const auto &selection : request.also) selected.push_back(rig.slots[selection.slot].Get());
+        rig.dispatch(pipeline, compiled.Get(), selected);
+        const int result = compare_output(rig, reference_slots);
         if (expect == L"refused") return 3; // ran when a refusal was expected
         return result;
     } catch (const std::exception &error) {
@@ -474,6 +530,6 @@ int wmain(int argc, wchar_t **argv) {
         return 4;
     }
     std::fputs("usage: native_global_srv_heap_replay root OUT.root | record SDK CACHE REQ.cdx ADAPTER SELECTOR ok|refused "
-               "[--no-guard] [--need raw_buffer|typed_buffer] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT\n", stderr);
+               "[--no-guard] [--need raw_buffer|typed_buffer] [--also SELECTOR raw_buffer|typed_buffer] | replay SDK CACHE REQ.cdx COMPILED.cso VIEWS ADAPTER ok|refused REFERENCE_SLOT|N+M\n", stderr);
     return 2;
 }

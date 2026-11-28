@@ -26,7 +26,8 @@ struct DirectCompute {
     bool wave64 = false;
     // The view class a GPU-selected heap slot is read as; see HeapViewContract.
     HeapViewContract heap_view = HeapViewContract::none;
-    // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
+    // heap_view is raw_buffer or raw_and_typed_dword and the path is direct: the byte-address rewrite of a heap
+    // descriptor is tracked.
     bool heap_window = false;
     // Binary16 add, sub, subrev and mul are lowered only while MODE stays at
     // the contract this path implements: round-to-nearest-even, f16 denormals
@@ -271,7 +272,8 @@ struct DirectCompute {
             }
         }
     }
-    // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer and typed_dword are translated.
+    // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer, typed_dword and raw_and_typed_dword
+    // are translated.
     void refuse_heap_contract(unsigned pc) const {
         if (heap_view == HeapViewContract::none)
             refuse(pc, "direct resource-heap load requires the selected GPU slot and its view type");
@@ -284,11 +286,14 @@ struct DirectCompute {
     // A byte window is the byte-address rewrite of that descriptor (word 0 copied, word 1 without stride, word 2 the
     // byte count, word 3 with the raw out-of-bounds mode; see byte_descriptor_field): read as the same raw slot view.
     // Under typed_dword the slot is a one-channel 32-bit typed buffer instead: a typed load of one channel (an element
-    // index), read as R32_UINT; raw reads and byte windows are refused.
+    // index), read as R32_UINT; raw reads and byte windows are refused. Under raw_and_typed_dword the kind of the load
+    // picks the path: typed_buffer_srv is typed, every other kind is raw.
     string heap_resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes) {
         const auto &symbol = s.at(base);
         refuse_heap_contract(i.pc);
-        const bool typed = heap_view == HeapViewContract::typed_dword;
+        const bool typed = heap_view == HeapViewContract::typed_dword ||
+                           (heap_view == HeapViewContract::raw_and_typed_dword &&
+                            kind == ComputeViewKind::typed_buffer_srv);
         if (typed && kind != ComputeViewKind::typed_buffer_srv)
             refuse(i.pc, "a GPU-selected heap slot is read as a typed dword buffer SRV only");
         if (typed && (i.op & 3))
@@ -502,7 +507,7 @@ struct DirectCompute {
             const auto &low = s.at(i.src[0]);
             const bool root = low.type == Symbol::Type::root_address;
             if (!root && low.type == Symbol::Type::table && low.value == compute_resource_heap) {
-                // Reads from the whole descriptor heap: only the indexed descriptor load of a captured raw buffer slot.
+                // Reads from the whole descriptor heap: only the indexed descriptor load of a slot under a heap contract.
                 if (i.op >= 8)
                     refuse(i.pc, "scalar buffer load from the descriptor heap is not translated");
                 refuse_heap_contract(i.pc);
@@ -1673,10 +1678,11 @@ struct DirectCompute {
             const auto field = source(i, i.src[1], state);
             if (descriptor.type == Symbol::Type::indexed_descriptor && descriptor.value == compute_resource_heap &&
                 descriptor.offset % 32 == 4 && field.type == Symbol::Type::constant && field.value == 0xe0010) {
-                // Reachable only through a heap descriptor load, which needs the raw_buffer contract. A raw buffer view
-                // has no stride to read, so the stride of a GPU-selected slot stays untranslated in the direct path.
-                // With the raw_buffer contract a stride read into s0-s105 is tracked symbolically
-                // (byte_descriptor_field) and does not reach here.
+                // Reachable only through a heap descriptor load, which needs the raw_buffer, typed_dword or
+                // raw_and_typed_dword contract. A raw buffer view has no stride to read, so the stride of a
+                // GPU-selected slot stays untranslated in the direct path. Under raw_buffer and raw_and_typed_dword
+                // a stride read into s0-s105 is tracked symbolically (byte_descriptor_field) and does not reach
+                // here; typed_dword admits the heap descriptor load but not that tracking, so it reaches this refusal.
                 refuse_heap_contract(i.pc);
                 refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }

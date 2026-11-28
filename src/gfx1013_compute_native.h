@@ -118,15 +118,23 @@ struct NativeComputeShader {
 // Under raw_buffer the direct path also reads the byte-address rewrite of the selected descriptor (stride read,
 // max(stride, 1), byte count, stride cleared, raw out-of-bounds mode) as the same raw view. The caller guarantees that
 // every slot the program can select is a raw view whose size is the guest range num_records * max(stride, 1); the
-// translator does not check that, nor the swizzle bits (word 1 bits 31:30) or the other word 3 fields, and a program
-// with two heap loads from different selectors is outside what one captured selection covers.
+// translator does not check that, nor the swizzle bits (word 1 bits 31:30) or the other word 3 fields.
 // typed_dword: only typed loads (buffer_load_format_x, an idxen element index or none, no offsets) read the heap; raw
 // loads and byte windows are refused. The caller guarantees that every slot the program can select is a typed buffer SRV
 // of R32_UINT, R32_SINT or R32_FLOAT (default mapping, no flags, no structure stride), bound as R32_UINT over the same
 // resource and element range, and that the guest descriptor it stands for has stride 4, a 32-bit UINT/SINT/FLOAT data
 // format, identity dst_sel_x, swizzle and add_tid disabled, and the out-of-bounds rule "index >= num_records reads 0",
 // with num_records equal to the view's element count. The translator checks none of these values.
-enum class HeapViewContract : unsigned { none, raw_buffer, typed_dword, other };
+// raw_and_typed_dword: a program reads some heap slots raw (raw loads and byte windows, all raw_buffer rules) and others
+// with typed loads (all typed_dword rules). Each heap load is emitted by its own kind: buffer_load_format_* (kind
+// typed_buffer_srv, any channel count) takes the typed path, where more than one channel is refused as under
+// typed_dword; every other kind, tbuffer_load_format_* through a plain or rewritten heap descriptor included, takes the
+// raw path. The caller guarantees the raw_buffer conditions for every slot a raw load or byte window can select and
+// the typed_dword conditions for every slot a typed load can select. The
+// translator cannot tell which heap index feeds which load, does not limit the number of heap loads, and checks none of
+// these conditions. Under every contract, a program whose heap loads use more selectors than were captured is outside
+// what the capture proves.
+enum class HeapViewContract : unsigned { none, raw_buffer, typed_dword, raw_and_typed_dword, other };
 NativeComputeShader translate_compute(const ComputeRequest &request, unsigned entry_byte_offset,
                                       bool direct_dxil = false);
 NativeComputeShader translate_compute_container(ComputeContainer container,
