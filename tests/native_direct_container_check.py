@@ -500,6 +500,10 @@ def main():
         check("compute-tbuffer-byte-count-missing-product", cs,
               compute(words(*tbuffer_broken, 0xe8a01000, 0x80070805, end), table=True),
               "non-contiguous resource descriptor")
+        # A writable access and the MTBUF read use the same table descriptor; the read has no verified view contract.
+        check("compute-tbuffer-writable-byte-window", cs,
+              compute(words(*tbuffer_view, 0xe0701000, 0x80070805, 0xe8a01000, 0x80070805, end), table=True),
+              "a writable MTBUF byte window has no verified view contract")
         # Convert v11 to a half in the high word of v6, retaining v6.low.
         # Widen the selected high word back from a scalar source into v7.
         halves = [0x7e0c02ff, 0xa5a53600, 0x7e1602ff, 0x3f801000, 0x7e0c14f9, 0x06150b,

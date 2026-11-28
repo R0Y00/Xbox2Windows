@@ -104,8 +104,12 @@ def main(cli, consumer, renderer, sdk, adapter):
         compare(got, GUARDS, result)
         refusal = 'Dispatch(3, 2, 2) refused: an MTBUF byte window requires identity component mapping'
         assert len(lines(result, refusal)) == 1, result.stderr[-3000:]
+        got, result = run(work, consumer, env, IDENTITY, mapping='cbv')
+        compare(got, GUARDS, result)
+        refusal = 'Dispatch(3, 2, 2) refused: an MTBUF byte window requires a buffer SRV'
+        assert len(lines(result, refusal)) == 1, result.stderr[-3000:]
         print(f'{adapter}: identity readback matched five pairs, seven out-of-range pairs and all guards. '
-              'Swapped X/Y refused for both descriptor forms. Cold and warm manifests matched.')
+              'Swapped X/Y and a CBV token refused. Cold and warm manifests matched.')
 
 
 if __name__ == '__main__':

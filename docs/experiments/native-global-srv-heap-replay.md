@@ -176,7 +176,7 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   path for both a hardware descriptor and a buffer SRV token. A 44-byte window holds five full pairs. The partial
   pair and the later pairs read zero. Swapped X/Y selectors refuse before Dispatch, and the output keeps its sentinel.
 - Typed loads (`buffer_load_format_*`) through a heap descriptor and scalar loads through the rewritten descriptor stay
-  refused. The startup runtime
-  does not pass a contract yet, so none of this reaches a title run (#3023).
+  refused. The startup runtime does not yet pass the required contract for GPU-selected heap loads, so that heap route
+  does not reach a title run (#3023).
 - The captured `select` must be the slot index the dispatch addresses; producing it from a title capture is outside this
   fixture.
