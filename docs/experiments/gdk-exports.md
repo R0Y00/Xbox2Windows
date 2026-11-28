@@ -30,6 +30,13 @@ Measured on 28 November 2026 with the 261000 LIB/DLL set:
 | chad | 7 | 5 | 5 | 2 | ok |
 | xg_xs | 27 | 2 | 2 | 25 | ok |
 | xcrdapi | 1 | 3 | 1 | 0 | ok |
+| gameinput | 1 | 1 | 1 | 0 | ok |
+
+`xgameruntime` is intentionally outside `DEFAULT_DEFS`: its `.def` is
+fixture-only and its exported thunk names are generated from
+`XGAMERUNTIME_THUNK_TABLE`, so a name comparison would report every GDK runtime
+export as missing. An inventory entry that is absent or unreadable is reported
+as unmeasured rather than covered.
 
 The xg_xs gap remains the largest: layout computation, DCC, tile shapes,
 hardware-version setup and descriptor validation are not exported by the shim.

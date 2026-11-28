@@ -25,6 +25,7 @@ DEFAULT_DEFS = {
     "chad": "src/startup_stubs/chad.def",
     "xg_xs": "src/startup_stubs/xg_xs.def",
     "xcrdapi": "src/startup_stubs/xcrdapi.def",
+    "gameinput": "src/startup_stubs/gameinput.def",
 }
 DATA_PREFIXES = ("IID_", "WKPDID_")
 
