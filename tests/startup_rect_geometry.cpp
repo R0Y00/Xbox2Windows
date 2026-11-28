@@ -361,7 +361,8 @@ float4 main(float4 pos : SV_Position) : SV_Target { return float4(1, 0, 0, 1); }
         };
         transition(target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ClearRenderTargetView(rtv_heap->GetCPUDescriptorHandleForHeapStart(), clear, 0, nullptr);
-        list->OMSetRenderTargets(1, &rtv_heap->GetCPUDescriptorHandleForHeapStart(), FALSE, nullptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

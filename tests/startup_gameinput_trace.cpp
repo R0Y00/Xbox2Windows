@@ -38,12 +38,12 @@ struct IGameInputReading {
     std::uint32_t Release()
     {
         using Fn = std::uint64_t(__stdcall*)(IGameInputReading*);
-        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(vtbl[2])(this));
+        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(const_cast<void*>(vtbl[2]))(this));
     }
     bool GetGamepadState(GamepadState* state)
     {
         using Fn = bool(__stdcall*)(IGameInputReading*, GamepadState*);
-        return reinterpret_cast<Fn>(vtbl[22])(this, state);
+        return reinterpret_cast<Fn>(const_cast<void*>(vtbl[22]))(this, state);
     }
 };
 
@@ -52,12 +52,12 @@ struct IGameInput {
     std::uint32_t Release()
     {
         using Fn = std::uint64_t(__stdcall*)(IGameInput*);
-        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(vtbl[2])(this));
+        return static_cast<std::uint32_t>(reinterpret_cast<Fn>(const_cast<void*>(vtbl[2]))(this));
     }
     HRESULT GetCurrentReading(std::uint32_t kind, void* device, IGameInputReading** reading)
     {
         using Fn = HRESULT(__stdcall*)(IGameInput*, std::uint32_t, void*, IGameInputReading**);
-        return reinterpret_cast<Fn>(vtbl[4])(this, kind, device, reading);
+        return reinterpret_cast<Fn>(const_cast<void*>(vtbl[4]))(this, kind, device, reading);
     }
 };
 

@@ -3665,16 +3665,24 @@ class Stage:
         'ones' writes do not mix. Any other write (M reused as an offset) is accepted only if a later 'zero' or 'ones'
         write overwrites it, since a 'keep' write would carry its bits for a skipped lane. The caller has checked that the block is straight-line."""
         name = 'vcc_lo' if key == 'vcc' else key
-        classes, temps, stale = set(), set(), False
+        classes, temps, stale, scc_live = set(), set(), False, False
         enc = self.lane_bit_keys(b, effects, targets, index)
         for i in range(b + 1, t):
             wrote = effects[i][2]
             _, ops, _ = parse(self.ins[i][3])
             base = re.sub(r'_e(32|64)$', '', self.ins[i][2])
+            # Refuse if an SCC reader follows an SCC-producing write to the accumulated mask.
+            if scc_live and ('scc' in effects[i][0] or reads_scc(self.ins[i][2], self.ins[i][3])):
+                return False
             if key in wrote:
+                scc_live = False  # new write overwrites the accumulated mask, clearing previous SCC concern
                 if not ops or ops[0] != name:
                     return False
                 kind = self.mask_write_class(base, ops, name, temps, enc)
+                # s_and_b32 ... exec_lo produces SCC based on whether the masked result is nonzero.
+                # If a later instruction reads SCC (e.g., s_cselect), it sees wave-wide status, not per-lane.
+                if base == 's_and_b32' and len(ops) == 3 and ('exec_lo' in ops[1:] or 'exec_lo' in ops[2]):
+                    scc_live = True
                 if kind is None:
                     stale = True   # data in M (an s_movk used as an offset): only a later full overwrite makes it exact
                 else:
