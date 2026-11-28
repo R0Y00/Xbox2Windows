@@ -8689,6 +8689,22 @@ more, and every shift count stays in 0..31. Width 0 still gives 0, and SCC is st
 The old formula, a 6-bit width, a dropped field mask and a dropped SCC write each fail it. It runs on the CPU and
 does not draw on a GPU.
 
+**The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
+forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
+issue #1797). They now lower to a ten-class helper carried in the shader preamble (ported from
+`tools/pixel_aot.py`), testing `class32(value) & mask`: the class bits are, in encoding order, signaling NaN,
+quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The mask is read as an integer
+operand (the census form uses the inline `-1`, i.e. every class) and the value as a float; the `_e32` and
+`_e64` spellings share the path, and the `v_cmpx_` form writes EXEC and clears the straight-line assumption.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class$' -V`.
+
+**The binary16 class comparison.** `v_cmp_class_f16` and `v_cmpx_class_f16` share the class-compare
+branch with the binary32 form but read the value as raw binary16 bits in the low half of the operand word:
+`class16(bits) & mask`, with the ten class bits of the half format and the quiet bit at 0x0200. The census
+form `v_cmp_class_f16_e64 s14, 0x7c01, v0` now lowers. An `abs`/`neg` modifier on the value acts on bit 15
+of the half, not bit 31, and a float-printed operand is refused because it would be lowered as its
+binary32 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class_f16$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
