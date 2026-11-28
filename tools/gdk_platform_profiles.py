@@ -55,6 +55,8 @@ def score(directory, vs, sdk):
         value += 5
     if sdk in parts:
         value += 3
+    if (directory / sdk).is_dir():
+        value += 15
     return value
 
 
@@ -62,7 +64,10 @@ def choose(root, platform, vs, sdk):
     matches = [item for item in platform_dirs(root) if item.name.lower() == platform.lower()]
     if not matches:
         return None
-    return max(matches, key=lambda item: (score(item, vs, sdk), -len(str(item))))
+    versioned = [item for item in matches if (item / sdk).is_dir()]
+    if not versioned:
+        return None
+    return max(versioned, key=lambda item: (score(item, vs, sdk), -len(str(item))))
 
 
 def list_command(args):
@@ -173,18 +178,22 @@ def combined(items, group, key, separator):
 def scan_command(args):
     directory = choose(args.root, args.platform, args.vs, args.sdk)
     if directory is None:
-        print(f"platform not found: {args.platform}", file=sys.stderr)
+        print(
+            f"platform not found for SDK {args.sdk}: {args.platform}",
+            file=sys.stderr,
+        )
         return 2
     sources = []
     properties = {}
     items = {}
+    edition = directory / args.sdk
     files = [
         directory / "Platform.default.props",
-        directory / "261000" / "Platform.Common.props",
-        directory / "261000" / "Platform.Edition.default.props",
-        directory / "261000" / "Platform.Edition.props",
-        directory / "261000" / "Platform.Edition.targets",
-        directory / "261000" / "Platform.Commandline.targets",
+        edition / "Platform.Common.props",
+        edition / "Platform.Edition.default.props",
+        edition / "Platform.Edition.props",
+        edition / "Platform.Edition.targets",
+        edition / "Platform.Commandline.targets",
         directory / "Platform.props",
         directory / "Platform.targets",
     ]

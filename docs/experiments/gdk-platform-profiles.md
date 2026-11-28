@@ -13,6 +13,11 @@ The GDK installation and the JSON profiles stay outside the repository.
     python -B tools/gdk_platform_profiles.py list --root D:\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK
     python -B tools/gdk_platform_profiles.py scan --root D:\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK --platform Gaming.Xbox.Scarlett.x64 --json out\scarlett.json
 
+The --sdk option selects the versioned subdirectory (261000, 999999, ...). A
+platform directory without that subdirectory is rejected before any output is
+written, so the reported SDK, the source paths and the extracted values always
+refer to the same edition.
+
 Measured on 28 November 2026 from the 261000 payload:
 
 | Platform | Sources | Defines | Includes | Libs | Dependencies |
