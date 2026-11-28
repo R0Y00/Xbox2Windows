@@ -76,7 +76,9 @@ def main(consumer, dxc_dir, adapter):
             refused = lines(result, 'refused: ')
             assert got == untouched, 'a Dispatch with no descriptor at table byte 32 wrote the output'
             assert len(refused) == 1 and 'no translation' not in refused[0], result.stderr[-3000:]
-        published = sorted(p.name for p in cache.iterdir() if not p.name.startswith('req_') and p.name != 'native')
+        # The first request writes revision.txt; it is cache metadata, not a publication.
+        published = sorted(p.name for p in cache.iterdir()
+                           if not p.name.startswith('req_') and p.name not in ('native', 'revision.txt'))
         assert not published, f'the native route left {published} in the cache'
 
         (directory / 'program').write_bytes(case_a)
@@ -109,6 +111,15 @@ def main(consumer, dxc_dir, adapter):
                   f'native translation is refused by that name with every word untouched; {controls}; the first '
                   f'program matches all {C.WORDS} words through its published translation')
             sys.exit(77)
+        shared_loads = LOADS_X4[:4] + bytes.fromhex('200000fa') + LOADS_X4[8:]
+        (directory / 'program').write_bytes(case_a.replace(LOAD_X8, shared_loads))
+        got, result = dispatch(directory, consumer, dict(env, X2W_NATIVE_SHADERS_ONLY='1'), 'dispatch-read-write-uav')
+        expected[288:] = [C.input_word(i) for i in range(288, C.WORDS)]
+        assert not mismatch(got, expected, result), mismatch(got, expected, result)
+        assert lines(result, '0 inputs, 1 outputs'), result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
+        print('shared guest UAV: in-place reads and writes matched with untouched tail')
         print(f'startup_compute_dispatch_native: PASS on {adapter} (all {C.WORDS} words match after the in-process '
               f'translation from an empty cache, and again with a published translation in the cache; the plain table '
               f'layout is refused when bound; {controls})')

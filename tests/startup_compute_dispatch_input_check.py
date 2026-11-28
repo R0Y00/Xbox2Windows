@@ -43,6 +43,8 @@ def main(consumer, dxc, adapter):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         cache, env = prepare(directory)
+        env.pop('X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT', None)  # prepare() copies os.environ: every baseline run starts with the flag off
+        env.pop("X2W_D3D12_RING_RELEASE_AT_SUBMIT", None)
         env.update(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
         if adapter == 'hardware':
             env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
@@ -85,6 +87,45 @@ def main(consumer, dxc, adapter):
         assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and             not lines(result, 'refused: '), result.stderr[-3000:]
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
+        # Opt-in X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT: an input in a placed buffer that does not alias title memory holds
+        # its bytes only in title memory (the desktop copy is zeros). Off, it is refused; on, the bytes are snapshotted
+        # into the snapshot pool and all 320 words match; with title memory zero (dispatch-input-copied) the dispatch runs
+        # on zeros: not refused, not the expected words, not untouched.
+        snapshot_env = dict(env, X2W_TRANSLATED_TITLE_INPUT_SNAPSHOT='1')
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-snapshot')
+        assert got == untouched and lines(result, 'refused: ')[0].endswith(CONTROLS[3][1]), result.stderr[-3000:]
+        got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-snapshot')
+        assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert len(lines(result, 'comes from a snapshot of title memory (1280 bytes)')) == 1, result.stderr[-3000:]
+        errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+        assert not errors, errors[0]
+        got, result = dispatch(directory, consumer, snapshot_env, 'dispatch-input-copied')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert got != expected and got != untouched, 'a snapshot of zero title memory must not give the expected words'
+        # Long run: 48 frames of dispatches whose 8 MiB title-memory input is snapshotted each frame, the queue completed between
+        # frames: 384 MiB in all, three times the snapshot pool (128 MiB). The pool must be recycled: every frame translates,
+        # gives the first frame's words (the consumer exits 85 if one does not), the last frame matches the CPU reference
+        # and no reservation is refused.
+        # With release enabled, keep the submitted lists closed to exercise release without Reset.
+        for release, mode in ((False, 'dispatch-input-snapshot-long'), (True, 'dispatch-input-snapshot-long-keep')):
+            long_env = dict(snapshot_env)
+            if release:
+                long_env["X2W_D3D12_RING_RELEASE_AT_SUBMIT"] = "1"
+            got, result = dispatch(directory, consumer, long_env, mode)
+            assert got == expected and not lines(result, 'refused: '), result.stderr[-3000:]
+            assert not lines(result, 'reservation refused'), lines(result, 'reservation refused')
+            assert len(lines(result, 'Dispatch(3, 2, 2) translated')) >= 1, result.stderr[-3000:]
+            # The input must really come from a snapshot (8 MiB), not be read in place: an empty long case would pass everything above.
+            assert len(lines(result, 'comes from a snapshot of title memory (8388608 bytes)')) == 1, result.stderr[-3000:]
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
+        # An all-zero descriptor is an unbound buffer: the dispatch runs on zeros instead of being refused (the empty
+        # control above has a nonzero base and stays refused).
+        got, result = dispatch(directory, consumer, env, 'dispatch-input-null')
+        assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused: '), result.stderr[-3000:]
+        assert len(lines(result, 'comes from zeros for a null descriptor (16 bytes)')) == 1, result.stderr[-3000:]
+        assert got != expected and got != untouched, 'a null input must read zeros, not the expected words'
+        print(f'{adapter}: title-input snapshot: off refused, on all {C.WORDS} words match, zero title memory runs on zeros')
         print(f'startup_compute_dispatch_input: PASS on {adapter} (all {C.WORDS} words match, also with the input behind '
               f'a memory view token; {len(CONTROLS)} inputs refused, each with its own reason and an untouched output)')
 
