@@ -92,7 +92,12 @@ struct Range {
 };
 
 struct Player {
-    std::unordered_map<u64, u64> objects;      // recorded wrapper -> replay wrapper
+    // X2W_REPLAY_INFER_EXECUTE=1 (opt-in, for recordings made before the recorder captured the list array of the title's
+    // ExecuteCommandLists on queue slot 35): a queue submit call whose array the file does not hold submits the next
+    // closed command lists in Close order. A recorded array always wins; this is a reconstruction, not recorded data.
+    std::vector<u64> closed_lists;
+    std::vector<u64> exec_array;
+    std::unordered_map<u64, u64> objects;     // recorded wrapper -> replay wrapper
     std::unordered_map<u64, HeapInfo> heaps;   // recorded heap wrapper -> its creation descriptor
     std::vector<ReservedSpan> descriptor_backings;  // exact ranges of heaps created so far
     std::unordered_map<u64, Microsoft::WRL::ComPtr<ID3D12Heap>> placement_heaps;
