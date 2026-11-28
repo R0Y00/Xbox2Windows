@@ -19,12 +19,14 @@ template<class Desc> inline unsigned sanitize_sampler_common(Desc& s)
     unsigned changed = 0;
     unsigned filter = static_cast<unsigned>(s.Filter);
     const unsigned basic = filter & ~0x180u;
-    if ((filter & ~0x1d5u) || (basic != 0x55u && (basic & ~0x15u))) {
+    // Anisotropic is 0x55, or 0x54 with a point mip filter (AnisoFilterWithPointMipSupported).
+    const auto anisotropic = [](unsigned f) { return ((f & ~0x180u) | 0x1u) == 0x55u; };
+    if ((filter & ~0x1d5u) || (!anisotropic(filter) && (basic & ~0x15u))) {
         filter = (filter & 0x180u) | 0x15u;
         s.Filter = static_cast<D3D12_FILTER>(filter);
         changed |= sampler_filter;
     }
-    if ((filter & ~0x180u) == 0x55u && (s.MaxAnisotropy < 1 || s.MaxAnisotropy > 16)) {
+    if (anisotropic(filter) && (s.MaxAnisotropy < 1 || s.MaxAnisotropy > 16)) {
         s.MaxAnisotropy = (std::max)(1u, (std::min)(16u, s.MaxAnisotropy));
         changed |= sampler_anisotropy;
     }

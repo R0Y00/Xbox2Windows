@@ -16,7 +16,12 @@ int main()
     valid[2].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR; valid[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     valid[3].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
     for (float& c : valid[3].BorderColor) c = 1;
+    valid[4].Filter = static_cast<D3D12_FILTER>(0x54); valid[4].MaxAnisotropy = 8;  // anisotropic with point mip
+    D3D12_SAMPLER_DESC reduced = valid[4]; reduced.Filter = static_cast<D3D12_FILTER>(0x154);  // minimum reduction
     for (auto s : valid) { const auto before = s; if (sanitize_sampler(s) || std::memcmp(&s, &before, sizeof(s))) return 1; }
+    { auto kept = reduced; const auto before = kept; if (sanitize_sampler(kept) || std::memcmp(&kept, &before, sizeof(kept))) return 17; }
+    { auto bad = valid[4]; bad.MaxAnisotropy = 0;
+      if (!(sanitize_sampler(bad) & sampler_anisotropy) || bad.MaxAnisotropy != 1 || static_cast<unsigned>(bad.Filter) != 0x54) return 18; }
     auto s = base;
     s.Filter = D3D12_FILTER_ANISOTROPIC; s.MaxAnisotropy = 0;
     if (!(sanitize_sampler(s) & sampler_anisotropy) || s.MaxAnisotropy != 1) return 2;
