@@ -10,6 +10,7 @@ Commands:
 
 parse-dumpbin accepts a file or a directory of text captured from:
     dumpbin /nologo /exports <library>
+Its sha256 identifies that capture, not the LIB or DLL it was taken from.
 """
 
 import argparse
@@ -31,9 +32,10 @@ def sha256(path):
     return digest.hexdigest().upper()
 
 
-def parse_dumpbin_text(text):
+def parse_dumpbin_report(text):
     exports = []
     started = False
+    unparsed = 0
     for line in text.splitlines():
         if re.match(r"^\s*ordinal\s+name\b", line) or re.match(
             r"^\s*ordinal\s+hint\s+RVA\s+name\b", line
@@ -68,14 +70,24 @@ def parse_dumpbin_text(text):
                     "rva": None,
                 }
             )
-    return exports
+            continue
+        unparsed += 1
+    return exports, unparsed
+
+
+def parse_dumpbin_text(text):
+    return parse_dumpbin_report(text)[0]
 
 
 def module_name(path, kind):
-    return Path(path).stem
+    name = Path(path).stem
+    for suffix in (".lib", ".dll"):
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)]
+    return name
 
 
-def collect_dumpbin(path, kind):
+def collect_dumpbin(path, kind, sdk="261000"):
     path = Path(path)
     if path.is_dir():
         entries = sorted(
@@ -86,20 +98,26 @@ def collect_dumpbin(path, kind):
     modules = []
     for entry in entries:
         text = entry.read_text(encoding="utf-8", errors="replace")
-        modules.append(
-            {
-                "sdk": "261000",
-                "module": module_name(entry, kind),
-                "file": str(entry),
-                "kind": kind,
-                "sha256": sha256(entry),
-                "exports": parse_dumpbin_text(text),
-            }
-        )
+        parsed, unparsed = parse_dumpbin_report(text)
+        module = {
+            "sdk": sdk,
+            "module": module_name(entry, kind),
+            "file": str(entry),
+            "kind": kind,
+            "sha256": sha256(entry),
+            "exports": parsed,
+        }
+        if unparsed:
+            module["unparsed"] = unparsed
+        if not parsed:
+            module["error"] = "no exports parsed"
+        elif unparsed:
+            module["error"] = f"{unparsed} unparsed export line(s)"
+        modules.append(module)
     return modules
 
 
-def scan_pe(path):
+def scan_pe(path, sdk="261000"):
     import pefile  # Imported here so parse-dumpbin needs only the standard library.
 
     pe = pefile.PE(str(path), fast_load=True)
@@ -117,19 +135,22 @@ def scan_pe(path):
                     "rva": "0x%X" % symbol.address,
                 }
             )
-    return {
-        "sdk": "261000",
+    module = {
+        "sdk": sdk,
         "module": module_name(path, "dll"),
         "file": str(path),
         "kind": "dll",
         "sha256": sha256(path),
         "exports": exports,
     }
+    if not exports:
+        module["error"] = "no exports parsed"
+    return module
 
 
-def write_document(path, modules):
+def write_document(path, modules, sdk="261000"):
     document = {
-        "sdk": "261000",
+        "sdk": sdk,
         "count": sum(len(module["exports"]) for module in modules),
         "modules": modules,
     }
@@ -147,17 +168,24 @@ def main(argv=None):
     dumpbin.add_argument("inputs", nargs="+")
     dumpbin.add_argument("--json", required=True)
     dumpbin.add_argument("--kind", choices=("lib", "dll"), default="lib")
+    dumpbin.add_argument("--sdk", default="261000")
     dumpbin.set_defaults(
         func=lambda args: write_document(
             args.json,
-            [module for path in args.inputs for module in collect_dumpbin(path, args.kind)],
+            [module for path in args.inputs for module in collect_dumpbin(path, args.kind, args.sdk)],
+            args.sdk,
         )
     )
 
     pe = sub.add_parser("scan-pe", help="read exports from a PE DLL")
     pe.add_argument("dlls", nargs="+")
     pe.add_argument("--json", required=True)
-    pe.set_defaults(func=lambda args: write_document(args.json, [scan_pe(path) for path in args.dlls]))
+    pe.add_argument("--sdk", default="261000")
+    pe.set_defaults(
+        func=lambda args: write_document(
+            args.json, [scan_pe(path, args.sdk) for path in args.dlls], args.sdk
+        )
+    )
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -576,7 +576,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {}, std:
     if (!provided && (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps)))) return;
     const HRESULT hr = provided && x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_ROOT_FAILURE") ? E_FAIL :
         x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
-        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), fixed_manifest);
+        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()), 0, fixed_manifest);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
         return;
@@ -3668,6 +3668,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     x2w_startup::SamplerSource source;
     u64 sampler_wrapper = 0;
     x2w_startup::ViewTable heap_records;
+    UINT heap_entries = 0;
     x2w_startup::ViewHeapSelection view_heaps;
     UINT bound_view_heaps = 0, visible_view_count = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
@@ -3678,12 +3679,12 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                     view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-                {
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                     ++bound_view_heaps;
                     visible_view_count = heap.desktop_gpu ? heap.logical_count : 0;
                     heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
                                                                    heap.increment, heap.desktop_gpu);
+                    if (heap_records.address) heap_entries = heap.logical_count;
                 }
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu) {
@@ -3704,6 +3705,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     pass.sampler_heap_wrapper = sampler_wrapper;
     pass.title_view_heap = heap_records;
     pass.mesh_heap_slots = bound_view_heaps == 1 && heap_records.address ? visible_view_count : 0;
+    pass.title_view_heap_entries = heap_entries;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).

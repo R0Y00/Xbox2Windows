@@ -892,8 +892,9 @@ static const char *view_kind_name(ComputeViewKind kind) {
         "buffer_srv", "typed_buffer_srv", "texture_srv", "texture_uav", "raw_vector_srv", "half_scalar_uav",
         "heap_stride_srv", "raw_buffer_uav", "typed_buffer_uav", "half_buffer_uav", "root_buffer_srv",
         "comparison_texture_srv", "half2_texture_uav", "half4_texture_uav", "cube_sample_srv", "cube_comparison_srv",
-        "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "heap_sampler",
-        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav"};
+        "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "packed_d16_x_uav",
+        "indexed_raw_srv", "heap_sampler", "uint_texture_uav", "float_texture_uav", "float2_texture_uav",
+        "float3_texture_uav"};
     const auto index = static_cast<size_t>(kind);
     return index < std::size(names) ? names[index] : "unknown";
 }
@@ -957,9 +958,15 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 b.kind == ComputeViewKind::byte_window_srv) {
                 srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
-            } else if (b.kind == ComputeViewKind::texture_srv && b.image_dimension == 1 && b.array_count == 1) {
-                srv_lines << "srv " << b.shader_register << " tex2d table " << b.root_parameter << ' ' << b.byte_offset
-                          << '\n';
+            } else if (b.kind == ComputeViewKind::texture_srv && b.array_count == 1 &&
+                       (b.image_dimension == 0 || b.image_dimension == 1 || b.image_dimension == 2 ||
+                        b.image_dimension == 5)) {
+                const char *tex = b.image_dimension == 0   ? "tex1d"
+                                  : b.image_dimension == 1 ? "tex2d"
+                                  : b.image_dimension == 2 ? "tex3d"
+                                                           : "tex2da";
+                srv_lines << "srv " << b.shader_register << ' ' << tex << " table " << b.root_parameter << ' '
+                          << b.byte_offset << '\n';
             } else {
                 return refuse(view_shape("SRV", b));
             }
@@ -969,6 +976,11 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             if (b.kind == ComputeViewKind::raw_buffer_uav) {
                 uav_lines << "uav " << b.shader_register << " table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
+            } else if ((b.kind == ComputeViewKind::packed_d16_x_uav && b.required_bytes == 2) ||
+                       (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
+                        (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8))) {
+                uav_lines << "uav " << b.shader_register << " bufhalf table " << b.root_parameter << ' '
+                          << b.byte_offset << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
                           << b.byte_offset << " channels 1\n";

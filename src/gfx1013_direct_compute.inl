@@ -44,6 +44,7 @@ struct DirectCompute {
     unsigned virtual_waves = 0;
     bool uses_exchange = false;
     bool wave64 = false;
+    bool narrow_wave64 = false;
     // The view class a GPU-selected heap slot is read as; see HeapViewContract.
     HeapViewContract heap_view = HeapViewContract::none;
     // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
@@ -229,8 +230,13 @@ struct DirectCompute {
             auto pair = exchange_halves(mask);
             write(dst, pair[0]);
             write(dst + 1, pair[1]);
-        } else
+        } else {
             write(dst, mask);
+            // V_CMPX replaces EXEC. A narrow guest wave64 has no upper
+            // lanes, even if a preceding scalar write set bits in EXEC_HI.
+            if (narrow_wave64 && dst == 126)
+                write(127, "0");
+        }
     }
     string pair_high(const Inst &i, unsigned src) {
         if (src <= 104 || src == 106 || src == 126) {
@@ -411,8 +417,7 @@ struct DirectCompute {
                          kind == ComputeViewKind::raw_vector_srv || kind == ComputeViewKind::byte_window_srv ||
                          kind == ComputeViewKind::indexed_atomic_uav || kind == ComputeViewKind::indexed_raw_srv;
         const bool half = kind == ComputeViewKind::half_buffer_uav;
-        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 :
-                               kind == ComputeViewKind::packed_d16_x_uav ? 1 : bytes / (half ? 2 : 4);
+        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 : bytes / (half ? 2 : 4);
         if (raw)
             ir.features |= 16;
         return ir.handle({unsigned(compute_uav(kind)), it->shader_register, raw ? 11u : 10u,
@@ -738,9 +743,7 @@ struct DirectCompute {
         unsigned n = raw ? widths[i.op & 3] : (i.op & 3) + 1, data = 256 + i.dst;
         if (i.dst + (half ? (n + 1) / 2 : n) > 256)
             refuse(i.pc, "direct buffer data overflow");
-        const bool packed_x = half && n == 1 && !graphics_input;
         auto kind = store ? (raw    ? ComputeViewKind::raw_buffer_uav
-                             : packed_x ? ComputeViewKind::packed_d16_x_uav
                              : half ? ComputeViewKind::half_buffer_uav
                                     : ComputeViewKind::typed_buffer_uav)
                     : raw && s.at(((i.b >> 16) & 31) * 4 + 1).type == Symbol::Type::zero_stride_word
@@ -817,22 +820,20 @@ struct DirectCompute {
             if (j < n || !raw) {
                 const unsigned component = (std::min)(j, n - 1);
                 value = read(data + (half ? component / 2 : component));
-                if (packed_x) {
-                    value = ir.binary("and", value, "65535");
-                } else if (half) {
+                if (half) {
                     if (component % 2)
                         value = ir.binary("lshr", value, "16");
                     value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", value}}, "nounwind readnone");
                 }
             }
-            args.emplace_back(half && !packed_x ? "float" : "i32", value);
+            args.emplace_back(half ? "float" : "i32", value);
         }
         args.emplace_back("i8", to_string(raw ? (1u << n) - 1 : 15));
         if (raw)
             args.emplace_back("i32", "4");
         ir.invoke("void",
                   raw    ? "rawBufferStore.i32"
-                  : half && !packed_x ? "bufferStore.f32"
+                  : half ? "bufferStore.f32"
                          : "bufferStore.i32",
                   raw ? 140 : 69, args, "nounwind");
         if (!graphics_input)
@@ -1544,7 +1545,7 @@ struct DirectCompute {
             if (i.enc != Encoding::Vop2 || i.wide || i.subword || i.dpp_control || permuted ||
                 i.abs || i.neg || i.clamp || i.scale)
                 refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
-        } else if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4)))) {
+        } else if (i.enc != Encoding::Mix || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4)))) {
             refuse(i.pc, "unsupported packed binary16 arithmetic encoding");
         }
         if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
@@ -1568,15 +1569,24 @@ struct DirectCompute {
                 return (negate & (1u << j)) ? ir.binary("xor", bits, "32768") : bits;
             };
             auto a = operand(0), b = operand(1);
-            if (fused)
-                return fused_half_rne(a, b, operand(2));
-            auto widen = [&](const string &bits) {
-                return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
-            };
-            const auto op = i.name == "v_pk_mul_f16" ? "fmul" : "fadd";
-            auto result = ir.value(string(op) + " float " + widen(a) + ", " + widen(b));
-            auto bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
-            return select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
+            string bits;
+            if (fused) {
+                bits = fused_half_rne(a, b, operand(2));
+            } else {
+                auto widen = [&](const string &half_bits) {
+                    return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", half_bits}}, "nounwind readnone");
+                };
+                const auto op = i.name == "v_pk_mul_f16" ? "fmul" : "fadd";
+                auto result = ir.value(string(op) + " float " + widen(a) + ", " + widen(b));
+                bits = packed_half_rne(ir.value("bitcast float " + result + " to i32"));
+                bits = select(cmp("ugt", ir.binary("and", bits, "32767"), "31744"), "32256", bits);
+            }
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", bits, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", bits, "32768"), "0"));
+                bits = select(low, "0", select(cmp("ugt", bits, "15359"), "15360", bits));
+            }
+            return bits;
         };
         // In VOP3P, NEG_HI occupies the ABS field and OP_SEL_HI[2] lives in word 0.
         // VOP2 v_pk_fmac_f16 runs low halves (pair 0) and high halves (pair 1) with no modifiers.
@@ -1690,7 +1700,9 @@ struct DirectCompute {
             if (i.subword || i.dpp_control || permuted || i.scale ||
                 (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[1] || i.src[2])))
                 refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
-            auto bits = ir.binary("and", operand32(i, i.src[0]), "65535");
+            const unsigned r = i.src[0];
+            auto bits = r >= 240 && r <= 248 ? to_string(inline_half_words[r - 240])
+                                             : ir.binary("and", operand32(i, r), "65535");
             if (i.abs & 1) bits = ir.binary("and", bits, "32767");
             if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
             auto sign = ir.binary("and", bits, "32768");
@@ -1871,16 +1883,18 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
             return true;
         }
-        if (n == "v_fract_f16") {
+        const bool fract = n == "v_fract_f16";
+        const bool cvt_norm = n == "v_cvt_norm_i16_f16" || n == "v_cvt_norm_u16_f16";
+        if (fract || cvt_norm) {
             if (i.enc != Encoding::Vop1 || i.subword || i.dpp_control || permuted)
-                refuse(i.pc, "unsupported v_fract_f16 encoding");
-            if (i.scale)
-                refuse(i.pc, "unsupported v_fract_f16 omod");
+                refuse(i.pc, "unsupported " + string(n) + " encoding");
+            if (fract ? i.scale : (i.clamp || i.scale))
+                refuse(i.pc, fract ? "unsupported v_fract_f16 omod" : ("unsupported " + string(n) + " clamp or omod"));
             const unsigned op_sel = i.wide ? ((i.a >> 11) & 15u) : 0u;
             if ((i.wide && (((i.abs | i.neg) & 6) || i.src[1] || i.src[2])) || (op_sel & 6u))
-                refuse(i.pc, "unsupported v_fract_f16 operand modifiers");
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
             if ((op_sel & 1u) && i.src[0] < 256)
-                refuse(i.pc, "unsupported v_fract_f16 high-half op_sel on non-VGPR source");
+                refuse(i.pc, "unsupported " + string(n) + " high-half op_sel on non-VGPR source");
             if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
                 refuse(i.pc, "unsupported binary16 rounding or denormal mode");
             const unsigned r = i.src[0];
@@ -1898,20 +1912,55 @@ struct DirectCompute {
             } else if (r <= 105 || (r >= 256 && r < 512)) {
                 bits = ir.binary("and", operand32(i, r), "65535");
             } else {
-                refuse(i.pc, "unsupported v_fract_f16 source");
+                refuse(i.pc, "unsupported " + string(n) + " source");
             }
             if (i.abs & 1u)
                 bits = ir.binary("and", bits, "32767");
             if (i.neg & 1u)
                 bits = ir.binary("xor", bits, "32768");
-            auto non_finite = cmp("uge", ir.binary("and", bits, "32767"), "31744");
-            auto a = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
-            auto fl = ir.invoke("float", "unary.f32", 27, {{"float", a}}, "nounwind readnone");
-            auto diff = ir.value("fsub float " + a + ", " + fl);
-            auto h = packed_half_rne(ir.value("bitcast float " + diff + " to i32"));
-            // Tiny negative fractions round x - floor(x) up to 1.0 (0x3c00); hardware clamps strictly below 1.0 (0x3bff).
-            auto finite = select(cmp("eq", h, "15360"), "15359", h);
-            auto result = select(non_finite, i.clamp ? "0" : "32256", finite);
+            string result;
+            if (fract) {
+                auto non_finite = cmp("uge", ir.binary("and", bits, "32767"), "31744");
+                auto a = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+                auto fl = ir.invoke("float", "unary.f32", 27, {{"float", a}}, "nounwind readnone");
+                auto diff = ir.value("fsub float " + a + ", " + fl);
+                auto h = packed_half_rne(ir.value("bitcast float " + diff + " to i32"));
+                // Tiny negative fractions round x - floor(x) up to 1.0 (0x3c00); hardware clamps strictly below 1.0 (0x3bff).
+                auto finite = select(cmp("eq", h, "15360"), "15359", h);
+                result = select(non_finite, i.clamp ? "0" : "32256", finite);
+            } else {
+                // Match tools/pixel_aot.py::f16_cvt_norm_result in exact 32-bit integer RNE arithmetic to avoid
+                // binary32 double-rounding (0x3801..0x3804 / 0xb801..0xb802) and preserve binary16 subnormals.
+                const bool signed_out = n == "v_cvt_norm_i16_f16";
+                auto sign = cmp("ne", ir.binary("and", bits, "32768"), "0");
+                auto mag = ir.binary("and", bits, "32767");
+                auto is_nan = cmp("ugt", mag, "31744");
+                auto is_zero = cmp("eq", mag, "0");
+                auto ge_one = cmp("uge", mag, "15360");
+                auto exp = ir.binary("lshr", mag, "10");
+                auto is_sub = cmp("eq", exp, "0");
+                auto mant = select(is_sub, mag, ir.binary("or", "1024", ir.binary("and", mag, "1023")));
+                // Keep shift in [1, 24] when mag >= 1.0 (exp >= 15); ge_one selects `scale` there anyway.
+                auto shift = select(is_sub, "24", select(cmp("ult", exp, "15"), ir.binary("sub", "25", exp), "1"));
+                const string scale = signed_out ? "32767" : "65535";
+                auto prod = ir.binary("mul", mant, scale);
+                auto q0 = ir.binary("lshr", prod, shift);
+                auto mid = ir.binary("shl", "1", ir.binary("sub", shift, "1"));
+                auto mask = ir.binary("sub", ir.binary("shl", "1", shift), "1");
+                auto rem = ir.binary("and", prod, mask);
+                auto tie_even = ir.value("and i1 " + cmp("eq", rem, mid) + ", " + cmp("ne", ir.binary("and", q0, "1"), "0"));
+                auto round_up = ir.value("or i1 " + cmp("ugt", rem, mid) + ", " + tie_even);
+                auto q_frac = ir.binary("add", q0, select(round_up, "1", "0"));
+                auto q_mag = select(ge_one, scale, q_frac);
+                if (signed_out) {
+                    auto neg_q = ir.binary("and", ir.binary("sub", "0", q_mag), "65535");
+                    auto signed_val = select(sign, neg_q, q_mag);
+                    result = select(ir.value("or i1 " + is_nan + ", " + is_zero), "0", signed_val);
+                } else {
+                    auto zero_out = ir.value("or i1 " + is_nan + ", " + ir.value("or i1 " + is_zero + ", " + sign));
+                    result = select(zero_out, "0", q_mag);
+                }
+            }
             auto dst_old = read(i.dst);
             auto packed_dst = (op_sel & 8u)
                 ? ir.binary("or", ir.binary("and", dst_old, "65535"), ir.binary("shl", result, "16"))
@@ -2029,6 +2078,108 @@ struct DirectCompute {
             auto low = pack(0), high = pack(1);
             auto result = ir.binary("or", low, ir.binary("shl", high, "16"));
             vector_write(i.dst, place_subword(i, result));
+            return true;
+        }
+        if (n == "v_cvt_pknorm_i16_f32" || n == "v_cvt_pknorm_u16_f32") {
+            if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted)
+                refuse(i.pc, "unsupported " + string(n) + " encoding");
+            if (i.clamp || i.scale)
+                refuse(i.pc, "unsupported " + string(n) + " clamp or omod");
+            if ((i.a & 0x7800) || ((i.abs | i.neg) & 4) || i.src[2])
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            const bool signed_out = n == "v_cvt_pknorm_i16_f32";
+            const unsigned k = signed_out ? 15u : 16u;
+            const string scale = signed_out ? "32767" : "65535";
+            const string lo_mask = signed_out ? "32767" : "65535";
+            auto cvt_lane = [&](unsigned j) {
+                auto bits = operand32(i, i.src[j]);
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "2147483648");
+                // Exact 32-bit integer RNE of clamp(|x|, 0, 1) * (2^k - 1) via m*(2^k - 1) split at bit k.
+                auto sign = cmp("ne", ir.binary("and", bits, "2147483648"), "0");
+                auto mag = ir.binary("and", bits, "2147483647");
+                auto is_nan = cmp("ugt", mag, "2139095040");
+                auto too_small = cmp("ult", mag, "922746880");
+                auto ge_one = cmp("uge", mag, "1065353216");
+                auto exp = ir.binary("lshr", mag, "23");
+                auto in_range = ir.value("and i1 " + cmp("uge", exp, "110") + ", " + cmp("ule", exp, "126"));
+                auto safe_exp = select(in_range, exp, "126");
+                auto s2 = ir.binary("sub", to_string(150u - k), safe_exp);
+                auto m = ir.binary("or", ir.binary("and", mag, "8388607"), "8388608");
+                auto m_hi = ir.binary("lshr", m, to_string(k));
+                auto m_lo = ir.binary("and", m, lo_mask);
+                auto borrow = select(cmp("ne", m_lo, "0"), "1", "0");
+                auto p_lo = ir.binary("and", ir.binary("sub", "0", m_lo), lo_mask);
+                auto p_hi = ir.binary("sub", ir.binary("sub", m, m_hi), borrow);
+                auto q0 = ir.binary("lshr", p_hi, s2);
+                auto mid_hi = ir.binary("shl", "1", ir.binary("sub", s2, "1"));
+                auto rem_mask = ir.binary("sub", ir.binary("shl", "1", s2), "1");
+                auto rem_hi = ir.binary("and", p_hi, rem_mask);
+                auto tie_or_above = ir.value("or i1 " + cmp("ne", p_lo, "0") + ", " +
+                                             cmp("ne", ir.binary("and", q0, "1"), "0"));
+                auto round_up = ir.value("or i1 " + cmp("ugt", rem_hi, mid_hi) + ", " +
+                                         ir.value("and i1 " + cmp("eq", rem_hi, mid_hi) + ", " + tie_or_above));
+                auto q_frac = ir.binary("add", q0, select(round_up, "1", "0"));
+                auto q_mag = select(too_small, "0", select(ge_one, scale, q_frac));
+                if (signed_out) {
+                    auto neg_q = ir.binary("and", ir.binary("sub", "0", q_mag), "65535");
+                    return select(is_nan, "0", select(sign, neg_q, q_mag));
+                }
+                return select(ir.value("or i1 " + is_nan + ", " + sign), "0", q_mag);
+            };
+            auto low = cvt_lane(0), high = cvt_lane(1);
+            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            return true;
+        }
+        if (n == "v_ldexp_f16") {
+            if (graphics_input)
+                return false;
+            if (i.subword || i.dpp_control || permuted || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 6) || i.src[2])))
+                refuse(i.pc, "unsupported v_ldexp_f16 operand modifiers");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto inline_s0 = i.src[0] >= 240 && i.src[0] <= 248 ? packed_f16_inline_constant(i.src[0]) : std::nullopt;
+            auto bits = inline_s0 ? to_string(*inline_s0) : ir.binary("and", operand32(i, i.src[0]), "65535");
+            if (i.abs & 1) bits = ir.binary("and", bits, "32767");
+            if (i.neg & 1) bits = ir.binary("xor", bits, "32768");
+            auto delta = ir.binary("ashr", ir.binary("shl", operand32(i, i.src[1]), "16"), "16");
+            auto sign = ir.binary("and", bits, "32768");
+            auto exponent = ir.binary("and", ir.binary("lshr", bits, "10"), "31");
+            auto mantissa = ir.binary("and", bits, "1023");
+            auto keep = ir.value("or i1 " + cmp("eq", exponent, "31") + ", " +
+                                 cmp("eq", ir.binary("and", bits, "32767"), "0"));
+            string x = mantissa, steps = "0";
+            for (unsigned k : {8u, 4u, 2u, 1u}) {
+                auto low = cmp("ult", x, to_string(1u << (11 - k)));
+                x = select(low, ir.binary("shl", x, to_string(k)), x);
+                steps = select(low, ir.binary("add", steps, to_string(k)), steps);
+            }
+            auto denormal = cmp("eq", exponent, "0");
+            mantissa = select(denormal, ir.binary("and", x, "1023"), mantissa);
+            auto e = select(denormal, ir.binary("sub", "1", steps), exponent);
+            delta = select(cmp("slt", delta, "-64"), "-64", select(cmp("sgt", delta, "64"), "64", delta));
+            e = ir.binary("add", e, delta);
+            auto normal = ir.binary("or", sign, ir.binary("or", ir.binary("shl", e, "10"), mantissa));
+            auto full = ir.binary("or", mantissa, "1024");
+            auto amount = select(cmp("sgt", e, "0"), "1", select(cmp("slt", e, "-10"), "11", ir.binary("sub", "1", e)));
+            auto half = ir.binary("shl", "1", ir.binary("sub", amount, "1"));
+            auto rest = ir.binary("and", full, ir.binary("sub", ir.binary("shl", half, "1"), "1"));
+            auto q = ir.binary("lshr", full, amount);
+            auto up = ir.value("or i1 " + cmp("ugt", rest, half) + ", " +
+                               ir.value("and i1 " + cmp("eq", rest, half) + ", " +
+                                        cmp("ne", ir.binary("and", q, "1"), "0")));
+            auto subnormal = ir.binary("or", sign, ir.binary("add", q, ir.value("zext i1 " + up + " to i32")));
+            string result = select(cmp("sgt", e, "0"), normal, select(cmp("slt", e, "-10"), sign, subnormal));
+            result = select(cmp("sgt", e, "30"), ir.binary("or", sign, "31744"), result);
+            result = select(keep, bits, result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
             return true;
         }
         if (binary16_alu(n) || binary16_unary(n)) {
@@ -2541,20 +2692,27 @@ struct DirectCompute {
                 // result and do not consume the incoming SCC. An explicit
                 // SRC_SCC operand still takes precedence below.
                 const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
-                    n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
+                    n == "s_xor_b64" || n == "s_orn2_b64" || n == "s_nand_b64" || n == "s_nor_b64" ||
+                    n == "s_xnor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
                     n == "s_quadmask_b32" || n == "s_quadmask_b64" ||
                     n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64" || n == "s_xor_saveexec_b64" ||
                     n == "s_andn2_saveexec_b64" || n == "s_orn2_saveexec_b64" ||
                     n == "s_nand_saveexec_b64" || n == "s_nor_saveexec_b64" || n == "s_xnor_saveexec_b64" ||
-                    n == "s_andn2_wrexec_b64";
+                    n == "s_andn1_saveexec_b64" || n == "s_orn1_saveexec_b64" ||
+                    n == "s_andn1_wrexec_b64" || n == "s_andn2_wrexec_b64";
                 const bool overwrites = mask_scc || n == "s_abs_i32" ||
                     n == "s_bcnt0_i32_b32" || n == "s_bcnt1_i32_b32" ||
                     n == "s_bcnt0_i32_b64" || n == "s_bcnt1_i32_b64" ||
                     inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
-                    n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
+                    n == "s_or_b32" || n == "s_max_u32" || n == "s_min_u32" || n == "s_min_i32" ||
+                    n == "s_max_i32" || n == "s_absdiff_i32" || n == "s_add_u32" || n == "s_sub_u32" ||
                     n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
-                    n == "s_or_saveexec_b32" || n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
-                    n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
+                    n == "s_or_saveexec_b32" || n == "s_xor_saveexec_b32" || n == "s_andn2_saveexec_b32" ||
+                    n == "s_orn2_saveexec_b32" || n == "s_nand_saveexec_b32" || n == "s_nor_saveexec_b32" ||
+                    n == "s_xnor_saveexec_b32" || n == "s_andn1_saveexec_b32" || n == "s_orn1_saveexec_b32" ||
+                    n == "s_andn1_wrexec_b32" || n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" ||
+                    n == "s_orn2_b32" || n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" ||
+                    n == "s_not_b32" ||
                     n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" ||
                     n == "s_lshl_b64" || n == "s_lshr_b64" || n == "s_ashr_i64" || n == "s_xor_b32" ||
                     n == "s_bfe_u64" || n == "s_bfe_i64" ||
@@ -2907,7 +3065,9 @@ struct DirectCompute {
             auto carry = add ? cmp("ult", result, a) : cmp("ult", a, b);
             if (n.find("_ci_") != n.npos) {
                 unsigned src = i.src[2];
-                if (src > 106) refuse(i.pc, "unsupported carry-in mask source");
+                // vcc_hi is a numeric wave32 mask in direct compute; translate_program refuses a guest wave64.
+                if (src > 107 || (src == 107 && (wave64 || graphics_input)))
+                    refuse(i.pc, "unsupported carry-in mask source");
                 string bit;
                 if (graphics_input) {
                     bit = cmp("ne",graphics_lane_mask(i,state,src,"unproven vertex carry-in mask"),"0");
@@ -3581,18 +3741,23 @@ struct DirectCompute {
             write(128, ir.value("zext i1 " + carry + " to i32"));
             return;
         }
-        if (compute && n == "s_bcnt1_i32_b64") {
-            const auto count = [&](const string &word) {
-                return ir.invoke("i32", "unaryBits.i32", 31, {{"i32", word}}, "nounwind readnone");
-            };
-            auto total = ir.binary("add", count(a), count(pair_high(i, i.src[0])));
-            write(i.dst, total);
-            write(128, ir.value("zext i1 " + cmp("ne", total, "0") + " to i32"));
-            return;
-        }
+        auto combine_scalar_mask = [&](Name op, const string &left, const string &right) -> string {
+            if (op == "and" || op == "or" || op == "xor")
+                return ir.binary(string(op), left, right);
+            if (op == "andn2" || op == "orn2")
+                return ir.binary(op == "andn2" ? "and" : "or", left, ir.binary("xor", right, "4294967295"));
+            if (op == "andn1" || op == "orn1")
+                return ir.binary(op == "andn1" ? "and" : "or", ir.binary("xor", left, "4294967295"), right);
+            if (op == "nand" || op == "nor" || op == "xnor")
+                return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right),
+                                 "4294967295");
+            return {};
+        };
         if ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) && n.size() > 6 && n.substr(n.size() - 4) == "_b64") {
             bool save = n.find("_saveexec_") != Name::npos;
-            const bool wrexec = compute && wave64 && n == "s_andn2_wrexec_b64";
+            const bool wrexec = compute &&
+                (((wave64 || narrow_wave64) && n == "s_andn2_wrexec_b64") ||
+                 (wave64 && n == "s_andn1_wrexec_b64"));
             auto op = n.substr(2, n.find('_', 2) - 2);
             if (wrexec ? ((i.dst | i.src[0]) & 1) || i.dst > 104 || i.src[0] > 104
                        : (i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
@@ -3601,32 +3766,34 @@ struct DirectCompute {
             auto ah = pair_high(i, i.src[0]);
             const bool updates_exec = save || wrexec;
             auto bl = updates_exec ? read(126) : b;
+            // The narrow model starts EXEC_HI at zero. Scalar code can
+            // explicitly write it, and later scalar instructions can read it.
             auto bh = updates_exec ? read(127) : pair_high(i, i.src[1]);
-            auto combine = [&](const string &left, const string &right) -> string {
-                if (op == "and" || op == "or" || op == "xor") return ir.binary(string(op), left, right);
-                if (op == "andn2" || op == "orn2")
-                    return ir.binary(op == "andn2" ? "and" : "or", left, ir.binary("xor", right, "4294967295"));
-                if (op == "nand" || op == "nor" || op == "xnor")
-                    return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right), "4294967295");
-                refuse(i.pc, "unsupported wave64 scalar mask operation");
-            };
             // SAVEEXEC and WREXEC combine the source with old EXEC in ISA operand order.
             // WREXEC stores the new mask in the destination pair.
-            auto lo = combine(a, bl), hi = combine(ah, bh);
+            auto lo = combine_scalar_mask(op, a, bl), hi = combine_scalar_mask(op, ah, bh);
+            if (lo.empty())
+                refuse(i.pc, "unsupported wave64 scalar mask operation");
             write(i.dst, save ? bl : lo);
             write(i.dst + 1, save ? bh : hi);
             if (updates_exec) { write(126, lo); write(127, hi); }
             write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
             return;
         }
-        const bool or_saveexec = n == "s_or_saveexec_b32" && compute && !wave64;
-        if (or_saveexec || n == "s_and_saveexec_b32" || n == "s_andn2_wrexec_b32") {
-            const bool save = n != "s_andn2_wrexec_b32";
-            if (or_saveexec && i.dst > 107)
+        const bool saveexec32 = i.enc == Encoding::Sop1 && n.size() > 13 && n.substr(n.size() - 13) == "_saveexec_b32";
+        const bool wrexec32 = n == "s_andn2_wrexec_b32" || (compute && !wave64 && n == "s_andn1_wrexec_b32");
+        if (n == "s_and_saveexec_b32" || n == "s_andn2_wrexec_b32" ||
+            (compute && !wave64 && (saveexec32 || wrexec32))) {
+            const bool save = saveexec32;
+            const bool strict_dst = n != "s_and_saveexec_b32" && n != "s_andn2_wrexec_b32";
+            if (strict_dst && i.dst > 107)
                 refuse(i.pc, "unsupported wave32 SAVEEXEC destination");
+            auto op = n.substr(2, n.find('_', 2) - 2);
             auto old = read(126);
             // Like s_mov_b32 exec_lo, EXEC keeps every bit; a lane runs only if its own bit is set.
-            auto mask = ir.binary(or_saveexec ? "or" : "and", a, save ? old : ir.binary("xor", old, "4294967295"));
+            auto mask = combine_scalar_mask(op, a, old);
+            if (mask.empty())
+                refuse(i.pc, "unsupported wave32 scalar mask operation");
             write(i.dst, save ? old : mask);
             write(126, mask);
             write(128, ir.value("zext i1 " + cmp("ne", mask, "0") + " to i32"));
@@ -3718,7 +3885,8 @@ struct DirectCompute {
             return;
         }
         if (n == "v_cndmask_b32") {
-            if (!wave64 && i.src[2] == 107)
+            // In direct compute s107 holds numeric data; translate_program refuses a guest wave64 here.
+            if (!wave64 && i.src[2] == 107 && graphics_input)
                 refuse(i.pc, "unsupported wave32 conditional mask source");
             z = select(cmp("ne", ir.binary("and", wave64 ? select(upper_half, pair_high(i, i.src[2]), val(2)) : val(2), lane_bit), "0"), b, a);
         } else if (n == "v_mov_b32")
@@ -4313,7 +4481,10 @@ struct DirectCompute {
             op.name == "v_fmac_f16" ||
             op.name == "v_fmamk_f16" ||
             op.name == "v_fmaak_f16" ||
-            op.name == "v_fract_f16")
+            op.name == "v_fract_f16" ||
+            op.name == "v_ldexp_f16" ||
+            op.name == "v_cvt_norm_i16_f16" ||
+            op.name == "v_cvt_norm_u16_f16")
                 half_binary = true;
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
