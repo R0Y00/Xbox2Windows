@@ -806,6 +806,11 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                                                            : "tex2da";
                 srv_lines << "srv " << b.shader_register << ' ' << tex << " table " << b.root_parameter << ' '
                           << b.byte_offset << '\n';
+            } else if (b.kind == ComputeViewKind::cube_sample_srv && b.array_count == 1 && b.image_dimension == 3) {
+                // The program declares a TextureCubeArray (resource kind 9); the runtime binds the title's cube view
+                // as a one-cube array. `texcube` keeps its draw meaning (TextureCube).
+                srv_lines << "srv " << b.shader_register << " texcubearr table " << b.root_parameter << ' '
+                          << b.byte_offset << '\n';
             } else {
                 return refuse(view_shape("SRV", b));
             }
