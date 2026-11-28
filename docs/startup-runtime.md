@@ -1307,6 +1307,21 @@ the stop. The report copies only the 32-bit exception code and whether it was fi
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+`tools/startup/refusal_census.py --cache <X2W_SHADER_CACHE dir> --log <stderr> [--log ...]` ranks the
+refused shader keys of a run by their blocked weight. Each `<key>.fail` contributes its first line.
+The weight uses the largest logged failure count for the key. A `compute census key` line counts
+dispatches minus translated dispatches, with a minimum of zero. Older lines without a translated count
+use total dispatches. The tool also counts `no RTV translation` and `ExecuteIndirect` refusal lines and
+uses not-drawn counts when available. Per-key use totals provide a fallback. An unmentioned key has
+weight 0 for lack of recorded evidence. Logs can be sampled or truncated.
+Classes use the `triage_run.py` shader categories or the first refusal with registers, numbers and
+addresses replaced by `R`, `N` and `H`. Use `--shareable` to keep only the fixed categories.
+The tool writes Markdown (stdout or `--out-md`) and TSV (`--out-tsv`). Each format has a separate
+section for runtime indirect-draw refusals. It reports the largest cumulative call count across the
+logs for each key and reason, including keys without a `.fail` file. It omits the unattributed zero key.
+Check with
+`python3 -B tests/startup_refusal_census_check.py` (ctest `startup_refusal_census`).
+
 `tools/startup/exit_report.py` is a narrower reader for the same directory when the question is only how the
 process ended. It reports the `EXIT_PROCESS` code, one of six fixed end-state labels, the last present/frame
 sample and the last presented surface. It does not copy module names, paths or addresses. Check with
