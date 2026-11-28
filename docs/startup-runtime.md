@@ -47,15 +47,13 @@ controls for other barrier types, flagged barriers, invalid resources and arrays
 
 ## Occlusion queries
 
-Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
-(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
-the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
-implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
-`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
-diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
-no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
-end at Close, not the numbering.
+The GXDK 261000 `ID3D12GraphicsCommandList8` table confirms `BeginQuery`, `EndQuery` and
+`ResolveQueryData` at command-list slots 28 to 30, and `SetPredication` at 31. Slots 32 to 55
+are the desktop slots 28 to 51 plus four; slots 56 to 58 are `SetMarker`, `BeginEvent` and
+`EndEvent`, and `ExecuteIndirect` is 61. The query bindings stay a diagnostic opt-in: only with
+`X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay no-ops
+as before. The fixture below calls those slots directly, so it checks the forwarding, the
+refusals and the end at Close, not the numbering.
 
 The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
 binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
@@ -76,7 +74,7 @@ the console `Map`. It then checks that the refused calls, among them resolves ov
 with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
 error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
-`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
+Slots 56 to 58 are the desktop marker methods, not query methods.
 
 ## Depth target on translated draws
 
