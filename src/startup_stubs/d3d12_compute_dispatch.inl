@@ -4,7 +4,8 @@
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
 // outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
-// (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
+// (`srv <i> <tex1d|tex2d|tex2da|tex3d> table <param> <byte>` inputs,
+// `uav <i> <dimension> <float|half> table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39, or from the descriptor a buffer input or output is
 // bound from: its stride and word 3 (`stride`, `descword3`), and word 3, the upper half of word 1 and the record
@@ -37,6 +38,7 @@ struct ComputeTranslation {
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
         bool root = false;
         bool atomic_uint_texture = false;
+        bool narrow_half_texture = false;
         unsigned channels = 4;
         D3D12_SRV_DIMENSION srv_dimension = D3D12_SRV_DIMENSION_UNKNOWN;
         unsigned half_buffer_bytes = 0;
@@ -226,6 +228,13 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
             tr.uavs.back().uav_dimension = uav_dimension();
             tr.uavs.back().channels = x;
+        }
+        else if (std::sscanf(line.c_str(), "uav %u %15s half table %d %d channels %u%n", &i, name, &a, &b, &x, &used) == 5 &&
+                 whole() && i == tr.uavs.size() && (x == 1 || x == 2) && uav_dimension() != D3D12_UAV_DIMENSION_UNKNOWN) {
+            tr.uavs.push_back({a, b, true});
+            tr.uavs.back().uav_dimension = uav_dimension();
+            tr.uavs.back().channels = x;
+            tr.uavs.back().narrow_half_texture = true;
         }
         else if (std::sscanf(line.c_str(), "srv %u %15s table %d %d%n", &i, name, &a, &b, &used) == 4 && whole() &&
                  i == tr.srvs.size() && srv_dimension() != D3D12_SRV_DIMENSION_UNKNOWN) {
@@ -622,15 +631,25 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             if (!reason && slot.atomic_uint_texture && format != DXGI_FORMAT_R32_UINT)
                 reason = "an image atomic requires an R32_UINT UAV";
             if (!reason && slot.channels < 4) {
-                if (float_output_channels(format) != slot.channels || float_output_channels(resource.Format) != slot.channels)
+                auto store_format = resource.Format;
+                if (slot.narrow_half_texture) {
+                    const auto kind = slot.channels == 1 ? x2w::ComputeViewKind::half_scalar_uav
+                                                        : x2w::ComputeViewKind::half2_texture_uav;
+                    const auto half = x2w::native_half_store_format(kind);
+                    if (!half.accepts(format, resource.Format))
+                        reason = "a D16 image store requires a matching half-float UAV and resource";
+                    store_format = half.typed;
+                } else if (float_output_channels(format) != slot.channels ||
+                           float_output_channels(resource.Format) != slot.channels) {
                     reason = "an exact-width image store requires a matching output texture channel count";
-                else {
-                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{resource.Format};
+                }
+                if (!reason) {
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{store_format};
                     if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
                                                                          sizeof(support))) ||
                         !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
                         reason = "an exact-width image store requires typed UAV store support";
-                    desc.Format = resource.Format;
+                    desc.Format = store_format;
                 }
             }
             if (!reason && !slot.atomic_uint_texture && !float_output_channels(format))
