@@ -260,6 +260,16 @@ bool translate_compute_natively(ComputeTranslation& tr)
         for (const auto& block : program.constants)
             for (unsigned word = 0; word < block.count; ++word)
                 tr.uds.push_back({static_cast<int>(block.root_parameter), static_cast<int>(word)});
+        for (unsigned srv : program.stride_srvs) {
+            const bool present = std::any_of(program.bindings.begin(), program.bindings.end(), [srv](const auto& view) {
+                return view.kind == x2w::ComputeViewKind::raw_vector_srv && view.shader_register == srv;
+            });
+            if (!present) throw std::runtime_error("descriptor stride source is not a bound SRV");
+            ComputeTranslation::Slot slot{};
+            slot.a = static_cast<int>(srv);
+            slot.source = ComputeTranslation::input_stride;
+            tr.uds.push_back(slot);
+        }
         std::sort(program.bindings.begin(), program.bindings.end(),
                   [](const auto& a, const auto& b) { return a.shader_register < b.shader_register; });
         for (const auto& view : program.bindings) {

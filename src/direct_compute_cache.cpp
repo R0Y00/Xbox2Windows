@@ -100,6 +100,9 @@ Bytes encode(const NativeComputeShader &program) {
         for (unsigned n : {c.root_parameter, c.first_sgpr, c.count})
             word(out, n);
     word(out, program.sampler_heap);
+    word(out, static_cast<unsigned>(program.stride_srvs.size()));
+    for (unsigned srv : program.stride_srvs)
+        word(out, srv);
     word(out, static_cast<uint32_t>(program.samplers.size()));
     for (const auto &s : program.samplers) {
         for (auto n : s.words)
@@ -149,6 +152,9 @@ NativeComputeShader decode(std::string_view bytes) {
         shader.constants.push_back(c);
     }
     shader.sampler_heap = in.count(1) != 0;
+    n = in.count(32);
+    for (unsigned j = 0; j < n; ++j)
+        shader.stride_srvs.push_back(in.count(31));
     n = in.count(2048);
     for (unsigned j = 0; j < n; ++j) {
         ComputeSampler sampler{};
@@ -346,7 +352,7 @@ NativeComputeShader cached_compute_ir(const fs::path &cache, const Bytes &key, b
     return program;
 }
 Bytes pack_version(unsigned entry) {
-    Bytes version = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6/prepared-1";
+    Bytes version = X2W_NATIVE_SHADER_REVISION "/slot67/cs_6_6/prepared-2";
     word(version, entry);
     return shader_digest(version);
 }
@@ -889,6 +895,7 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             return std::nullopt;
         ud_count += block.count;
     }
+    ud_count += static_cast<unsigned>(program.stride_srvs.size());
     if (ud_count > 32)
         return std::nullopt;
 
@@ -957,6 +964,12 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
     for (const auto &block : program.constants)
         for (unsigned j = 0; j < block.count; ++j)
             out << "udsrc " << ud_index++ << " rootconst " << block.root_parameter << ' ' << j << '\n';
+    for (unsigned srv : program.stride_srvs) {
+        if (srv >= srv_count || sorted[srv].kind != ComputeViewKind::raw_vector_srv ||
+            sorted[srv].array_count != 1)
+            return std::nullopt;
+        out << "udsrc " << ud_index++ << " stride " << srv << '\n';
+    }
     out << srv_lines.str() << uav_lines.str() << sampler_lines.str();
     return out.str();
 }
