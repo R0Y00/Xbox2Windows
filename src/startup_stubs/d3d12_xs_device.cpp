@@ -5219,6 +5219,26 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     if (default_view) args[desc_index] = 0;
+    // CreateSampler: a description outside the D3D12_SAMPLER_DESC ranges is repaired on a copy (sampler_desc_check.h).
+    D3D12_SAMPLER_DESC repaired_sampler{};
+    if constexpr (N == 22) {
+        const auto* sampler = reinterpret_cast<const D3D12_SAMPLER_DESC*>(args[0]);
+        if (!sampler || !x2w_local::readable(sampler, sizeof(*sampler))) {
+            static LONG unreadable;
+            if (first_calls(unreadable, 8)) log("x2w-d3d12 sampler refused: unreadable description");
+            return 0;
+        }
+        std::memcpy(&repaired_sampler, sampler, sizeof(repaired_sampler));
+        const unsigned repairs = x2w_startup::sanitize_sampler(repaired_sampler);
+        if (repairs) {
+            static LONG counts[7];
+            static constexpr const char* names[] = {"filter", "anisotropy", "lod", "bias", "comparison", "address", "border"};
+            for (unsigned i = 0; i < 7; ++i)
+                if ((repairs & (1u << i)) && first_calls(counts[i], 8))
+                    log("x2w-d3d12 sampler repaired: %s", names[i]);
+            args[0] = reinterpret_cast<u64>(&repaired_sampler);
+        }
+    }
     const LONG removed_before = removal_reported;
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     // A desktop view creation returns void, so the only failure it reports is a removed device. Only a created view
