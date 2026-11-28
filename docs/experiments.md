@@ -16075,6 +16075,51 @@ scalar counter work on the staying path, outside this proof. Run
 `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
 `binary llvm-mc-15` to reassemble the fixture.
 
+### Accumulated lane mask live at a compute exit (#2645 T4)
+
+The 132-byte gfx1013 fixture `ACCUM_*` in `tests/startup_gfx2hlsl_compute_check.py` is the
+straight exit above with `s_and_b32 s25, s25, exec_lo` and `s_or_b32 s26, s26, s25` between
+the staying remask and the scalar run. `s25` is an entry copy of EXEC and `s26` starts at 0.
+The exit branch jumps over the pair. A lane that leaves skips it; the wave runs it with that
+lane's exec bit clear, so the lane's own bit of `s26` is unchanged. `s25` is not lane-kept for
+that lane, and it is dead at the exit. After EXEC is restored, `v_cndmask_b32` reads `s26` per
+lane. In an eight-lane group the staying remask is bits 3–7, so those lanes store 1 and lanes
+0–2 store 9. The wave and singleton traces both produce `[9, 9, 9, 1, 1, 1, 1, 1]`. With three
+threads every lane leaves, the wave skips the pair, and both traces produce `[9, 9, 9]`.
+
+Three controls stay `branch out of the block` and the traces disagree: a `v_mov` of the whole
+`s26` word (wave 248, singletons `[0, 0, 0, 8, 16, 32, 64, 128]`), an `s_or` of the saved entry
+mask instead of the exec-masked word (lane 0 is 1 in the wave and 9 in the model), and a
+per-lane read of `s25` (lane 0 is 9 in the wave and 1 in the model). With the accumulation
+pass removed, the accepted words are refused as `branch out of the block` again.
+
+`s_and_b32 s27, s26, exec_lo` after the restore writes s27's lane bit and sets SCC from the
+whole word. `ACCUM_AND_*` overwrites that SCC with `s_cmp_eq_u32 s4, s4` before any read and
+then selects with `v_cndmask_b32` on s27. The traces stay `[9, 9, 9, 1, 1, 1, 1, 1]`.
+`ACCUM_SCC_*` reads the SCC with `s_cselect_b32 s28, 1, 0` and stores s28. The wave word is
+nonzero, so every lane stores 1. A leaving lane's singleton stores 0. That program stays
+`branch out of the block`. With the dead-SCC check removed it translates, so the refusal
+depends on the check.
+
+`ACCUM_KEPT_*` reads s26 per lane, clears s26, then reads s25 with `v_cndmask_b32`. s25 is
+still live at the exit. The wave cleared a leaving lane's bit and the model kept it, so lane 0
+is 9 in the wave and 1 in the model. Dropping the "sA dead at the exit" test accepts these
+words. `ACCUM_SAVEEXEC_*` is `s_and_saveexec_b32 s28, s26`, a restore of that saved EXEC, and
+`s_cselect_b32` of the SCC. The traces are the same 1-versus-0 split as `ACCUM_SCC_*`. A
+dead-SCC check that looks only at `s_and_b32` accepts it.
+
+The counted
+loop keeps its backward-latch diagnostic. This fixture does not translate that loop: the latch
+and the second saved mask are still refused. Run
+`python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
+`binary llvm-mc-15` to reassemble the fixture. None of these programs is a dispatch case, so a
+ctest filter that only runs the compute dispatches does not exercise them. The host controls
+on the Windows test PC are:
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_compute_controls$'
+```
+
 ### Startup compute formatted buffer reads
 
 The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
