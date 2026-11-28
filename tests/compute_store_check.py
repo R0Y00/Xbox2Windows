@@ -376,6 +376,7 @@ def controls():
     sub_co_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    ldexp_f32_controls()
     bfe_controls()
     vadd_nc_i32_controls()
     cvt_u32_f32_controls()
@@ -2978,6 +2979,244 @@ def vcmp_select_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"{op}\n" for op in sorted(opcodes)), encoding="utf-8")
+    return 0
+
+
+LDEXP_F32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, -3",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_and_b32_e32 v8, 1, v3",
+    "v_lshlrev_b32_e32 v9, 31, v8",
+    "v_and_b32_e32 v10, 0x1e, v3",
+    "v_lshlrev_b32_e32 v10, 18, v10",
+    "v_or_b32_e32 v10, 0x3fc00000, v10",
+    "v_or_b32_e32 v10, v9, v10",
+    "v_or_b32_e32 v10, v8, v10",
+    "v_add_nc_u32_e32 v11, -20, v3",
+    "v_mul_lo_u32 v11, 10, v11",
+    "v_ldexp_f32 v4, v10, v11",
+    "v_add_nc_u32_e32 v12, 1, v3",
+    "v_lshlrev_b32_e32 v12, 16, v12",
+    "v_or_b32_e32 v12, v9, v12",
+    "v_ldexp_f32 v5, v12, s4",
+    "v_lshrrev_b32_e32 v13, 1, v3",
+    "v_and_b32_e32 v13, 1, v13",
+    "v_sub_nc_u32_e32 v13, 0, v13",
+    "v_lshrrev_b32_e32 v14, 2, v3",
+    "v_and_b32_e32 v14, 1, v14",
+    "v_lshlrev_b32_e32 v14, 22, v14",
+    "v_or_b32_e32 v14, 0x7f800000, v14",
+    "v_lshrrev_b32_e32 v15, 3, v3",
+    "v_and_b32_e32 v15, 1, v15",
+    "v_add_nc_u32_e32 v16, 1, v3",
+    "v_mul_lo_u32 v15, v15, v16",
+    "v_or_b32_e32 v14, v14, v15",
+    "v_and_b32_e32 v14, v13, v14",
+    "v_or_b32_e32 v13, v9, v14",
+    "v_add_nc_u32_e32 v14, 0x7fffffff, v8",
+    "v_ldexp_f32 v6, v13, v14",
+    "v_or_b32_e32 v15, 0x00800000, v8",
+    "v_lshrrev_b32_e32 v16, 1, v3",
+    "v_add_nc_u32_e32 v16, -26, v16",
+    "v_lshrrev_b32_e32 v17, 5, v3",
+    "v_mul_lo_u32 v17, 0x7ffffffb, v17",
+    "v_add_nc_u32_e32 v16, v16, v17",
+    "v_ldexp_f32 v7, v15, v16",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+LDEXP_F32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, f32_mode="ieee-rne-denorm")
+
+
+def ldexp_f32_word(a, b, *, clamp_exp=True, flush_subnormal=False, quiet_snan=True, norm_denormal=True, ftz=False):
+    """Independent RDNA2 V_LDEXP_F32 model on 32-bit unsigned words: S0.f32 * 2^S1.i32."""
+    a &= 0xffffffff
+    b &= 0xffffffff
+    sign = a & 0x80000000
+    exp = (a >> 23) & 0xff
+    mant = a & 0x7fffff
+    if exp == 0xff:
+        if mant:
+            return (a | 0x00400000) if quiet_snan else a
+        return a
+    if exp == 0 and (mant == 0 or ftz):
+        return sign if ftz else a
+    delta = b - 0x100000000 if b & 0x80000000 else b
+    if exp == 0:
+        if norm_denormal:
+            shift = 24 - mant.bit_length()
+            mant = (mant << shift) & 0x7fffff
+            e = 1 - shift
+        else:
+            e = 0
+    else:
+        e = exp
+    if clamp_exp:
+        delta = max(-512, min(512, delta))
+        e += delta
+    else:
+        e = ((e + delta + 0x80000000) & 0xffffffff) - 0x80000000
+    if e >= 255:
+        return sign | 0x7f800000
+    if e <= 0:
+        if ftz or flush_subnormal or e < -23:
+            return sign
+        full = mant | 0x800000
+        shift = 1 - e
+        half_bit = 1 << (shift - 1)
+        mask = (1 << shift) - 1
+        rem = full & mask
+        q = full >> shift
+        if rem > half_bit or (rem == half_bit and (q & 1)):
+            q += 1
+        return sign | q
+    return sign | (e << 23) | mant
+
+
+def ldexp_f32_words(**model_opts):
+    """Expected 320-word readback for LDEXP_F32."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        bit0 = flat & 1
+        sign = bit0 << 31
+        w0_a = sign | ((flat & 0x1e) << 18) | 0x3fc00000 | bit0
+        w0_b = (((flat - 20) & 0xffffffff) * 10) & 0xffffffff
+        w1_a = sign | (((flat + 1) & 0xffffffff) << 16)
+        w1_b = 0xfffffffd
+        is_special = -((flat >> 1) & 1) & 0xffffffff
+        payload = ((flat >> 3) & 1) * (flat + 1)
+        w2_a = sign | (is_special & (0x7f800000 | (((flat >> 2) & 1) << 22) | payload))
+        w2_b = (0x7fffffff + bit0) & 0xffffffff
+        w3_a = 0x00800000 | bit0
+        w3_b = (((flat >> 1) - 26) + (flat >> 5) * 0x7ffffffb) & 0xffffffff
+        base = flat * 4
+        words[base] = ldexp_f32_word(w0_a, w0_b, **model_opts)
+        words[base + 1] = ldexp_f32_word(w1_a, w1_b, **model_opts)
+        words[base + 2] = ldexp_f32_word(w2_a, w2_b, **model_opts)
+        words[base + 3] = ldexp_f32_word(w3_a, w3_b, **model_opts)
+    return words
+
+
+def ldexp_f32_controls():
+    """v_ldexp_f32: exact output, helper emission, and one rejection per assumption."""
+    lines = aot.lower(LDEXP_F32, 64, **LDEXP_F32_BINDING).splitlines()
+    assert any(line.startswith("uint f32_ldexp(uint a, uint b)") for line in lines), lines
+    assert lines[-2].startswith("    outputData.Store4(tid.x * 16u + 0u, uint4(f32_ldexp("), lines
+    no_f32_mode = dict(LDEXP_F32_BINDING)
+    del no_f32_mode["f32_mode"]
+    rejects("v_ldexp_f32 requires a declared f32 mode", aot.lower, LDEXP_F32, 64, **no_f32_mode)
+    rejects("Unsupported f32 mode", aot.lower, LDEXP_F32, 64, **(LDEXP_F32_BINDING | {"f32_mode": "ieee-rne-ftz"}))
+    # Accepted constant/register forms: inline float, 0, hex literal, SGPR, negative inline int.
+    for s0, s1, exp0, exp1 in (
+            ("1.0", "v11", "0x3f800000u", None),
+            ("0x40490fdb", "s4", "0x40490fdbu", "0xfffffffdu"),
+            ("0", "-3", "0x00000000u", "0xfffffffdu"),
+            ("s4", "512", "0xfffffffdu", "0x00000200u")):
+        prog = variant(LDEXP_F32, ("v_ldexp_f32 v4, v10, v11", f"v_ldexp_f32 v4, {s0}, {s1}"))
+        # Use a valid float SGPR for ("s4", "512") by loading 2.0 into s4.
+        if s0 == "s4":
+            prog = variant(prog, ("s_mov_b32 s4, -3", "s_mov_b32 s4, 0x40000000\ns_mov_b32 s5, -3"),
+                           ("v_ldexp_f32 v5, v12, s4", "v_ldexp_f32 v5, v12, s5"))
+            exp0 = "0x40000000u"
+        out = aot.lower(prog, 64, **LDEXP_F32_BINDING).splitlines()
+        needle = f"f32_ldexp({exp0}, {exp1})" if exp1 is not None else f"f32_ldexp({exp0}, "
+        assert needle in out[-2], (s0, s1, out[-2])
+    unsupported, bad_float, bad_alu = "Unsupported compute instruction: ", "Unverified float operand", "Unverified ALU operand"
+    for message, changes in (
+            # Other spelling, output modifiers, input modifiers, register range, and float literal in S1.
+            (unsupported + "v_ldexp_f32_e64", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32_e64 v4, v10, v11"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, v11 clamp"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, v11 mul:2"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, -v10, v11"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, |v10|, v11"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, -v11"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, |v11|"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v[10:11], v11"),)),
+            (unsupported + "v_ldexp_f32", (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, 1.0"),)),
+            # Unknown or pending S0, non-finite/denormal S0 constant, and invalid destination.
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v40, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, s30, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, s12, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, 0x7fc00000, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, 0xff800000, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, 0x00000001, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, -1, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, 5, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, 1.5, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "s_mov_b32 s5, 0x00400000\nv_ldexp_f32 v4, s5, v11"),)),
+            (bad_float, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v256, v10, v11"),)),
+            # Unknown, pending, or out-of-range S1.
+            (bad_alu, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, v40"),)),
+            (bad_alu, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, s30"),)),
+            (bad_alu, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, s12"),)),
+            (bad_alu, (("v_ldexp_f32 v4, v10, v11", "v_ldexp_f32 v4, v10, 0x100000000"),)),
+            ("ALU expression too large", (("v_ldexp_f32 v4, v10, v11",
+                                           "v_ldexp_f32 v4, v10, v11" + "\nv_ldexp_f32 v4, v4, 1" * 40),)),
+    ):
+        rejects(message, aot.lower, variant(LDEXP_F32, *changes), 64, **LDEXP_F32_BINDING)
+
+
+def ldexp_f32_binary(directory, assembler, objcopy, library):
+    """The assembled LDEXP_F32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, LDEXP_F32), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_ldexp_f32")] == [
+        line for line in LDEXP_F32 if line.startswith("v_ldexp_f32")], decoded
+    assert aot.lower(decoded, 64, **LDEXP_F32_BINDING) == aot.lower(LDEXP_F32, 64, **LDEXP_F32_BINDING)
+
+
+def ldexp_f32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("ldexp_f32.hlsl", "ldexp_f32.cso", "ldexp_f32.case")]
+    source = aot.lower(LDEXP_F32, 64, **LDEXP_F32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = ldexp_f32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    ftz_expected = ldexp_f32_words(ftz=True)
+    # Non-folded per-lane discriminators: denormal input (word 1) and normal input underflowing to denormal (word 20).
+    assert expected[1] != ftz_expected[1] and expected[20] != ftz_expected[20], (
+        expected[1], ftz_expected[1], expected[20], ftz_expected[20])
+    for label, reference, word in (
+            ("no exponent clamp", ldexp_f32_words(clamp_exp=False), 243),
+            ("ftz model", ftz_expected, 1),
+            ("flush subnormals", ldexp_f32_words(flush_subnormal=True), 1),
+            ("sNaN not quieted", ldexp_f32_words(quiet_snan=False), 42),
+            ("no denormal input normalization", ldexp_f32_words(norm_denormal=False), 1),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"ldexp_f32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("narrow exponent clamp", source.replace("clamp(asint(b), -512, 512)", "clamp(asint(b), -100, 100)")),
+            ("ftz", source.replace("if (exp == 0u) {", "if (exp == 0u) return sign;\n    if (false) {").replace(
+                "return sign | q;", "return sign;")),
+            ("flush subnormals", source.replace("return sign | q;", "return sign;")),
+            ("sNaN not quieted", source.replace("(a | 0x00400000u)", "a")),
+            ("no denormal input normalization", source.replace("if (exp == 0u) {", "if (false) {"))):
+        if mutated == source:
+            raise AssertionError(f"ldexp_f32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"ldexp_f32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in LDEXP_F32 if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -6668,6 +6907,7 @@ def binary(directory, assembler, objcopy, library):
     sub_co_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    ldexp_f32_binary(directory, assembler, objcopy, library)
     bfe_binary(directory, assembler, objcopy, library)
     vadd_nc_i32_binary(directory, assembler, objcopy, library)
     cvt_u32_f32_binary(directory, assembler, objcopy, library)
@@ -10052,6 +10292,7 @@ if __name__ == "__main__":
                  "draw-add-co": add_co_draw,
                  "draw-sub-co": sub_co_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-ldexp_f32": ldexp_f32_draw,
                  "draw-bfe": bfe_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
