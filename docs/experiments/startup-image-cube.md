@@ -35,8 +35,9 @@ The translator emits a helper `x2w_cube_dir(s, t, face)` that rebuilds a directi
 - A cube-array view is not recognisable from the instruction (gfx10 MIMG has no array bit; the descriptor sets
   the dimension). The helper keeps the face bits of the id (`id & 7`) and samples layer 0 of a `TextureCube`,
   which is wrong for a later layer of a cube array.
-- A face id of 6 or 7 maps to face 5, a negative, NaN or huge id to face 0, and `s` or `t` outside [1, 2] are
-  clamped to the face edge. Mesa does not produce these for a finite non-zero direction; none of them is measured.
+- A face id of 6 or 7 maps to face 5, a negative, NaN or huge id to face 0, and `s` or `t` outside `[1, 2]` are
+  assumed to clamp to `[-1, 1]` on the face edge. Mesa does not produce these for a finite non-zero direction;
+  clamping outside `[1, 2]` is not tested and none of these out-of-range inputs is measured.
 - The implicit-LOD and bias forms take the desktop derivatives of the rebuilt direction. Inside one face these
   follow the guest's face coordinates; a quad that straddles a face edge can choose another level.
 - Heap and register samplers are not read at translation, so their `DISABLE_CUBE_WRAP` bit is not validated (a set
@@ -47,28 +48,30 @@ The translator emits a helper `x2w_cube_dir(s, t, face)` that rebuilds a directi
 ## Fixture
 
 `tests/startup_image_cube_check.py` (controls, `binary <llvm-mc>`, `draw <dxc> <offscreen_check> <warp|hardware>`).
-`offscreen_check --startup-image-cube` binds six 2x2 R32G32B32A32_FLOAT faces as a TextureCube whose texel (x, y)
-of face f holds ((1 + x + 2y + 4f) / 32, x, y, f). The sampler is the all-zero inline sampler (point, wrap), and
-every `s` and `t` is a texel centre.
+`offscreen_check --startup-image-cube` binds six 4x4 R32G32B32A32_FLOAT faces as a TextureCube whose texel (x, y)
+of face f holds ((1 + x + 4y + 16f) / 128, x, y, f). The sampler is the all-zero inline sampler (point, wrap), and
+every `s` and `t` is a texel centre (in `{1.125, 1.375, 1.625, 1.875}`).
 
-- Seven programs set `(s, t, face)` as constants, without `v_cube*`, so the reference is only the address meaning
-  (texel x = 0 below `s = 1.5`, else 1, the same for `t`). The desktop driver picks the face of the rebuilt
-  direction itself, so a wrong face, sign or axis in the helper reads another texel. Every face has a case whose
-  texel has x != y.
+- Seven programs set `(s, t, face)` as constants (`1.125` or `1.875`), without `v_cube*`, so the reference is only the
+  address meaning (`x = floor(4 * (s - 1))`, `y = floor(4 * (t - 1))`). The desktop driver picks the face of the
+  rebuilt direction itself, so a wrong face, sign, axis or `2.0 * (s - 1.5)` / `2.0 * (t - 1.5)` scale in the helper
+  reads another texel. Every face has a case whose texel has x != y.
 - `image_sample`, `image_sample_l` and `image_sample_b` each draw one case.
 - Controls: the face one higher and `s`, `t` exchanged must read those texels; `image_sample_l` and
   `image_sample_b` with the face in the LOD or bias dword must read face 0.
-- Thirteen translator mutants edit the emitted helper (for each face the sign of the `u` term flipped, `u` and `v`
-  exchanged, and faces 2 and 3 exchanged). Each must read the texel a D3D cube lookup of its direction gives.
+- Fifteen translator mutants edit the emitted helper (for each face the sign of the `u` term flipped, `u` and `v`
+  exchanged, faces 2 and 3 exchanged, and dropping the `2.0 *` scale on `u` or `v`). Each must read the texel a D3D
+  cube lookup of its direction gives.
 - Six programs run the `v_cube` chain (`v_cubema`, `v_cubesc`, `v_cubetc`, `v_cubeid`, `v_rcp_f32` of `|ma|` and
   `v_fma_f32` with 1.5) on one direction per face. Each must match the face texel LLVM's table gives and a desktop
   pixel shader that samples the same direction from the TextureCube.
 
-Measured on 27.11.2026, commit 6ee878d8 plus this change, Windows 11 24H2 (10.0.26100.9711), debug layer
+Measured on 28.11.2026, commit f7da3f69 plus this change, Windows 11 24H2 (10.0.26100.9711), debug layer
 unavailable on both adapters: the 22 reference draws (7 literal, 3 forms, 6 chain, 6 desktop TextureCube) matched
 on NVIDIA Quadro M1000M (driver 32.0.15.7371) and on WARP (Microsoft Basic Render Driver 10.0.26100.9711), and all
-17 controls and mutants read the texel they predict. With the translator change reverted, the controls fail on
-`image dimension SQ_RSRC_IMG_CUBE`.
+19 controls and mutants read the texel they predict (`dev` and `release` `/O2`). With the translator change reverted,
+the controls fail on `image dimension SQ_RSRC_IMG_CUBE`, and dropping the `2.0 *` scale on `u` fails both
+`startup_image_cube_controls` and `startup_image_cube_warp`.
 The 16 fixture programs reassemble to the recorded words with LLVM 15.0.7.
 
 ```powershell

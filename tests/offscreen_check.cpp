@@ -1329,8 +1329,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 // The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 // --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
 // third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
-// mip levels whose cells all differ (tests/startup_image_3d.cpp). --startup-image-cube binds six 2x2 faces as a
-// TextureCube whose 24 texels all differ (#2943); z is passed through as for the other modes.
+// mip levels whose cells all differ (tests/startup_image_3d.cpp). --startup-image-cube binds six 4x4 faces as a
+// TextureCube whose 96 texels all differ (#2943); z is passed through as for the other modes.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const bool array_mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;

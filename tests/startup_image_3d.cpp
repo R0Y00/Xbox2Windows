@@ -27,8 +27,9 @@ namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
 constexpr UINT max_levels = 3;
-// A cube fixture: six 2x2 faces, one level (dim:SQ_RSRC_IMG_CUBE, #2943).
+// A cube fixture: six 4x4 faces, one level (dim:SQ_RSRC_IMG_CUBE, #2943).
 constexpr UINT cube_faces = 6;
+constexpr UINT cube_side = 4;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
@@ -78,7 +79,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
         throw std::runtime_error("Unsupported image mip level count");
     if (view_levels && ((!two_dimensional && !array) || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");
-    const UINT base = levels > 1 ? mip_base : side;
+    const UINT base = cube ? cube_side : (levels > 1 ? mip_base : side);
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
@@ -153,8 +154,8 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                     texel_value(tx, ty, tz, level, levels, base, texel);
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     if (cube) {
-                        // Every one of the 24 texels differs: face f, column tx and row ty.
-                        const float face[4] = {(1.0f + tx + 2.0f * ty + 4.0f * tz) / 32.0f, float(tx), float(ty), float(tz)};
+                        // Every one of the 96 texels differs: face f, column tx and row ty.
+                        const float face[4] = {(1.0f + tx + 4.0f * ty + 16.0f * tz) / 128.0f, float(tx), float(ty), float(tz)};
                         std::memcpy(texel, face, sizeof(face));
                     }
                     auto* const slice = (array || cube) ? start + place.Offset : start + place.Offset + tz * slice_pitch;

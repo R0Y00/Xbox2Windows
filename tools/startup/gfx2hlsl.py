@@ -11819,7 +11819,8 @@ class Pipeline:
             # sc/|ma| + 1.5 and tc/|ma| + 1.5 and f the face id, with the per-face sc and tc of v_cubesc and
             # v_cubetc (cube() above). A major component of +-1 reproduces u = sc/|major| and v = tc/|major|.
             # A cube-array id (8 * layer + face) keeps only its face, so layer 0 is sampled; faces 6 and 7, a
-            # negative or NaN id become faces 5 and 0. Coordinates outside the face are clamped to its edges.
+            # negative or NaN id become faces 5 and 0. Coordinates outside [1, 2] are assumed to clamp to face edges
+            # (untested outside [1, 2]).
             out.extend((
                 'float3 x2w_cube_dir(float s, float t, float f) {',
                 '    float u = clamp(2.0 * (s - 1.5), -1.0, 1.0);',
