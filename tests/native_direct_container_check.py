@@ -461,13 +461,10 @@ def main():
         root_vs = vertex(constants=(0,2,1), program=[*root_load, 0x7e00020f, 0xf80008cf, 0, end])
         check("address-vs", "gfx1013-container-vs", root_vs)
         check("address-cs", cs, compute(words(*root_load, end), root_descriptor=True))
-        for offset in (106, 107):
-            check(f"wave64-smem-offset-{offset}", cs,
-                  compute(words(0xf4000200, offset << 25, end), threads=64,
-                          root_descriptor=True, wave32=False), "unsupported scalar memory addressing")
-        check("wave64-smem-vcc-dst", cs,
-              compute(words(0xf4000000 | 107 << 6, 125 << 25, end), threads=64,
-                      root_descriptor=True, wave32=False), "unsupported scalar memory destination range")
+        check("wave64-smem-symbolic-vcc-dst", cs,
+              compute(words(0xbe810380, 0xf4080000 | 104 << 6, 125 << 25, end),
+                      threads=64, table=True, wave32=False),
+              "symbolic scalar memory destination overlaps wave64 VCC")
         check("wave32-smem-cross-vcc", cs,
               compute(words(0xf40c0000 | 104 << 6, 125 << 25, end), root_descriptor=True),
               "unsupported scalar memory destination range")
