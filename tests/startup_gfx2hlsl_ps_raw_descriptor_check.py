@@ -116,6 +116,11 @@ def finish(body, exports=(1, 2, 3, 4)):
     return body + struct.pack('<I', 0xbf8c3f70) + exp_mrt0(*exports)
 
 
+def wrap_program():
+    """v0 is 0xfffffffc. Offsets 12, 28 and 32 wrap; offset 0 is out because the end byte wraps."""
+    return program(conversion(), v0=0xfffffffc, offsets=(12, 28, 32, 0))
+
+
 def program(middle, idxen=False, v0=0, offsets=OFFSETS, srsrc=DESC, soffset=128):
     mov = v_mov(0, v0) if isinstance(v0, int) and 0 <= v0 <= 64 else v_mov_lit(0, v0)
     return finish(smem_load_x4(DESC, 8) + middle + mov + loads(idxen, srsrc, offsets, soffset))
@@ -257,7 +262,7 @@ def controls():
 
     # v0 is 0xfffffffc. Adding 12, 28 or 32 wraps before the range test, so those loads are zero
     # rather than the words at the truncated addresses 8, 24 and 28.
-    wrapped = program(conversion(), v0=0xfffffffc, offsets=(12, 28, 32, 0))
+    wrapped = wrap_program()
     wrapped_ps = translate(wrapped).hlsl_ps()
     assert 'ok = ok && base + (v0) >= base; base += v0;' in wrapped_ps, wrapped_ps
     assert raw_dwords((0xfffffffc, 12), 1) == (0,)
@@ -265,6 +270,16 @@ def controls():
     assert raw_dwords((0xfffffffc, 32), 1) == (0,)
     assert (SOURCE[2], SOURCE[6], SOURCE[7]) == (0x40400000, 0x40e00000, 0x41000000)
     print('address wrap: a term that overflows the 32-bit sum reads zero')
+
+    # The converted descriptor and an untouched second descriptor. The second load must not keep the first bound.
+    both = finish(smem_load_x4(DESC, 8) + smem_load_x4(24, 8, 32) + conversion() + v_mov(0, 0)
+                  + encode_mubuf(0x0c, imm=0, offen=1, vdata=1, srsrc=DESC)
+                  + encode_mubuf(0x0c, imm=0, offen=1, vdata=2, srsrc=24),
+                  exports=(1, 2, 1, 2))
+    both_ps = translate(both).hlsl_ps()
+    assert 'v1 = (ok && a + 4u >= a && a + 4u <= lim) ? r0.Load(a + 0) : 0u;' in both_ps, both_ps
+    assert 'v2 = r1.Load(a + 0);' in both_ps and 'v2 = (ok' not in both_ps, both_ps
+    print('second descriptor: an untouched load does not keep the converted bound')
 
     typed = finish(smem_load_x4(DESC, 8) + conversion() + v_mov(0, 0)
                    + encode_mtbuf(0, 22, imm=32, offen=1, vdata=1), exports=(1, 1, 1, 1))
@@ -366,24 +381,47 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if failed.returncode == 0 or 'deadbeef' not in failed.stderr:
                 raise AssertionError('%s unbound control\n%s\n%s' % (kind, failed.stdout, failed.stderr))
             print('%s: dropping the bound reads the word past NUM_RECORDS * stride' % kind)
+            wrap_pipe = translate(wrap_program())
+            wrap_ps = compile_hlsl(compiler, kind, wrap_pipe.hlsl_ps(), 'ps_wrap_%s' % kind, ps_profile, directory)
+            wrap_run = draw_once(renderer, adapter, vs, wrap_ps, entry_constants(wrap_pipe.manifest()), (0, 0, 0, 0))
+            if wrap_run.returncode:
+                raise AssertionError('%s wrap\n%s\n%s' % (kind, wrap_run.stdout, wrap_run.stderr))
+            print('%s: a wrapping address reads four zeros' % kind)
 
 
 def check_udsrc():
     """The draw stand-in accepts numrecords and refuses an unknown kind instead of skipping the rest."""
     root = HERE.parent
     header = (root / 'src/startup_stubs/udsrc_line.h').read_text(encoding='utf-8')
+    view_header = (root / 'src/startup_stubs/indirect_buffer_view.h').read_text(encoding='utf-8')
     draw = (root / 'src/startup_stubs/d3d12_draw.inl').read_text(encoding='utf-8')
     assert 'else if (!std::strcmp(source, "numrecords")) kind = udsrc_num_records;' in header
     assert 'record_counts[i] = words[2];' in draw
     assert 'records = words[2];' in draw
     assert 'record_counts[i] = view.records;' in draw
-    # records is a UINT and upload is a bool after it. Assigning by name avoids narrowing the count into the bool.
-    assert 'view.records = records;' in draw and 'view.upload = upload;' in draw
-    assert 'return {allocation.resource' not in draw and 'return {native, offset, bytes, stride' not in draw
+    assert 'records = view.Buffer.NumElements;' in draw
+    assert 'record_counts[i] = view.Buffer.NumElements;' in draw
+    # records is unsigned and upload is a bool after it, then source. Assigning by name keeps that order.
+    assert 'view.records = records;' in view_header and 'view.upload = upload;' in view_header
+    assert 'view.source = source;' in view_header
+    for call in (
+        'return indirect_buffer_view(zero_ring, zero_offset, 16, 0, 0, true, 3);',
+        'return indirect_buffer_view(allocation.resource, allocation.offset, bytes, stride, records, true, 0);',
+        'return indirect_buffer_view(alias.resource, alias.offset, bytes, stride, records, false, 0);',
+        'return indirect_buffer_view(ring, ring_offset, bytes, stride, records, true, 2);',
+        'return indirect_buffer_view(native, offset, bytes, stride, records, upload, input_source);',
+    ):
+        assert call in draw, call
+    assert 'return {zero_ring' not in draw and 'return {ring,' not in draw
+    assert 'return {native, offset, bytes, stride' not in draw
     compute = (root / 'src/startup_stubs/d3d12_compute_dispatch.inl').read_text(encoding='utf-8')
+    assert 'return indirect_buffer_view(allocation.resource, allocation.offset, bytes, 0, 0, true, 0);' in compute
+    assert 'return indirect_buffer_view(native, offset, bytes, 0, 0, false, 0);' in compute
     assert 'return {allocation.resource' not in compute and 'return {native, offset, bytes, 0, false}' not in compute
     assert 'ud.kind == Translation::num_records && ud.a >= 0 && ud.a < 32 ? record_counts[ud.a]' in draw
     assert 'x2w-draw unsupported udsrc' in draw
+    refusal = draw.split('x2w-draw unsupported udsrc', 1)[1][:220]
+    assert 'return;' in refusal and 'continue;' not in refusal, refusal
     run_udsrc_driver(root)
     print('udsrc: numrecords is stored, and an unknown kind or a gap refuses the manifest')
 

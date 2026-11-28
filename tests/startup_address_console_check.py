@@ -1,6 +1,6 @@
 """Draw textures published by address (device slot 70) whose texels are in a console layout.
 
-  <consumer> <backend>               fourteen textures, three cubes and two volumes, each drawn once; every
+  <consumer> <backend>               fourteen textures, three cubes and nine volume mips, each drawn once; every
                                      pixel of the 512x128 target is compared with the texel the view names;
                                      then three held descriptions and one texture whose address is announced
                                      as XG rows after it was published
@@ -120,25 +120,52 @@ class Console:
         return self.start[mip] + (block << self.log2) + self.in_block(x % self.block_w, y % self.block_h)
 
 
-# A volume in the 4 KiB standard mode (0x105), one mip: addrlib lays a 3D resource in a standard mode out in
-# thick blocks (Gfx10Lib::HwlIsThick). The 12 address bits of a 4-byte element follow the one-pipe row of
-# GFX10_SW_4K_S3_PATINFO; the block is 8x16x8 elements, and blocks follow in x, then y, then a layer of
-# blocks at a time in z.
-THICK_4K_S3 = {4: "0 0 X0 Y0 Z0 Y1 X1 Z1 Y2 X2 Z2 Y3"}
+# A volume in the 4 KiB standard mode (0x105): addrlib lays a 3D resource in a standard mode out in thick
+# blocks (Gfx10Lib::HwlIsThick). The 12 address bits of an element follow the one-pipe row of
+# GFX10_SW_4K_S3_PATINFO for its size; the block is 8x16x8 elements of 4 bytes, or 8x8x8 of 8. The volume is
+# stored a layer of blocks (8 deep) at a time, and each layer holds that layer of every mip: the shared tail
+# block first when the chain has one, then the mips from the smallest to the largest, blocks in x, then y.
+# Mip sizes round up. A mip is in the tail when it is at most a block wide and half a block high and at most
+# five mips remain; tail mip k from the end sits at byte (k << 8) of the tail block, which, read as 256-byte
+# micro blocks (4x4x4 elements of 4 bytes, 4x2x4 of 8), is its origin in x and y. A BC1 volume is the volume
+# of its 4x4 blocks, 8-byte elements one depth layer each: the sides are first rounded up to whole blocks,
+# and every mip size after that is in blocks.
+THICK_4K_S3 = {4: "0 0 X0 Y0 Z0 Y1 X1 Z1 Y2 X2 Z2 Y3", 8: "0 0 0 X0 Z0 Y0 X1 Z1 Y1 X2 Z2 Y2"}
+MICRO_3D = {4: (4, 4), 8: (4, 2)}
 
 
 class ConsoleVolume:
-    def __init__(self, width, height, depth, element):
+    def __init__(self, width, height, depth, element, mips=1, texels=1):
+        width, height = -(-width // texels), -(-height // texels)
         self.width, self.height, self.depth = width, height, depth
         self.bits = THICK_4K_S3[element].split()
         self.block = [1 << sum(b[0] == axis for b in self.bits) for axis in "XYZ"]
-        self.wide, high, layers = (-(-side // block) for side, block in zip((width, height, depth), self.block))
-        self.layer = self.wide * high * 4096
-        self.bytes = self.layer * layers
-
-    def address(self, x, y, z):
         bw, bh, bd = self.block
-        value = (z // bd) * self.layer + ((y // bh) * self.wide + x // bw) * 4096
+        mw, mh = MICRO_3D[element]
+        size = [(max(1, -(-width // (1 << m))), max(1, -(-height // (1 << m)))) for m in range(mips)]
+        tail = next((m for m, (w, h) in enumerate(size) if mips > 1 and w <= bw and h <= bh // 2 and mips - m <= 5),
+                    mips)
+        self.wide, self.start, self.origin = {}, {}, {}
+        offset = 4096 if tail < mips else 0
+        for m in reversed(range(tail)):
+            self.wide[m] = -(-size[m][0] // bw)
+            self.start[m] = offset
+            offset += self.wide[m] * -(-size[m][1] // bh) * 4096
+        for m in range(tail, mips):
+            at = (4 - (m - tail)) << 8
+            self.start[m] = 0
+            self.origin[m] = (mw * ((at >> 9 & 1) | (at >> 10 & 2)), mh * ((at >> 8 & 1) | (at >> 9 & 2)))
+        self.layer = offset
+        self.bytes = self.layer * -(-depth // bd)
+
+    def address(self, x, y, z, mip=0):
+        bw, bh, bd = self.block
+        value = (z // bd) * self.layer + self.start[mip]
+        if mip in self.origin:
+            x, y = x + self.origin[mip][0], y + self.origin[mip][1]
+        else:
+            value += ((y // bh) * self.wide[mip] + x // bw) * 4096
+        x, y = x % bw, y % bh
         for bit, name in enumerate(self.bits):
             coordinate = {"X": x % bw, "Y": y % bh, "Z": z % bd}.get(name[0])
             if coordinate is not None and (coordinate >> int(name[1:])) & 1:
@@ -180,38 +207,68 @@ CASES = [
 ]
 
 
-def volume_texel(x, y, z):
-    return bytes(((7 * x + 1) & 255, (5 * y + 3) & 255, (29 * z + 11) & 255, 255))
+def volume_texel(x, y, z, mip=0):
+    return bytes(((7 * x + 1) & 255, (5 * y + 3) & 255, (29 * z + 11) & 255, 255 - 16 * mip))
 
 
-# name, width, height, depth, format, layout: one mip of RGBA8 in the 4 KiB standard mode, viewed as a
-# Texture3D. Each target tile of the texture's width and height draws one depth layer.
+def volume_bc1_block(x, y, z, mip=0):
+    """The block of BC1 volume block (x, y) of layer z: one colour, which differs between neighbours."""
+    return bc1_block(mip, x, y + 3 * z)
+
+
+# name, width, height, depth, format, layout, mips, viewed mip: RGBA8 or BC1 in the 4 KiB standard mode, one
+# mip viewed as a Texture3D. Each target tile of the viewed mip's width and height draws one depth layer. The
+# chains view a mip outside the tail and one inside it.
 VOLUMES = [
-    ("RGBA8 volume 17x17x17 4 KiB standard", 17, 17, 17, RGBA8, 0x105),
-    ("RGBA8 volume 33x9x18 4 KiB standard", 33, 9, 18, RGBA8, 0x105),
+    ("RGBA8 volume 17x17x17 4 KiB standard", 17, 17, 17, RGBA8, 0x105, 1, 0),
+    ("RGBA8 volume 33x9x18 4 KiB standard", 33, 9, 18, RGBA8, 0x105, 1, 0),
+    ("RGBA8 volume 32x32x32 6 mips, mip 1", 32, 32, 32, RGBA8, 0x105, 6, 1),
+    ("RGBA8 volume 32x32x32 6 mips, mip 3 in the tail", 32, 32, 32, RGBA8, 0x105, 6, 3),
+    ("RGBA8 volume 20x24x16 5 mips, mip 1", 20, 24, 16, RGBA8, 0x105, 5, 1),
+    ("RGBA8 volume 20x24x16 5 mips, mip 3 in the tail", 20, 24, 16, RGBA8, 0x105, 5, 3),
+    ("BC1 volume 48x40x12 4 KiB standard", 48, 40, 12, BC1, 0x105, 1, 0),
+    ("BC1 volume 64x64x8 5 mips, mip 1", 64, 64, 8, BC1, 0x105, 5, 1),
+    ("BC1 volume 64x64x8 5 mips, mip 3 in the tail", 64, 64, 8, BC1, 0x105, 5, 3),
 ]
 
 
-def build_volume(width, height, depth):
-    """Backing bytes of a volume, built from the S3 row above."""
-    console = ConsoleVolume(width, height, depth, 4)
+def mip_sides(width, height, depth, mip):
+    return max(1, width >> mip), max(1, height >> mip), max(1, depth >> mip)
+
+
+def volume_colour(fmt, x, y, z, mip):
+    """The RGBA8 colour a correct detile shows at texel (x, y, z) of a mip."""
+    return volume_bc1_block(x // 4, y // 4, z, mip)[1] if fmt == BC1 else volume_texel(x, y, z, mip)
+
+
+def build_volume(width, height, depth, mips=1, fmt=RGBA8):
+    """Backing bytes of a volume and its mips, built from the S3 rows above."""
+    texels, element = (4, 8) if fmt == BC1 else (1, 4)
+    console = ConsoleVolume(width, height, depth, element, mips, texels)
     backing = bytearray(console.bytes)
     seen = set()
-    for z in range(depth):
-        for y in range(height):
-            for x in range(width):
-                at = console.address(x, y, z)
-                if at in seen or at + 4 > len(backing):
-                    raise AssertionError(f"oracle address {at:#x} of ({x},{y},{z}) is shared or outside the volume")
-                seen.add(at)
-                backing[at:at + 4] = volume_texel(x, y, z)
+    for mip in range(mips):
+        w, h, d = mip_sides(width, height, depth, mip)
+        for z in range(d):
+            for y in range(-(-h // texels)):
+                for x in range(-(-w // texels)):
+                    at = console.address(x, y, z, mip)
+                    if at in seen or at + element > len(backing):
+                        raise AssertionError(f"oracle address {at:#x} of mip {mip} ({x},{y},{z}) is shared or outside "
+                                             "the volume")
+                    seen.add(at)
+                    if fmt == BC1:
+                        backing[at:at + 8] = volume_bc1_block(x, y, z, mip)[0]
+                    else:
+                        backing[at:at + 4] = volume_texel(x, y, z, mip)
     return backing
 
 
 def check_volume(directory, consumer, backend, case, held=None):
-    name, width, height, depth, fmt, layout = case
+    name, width, height, depth, fmt, layout, mips, viewed = case
     source = directory / "texels.bin"
-    source.write_bytes(build_volume(width, height, depth))
+    source.write_bytes(build_volume(width, height, depth, mips, fmt))
+    width, height, depth = mip_sides(width, height, depth, viewed)
     across = -(-TARGET_W // width)
     hlsl = ("Texture3D<float4> t : register(t0);\n"
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
@@ -220,7 +277,7 @@ def check_volume(directory, consumer, backend, case, held=None):
             f"  return t.Load(int4(x % {width}, y % {height}, z, 0));\n}}\n")
     trap_log = directory / "trap.log"
     modes = {"X2W_TEST_CONSOLE_VIEW": str(source), "X2W_TRAP_LOG": str(trap_log),
-             "X2W_TEST_CONSOLE_DESC": f"{width},{height},1,{fmt},{layout},0,{depth}"}
+             "X2W_TEST_CONSOLE_DESC": f"{case[1]},{case[2]},{mips},{fmt},{layout},{viewed},{case[3]}"}
     actual = draw_texture(directory, consumer, backend, hlsl, modes, "tex3d")
     if actual is None:
         return 77
@@ -240,7 +297,7 @@ def check_volume(directory, consumer, backend, case, held=None):
             z = (x // width + (y // height) * across) % depth
             layers.add(z)
             pixel = actual[4 * (y * TARGET_W + x):4 * (y * TARGET_W + x) + 4]
-            expect = volume_texel(x % width, y % height, z)
+            expect = volume_colour(fmt, x % width, y % height, z, viewed)
             if pixel != expect:
                 raise AssertionError(f"{name}: pixel ({x},{y}) layer {z} actual {pixel.hex()} expected {expect.hex()}")
     if len(layers) != depth:
@@ -254,7 +311,7 @@ def check_volume(directory, consumer, backend, case, held=None):
 # A volume past the size the XG stand-in reports: 64x8x40 RGBA8 is eight blocks across, one down and five
 # layers of blocks (163,840 bytes); the desktop footprint (40 layers of 8 rows of 256 bytes) rounded to
 # 64 KiB is 131,072. A volume has one slice, so the footprint is not counted once per layer.
-HELD_VOLUME = (("RGBA8 volume 64x8x40 4 KiB standard past the XG size", 64, 8, 40, RGBA8, 0x105),
+HELD_VOLUME = (("RGBA8 volume 64x8x40 4 KiB standard past the XG size", 64, 8, 40, RGBA8, 0x105, 1, 0),
                "console_layout_beyond_xg_size")
 
 

@@ -130,8 +130,8 @@ void check_startup_raw_buffer(ID3D12Device* device, const char* vertex_path, con
                               const std::uint32_t* constants, UINT constant_count,
                               const std::uint32_t* source, UINT source_dwords, std::uint32_t words[4])
 {
-    if (constant_count < 1 || constant_count > 64)
-        throw std::runtime_error("raw buffer draw needs 1..64 entry constants");
+    if (constant_count < 1 || constant_count > 63)
+        throw std::runtime_error("raw buffer draw needs 1..63 entry constants; the descriptor table uses the 64th root dword");
     if (source_dwords < 1 || source_dwords > 4096)
         throw std::runtime_error("raw buffer draw needs 1..4096 source dwords");
     const auto vs = read_blob(vertex_path);
