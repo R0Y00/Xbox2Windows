@@ -42,8 +42,7 @@ The translator emits a helper `x2w_cube_dir(s, t, face)` that rebuilds a directi
 - Heap and register samplers are not read at translation, so their `DISABLE_CUBE_WRAP` bit is not validated (a set
   bit would filter differently at face edges), and their LOD range stays unvalidated as for 2D textures.
 - Only pixel-stage draws are measured; the vertex-stage form is translated but not drawn.
-- The runtime binding of a `texcube` view is PR #2938. Without it the main runtime parses `texcube` as an unknown
-  kind and would bind the slot as a buffer, so this lowering must not be merged before #2938.
+- The runtime binding of a `texcube` view landed in PR #2938 (`7fcde81f`).
 
 ## Fixture
 
