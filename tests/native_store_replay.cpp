@@ -1,11 +1,14 @@
 #include "desktop_gpu.h"
 #include "native_buffer_store_view.h"
 #include "native_compute_pipeline.h"
+#include "xmem_test_device.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <dxgi1_4.h>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -34,21 +37,72 @@ DXGI_FORMAT typed_format(unsigned bytes, bool half, bool reference) {
     if (half) return bytes == 2 ? DXGI_FORMAT_R16_FLOAT : bytes == 4 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     return (reference ? floats : uints)[bytes/4-1];
 }
+void report_adapter(ID3D12Device* device) {
+    const LUID luid = device->GetAdapterLuid();
+    std::fprintf(stderr, "adapter_luid=%08lx:%08lx\n", static_cast<unsigned long>(luid.HighPart), luid.LowPart);
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
+        FAILED(adapter->GetDesc1(&desc))) {
+        std::fputs("adapter=unavailable via DXGI\n", stderr);
+        return;
+    }
+    std::fprintf(stderr, "adapter=%ls vendor=%04x device=%04x\n", desc.Description, desc.VendorId, desc.DeviceId);
+    LARGE_INTEGER driver{};
+    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver)))
+        std::fprintf(stderr, "driver=%u.%u.%u.%u\n", HIWORD(driver.HighPart), LOWORD(driver.HighPart),
+                     HIWORD(driver.LowPart), LOWORD(driver.LowPart));
+    else
+        std::fputs("driver=unavailable via DXGI\n", stderr);
+}
 }
 
 // A reference directory supplies independently compiled DXIL and its user-data layout.
 // --direct exercises the same direct DXIL frontend used by the runtime.
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 6 && argc != 7) return 2;
+    if (argc < 6 || argc > 8) return 2;
     try {
+        const auto mode = argc >= 7 ? std::wstring_view(argv[6]) : std::wstring_view{};
+        const bool warp = mode == L"--direct-warp";
+        ComPtr<IDXGIAdapter> adapter;
+        if (warp) {
+            ComPtr<IDXGIFactory4> factory;
+            check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
+            const auto warp_hr = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+            if (warp_hr == DXGI_ERROR_NOT_FOUND || warp_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+            check(warp_hr, "WARP adapter");
+        }
         ComPtr<ID3D12Device> device;
-        const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
-        if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
-        check(device_hr, "device");
+        if (warp) {
+            // --direct-warp: the WARP adapter chosen above.
+            const auto device_hr = D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
+            if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+            check(device_hr, "device");
+        } else {
+            if (GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", nullptr, 0)) {
+                bool unmatched = false;
+                device = create_device(false, unmatched, [](IUnknown* adapter, REFIID iid, void** result) {
+                    return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, result);
+                }, stderr);
+                if (!device) {
+                    if (!unmatched)
+                        std::fputs("Unable to enumerate D3D12 hardware adapters\n", stderr);
+                    return 2;
+                }
+            } else {
+                const auto device_hr = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device));
+                if (device_hr == DXGI_ERROR_UNSUPPORTED) return 77;
+                check(device_hr, "device");
+            }
+            report_adapter(device.Get());
+        }
         ShaderDxilCompiler compiler(argv[1]);
         fs::path marker=argv[2], dest=argv[5];
-        const bool null_array = argc == 7 && std::wstring_view(argv[6]) == L"--direct-null-srv";
-        const bool direct = null_array || (argc == 7 && std::wstring_view(argv[6]) == L"--direct");
+        const bool null_array = mode == L"--direct-null-srv";
+        const bool direct = null_array || warp || mode == L"--direct";
+        if (argc == 8 && !direct) return 2;
         if (direct) {
             D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
             D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
@@ -66,6 +120,13 @@ int wmain(int argc, wchar_t **argv) {
         UINT index=0;
         for (auto &block:p.constants)
             for (unsigned j=0;j<block.count;++j) args[index++]=constant(j);
+        std::vector<unsigned> strides;
+        if (argc == 8) {
+            std::ifstream input{fs::path(argv[7])};
+            unsigned stride;
+            while (input >> stride) strides.push_back(stride);
+            if (!input.eof()) throw std::runtime_error("invalid descriptor stride metadata");
+        }
         UINT roots[64]{};
         if (reference) {
             fs::path base=fs::path(argv[6])/marker.stem().wstring().substr(4);
@@ -178,7 +239,8 @@ int wmain(int argc, wchar_t **argv) {
         if(reference){
             ID3D12DescriptorHeap* h=heap.Get();cmd.list->SetDescriptorHeaps(1,&h);cmd.list->SetComputeRootSignature(p.root.Get());
             cmd.list->SetComputeRoot32BitConstants(0,64,roots,0);
-        } else p.bind(cmd.list.Get(),heap.Get(),heap->GetGPUDescriptorHandleForHeapStart(),step,args.data(),atomic);
+        } else p.bind(cmd.list.Get(),heap.Get(),heap->GetGPUDescriptorHandleForHeapStart(),step,args.data(),atomic,
+                      nullptr,strides);
         cmd.list->Dispatch(2,1,1);
         for(auto &w:windows) if(w.write) {
             transition(cmd.list.Get(),w.resource.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);

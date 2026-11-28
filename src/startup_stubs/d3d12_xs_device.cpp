@@ -15,6 +15,7 @@
 #include "startup_stubs/trap.h"
 #include "x2w_build_rev.h"
 #include "xmem_page_batch.h"
+#include "startup_stubs/commit_state.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/manifest_retry.h"
@@ -81,9 +82,12 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "startup_stubs/xmem_section_buffer.h"
+#include "native_buffer_store_view.h"
+#include "native_compute_output.h"
 #ifdef X2W_NATIVE_SHADERS  // d3d12_xs_shim only: the C++ shader compiler (startup_stubs/d3d12_compute_dispatch.inl)
 #include "gfx1013_compute_native.h"
 #include "shader_dxil_compiler.h"
+#include "direct_compute_cache.h"
 #endif
 #include <d3d12sdklayers.h>
 #include <d3d12shader.h>
@@ -179,8 +183,10 @@ struct alignas(16) WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
-    UploadChunkMask upload_chunks;    // Ring chunks referenced by this recording, including while closed.
+    UploadChunkMask upload_chunks;    // Ring and snapshot chunks referenced by this recording, including while closed.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
+    bool unplaced_srv_backing;  // Resource: synthetic backing for an address-only buffer SRV.
+    bool exact_copy;            // Resource: synthetic backing that starts at the view address.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
                             // accesses: a race needs the guest to use a resource across its own final Release.
@@ -500,6 +506,10 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().real = real;
     w->own().refs = 1;
     w->own().kind = kind;
+    // The guest checks device byte +0x18 before using its inline descriptor
+    // writers. Request vtable calls so the shim records the descriptor.
+    static_assert(offsetof(Wrapper, console_fields) + 2 * sizeof(u64) == 0x18);
+    if (kind == device_kind) w->console_fields[2] = 1;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
     try {
@@ -1469,6 +1479,7 @@ std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
 std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
 std::unordered_map<ID3D12CommandQueue*, UploadQueue<ID3D12Fence>> queue_submits;
 std::vector<UploadRingChunk> upload_chunks;  // allocator_lock also protects recording holds and queue fence values
+std::vector<UploadRingChunk> snapshot_chunks;  // the title input snapshot pool: same rules, its own chunks and budget
 // X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 (allocator_lock): chunks each closed list released at a fenced submit, until its Reset.
 std::unordered_map<Wrapper*, ReleasedUploadChunks> released_upload_chunks;
 LONG upload_resubmits_refused;  // closed lists submitted again after a released chunk was reused; not executed
@@ -1478,7 +1489,7 @@ LONG allocator_swaps, allocator_creates;
 void release_upload_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
-    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data());
+    discard_upload_chunks(list->own().upload_chunks, upload_chunks.data(), snapshot_chunks.data());
     released_upload_chunks.erase(list);
     ReleaseSRWLockExclusive(&allocator_lock);
 }
@@ -1708,13 +1719,13 @@ bool released_chunks_recycled(Wrapper* list)
     const auto released = released_upload_chunks.find(list);
     if (released == released_upload_chunks.end()) return false;
     UploadChunkMask recycled = 0;
-    resubmitted_upload_chunks(released->second, upload_chunks.data(), recycled);
+    resubmitted_upload_chunks(released->second, upload_chunks.data(), recycled, snapshot_chunks.data());
     if (!recycled) return false;
     InterlockedIncrement(&upload_resubmits_refused);
     static LONG logged;
     if (first_calls(logged, 8))
-        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%x were reused; "
-            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned>(recycled));
+        log("x2w-draw upload ring: closed list %p submitted again after its released chunks 0x%llx were reused; "
+            "refused, it is not executed", static_cast<void*>(list), static_cast<unsigned long long>(recycled));
     return true;
 }
 
@@ -1740,7 +1751,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
         if (released == released_upload_chunks.end()) continue;
         // A list with a reused chunk was refused before the execute, under the same locks: all of them are intact.
         UploadChunkMask reused = 0;
-        chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused);
+        chunks |= resubmitted_upload_chunks(released->second, upload_chunks.data(), reused, snapshot_chunks.data());
     }
     const bool signaled = fence && SUCCEEDED(queue->Signal(fence, value + 1));
     if (signaled) ++value;
@@ -1750,7 +1761,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
             if (!list->own().upload_chunks) continue;
             try {
                 release_upload_chunks_at_submit(list->own().upload_chunks, upload_chunks.data(),
-                                                released_upload_chunks[list]);
+                                                released_upload_chunks[list], snapshot_chunks.data());
             } catch (const std::bad_alloc&) {
                 // Keep the holds: the list then pins its chunks until its Reset, as without the switch.
             }
@@ -1889,7 +1900,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
-            discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+            discard_upload_chunks(state.upload_chunks, upload_chunks.data(), snapshot_chunks.data());
             released_upload_chunks.erase(self);
             state.list_uploads = nullptr;
             state.list_scratch = nullptr;
@@ -1932,7 +1943,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
     if (FAILED(hr)) {
-        discard_upload_chunks(state.upload_chunks, upload_chunks.data());
+        discard_upload_chunks(state.upload_chunks, upload_chunks.data(), snapshot_chunks.data());
         if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
             found->second->close_failed = true;
     }
@@ -2681,36 +2692,53 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
 // 16 MiB up to 256 MiB in total and stay alive for the process. A full chunk can be reused once
 // no recording can submit its bytes and every queue that used it has finished. With
-// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 every chunk is 16 MiB, up to 512 MiB, and a fenced submit releases its lists.
+// X2W_D3D12_RING_RELEASE_AT_SUBMIT=1 the ring uses 16 MiB chunks (larger for oversized reservations),
+// up to 512 MiB. A fenced submit releases the list's holds in both pools.
 
-UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
+volatile LONG64 upload_ring_reserved_bytes, upload_ring_capacity_bytes;
+volatile LONG upload_ring_reservations, upload_ring_refusals;
+
+// snapshot = true takes the reservation from the title input snapshot pool (128 MiB, chunks numbered after the ring's).
+UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes, bool snapshot = false)
 {
-    constexpr u64 max_alloc_bytes = max_upload_ring_bytes / 4;
+    const u64 max_pool_bytes = snapshot ? max_snapshot_pool_bytes : max_upload_ring_bytes;
+    const unsigned base = snapshot ? snapshot_chunk_base : 0;
+    const u64 max_alloc_bytes = max_pool_bytes / 4;
     UploadReservation reservation;
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
+    const auto note_reserved = [snapshot](u64 reserved) {
+        if (snapshot) return;
+        InterlockedAdd64(&upload_ring_reserved_bytes, static_cast<LONG64>(reserved));
+        InterlockedIncrement(&upload_ring_reservations);
+    };
 
-    auto& chunks = upload_chunks;
-    static unsigned active = 0;
-    static u64 total_bytes = 0;
+    auto& chunks = snapshot ? snapshot_chunks : upload_chunks;
+    static unsigned actives[2] = {0, 0};
+    static u64 totals[2] = {0, 0};
+    unsigned& active = actives[snapshot ? 1 : 0];
+    u64& total_bytes = totals[snapshot ? 1 : 0];
 
     AcquireSRWLockExclusive(&allocator_lock);
     const auto finish = [&](unsigned index) {
         active = index;
-        chunks[index].hold(list->own().upload_chunks, index);
+        chunks[index].hold(list->own().upload_chunks, base + index);
         ReleaseSRWLockExclusive(&allocator_lock);
         return reservation;
     };
     if (!chunks.empty()) {
         reservation = reserve_upload_chunk(chunks[active], rounded);
-        if (reservation.mapped) return finish(active);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(active);
+        }
     }
 
-    const bool release_at_submit = ring_release_at_submit();
-    const u64 ring_bytes = release_at_submit ? max_released_upload_ring_bytes : max_upload_ring_bytes;
-    const u64 remaining = total_bytes < ring_bytes ? ring_bytes - total_bytes : 0;
+    const bool grow_released_ring = !snapshot && ring_release_at_submit();
+    const u64 budget_bytes = grow_released_ring ? max_released_upload_ring_bytes : max_pool_bytes;
+    const u64 remaining = total_bytes < budget_bytes ? budget_bytes - total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() || release_at_submit ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = chunks.empty() || grow_released_ring ? initial_upload_chunk_bytes : chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
@@ -2733,7 +2761,9 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
                     try {
                         chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
                         total_bytes += chunk_bytes;
+                        if (!snapshot) InterlockedAdd64(&upload_ring_capacity_bytes, static_cast<LONG64>(chunk_bytes));
                         reservation = reserve_upload_chunk(chunks.back(), rounded);
+                        note_reserved(rounded);
                         return finish(static_cast<unsigned>(chunks.size() - 1));
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
@@ -2750,35 +2780,43 @@ UploadReservation reserve_upload_ring(Wrapper* list, std::size_t bytes)
     // Allocation failed or the cap was reached. Older unused tails are still safe.
     for (unsigned index = 0; index < chunks.size(); ++index) {
         reservation = reserve_upload_chunk(chunks[index], rounded);
-        if (reservation.mapped) return finish(index);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     for (unsigned index = 0; index < chunks.size(); ++index) {
-        reservation = reuse_upload_chunk(chunks[index], index, rounded, queue_submits);
-        if (reservation.mapped) return finish(index);
+        reservation = reuse_upload_chunk(chunks[index], base + index, rounded, queue_submits);
+        if (reservation.mapped) {
+            note_reserved(rounded);
+            return finish(index);
+        }
     }
 
     ReleaseSRWLockExclusive(&allocator_lock);
-    static LONG refused;
-    if (first_calls(refused, 8))
-        log("x2w-draw upload ring reservation refused: no unused capacity");
+    if (!snapshot) InterlockedIncrement(&upload_ring_refusals);
+    static LONG refused[2];
+    if (first_calls(refused[snapshot ? 1 : 0], 8))
+        log(snapshot ? "x2w-draw snapshot pool reservation refused: no unused capacity"
+                     : "x2w-draw upload ring reservation refused: no unused capacity");
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(Wrapper* list, std::size_t bytes, u64* offset, ID3D12Resource** resource, bool snapshot = false)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(list, bytes);
+    const UploadReservation reservation = reserve_upload_ring(list, bytes, snapshot);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(Wrapper* list, u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, bool snapshot = false)
 {
-    auto* dest = reserve_upload_ring(list, bytes, offset, resource);
+    auto* dest = reserve_upload_ring(list, bytes, offset, resource, snapshot);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
@@ -2845,6 +2883,7 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     x2w_startup::ViewTable title_view_heap;  // slot 32: the title memory of the list's view heap (heap records)
+    UINT title_view_heap_entries = 0;        // logical descriptor count of title_view_heap (indices 0..count-1)
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
@@ -2868,6 +2907,7 @@ struct Pass {
     ID3D12Resource* bound_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
+    u64 sampler_heap_wrapper = 0;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
@@ -3345,9 +3385,9 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
     return TRUE;
 }
 
-// Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
-// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
-// desktop desc. Only occlusion queries are
+// Query slots 28 to 30, confirmed by the GXDK 261000 ID3D12GraphicsCommandList8 function table
+// (command_list_slot_names.h): they are bound only with X2W_D3D12_QUERY_SLOTS=1 because the behavior is
+// diagnostic. The heap reaches device slot 39 with the desktop desc. Only occlusion queries are
 // forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
 // heap it names is refused and logged with its values instead of reaching the desktop list.
 enum QueryMethod { begin_query, end_query, resolve_query };
@@ -4461,15 +4501,14 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     list->Dispatch(x, y, z);
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
-bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+void draw_startup_direct(Wrapper* self, UINT count, UINT instances, UINT start, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        draw_startup_direct(self, vertices, instances, first_vertex, first_instance);
         return;
     }
     if (list && pass.root_heap_flags) {
@@ -4516,7 +4555,6 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_compute_dispatch.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
-#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
@@ -5045,7 +5083,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     const auto record_view = [&](bool materialized) {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
-        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? 40 : N == 19 ? 40 : N == 20 ? 20 : 16;
+        const std::size_t described_bytes = N == 17 ? 16 : N == 22 ? 52 : N == 18 ? ViewRecord::srv_desc_bytes :
+            N == 19 ? ViewRecord::uav_desc_bytes : N == 20 ? 20 : 16;
         note_view(N, (N >= 18 && N <= 21) ? raw[0] : 0, N == 19 ? raw[1] : 0, reinterpret_cast<const void*>(raw[described]),
                   described_bytes, title_dest, args[D], materialized);
     };
@@ -5246,6 +5285,45 @@ void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 des
     check_device("Device CopyDescriptorsSimple", 24);
     static LONG calls;
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%d", count, dest, src, type);
+}
+
+// Slot 61 accepts the extended console sampler description; its destination is a CPU handle.
+void __stdcall device_console_sampler(Wrapper* self, const UINT* words, u64 destination)
+{
+    if (!words || !x2w_local::readable(words, 27 * sizeof(UINT))) return;
+    const auto handle = desktop_cpu_handle(destination);
+    if (!handle) return;
+    D3D12_SAMPLER_DESC sampler{};
+    const auto address_valid = [](UINT value) {
+        return value >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && value <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    };
+    if (words[1] > 3 || words[2] > 3 || words[3] > 2 || words[5] > 2 ||
+        words[16] > D3D12_COMPARISON_FUNC_ALWAYS || !std::all_of(words + 6, words + 9, address_valid)) {
+        sampler = x2w_startup::border_sampler();
+        device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+        note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
+        static LONG refused;
+        if (first_calls(refused, 4)) log("x2w-d3d12 unsupported console sampler fields; using border sampler");
+        return;
+    }
+    sampler.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[6]);
+    sampler.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[7]);
+    sampler.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(words[8]);
+    sampler.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>((std::max)(1u, words[16]));
+    const auto reduction = words[5] == 1 ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM :
+        words[5] == 2 ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM :
+        words[16] > 1 && words[16] < 8 ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const bool anisotropic = words[1] >= 2 || words[2] >= 2;
+    sampler.Filter = anisotropic ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction) :
+        D3D12_ENCODE_BASIC_FILTER(words[2] & 1, words[1] & 1, words[3] == 2 ? 1u : 0u, reduction);
+    sampler.MaxAnisotropy = anisotropic ? std::clamp(words[13], 1u, 16u) : 1u;
+    std::memcpy(&sampler.MinLOD, words + 9, sizeof(float));
+    std::memcpy(&sampler.MaxLOD, words + 10, sizeof(float));
+    if (!words[3]) sampler.MaxLOD = sampler.MinLOD;
+    std::memcpy(&sampler.MipLODBias, words + 11, sizeof(float));
+    std::memcpy(sampler.BorderColor, words + 17, sizeof(sampler.BorderColor));
+    device_of(self)->CreateSampler(&sampler, {static_cast<SIZE_T>(handle)});
+    note_view(22, 0, 0, &sampler, sizeof(sampler), destination, handle);
 }
 
 // Device slot 23, desktop CopyDescriptors(destCount, destStarts, destSizes, srcCount, srcStarts, srcSizes, type).
@@ -5712,6 +5790,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
 // member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
@@ -6584,8 +6663,8 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_written_probe(void* address, uns
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
 // serves pageSize 2 (bits 14-15) from a 64 MiB block, then asserts that the block was used up:
 // the console runtime evidently takes committed-resource memory from XMemAlloc with allocatorId
-// 0x80. Hypothesis used here: attributes = pageSize (2 from 4 MiB up, else 1) << 14 | 0x80 << 16 |
-// log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
+// 0x80. Hypothesis used here: attributes = pageSize (2, a 2 MiB page, selected from 4 MiB up; else 1)
+// << 14 | 0x80 << 16 | log2(alignment) << 24, memory type 0. The block is bookkeeping only; the desktop resource has its
 // own memory and does not alias it.
 using XMemAllocHook = void*(__stdcall*)(SIZE_T, ULONGLONG);
 XMemAllocHook title_alloc_hook()
@@ -7149,7 +7228,25 @@ void report_budget(ID3D12CommandQueue* queue)
         if (n < 0 || static_cast<std::size_t>(n) >= sizeof(text) - used) break;
         used += n;
     }
-    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu", local, nonlocal, text, counts.unmeasured);
+    // System commit and the physical-page pool behind it: a run that ends on a commit limit (error 1455) shows
+    // whether the pool (sections, slots) or the resources above grew (#1199).
+    char commit[80];
+    x2w_local::format_commit(commit, sizeof(commit), x2w_local::system_commit());
+    char job[64];
+    x2w_local::format_job(job, sizeof(job), x2w_local::job_memory());
+    char pool[96] = "sections=n/a slabs=n/a slots=n/a";
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    using SlabStats = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*, ULONGLONG*);
+    HMODULE xmem = nullptr;
+    if (GetModuleHandleExW(0, L"xmem.dll", &xmem)) {  // adds a reference: released below
+        ULONGLONG sections = 0, slabs = 0, in_use = 0, free_slots = 0;
+        const auto page_stats = reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats"));
+        const auto slab_stats = reinterpret_cast<SlabStats>(GetProcAddress(xmem, "x2w_xmem_slab_stats"));
+        if (page_stats && slab_stats && page_stats(&sections) && slab_stats(&slabs, &in_use, &free_slots))
+            std::snprintf(pool, sizeof(pool), "sections=%llu slabs=%llu slots=%llu/%llu", sections, slabs, in_use, free_slots);
+        FreeLibrary(xmem);
+    }
+    log("x2w-budget local=%s nonlocal=%s%s unmeasured=%llu %s %s %s", local, nonlocal, text, counts.unmeasured, commit, pool, job);
 }
 
 // X2W_PRESENT_COMPOSITE=1 (experimental, docs/startup-runtime.md#presented-planes): the output
@@ -7330,25 +7427,30 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             root_srv_copies_made);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
-            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld)", render_resets,
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld, ring_full %ld), "
+            "formatted-load draws refused %ld, textures uploaded %ld (%ld KiB, unreadable %ld), reads refused before a fault %ld, heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines first looked up by ExecuteIndirect %ld, compute requests published %ld (already present %ld, failed %ld, pointer-like blob qwords %ld), "
+            "missing shader fallback draws %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
-            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], formatted_draws_refused, textures_uploaded,
-            texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], null_causes[5], formatted_draws_refused, textures_uploaded,
+            texture_bytes_uploaded, textures_unreadable, static_cast<long>(x2w_local::faults_avoided), heap_roots_deferred,
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
-            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
+            compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words,
+            missing_shader_fallback_draws);
     if (render_mode() && frame % 300 == 0 && (pso_recipes_loaded || pso_recipes_precreated || pso_recipe_mismatches || pso_recipe_fallbacks))
         log("x2w-draw pso recipes totals: loaded %ld, precreated %ld, mismatches %ld, fallbacks %ld", pso_recipes_loaded,
             pso_recipes_precreated, pso_recipe_mismatches, pso_recipe_fallbacks);
     if (render_mode() && frame % 300 == 0) {
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld",
+        log("x2w-render upload ring: reserved %llu MiB in %ld reservations, refusals %ld, capacity %llu MiB",
+            static_cast<unsigned long long>(upload_ring_reserved_bytes) >> 20, upload_ring_reservations, upload_ring_refusals,
+            static_cast<unsigned long long>(upload_ring_capacity_bytes) >> 20);
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld, builder gate refused %ld; placed inputs from a GPU copy %ld, from a title snapshot %ld (%ld KiB)",
             compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled,
-            compute_builder_gate_refusals);
+            compute_builder_gate_refusals, compute_inputs_gpu_copied, compute_inputs_snapshot, compute_inputs_snapshot_kib);
         log_compute_census();
     }
     if (render_mode() && frame % 300 == 0) {
@@ -7489,6 +7591,7 @@ void build_tables()
     tables[device_kind][19] = reinterpret_cast<void*>(&view_slot<19, 3>);  // CreateUnorderedAccessView(res, counter, desc, dest)
     tables[device_kind][20] = reinterpret_cast<void*>(&view_slot<20, 2>);  // CreateRenderTargetView(res, desc, dest)
     tables[device_kind][21] = reinterpret_cast<void*>(&view_slot<21, 2>);  // CreateDepthStencilView(res, desc, dest)
+    tables[device_kind][61] = reinterpret_cast<void*>(&device_console_sampler);
     tables[device_kind][22] = reinterpret_cast<void*>(&view_slot<22, 1>);  // CreateSampler(desc, dest)
     tables[device_kind][23] = reinterpret_cast<void*>(&device_copy_descriptors);
     tables[device_kind][24] = reinterpret_cast<void*>(&device_copy_descriptors_simple);
@@ -7574,8 +7677,8 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
-        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
-        // bindings are opt-in. Unset, the slots stay no-ops.
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): the 261000 table confirms BeginQuery, EndQuery and
+        // ResolveQueryData at 28 to 30, but the bindings stay opt-in. Unset, the slots stay no-ops.
         if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
             list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
             list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);

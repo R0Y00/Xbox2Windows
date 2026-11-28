@@ -12,19 +12,42 @@ import sys
 import time
 
 
+def _storage_completed(line):
+    """Requests the DirectStorage stand-in has finished, from a status or heartbeat line.
+
+    New lines carry "completed=N" (raw + inflated + bcpack-blank). Older lines have "done=N" (uncompressed copies
+    only) next to "inflated=N" and, in the heartbeat, "bcpack-blank=N": the same total is rebuilt from those."""
+    m = re.search(r"\bcompleted=(\d+)", line)
+    if m:
+        return int(m.group(1))
+    total = 0
+    for name in ("done", "raw", "inflated", "bcpack-blank"):
+        m = re.search(rf"\b{name}=(\d+)", line)
+        if m:
+            total += int(m.group(1))
+    return total
+
+
 class _LogViewer:
     """Stateful log parser and status tracker for a single live_view session."""
 
     def __init__(self, package=None):
         # The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
-        roots = ["G:\\"] + ([os.path.join(os.path.abspath(package), "")] if package is not None else [])
+        roots = ["G:\\"]
+        if package is not None:
+            # Windows may spell the same root with an 8.3 alias or a different case; the log can
+            # carry the resolved form while run.ps1 passes the short one. Accept both spellings.
+            for candidate in (os.path.abspath(package), os.path.realpath(package)):
+                root = os.path.join(candidate, "")
+                if root not in roots:
+                    roots.append(root)
         self.game_file = re.compile(
             r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:"
             + "|".join(map(re.escape, roots))
             + r").+)(?= from (?:[^+]*\+)?0x[0-9a-fA-F]+ )"
         )
         self.start = time.time()
-        self.counts = {"modules": 0, "files": 0, "refused": 0, "chunks": 0, "gpu calls first seen": 0}
+        self.counts = {"modules": 0, "files": 0, "refused": 0, "chunks": 0, "completed": 0, "gpu calls first seen": 0}
         self.last_status = 0.0
         self.state = "?"
         self.frames = "0"
@@ -87,13 +110,17 @@ class _LogViewer:
             m = re.search(r"inflated=(\d+) failed=(\d+)", line)
             if m:
                 self.counts["chunks"] = int(m.group(1))
-                self.say("storage", f"read batch complete: {m.group(1)} compressed chunks decompressed so far, {m.group(2)} failed")
+                completed = _storage_completed(line)
+                self.counts["completed"] = completed
+                self.say("storage", f"read batch complete: {completed} requests completed so far, "
+                                    f"{m.group(1)} compressed chunks decompressed, {m.group(2)} failed")
         elif "EnqueueRequest" in line or "options=" in line or "Queue::Submit" in line or "IsComplete" in line:
             return
         elif line.startswith("x2w-dstorage heartbeat "):
             m = re.search(r"\binflated=(\d+)", line)
             if m:
                 self.counts["chunks"] = int(m.group(1))
+                self.counts["completed"] = _storage_completed(line)
             self.say("storage", line)
         elif line.startswith("x2w-render totals:"):
             self.say("render", line)
@@ -180,6 +207,7 @@ def main(argv=None) -> int:
                     "status",
                     f"state {viewer.state}, {viewer.frames} frames, {viewer.counts['modules']} modules, "
                     f"{viewer.counts['files']} game-file opens, {viewer.counts['chunks']} chunks decompressed, "
+                    f"{viewer.counts['completed']} storage requests completed, "
                     f"{viewer.counts['refused']} network opens refused, "
                     f"{viewer.counts.get('handled probes', 0)} handled probes",
                 )

@@ -47,15 +47,13 @@ controls for other barrier types, flagged barriers, invalid resources and arrays
 
 ## Occlusion queries
 
-Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
-places `ResourceBarrier` at 26 and four additional console methods in the 26 to 31 range
-(32 is `SetDescriptorHeaps`, desktop 28 plus four). It also shows that
-the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
-implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
-`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
-diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
-no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
-end at Close, not the numbering.
+The GXDK 261000 `ID3D12GraphicsCommandList8` table confirms `BeginQuery`, `EndQuery` and
+`ResolveQueryData` at command-list slots 28 to 30, and `SetPredication` at 31. Slots 32 to 55
+are the desktop slots 28 to 51 plus four; slots 56 to 58 are `SetMarker`, `BeginEvent` and
+`EndEvent`, and `ExecuteIndirect` is 61. The query bindings stay a diagnostic opt-in: only with
+`X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay no-ops
+as before. The fixture below calls those slots directly, so it checks the forwarding, the
+refusals and the end at Close, not the numbering.
 
 The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
 binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
@@ -76,7 +74,7 @@ the console `Map`. It then checks that the refused calls, among them resolves ov
 with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
 error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
-`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
+Slots 56 to 58 are the desktop marker methods, not query methods.
 
 ## Depth target on translated draws
 
@@ -809,7 +807,14 @@ ctest --preset release --no-tests=error -R '^startup_stubs$' -V
 ```
 
 The build produces `xmem.dll`, `d3d12_xs.dll`, `AcpHal.dll`, `XCRDAPI.dll`, `chad.dll`, `xapu.dll`,
-`xg_xs.dll` and `GameInput.dll`. Without the switches, every export that has no implementation
+`xg_xs.dll` and `GameInput.dll`. To run a title you need only these eight and the build revision stamp, not the test
+executables: `cmake --preset release` once, then
+
+```powershell
+cmake --build --preset runtime
+```
+
+builds the `startup_runtime` target, which depends on exactly the files `run.ps1` copies. Without the switches, every export that has no implementation
 traps: it logs `x2w-trap <dll>!<export>` with its argument registers and ends the process with a
 code that names the export (see `src/startup_stubs/trap.h`).
 
@@ -822,15 +827,18 @@ Alternatively, stage one executable and its adjacent DLLs with:
 .\tools\startup\stage_package.ps1 -PackageDir <package root> -Exe <title>.exe -RunDir <fresh run folder>
 ```
 
-The destination must be absent or empty and separate from the package. Archives and subdirectories
-are not copied. Keep using the package root as `-DataDir`, then run the staged executable:
+The destination must be absent or empty and separate from the package. The helper checks resolved
+paths as well as their spelling, and stops if Windows cannot resolve an existing path (which can
+occur on some network shares). Archives and subdirectories are not copied. Keep using the package
+root as `-DataDir`, then run the staged executable:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
     -Seconds 180 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
 ```
 
-`run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
+`run.ps1` copies the stand-ins next to the executable (build them with `cmake --build --preset runtime`) and starts
+`tools/startup/debug_launch.py`.
 Use `-BuildDir` to select their build directory; relative paths are relative to the repository root,
 and absolute paths are used as supplied. The default is `out/build/release`.
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
@@ -858,6 +866,20 @@ exports are `RUNTIME_CALL_HOOKS` and `MOVIE_CALL_HOOKS` in `debug_launch.py`. `s
 that its fixture's module and export are in that list, that a source-built DLL loaded under the
 movie-player module name is not hooked by default, that each of its 7 export calls is counted with
 `--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
+
+**Window pictures.** At the end of a run that is still going, `debug_launch.py` saves the client area of the
+title's window as `window.png`. `--capture-every <seconds>` (`run.ps1 -CaptureEvery`, `run.sh --capture-every`)
+also saves it every N seconds (N is at least 1; 0, the default, is off) as `window_<sss>s.png`, with the seconds
+since the process started, so a run that passes several screens leaves one picture per screen. A frame whose
+pixels equal the previous frame is not saved, at most 120 files are written (later changes are counted, not
+saved), and the summary prints one line such as `window captures: 12 saved, 7 unchanged skipped, first change
+at 74 s`. A thread of its own takes the pictures, so a capture never delays the debug events, and the
+conversion to PNG uses whole-buffer slices instead of a per-byte loop. The end-of-run `window.png` is
+unchanged. `tests/startup_window_capture_check.py` checks the file names, the skip, the cap, the summary line
+and the pixels of the PNG against a per-pixel reference. `tests/startup_debug_window_check.py` runs the
+source-built `tests/startup_window_probe.cpp` (a window that is red, then blue after 3.5 s) with
+`--capture-every 1`: one red and one blue frame are saved, the others are skipped, the reported first change
+falls in the second the probe changes it, and without the option no `window_<sss>s.png` exists.
 
 `run.ps1 -TraceApi` sets `X2W_TRACE_API=1` for the child process and enables
 `x2w-api` lines for individual runtime provider methods. Use `-TraceCalls` for
@@ -898,6 +920,38 @@ It writes:
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
 | `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
+
+### Package on another volume
+
+A console executable opens its package at a fixed drive letter, so a package that lives on another
+volume never mounts: the first open returns "not found", nothing is mounted, and the run usually
+stops within a second on a table sized from data that was never loaded. `-MapDrive` rewrites opens on
+a mapped letter to the real folder, in the caller's own path structure and inside the debugger's
+existing file hook, so the letter does not have to be free and a real volume on it is not disturbed:
+
+```powershell
+.\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
+    -MapDrive "G=D:\package"
+```
+
+The value is `LETTER=FOLDER`, and several mappings are separated by `;`. The debugger logs a `MAP`
+line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a letter that is not
+mapped is left untouched. The rewritten name is borrowed for the hooked call only: the caller's
+`UNICODE_STRING` is restored (length, buffer pointer and contents) when the call returns, so a
+failure or a retry sees the name it built. When the replacement does not fit the caller's buffer the
+debugger borrows a name buffer for the duration of that call and returns it to a pool on restore, so
+serial opens reuse one buffer instead of allocating per open and overlapping calls do not share one.
+One limit remains: only opens that pass through the file hooks are rewritten, so a title that reads
+its package through a memory-mapped API is not covered. A call that enters the same hooked function on
+another thread is rewritten too: the debugger holds the other threads for each step over a hooked byte
+([Concurrent calls through a hooked function](#concurrent-calls-through-a-hooked-function), #1281).
+`startup_map_drive` covers the rewrite, the negative control without the option, that an unmapped letter
+is left alone, and one caller-owned `UNICODE_STRING` reused across 32 serially opened files with its
+length, buffer pointer and contents checked after every return and a single name buffer.
+`startup_map_drive_overlap` runs two threads of 32 opens each with their own caller-owned names: all 64
+opens must see the mapped name and succeed, every caller string must be back as built and the debugger must
+report no unprotected window, three times. Its control without holding the other threads
+(`--suspend-others 0`) must lose opens.
 
 ### Translating shaders during a run
 
@@ -954,12 +1008,21 @@ The existing dispatch path records the result, and a program is accepted only wi
 fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
 and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
 scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
-not lower) is refused. The first 16 refusals of a process are logged as
+not lower) is refused. Programs published as `<key>.txt` also bind 1D, 2D, 2D-array and 3D texture SRVs
+(`srv N tex1d|tex2d|tex2da|tex3d table R B`) from the title's described view of that dimension, or are
+refused by name; cube texture SRVs are not published. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
 translation is tried once per key and before a published `<key>.txt`. It covers compute only; graphics
 pipelines still need a published translation.
+
+Published compute translations from `compile_dxil --requests` and `--watch` carry a `native 1` line in the
+`x2w-manifest 2` manifest. The stand-in requires the current native output revision. An unmarked manifest
+is accepted with a `<key>.cs.hlsl` sidecar, which identifies a Python translation. `compile_dxil --watch`
+rebuilds stale native outputs and leaves Python publications in place. The stand-in retries a stale or
+absent manifest on subsequent dispatches on the ManifestRetry schedule (1 s, doubling up to 32 s), so a running process can
+pick up a rebuilt output (by the code path; no test covers the reload). Compute request keys stay at `29cs`, and revision-28 archives are still read.
 
 Check with `ctest --preset dev -R '^startup_compute_dispatch_native_(warp|hardware)$' -V`
 ([`tests/startup_compute_dispatch_native_check.py`](../tests/startup_compute_dispatch_native_check.py);
@@ -1244,6 +1307,11 @@ the stop. The report copies only the 32-bit exception code and whether it was fi
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+`tools/startup/exit_report.py` is a narrower reader for the same directory when the question is only how the
+process ended. It reports the `EXIT_PROCESS` code, one of six fixed end-state labels, the last present/frame
+sample and the last presented surface. It does not copy module names, paths or addresses. Check with
+`python3 -B tests/startup_exit_report_check.py`.
+
 ## Iterating on start-up runs
 
 This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
@@ -1501,7 +1569,15 @@ the two recovery checks are its sole failures),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
-`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
+A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when `X2W_PROBE_PRECHECK` is set to anything but `0`, or when it is unset and a debugger is attached (read once; `X2W_PROBE_PRECHECK=0` keeps it off under the debugger that title runs start in, and off, the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
+region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
+Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
+a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render
+totals line prints `reads refused before a fault <n>` after the textures count. The check adds an unmapped range
+that must return false and 0 with no exception seen by a vectored handler, for the probe and the copy, and counts the
+avoided faults. No GPU is required:
 
 ```powershell
 cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check
@@ -1524,25 +1600,52 @@ cmake --build --preset dev --target startup_trap_header_check
 ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_precedence_control)?$' -V
 ```
 
+## Concurrent calls through a hooked function
+
+The debugger's file, socket and allocation hooks are one patched byte per function. To run the original
+instruction it restores the byte, single-steps the thread that hit it and patches the byte again. A second thread that
+entered the function inside that window ran untraced, so `files.txt` could miss opens and the
+offline mode could miss a refused socket. Now every other thread is held for the step and resumes when the stepping
+thread is done (`tools/startup/hook_window.py`). A thread that had already trapped when it was held goes back to the
+hook address and traps again afterwards, so its call is traced once, not twice. Each window has a 2 s deadline, so a
+thread is never held forever. Per-thread state of a call in flight (the return address and stack pointer it will come back to) is
+keyed by thread id, not shared.
+
+Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+
+`tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
+enter `CreateFileW` together 16 times each on one file, and all 64 opens must show in `files.txt` with their result and
+`unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
+| `X2W_LOW_ADDRESSES=1` (`run.ps1 -LowAddresses`) | [#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758): `tools/startup/launch.py` and `debug_launch.py` start the title with bottom-up ASLR always off (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, `PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF`), so the title's own `VirtualAlloc` blocks come from the low end of the address space instead of a random start above 2^40. The package acceleration-structure builder refuses a destination address with bits set above bit 39 and receives the title's CPU address, which the shim cannot move. `startup_launch` runs a probe four times with the switch (every block ends below 2^40) and eight times without (at least one block ends above 2^40). |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
 | `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
+| `X2W_DRAW_MISSING_SHADER=1` | records a [diagnostic fallback draw](experiments/missing-shader-fallback.md) for direct, non-indexed triangle lists while the requested translation manifest is absent. Requires single-sample attachments and a guest viewport and scissor. The shader pair leaves the attachments untouched. The render totals report `missing shader fallback draws`. |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_NATIVE_SHADERS=<dir>` (`run.ps1 -NativeShaders <dir>`) | experimental, in render mode: translates device slot 67 compute requests in the stand-in with the C++ compiler; `<dir>` holds `dxcompiler.dll` and `dxil.dll`. See [Translating compute programs in the stand-in](#translating-compute-programs-in-the-stand-in) |
 | `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it (private allocations larger than 256 MiB are skipped only with `X2W_D3D12_CAP_EXISTING_HEAP=1`), otherwise copied from title memory at each submission, otherwise the default backing is kept and the refusal recorded; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_CAP_EXISTING_HEAP=1` | opt-in 256 MiB (`unplaced_existing_heap_allowed`) allocation-size cap on `OpenExistingHeapFromAddress` in device slot 133 (`startup_slot133_heap_cap_*`). Unset (default), private allocations larger than 256 MiB keep the formerly aliased path: a capped copied placement is refused by `CopyBufferRegion` (list slot 15) as `title_backed_source`, losing a late guest write made after recording and before submit. Set, allocations larger than 256 MiB skip `OpenExistingHeapFromAddress` so multi-GiB startup blocks are not pinned in `WorkingSetSize` and `NonLocal` GPU memory |
 | `X2W_D3D12_ROOT_SRV_AT_DRAW=1` | opt-in, render mode: a graphics root SRV (slot 44) without an upload mapping is not copied into the upload ring, since no draw reads that desktop binding (default: a 64 KiB copy at every slot 44 call). Translated draws copy the SRV themselves and are unaffected (`startup_root_srv_draw_*`). See [the experiment note](experiments/startup-root-srv-at-draw.md) |
 | `X2W_D3D12_RING_RELEASE_AT_SUBMIT=1` | opt-in, render mode: a closed command list releases its upload ring chunks once its submit is fenced instead of holding them until Reset, and the ring grows in 16 MiB chunks up to 512 MiB (default: doubling chunks up to 256 MiB, holds until Reset). The larger ring can add up to about 1 GiB of process commit at peak (startup runs in the experiment note). A later submit of the same list before its Reset fences its unchanged chunks again; if one was reused in between, that list is refused before the execute and logged (`startup_address_console_gate_ring_keep_*`, `upload_reservation`). See [the experiment note](experiments/startup-upload-ring-release-at-submit.md) |
-| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
+| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the confirmed `BeginQuery`, `EndQuery` and `ResolveQueryData` methods (see [Occlusion queries](#occlusion-queries)). The bindings remain diagnostic because the forwarding behavior is not a console runtime oracle. Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | legacy diagnostic. Logs that clearing live slots is disabled and enables the existing retirement breakdown when base retirement and budgets are on ([details](#d3d12-resource-budget)) |
@@ -1560,12 +1663,14 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
+| `X2W_AUDIO_ACTIVITY=1` | with `X2W_AUDIO_PERMISSIVE=1`, counts XMA context changes, HAL submits and XApu commands, and logs at most a line per second when a count moved ([Activity counter](#activity-counter)) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is the root of the drive the title sees, not its save folder: the title appends `x2w-gamesave` itself. It is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
+| `X2W_INPUT_TRACE=1` | opt-in: logs the resolved virtual gamepad state (buttons and all six axes), the script time or `off`, the present number or `none`, and one line per script wait, mark or skipped group, all prefixed `x2w-input-trace`. At most one state line per change and one per 250 ms while unchanged; unset, nothing is logged. See [Input trace](#input-trace). |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -1586,7 +1691,16 @@ handle returns `0x80004005`.
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
-then start the build again. The new key keeps the former bytecode and manifest
+then start the build again.
+The first request of a process also writes the runtime's revisions to `<cache-directory>/revision.txt`
+(`graphics`, `compute` and `mesh57` lines). With `-Render -Translate` (`--render --translate`),
+`run.ps1` and `run.sh` compare that file with the `gfx2hlsl.py` they start
+(`tools/startup/shader_cache_revision.py`) and print one warning naming both revisions when they differ,
+or when the cache holds requests but no `revision.txt`: every cached request would be refused as a key
+mismatch. The warning comes before the watcher starts, or after the run when the run's own stand-ins
+wrote the first `revision.txt`. Rebuild the stand-ins from the same checkout, or start with an empty cache:
+`-FreshShaderCache` (`--fresh-shader-cache`) moves a cache that is not empty to `<cache>.old-<date>-<time>` first
+([#2815](https://github.com/R0Y00/Xbox2Windows/issues/2815)). The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
@@ -1633,6 +1747,18 @@ Set `X2W_D3D12_BUDGET=1` before startup to add one `x2w-budget` line to each
 D3D12 present heartbeat. `local` and `nonlocal` show DXGI current usage and
 budget in bytes for node 0 of the adapter matching the desktop device LUID.
 An unavailable segment reads `n/a`.
+
+The line ends with the system commit and the physical-page pool (#1199):
+`commit=<used>/<limit> avail=<free>` in MiB (all processes: RAM plus page files, what a new commit can still
+get) and `sections=<n> slabs=<n> slots=<in use>/<free>` (live 64 KiB physical-page sections, open slabs, slots in
+the open slabs), then `job_peak=<MiB> job_limit=<MiB>`: the peak commit of the job the title runs in and its memory
+limit (`run.ps1 -MemoryGiB`; `none` without a limit). Each reads `n/a` when it cannot be read. A run that ends on error 1455 shows from these whether
+the pool (a flat `sections`) or the resources below (committed texture bytes) grew. The first three commit failures
+(error 1455 or 8) of the page pool also
+log `x2w-xmem commit exhausted at <call> (error N): job memory limit N GiB reached (run.ps1 -MemoryGiB)` when the job peak is within 256 MiB of its limit (otherwise `job memory limit not reached`), then the job numbers, `system commit=... avail=...` and `pool sections=... slabs=...
+slots=.../...` with the hint that `X2W_XMEM_LAZY_COMMIT=1` (`run.ps1 -LazyMemory`) keeps untouched pages out of
+the commit. `tests/startup_commit_state_check.cpp` checks the text, `tests/startup_triage_run_check.py` that
+`triage_run.py` still reads the line with and without these fields.
 
 Each allocation category reads `live-bytes/live-objects+retained-bytes/retained-objects`.
 The categories are desktop placed resources, committed textures, committed
@@ -1948,6 +2074,31 @@ ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|
 
 It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
 values merge into every reading.
+
+### Input trace
+
+`X2W_INPUT_TRACE=1` (off by default) logs the gamepad state the stand-in resolves after the
+keyboard, XInput pad 0, the shared pad block, `X2W_INPUT_PRESS` and `X2W_INPUT_SCRIPT` have been
+merged. Every line starts with `x2w-input-trace` and goes to stderr and `X2W_TRAP_LOG` like the
+stand-in's other lines. A state line has the form
+
+```text
+x2w-input-trace state buttons=0x00000004 lt=0.000 rt=0.000 lx=1.000 ly=0.500 rx=0.000 ry=0.000 script=2.500 present=11
+```
+
+where `script` is the script time in seconds or `off`, and `present` is the latest present number
+from the picture signature or `none` without a presenter sample. One state line is written per
+change and, while the state is unchanged, at most once every 250 ms. Waits, marks and skipped
+groups add one `x2w-input-trace wait`, `mark` or `group` line each, with the script item and shifted
+script time. The fixture `startup_gameinput_trace` runs one script with the switch on and off:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gameinput_trace$' -V
+```
+
+The control must observe the same gamepad states and write no trace line. See
+[the input trace experiment](experiments/startup-input-trace.md) for the exact line fields, the
+fixture's expected states and the movement evidence it supports.
 
 `IGameInput::GetTemporalReading` uses the v0 ABI and returns `E_NOTIMPL` as
 [documented by Microsoft](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/deprecated/interfaces/igameinput/methods/igameinput_gettemporalreading). The
@@ -2292,7 +2443,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vcc_hi"`: the draws on WARP and hardware compare 16 x 16
   pixels of a compare, a carry and a scalar use of `vcc_hi` with a CPU reference, with translations that drop the
   compare bit, the carry or read `vcc_hi` as zero as failing controls.
-- **Wave reductions.** A whole wave32 reduction chain in a straight-line pixel stage (`s_or_saveexec_b32 sS, -1`,
+- **Wave reductions.** A whole wave32 reduction chain in a pixel stage (`s_or_saveexec_b32 sS, -1`,
   the identity fill `v_cndmask_b32_e64 vT, <identity>, vX, sS`, four `_dpp` steps `quad_perm:[1,0,3,2]`,
   `quad_perm:[2,3,0,1]`, `row_half_mirror`, `row_mirror`, `v_permlanex16_b32 vP, vT, 0, 0`, the combine,
   `s_mov_b32 exec_lo, sS` and `v_readlane_b32 sD, vT, 31`) of `v_or_b32`, `v_min_u32` or `v_max_u32` is recognised
@@ -2300,7 +2451,9 @@ These are measured on one executable; treat them as hypotheses for others.
   program cannot depend on how pixels are packed into waves). The min chain may read its lane later, as the #2125
   censuses show: after its restore, one `v_cndmask_b32_sdwa` (lowered as usual), the saveexec of a max chain, then the
   readlane, carried by that max chain before its fill. The entry EXEC must still hold, without `s_wqm`, so helper
-  lanes are left out on both sides. Other shapes that start like a chain are refused with their reason
+  lanes are left out on both sides. The chain itself stays straight. A uniform branch may sit before it, after it, or
+  both; a branch that is not proven uniform, a branch target inside the chain, and wave64 stay refused. Other shapes
+  that start like a chain are refused with their reason
   ([the note](experiments/startup-gfx2hlsl-wave-reduce.md)). Run
   `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_wave_reduce"`.
   [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
@@ -2319,7 +2472,12 @@ These are measured on one executable; treat them as hypotheses for others.
   [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
-  `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
+  `-AssertSites N` (`--assert-sites N` for `run.sh`), which steps over every hit at up to N distinct
+  main-image `int3` sites, so a site that repeats never runs the budget out however long the run is.
+  The first hit at one more site still stops the run, as do `X2W_STOP_AT` sites. `-ContinueAsserts N`
+  counts hits instead: it steps over the first N hits at any site. A hit is stepped over when either
+  budget allows it, and each budget counts only the hits it covers: the site budget takes the first N
+  distinct sites, and the hit budget counts the hits at other sites. Run `ctest --preset dev --no-tests=error -R "^startup_debug"`. One of them fires about ten times a second in the texture-streaming path
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
@@ -2490,8 +2648,8 @@ These are measured on one executable; treat them as hypotheses for others.
   for a load. Before, the stage was refused and every draw through its pipeline was skipped.
   Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
   hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
-  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
-  and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
+  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Multisampled
+  and 1D images are still refused here; cube sampling is lowered since #2943 (`startup_image_cube_`). Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
 - **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
   `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
@@ -2559,6 +2717,16 @@ These are measured on one executable; treat them as hypotheses for others.
   · [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview#geterroreventretrieveerrorrecord)
   · [DSTORAGE_ERROR_RECORD](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_error_record?view=gdk-2604)
   · [DSTORAGE_COMMAND_TYPE](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_command_type?view=gdk-2604)
+- **DirectStorage request totals (#2816).** The heartbeat's totals line and the first `Queue::EnqueueStatus` lines print
+  `requests raw=<n> inflated=<n> failed=<n> bcpack-blank=<n> completed=<n>`. `raw` counts the uncompressed copies only
+  (it was printed as `done=`, which read as zero for a title whose requests are all compressed), `inflated` every
+  compressed stream that was decoded (zlib, standalone or embedded BCPack), `bcpack-blank` the BCPack requests that
+  completed without decoded data, and `completed` is `raw + inflated + bcpack-blank`: every request that finished and
+  wrote its destination (a failed request is not in it). The text `inflated=<n> failed=<n>` is unchanged;
+  `tools/startup/live_view.py` parses it, takes `completed` from new lines and rebuilds it from `done`, `inflated` and
+  `bcpack-blank` on older ones. `startup_storage_failure_counts` checks the totals of a mixed run and of a run with only zlib
+  requests (`raw=0`, `completed` equal to the finished requests); `startup_live_telemetry_check.py` checks both line formats.
+  [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview)
 - **DirectStorage failure causes (#1198).** After its totals line, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: failed requests by cause` with one count for each of
   `read-at-or-past-eof`, `read-crossing-eof`, `read-other`, `destination-capacity`,
@@ -2679,7 +2847,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/logical_view_table.h` without a device. It covers the first and last records, one
   past the end, handles inside a record or below the heap, missing heap fields, memory that wraps past
   the top of the address space, and records crossing the end of a window.
-- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations. At process exit, one `x2w-dstorage BCPack summary` line reports request and zero-filled counts for every format 1..15 that was requested. The consumer fixture sends a format 6 request and checks that it succeeds, leaves a zero-filled destination, and appears in both counts; BC1 and BC7 requests must not be counted as zero-filled.
+- BCPack DirectStorage requests decode BC1–BC7 complete multi-lane rANS payloads into temporary memory and publish only after success. They are excluded from continuation caching. BC2/BC6H now reconstruct packed blocks; invalid formats and damaged streams fail without publishing blank textures. BC1 uses independent endpoint/index history and exact format dictionaries; the fitted window and quadrant masks have been removed. File and memory sources, outer zlib and physical-page destinations share this path. Historical zero-filled counters remain in the summary log schema but are no longer incremented. [Implementation, synthetic fixtures and oracle reproduction](experiments/bcpack-standalone.md).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
@@ -2726,7 +2894,7 @@ These are measured on one executable; treat them as hypotheses for others.
   mip 0 and mip 3 instead: `ctest --preset dev --no-tests=error -R '^startup_sampler_lod_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
-  gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
+  gather, clamp, 1D and `unorm` forms are refused; a cube lowers since #2943 ([note](experiments/startup-image-cube.md)). Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
   first address register. Offset, clamp, compare and gather forms, other stages, code after a branch, a sampler with a
@@ -2903,13 +3071,23 @@ observed callers. The experimental mode echoes any 32-bit type value at `+0x00` 
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
 outside `+0x00` and `+0x04` zero (`+0x34` carries decoded bytes only in the optional Opus build below). Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
-(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`). With `X2W_AUDIO_ACTIVITY=1` it also counts
+commands by class (see [Activity counter](#activity-counter)).
 
 The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=ON` (and `Opus_DIR` pointing at an
 installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
 must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
 its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
-completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+completions on, a type `3` command then decodes one Opus packet. For a connection with processing kind
+`1`, activate (type `1`) supplies the stream channel count at `+0x18`. The decoder runs at 48 kHz.
+Process skips the leading frames at `+0x20` and returns at most the frame count at `+0x24` and the output
+capacity at `+0x34`. Connection option bit `4` selects planar stereo. The result echoes the first 24
+command bytes, reports kept frames at `+0x30` and byte count at `+0x34`, and returns the output pointer,
+input byte count and input pointer at `+0x38`, `+0x44` and `+0x48`. Pitch conversion and result events
+are outside the tested subset. The source-built stereo check compares both output orders to libopus and
+verifies that a 960-frame packet with a 312-frame prefix produces 648 frames.
+
+The earlier packet-only fixture path uses the following fields:
 `+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
 `+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
 (interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output
@@ -2925,8 +3103,8 @@ are copied from scratch only after the result is queued.
 
 ```powershell
 cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
-cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
-ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check startup_xapu_opus_count_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus|opus_count)$' -V
 ```
 
 `startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
@@ -2935,6 +3113,12 @@ a reference decoder, untouched guard floats past the decoded frames, a malformed
 an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
 starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
 off. It is registered only in the optional build.
+
+`startup_xapu_opus_count` uses the same libopus tones to check the bounded telemetry: decoded
+packets, dequeued completions and each refusal reason. The stand-in writes one
+`x2w-audio XApu opus summary:` line at the last disconnect or at process exit, and the audio sink
+reports `accepted` and `not_open` submissions. See
+[the completion-count note](experiments/startup-opus-completion-count.md).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
@@ -2994,6 +3178,48 @@ address validity/mapping exports, then runs 4 threads of 1000 rounds against an 
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
+```
+
+### Activity counter
+
+With `X2W_AUDIO_ACTIVITY=1` as well, the stand-ins count what a caller does with the audio processor without decoding
+anything. `AcpHal.dll` keeps a copy of the XMA context array that `AcpHalAllocateShapeContexts` hands out and compares
+the array with it inside the calls that count (HAL submits, `AcpHalAllocateShapeContexts`, every `ApuFree` once counting
+started and `x2w_acphal_xma_activity`), at most once per 10 ms. Each 64-byte context is taken as a whole and no field in
+it is read: one that goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that
+returns to all zero as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every
+`XApuEnqueueCommand` call by command class, taken as the first `UINT32` of the command, with no cap; unreadable commands
+and unknown handles are counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls
+are not in it. In an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3 command too short to decode
+returns `E_POINTER` before the queue and is still counted, as class 3.
+Neither DLL starts a thread: a counted call at least a second after a DLL's previous line (or its first
+counted call) logs the next line, with the counts since that line, only when a count moved, so nothing of either DLL
+runs after a caller unloads it. Until then the counts wait for a later call: counts from the last second before a
+caller's final call, and changes after it, are not logged, though the exports still return them. With the fixture's
+caller, for example:
+
+```
+x2w-audio xma-activity t=1.1 s: contexts filled=5 changed=3 cleared=2 live=0/0; hal submits=4 by type 1=2 3=1 other=1
+x2w-audio xapu-activity t=1.1 s: commands=7 by class 1=3 2=2 other=1 unreadable=1; rejected=1 (not in commands)
+```
+
+`t` is seconds since the process started, the same base in both DLLs; the fixture's line comes after its `ApuFree`, so
+no context is watched (`live=0/0`). A context written across a sample counts twice, and one filled and cleared between
+two samples is not counted. `ApuFree` of the array ends the count before the block can be reused, and a second
+`AcpHalAllocateShapeContexts` samples the old array once more and then watches only the new one. The totals are also
+returned by the experimental exports `x2w_acphal_xma_activity` and `x2w_xapu_command_counts`. The 64-byte stride and the
+command class are stand-in conventions, not a console layout, and no field inside a context, such as an enable flag, is
+identified. With the variable unset nothing runs: no read of caller memory, no line.
+
+The source-built check runs four child processes: counter on (the exports and the logged lines give exactly what the
+caller script did, and an array freed and allocated again is no longer counted), counter on with a caller that writes
+only the 64 bytes after the last context and sends nothing (every count 0, no line), counter off (no count, no line),
+and an unload case. That one allocates the contexts twice without `ApuFree` (the old array's unsampled change counts,
+later ones do not), then frees both DLLs, checks that they are unmapped, waits 1.5 s and must exit 0. Every result,
+output, last error and the final context bytes must match between the on and off runs:
+
+```
+ctest --preset release --no-tests=error -R '^startup_acphal_xma_activity$' -V
 ```
 
 ## Uniform first-lane reads
@@ -3102,8 +3328,7 @@ arrive. It reports frame counts and FPS from the graphics heartbeat without infe
 draws were executed. Network refusals are shown when observed; the window does not establish
 that all network activity is blocked. To check this presentation with generated logs, run
 `python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
-for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
-the launcher's concurrent-hook limitation.
+for memory accounting.
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
@@ -3417,27 +3642,39 @@ texture with that description exists at the address, its view is created as befo
 70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
 BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
 with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
-4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR) or the linear mode `0x100` (rows
+whose pitch is rounded up to 256 bytes, the mips stored from the smallest up), the texels are read from the
 address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
 draw that samples the view copies each mip of each array slice from that layout into desktop
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
 after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
 
-The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+The description must be two-dimensional, or in the linear mode `0x100` one-dimensional and not an array (one row per mip, no block-compressed format), at most 16384 texels a side, with 1 to 15 mips, one sample,
 no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
-texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 1D, 2D or 2D-array view must match the texture's dimension and fit the mip and slice ranges. A cube view is taken on a 2D array of exactly six slices (the faces, +X to -Z) and is bound where a translation's manifest declares `texcube`; `tools/startup/gfx2hlsl.py` does not emit that kind yet, because it refuses `dim:SQ_RSRC_IMG_CUBE`. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
 
-A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one mip, one
-sample, at most 2048 texels on each side and an uncompressed format with a known element size,
-viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+
+A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
+at most 2048 texels on each side and a format with a known element size (8- to 128-bit texels and
+BC1 to BC7, whose largest mip must then be whole 4x4 blocks across and down; the depth is any), with
+one mip or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit
+the chain. A block-compressed volume is laid out as the volume of its 4x4 blocks, each one depth layer
+deep: the sides are rounded up to whole blocks first, and every mip size after that is counted in
+blocks (`ElemLib::AdjustSurfaceInfo`), so a mip whose texel side is not a multiple of 4 can be a block
+wider in the layout than in the view. addrlib lays a 3D resource in a standard or display mode out in thick blocks
 (`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
-16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
-every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
-Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
-other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
-swizzle modes and every other layout value. The texels must be readable and span
+16-byte elements, and the volume is stored a layer of blocks (one block deep) at a time. Each layer
+holds that layer of every mip: first the shared tail block when the chain has one, then the mips from
+the smallest to the largest, each in blocks along x, then y, with every side rounded up at each level
+and padded to whole blocks. A mip is in the tail when it is at most a block wide and half a block high
+and at most five mips remain; tail mip k from the end starts at byte k x 256 of the tail block, which,
+read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoMacroTiled`). Each
+depth layer is copied to its own footprint rows.
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
+without a live texture, cube views of other arrays, three-dimensional descriptions in any
+other layout, multisampled textures, the XOR swizzle modes and
+every other layout value. The texels must be readable and span
 at most 64 MiB.
 
 A console-layout description is held (not published, descriptor unchanged) in the two cases a
@@ -3477,8 +3714,10 @@ Limits and choices that are not measured against a console:
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
 - The thick `0x105` volume layout is compared with addrlib itself when the build has it
-  (`startup_gfx10_volume_addrlib`: every element address of 190 volumes). Mip chains, block-compressed
-  volumes and volumes in the other modes are not handled; they stay refused.
+  (`startup_gfx10_volume_addrlib`: every element address of every mip of 501 volumes, 115 of the uncompressed ones
+  with a mip chain, and 196 block-compressed ones, every mip count of four chains for each of BC1
+  to BC7). Only BC1 volumes are drawn. Volumes in the other modes are not handled; they stay
+  refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
@@ -3486,7 +3725,7 @@ Log lines (stderr and `X2W_TRAP_LOG`):
   for each new combination of format, layout, one or several mips, one or several slices, flags,
   dimension, view format, view dimension and outcome (at most 200). The outcome is
   `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
-  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+  `published console layout`, one of the two hold reasons, `texture_no_resource` (no live resource at that base and description), `texture_unreadable` (the texels are not readable), `texture_over_64mib` (more than the 64 MiB single-copy limit) or `texture_unavailable` (publication failed otherwise).
 - `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
   submits that drop retained uploads.
 
@@ -3591,7 +3830,9 @@ descriptions with:
   re-checking committed status to handle title memory deallocation/reallocation. On adapters supporting
   `D3D12_FEATURE_EXISTING_HEAPS` for `MEM_PRIVATE` memory, it opens the existing heap and creates a
   zero-copy placed resource alias; otherwise (or on WARP), it falls back to a committed upload buffer and
-  synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
+  synchronizes memory from the host. If the page offset cannot be expressed in whole elements for a
+  non-raw view, an upload copy starts at the view address. Cached backings leave this option available
+  even when an earlier raw call has already created a page backing. When the device wrapper is released (`refs == 0`),
   `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
   adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
@@ -3622,7 +3863,9 @@ typed format, views that end exactly at the end of the buffer, raw alignment of 
 element, widths, addresses and first elements above 4 GiB, page extent calculation, and cache range
 coverage. Its `_control` runs (`height`, `exact-fit`, `first-32`, `unplaced-extent`, `unplaced-covers`)
 expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises placed and unplaced buffer
-views with valid addresses on a device (WARP and hardware), and verifies the refusal lines.
+views with valid addresses on a device (WARP and hardware), and verifies the refusal lines. Its
+readback checks stride-12 views before and after a raw view on the same page, and compares stride-16
+views on fresh pages with and without a preceding unaligned raw call.
 
 `startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
 device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).
@@ -3635,7 +3878,8 @@ footprint layout (256-byte row pitch alignment and 512-byte subresource placemen
 `startup_address_volume_srv_*` exercises volume SRVs on a device (WARP and hardware)
 with multiple depth slices and mip levels, where footprint row pitch (256 bytes) exceeds packed row bytes (16 bytes),
 and verifies refusal lines for mismatched view dimensions, short backings, out-of-bounds mips, explicit clamps,
-and console layouts. On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driver 32.0.21045.11001),
+and a console-layout description over the live volume (`overlapping_resource`; before mip chains of `0x105`
+volumes were read, `unsupported_description`). On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driver 32.0.21045.11001),
 `startup_address_volume_srv_hardware` passed with all 32 RGBA pixels exact.
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer|volume)$' -V`
