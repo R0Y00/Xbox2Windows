@@ -2,7 +2,7 @@
 // Three descriptor heaps over title memory the fixture owns, protected after creation: writable, read-only, and with a
 // guard page. A texture SRV (device slot 18) goes into each, and a second one into the writable heap. In both modes the
 // writable heap gets both tokens, the read-only heap stays zero without a crash, and the guard page keeps its guard bit
-// and stays zero. Two more heaps start 16 bytes before a page boundary (title backing has no alignment check), so
+// and stays zero while the page after it stays read-write (the bit is set again on that page only). Two more heaps start 16 bytes before a page boundary (title backing has no alignment check), so
 // their first descriptor's token crosses into a read-only or a guard page: in both modes the writable prefix keeps its
 // bytes, the left page stays read-write without a guard bit, and the right page keeps its protection and stays zero.
 // The stand-in's counters (x2w_d3d12_view_token_writes) tell the two paths apart: (0, 0) when the switch is unset,
@@ -183,6 +183,9 @@ int main(int argc, char** argv)
     MEMORY_BASIC_INFORMATION info{};
     expect(VirtualQuery(memory[guard], &info, sizeof(info)) && (info.Protect & PAGE_GUARD),
            "the guard page lost its guard bit");
+    // The guard bit is set again on the guard page only: the rest of the region stays read-write.
+    expect(protection(static_cast<unsigned char*>(memory[guard]) + page) == PAGE_READWRITE,
+           "the page after the guard page changed its protection");
     if (VirtualProtect(memory[guard], page, PAGE_READWRITE, &old))
         expect(all_zero(memory[guard], UINT64{stride} * descriptors), "the guard page was written");
 

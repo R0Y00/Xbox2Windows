@@ -177,7 +177,8 @@ bool view_token_in_one_page(u64 dest, std::size_t bytes)
 // The token write of view_token_guarded(), for a span inside one page (view_token_in_one_page), so a refusal happens
 // on the first byte and writes nothing. A page that refuses the write (no access, read-only, a guard page, an in-page
 // error) leaves the descriptor without a token, as writable() returning false did; a guard page has its guard bit set
-// again, on that page only.
+// again, on that page only. Between the fault that clears the guard bit and the re-arm, another thread's write to that
+// page goes through, where writable() would have refused it.
 __declspec(noinline) bool write_view_token(void* dest, const void* token, std::size_t bytes) noexcept
 {
     DWORD code = 0;

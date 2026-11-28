@@ -10,10 +10,14 @@ recording threads at once.
 ## What the switch changes
 
 - `X2W_D3D12_VIEW_TOKEN_GUARDED=1`: the token is written by `write_view_token` under `__try`, without the commit call
-  and the query. A lazily committed page is committed by xmem's vectored handler on the first touch, as for any other
-  write. A page that refuses the write (no access, read-only, a guard page, an in-page error) leaves the descriptor
-  without a token, as `writable` returning false did; a guard page has its guard bit set again, as
-  `probe_readable` does.
+  and the query. A page that refuses the write (no access, read-only, a guard page, an in-page error) leaves the
+  descriptor without a token, as `writable` returning false did; a guard page has its guard bit set again, on that
+  page only, as `probe_readable` does.
+- Lazy commit: with `X2W_XMEM_LAZY_COMMIT`, xmem's vectored handler commits a page on the first touch, before the
+  `__except` filter sees the fault. Only the startup runs below exercise this; the fixture commits its memory up
+  front and loads no xmem.dll.
+- Concurrency: between the fault that clears a guard bit and the re-arm, another thread's write to that page goes
+  through, where `writable` would have refused it. The runs below refused no write, so it did not occur there.
 - Only a token that lies inside one 4 KiB page takes the guarded write, so a refusal comes on its first byte and
   changes nothing. A descriptor heap's title backing has no alignment check, so a token can cross a page boundary;
   such a token keeps the full-span `writable` check, with or without the switch.
@@ -37,7 +41,9 @@ guard page: in both modes the 16-byte writable prefix keeps its bytes, the left 
 a guard bit, and the right page keeps its protection and stays zero. The fixture-only export
 `x2w_d3d12_view_token_writes` reports the guarded writes: unset `0, 0`, set `2, 2` (crossing tokens are not
 guarded writes). Mutants: ignoring the switch fails `the guarded path did not write 2 tokens and refuse 2`; not
-setting the guard bit again fails `the guard page lost its guard bit`; guarding crossing tokens too fails
+setting the guard bit again fails `the guard page lost its guard bit`; setting it again over the whole region
+(`info.BaseAddress`, `info.RegionSize`) fails `the page after the guard page changed its protection`; guarding
+crossing tokens too fails
 `a crossing heap's writable prefix changed` (read-only right page) and leaves the left page `0x104`
 (`PAGE_READWRITE | PAGE_GUARD`, guard right page).
 
@@ -63,7 +69,9 @@ run; only this switch differs. Two pairs, the second in reverse order. Aggregate
   (`NtQuerySystemInformation`, every 20 ms) found them runnable but without a free core in 14–21% of the samples,
   so CPU time they save is CPU time they use for the next lists.
 - A confirmation run with the switch set (the report line above) logged `written 16447410, refused 0`: the guard
-  refused no write, so the tokens written match the default path. The `token` null bindings scale with the draws
-  recorded; runs without this change gave 23–34 per 1,000 translated draws on the same machine.
+  refused no write. That shows no token was lost to a refusal, not that every token matches the default path.
+- The `token` null bindings were higher with the switch (33.6 / 30.1 against 25.7 / 23.5 per 1,000 translated
+  draws). Runs without this change gave 23–34 per 1,000 on the same machine, so the difference lies within that
+  spread, but it is not explained.
 
 Not established: other adapters and drivers, hosts with more cores, and Wine (where #2911 changes `writable`).
