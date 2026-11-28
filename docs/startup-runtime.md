@@ -1528,7 +1528,15 @@ the two recovery checks are its sole failures),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
-`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
+A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when a debugger is attached or `X2W_PROBE_PRECHECK` is set to anything but `0` (read once; otherwise the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
+region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
+Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
+a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render
+totals line prints `reads refused before a fault <n>` after the textures count. The check adds an unmapped range
+that must return false and 0 with no exception seen by a vectored handler, for the probe and the copy, and counts the
+avoided faults. No GPU is required:
 
 ```powershell
 cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check

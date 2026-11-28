@@ -17847,3 +17847,14 @@ ctest --preset dev --no-tests=error -j1 -R '^(native_pixel_raw_uav_(warp|hardwar
 ```
 
 Repeat with the release preset. The source-built shader pair goes through request publication, native DXIL, actual PSO/draw and GPU readback. The fixture checks full buffer and color-target contents, nonzero/short/end views, decoy and invalid descriptors; the validator also checks alignment and bounds. Local RX 7900 XT/WARP Debug and Release runs passed 54 cases (3,456 DWORDs and 1,728 pixels); the independent review over main 886a5a28 reproduced the same counts on RTX 4060 Laptop and WARP with the D3D12 debug layer enabled and zero errors. Actual title rendering impact is not established.
+
+## Native pixel raw DWORD atomic add
+
+The native pixel compiler supports raw DWORD buffer atomic add in a proven straight-line guest block, with exact coverage/EXEC, including restoration from whole-quad entry. GLC returns the old value, preserves inactive VGPRs, and returns zero for an active out-of-view access; without GLC the addend is unchanged. The runtime uses the single raw pixel UAV direct non-indexed draw contract above. Indexed atomics, other atomic operations, general CFG and unproven WQM remain refused (#3216, #3217).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer compile_dxil
+ctest --preset dev --no-tests=error -j1 -R '^native_pixel_atomic_(warp|hardware)$' -V
+```
+
+Repeat with the release preset. The source-built fixture verifies 13 actual draws and four refusal controls per adapter/configuration, including contention, guard words, active out-of-view, odd raster edges and real WQM quad-neighbor reads with and without GLC. WQM+GLC records returned old values through a second exact atomic in a private lane slot and checks a valid serialization of the varying addends. Local RX 7900 XT/WARP Debug/Release integration over main 4b0350e passed 52 draws, 3328 DWORD and 1664 pixel comparisons, and 16 refusal controls. The debug layer was unavailable; actual title rendering is not established.
