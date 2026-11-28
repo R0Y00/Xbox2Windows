@@ -12875,6 +12875,20 @@ mapping, archive stream discovery and rendered pixels remain separate work.
 The existing prefix probe keeps its diagnostic behavior. No local archive or
 texture payload is used by these checks.
 
+### Standalone BCPack block reconstruction
+
+The startup DirectStorage stand-in reconstructs BC1–BC7 packed blocks without an
+installed GDK or external table file. BC1's fitted endpoint window and quadrant
+masks are removed; BC2 and BC6H now decode rather than report blank success.
+See [the standalone implementation notes](experiments/bcpack-standalone.md) for
+source provenance, synthetic golden checks, atomic storage tests, and optional
+oracle reproduction commands.
+
+```powershell
+cmake --build --preset dev --target bcpack_formats_check startup_stub_consumer startup_stub_xcrdapi
+ctest --preset dev --no-tests=error -R '^(bcpack_all_formats|startup_bcpack_storage)' -V
+```
+
 ### BCPack lane decoder paths
 
 The startup storage stand-in decodes BCPack streams with `decode_lanes` in
