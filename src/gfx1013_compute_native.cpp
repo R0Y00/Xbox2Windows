@@ -710,8 +710,10 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         set(i.dst, v);
         if (i.name == "s_mov_b64")
             set(i.dst + 1, high);
-    } else if (!graphics && !wave64 && (i.name == "s_and_saveexec_b32" || i.name == "s_or_saveexec_b32")) {
-        // Both the saved EXEC and the updated EXEC are numeric mask words.
+    } else if (!graphics && !wave64 && i.enc == Encoding::Sop1 &&
+               ((i.name.size() > 13 && i.name.substr(i.name.size() - 13) == "_saveexec_b32") ||
+                i.name == "s_andn1_wrexec_b32" || i.name == "s_andn2_wrexec_b32")) {
+        // Both the saved/written destination and the updated EXEC are numeric mask words.
         set(i.dst, {});
         set(126, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {

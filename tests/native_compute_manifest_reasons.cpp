@@ -3,6 +3,7 @@
 #include "native_compute_output.h"
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 
@@ -58,9 +59,9 @@ int main() {
         {"SRV registers not contiguous", [](auto &p) { p.bindings[0].shader_register = 1; }},
         {"UAV registers not contiguous", [](auto &p) { p.bindings[1].shader_register = 1; }},
         {"SRV kind root_buffer_srv", [](auto &p) { p.bindings[0].kind = K::root_buffer_srv; }},
-        {"SRV kind texture_srv 3d", [](auto &p) {
+        {"SRV kind texture_srv cube", [](auto &p) {
              p.bindings[0].kind = K::texture_srv;
-             p.bindings[0].image_dimension = 2;
+             p.bindings[0].image_dimension = 3;
          }},
         {"SRV kind texture_srv 2d array", [](auto &p) {
              p.bindings[0].kind = K::texture_srv;
@@ -92,6 +93,30 @@ int main() {
                     ok ? "" : manifest ? "a manifest" : reason.c_str());
         failures += !ok;
     }
-    std::printf("%d of %zu manifest reasons wrong\n", failures, std::size(cases) + 1);
+    // A texture SRV is published under the name of its dimension: the line the runtime's reader takes.
+    const struct {
+        unsigned image_dimension;
+        const char *line;
+    } published[] = {
+        {0, "srv 0 tex1d table 1 64\n"},
+        {1, "srv 0 tex2d table 1 64\n"},
+        {2, "srv 0 tex3d table 1 64\n"},
+        {5, "srv 0 tex2da table 1 64\n"},
+    };
+    for (const auto &c : published) {
+        auto program = base();
+        program.bindings[0].kind = K::texture_srv;
+        program.bindings[0].image_dimension = c.image_dimension;
+        reason = "unset";
+        const auto manifest = format_compute_runtime_manifest(program, &reason);
+        std::string wanted = expected;
+        wanted.replace(wanted.find("srv 0 buf table 1 64\n"), std::strlen("srv 0 buf table 1 64\n"), c.line);
+        const bool ok = manifest && *manifest == wanted && reason == "unset";
+        std::printf("%s publishes %s", ok ? "ok  " : "FAIL", c.line);
+        if (!ok)
+            std::printf(" | got: %s\n", manifest ? manifest->c_str() : reason.c_str());
+        failures += !ok;
+    }
+    std::printf("%d of %zu manifest reasons wrong\n", failures, std::size(cases) + std::size(published) + 1);
     return failures ? 1 : 0;
 }

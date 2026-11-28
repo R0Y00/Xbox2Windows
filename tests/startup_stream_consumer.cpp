@@ -242,6 +242,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const bool long_run = keep_closed || mode == "dispatch-input-snapshot-long";
     constexpr UINT long_records = 2u << 20, long_frames = 48;
     const bool shared_uav = mode == "dispatch-read-write-uav";
+    const bool typed_output_offset = mode == "dispatch-records32-output-offset";
     const bool indirect = mode.rfind("dispatch-indirect-", 0) == 0;
     const bool heap_waterfall = mode.rfind("dispatch-heap-waterfall", 0) == 0;
     const bool pixel = mode.rfind("dispatch-indirect-pixel-", 0) == 0;
@@ -339,6 +340,10 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else if (mode == "dispatch-output-unaligned") {
         descriptors[1][0] += 8;  // still inside the buffer: 318 records
         descriptors[1][2] = words - 2;
+    } else if (typed_output_offset) {
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[1]) + 8;
+        descriptors[1][0] = static_cast<UINT>(address);
+        descriptors[1][1] = static_cast<UINT>(address >> 32) | fields[1][0] << 16;
     }
     const bool heap_short = mode == "dispatch-heap-waterfall-short";
     const struct {
@@ -378,7 +383,7 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     } else {
         std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
     }
-    if (mode == "dispatch-records32" || shared_uav) {  // the output's descriptor at table byte 32, none at byte 16
+    if (mode == "dispatch-records32" || typed_output_offset || shared_uav) {  // output at byte 32, none at byte 16
         std::memset(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), 0, sizeof(descriptors[1]));
         std::memcpy(reinterpret_cast<void*>(cpu + 32), descriptors[1], sizeof(descriptors[1]));
     }
@@ -475,6 +480,65 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + (mode == "dispatch-input-token" ? 0 : 64));
         // Byte 16 is not a descriptor of the heap: the token's words are copied there, as a title copies descriptors.
         if (mode == "dispatch-output-texture-token") std::memcpy(reinterpret_cast<void*>(cpu + 16), reinterpret_cast<const void*>(cpu + 64), 16);
+    }
+    if (mode.rfind("dispatch-texdim-", 0) == 0) {
+        // dispatch-texdim-<1d|2da|3d>[-mismatch|-undescribed|-clamped]: the sampled input is a described R32_FLOAT texture
+        // of that dimension in the SRV at table byte 64, texel (x + y * 4 + slice * 16) holding 0.25 * (index + 1):
+        // 1d is 8 texels wide, 2da is 4x4 with six slices (the view starts at slice 1 and spans four), 3d is 4x4x4.
+        // Each subresource is uploaded by its own copy. -mismatch views a plain 2D texture instead (a view dimension
+        // that is not the manifest's), -undescribed creates the view without a description, -clamped sets
+        // ResourceMinLODClamp 1.0 (a valid desktop view that is not a view of the texels as stored; a view outside the
+        // texture would remove the device when it is created).
+        const std::string rest = mode.substr(16);
+        const std::string kind = rest.substr(0, rest.find('-'));
+        const std::string control = rest.find('-') == std::string::npos ? "" : rest.substr(rest.find('-') + 1);
+        const bool one = kind == "1d", array = kind == "2da", volume = kind == "3d";
+        if (!one && !array && !volume) return 2;
+        const bool plain = control == "mismatch";
+        constexpr DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT;
+        const UINT width = one && !plain ? 8 : 4, height = one && !plain ? 1 : 4;
+        const UINT depth = plain || one ? 1 : array ? 6 : 4;
+        const D3D12_RESOURCE_DIMENSION dimension = plain || array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D :
+            one ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const D3D12_RESOURCE_DESC texture_desc{dimension, 0, width, height, static_cast<UINT16>(depth), 1, format, {1, 0}};
+        constexpr UINT pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, slice_bytes = pitch * 4;
+        const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 8192, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        void* const texture = make_committed(device, D3D12_HEAP_TYPE_DEFAULT, texture_desc, D3D12_RESOURCE_STATE_COMMON);
+        void* const upload = make_committed(device, D3D12_HEAP_TYPE_UPLOAD, upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* texel = nullptr;
+        if (!texture || !upload || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&texel)))) || !texel) return 80;
+        std::memset(texel, 0, 8192);
+        for (UINT z = 0; z < depth; ++z)
+            for (UINT y = 0; y < height; ++y)
+                for (UINT x = 0; x < width; ++x) {
+                    const float value = 0.25f * static_cast<float>(x + y * 4 + z * 16 + 1);
+                    std::memcpy(static_cast<char*>(texel) + z * slice_bytes + y * pitch + x * 4, &value, sizeof(value));
+                }
+        invoke(upload, 9, 0, 0);
+        // A 3D texture is one subresource whose footprint spans its depth; a 2D one has a subresource per slice.
+        const UINT copies = volume ? 1 : depth;
+        for (UINT i = 0; i < copies; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            image.SubresourceIndex = i;
+            D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            source.PlacedFootprint = {UINT64{i} * slice_bytes, {format, width, height, volume ? depth : 1, pitch}};
+            invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        const float clamp = control == "clamped" ? 1.0f : 0.0f;
+        if (plain) view.Texture2D.MipLevels = 1;
+        else if (one) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            view.Texture1D = {0, 1, clamp};
+        } else if (array) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Texture2DArray = {0, 1, 1, 4, 0, clamp};
+        } else {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Texture3D = {0, 1, clamp};
+        }
+        invoke(device, 18, word(texture), control == "undescribed" ? 0 : word(&view), cpu + 64);
     }
     if (mode == "dispatch-input-memory-view") {
         // The input is a buffer view (device slot 70) of memory no buffer is placed over, 16 bytes in; its token

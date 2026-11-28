@@ -16697,6 +16697,22 @@ which then reads another mip's texels. A chain whose layout runs past the size t
 reports is held as before: RGBA8 33 by 9 by 18 with six mips takes 135,168 bytes in the layout against
 65,536 reported.
 
+Block-compressed volumes are read too. addrlib turns the texel sides of a BC volume into 4x4 blocks
+before it lays the volume out, and does not divide the depth: the volume is the volume of its blocks,
+each one depth layer deep, with every mip size counted in blocks from there. `startup_gfx10_volume`
+checks that BC1 64 by 64 by 16 with five mips and BC7 48 by 20 by 9 with three mips take, element for
+element, the addresses of the 8-byte and 16-byte volumes of their blocks, and adds the distinct bytes
+and round trips of seven BC volumes (BC1 to BC7, with and without a chain, sides that are not powers
+of two). `startup_gfx10_volume_bc_control` sizes a BC volume by its texel sides instead and must fail;
+it fails four checks. `startup_gfx10_volume_addrlib`, passing each BC format to addrlib as itself, now
+compares every mip count of four chains for each of BC1 to BC7 too: 501 volumes and 13,205,290
+element addresses with 0 mismatches.
+
+`startup_address_console_{warp,hardware}` draws three BC1 volume mips: 48 by 40 by 12 with one mip,
+and mips 1 and 3 (the second in the tail) of 64 by 64 by 8 with five mips. Each block is one solid
+colour, and all 65,536 pixels of each must match. A local mutation that sizes the thick layout by
+texels instead of blocks, run once, fails it on the first BC volume.
+
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_volume'
 ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_console_(hardware|warp)$'
