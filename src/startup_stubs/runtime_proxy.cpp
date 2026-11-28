@@ -7,9 +7,12 @@
 // (package helpers). Dynamic QueryApiImpl is wrapped only when the provider module's basename is
 // xgameruntime.dll. The pre-link load notification only requests another scan. A worker scans
 // and rewrites linked modules outside the notification, keeping each module live while it is patched.
-// Enabled proxies remain loaded until process exit. Delay-import IAT slots are not
-// rewritten. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
-// and forward to the real object.
+// Enabled proxies remain loaded until process exit. Unbound delay-import IAT slots are left alone.
+// A later scan stores the proxy in a delay QueryApiImpl slot only when that slot still holds the
+// real export at the compare-exchange, and counts only that store.
+// GetProcAddress("QueryApiImpl") is always logged (the generic GPA log stays capped). The wrapper
+// hands out proxy objects whose methods log their first calls ("x2w-runtime") and forward to the
+// real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
@@ -71,12 +74,16 @@ bool keep_forward_target(FARPROC target) noexcept
 #endif
 }
 
-bool remember_real_query(QueryApi query) noexcept
+bool remember_real_query(QueryApi query, const char* source) noexcept
 {
     QueryApi expected = real_query.load(std::memory_order_acquire);
     if (expected) return expected == query;
     if (!keep_forward_target(reinterpret_cast<FARPROC>(query))) return false;
-    return real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel) || expected == query;
+    if (!real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel))
+        return expected == query;
+    x2w_local::logf("x2w-runtime QueryApiImpl remembered via %s -> %p", source ? source : "?",
+                    static_cast<void*>(query));
+    return true;
 }
 
 QueryApi load_real_query() noexcept { return real_query.load(std::memory_order_acquire); }
@@ -492,12 +499,16 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
     const FARPROC real = GetProcAddress(module, name);
     if (real && reinterpret_cast<u64>(name) > 0xffff) {
         static LONG logged;
-        if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
+        const bool query_name = std::strcmp(name, "QueryApiImpl") == 0;
+        // Always log QueryApiImpl so a late lookup is visible past the generic 40-line GPA cap.
+        if (query_name || x2w_local::first_calls(logged, 40))
+            x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name,
+                            static_cast<void*>(real));
         // Registry exports only when the module is a Windows registry provider (registry_console_mode.inl).
         if (const FARPROC hook = registry_hook_for(module, name, real)) return hook;
         // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
-        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
-            remember_real_query(reinterpret_cast<QueryApi>(real)))
+        if (module_is_xgameruntime(module) && query_name &&
+            remember_real_query(reinterpret_cast<QueryApi>(real), "gpa"))
             return reinterpret_cast<FARPROC>(&proxy_query);
         if (runtime_local() && fake_user() && module_is_xgameruntime(module)) {
             static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
@@ -517,12 +528,22 @@ void remember_real_query_from_export() noexcept
     const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
     if (!runtime || !module_is_xgameruntime(runtime)) return;
     // This stand-in's own GetProcAddress IAT is left unpatched, so this is the real export lookup.
-    remember_real_query(reinterpret_cast<QueryApi>(GetProcAddress(runtime, "QueryApiImpl")));
+    remember_real_query(reinterpret_cast<QueryApi>(GetProcAddress(runtime, "QueryApiImpl")), "export");
+}
+
+void log_query_status_once() noexcept
+{
+    static LONG logged;
+    const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
+    if (!runtime || !x2w_local::first_calls(logged, 1)) return;
+    x2w_local::logf("x2w-runtime QueryApiImpl status: xgameruntime loaded, real_query=%p",
+                    static_cast<void*>(load_real_query()));
 }
 
 // Rewrite one module's regular GetProcAddress / xgameruntime.dll!QueryApiImpl IAT slots.
-// Delay-import hits are not rewritten (slot is a delay thunk until first use). Caller must hold the
-// module live (pin) for the duration of the rewrite.
+// Unbound delay-import slots stay untouched. A delay QueryApiImpl slot is rewritten only when the
+// compare-exchange still sees the real export; a thunk restored after the eligibility read is left
+// in place and is not counted. Caller must hold the module live (pin) for the rewrite.
 int patch_module(HMODULE module)
 {
     if (!module || !module_is_exe_or_package_helper(module)) return 0;
@@ -533,28 +554,54 @@ int patch_module(HMODULE module)
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
     const auto image_size = static_cast<std::size_t>(nt->OptionalHeader.SizeOfImage);
     const bool self = module == proxy_module;
+    const ULONGLONG proxy = reinterpret_cast<ULONGLONG>(&proxy_query);
     int patched = 0;
     x2w_runtime_patch::visit_imports(base, image_size, [&](const x2w_runtime_patch::Hit& hit) {
         // Never rewrite this DLL's GetProcAddress: hooked_get_proc_address calls it for the real lookup.
         if (self && hit.kind == x2w_runtime_patch::Kind::get_proc_address) return;
+        auto* slot = reinterpret_cast<ULONGLONG*>(base + hit.first_thunk_rva);
         if (hit.delay_import) {
-            // Delay IAT holds a thunk, not the export. Do not rewrite; delay GetProcAddress is unhooked.
-            if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) remember_real_query_from_export();
+            // Delay GetProcAddress stays unhooked (CRT delay helper uses its own lookup).
+            if (hit.kind != x2w_runtime_patch::Kind::query_api_impl) return;
+            // The export is remembered once. Later quiet scans already have it.
+            if (!load_real_query()) remember_real_query_from_export();
+            const ULONGLONG real_bits = reinterpret_cast<ULONGLONG>(load_real_query());
+            // Skip the protection change when the slot is not the export. The store below still
+            // requires that same value: VirtualProtect can overlap a delay-loader restore.
+            if (!x2w_runtime_patch::delay_query_slot_is_bound(*slot, real_bits, proxy)) return;
+            DWORD old = 0;
+            if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
+            if (x2w_runtime_patch::replace_bound_delay_query(
+                    reinterpret_cast<std::uint64_t*>(slot), real_bits, proxy,
+                    [](std::uint64_t* destination, std::uint64_t desired, std::uint64_t expected) noexcept {
+                        return static_cast<std::uint64_t>(InterlockedCompareExchange64(
+                            reinterpret_cast<volatile LONG64*>(destination), static_cast<LONG64>(desired),
+                            static_cast<LONG64>(expected)));
+                    }))
+                ++patched;
+            VirtualProtect(slot, 8, old, &old);
             return;
         }
-        auto* slot = reinterpret_cast<ULONGLONG*>(base + hit.first_thunk_rva);
+        // Compare first. A quiet pass must not change protection on a slot that is already patched.
+        const ULONGLONG hooked = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+        if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
+            if (*slot == hooked) return;
+        } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
+            if (*slot == proxy) return;
+        } else {
+            return;
+        }
         DWORD old = 0;
         if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
         if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
-            if (*slot != reinterpret_cast<ULONGLONG>(&hooked_get_proc_address)) {
-                *slot = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+            if (*slot != hooked) {
+                *slot = hooked;
                 ++patched;
             }
         } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
             // Regular import: slot holds the real export after the loader bound it.
-            if (*slot != reinterpret_cast<ULONGLONG>(&proxy_query) &&
-                remember_real_query(reinterpret_cast<QueryApi>(*slot))) {
-                *slot = reinterpret_cast<ULONGLONG>(&proxy_query);
+            if (*slot != proxy && remember_real_query(reinterpret_cast<QueryApi>(*slot), "iat")) {
+                *slot = proxy;
                 ++patched;
             }
         }
@@ -571,14 +618,14 @@ int patch_module(HMODULE module)
 }
 
 // Pin the module, rewrite after linking, then drop the pin. Safe outside LdrDllNotification.
-int patch_module_pinned(void* dll_base)
+int patch_module_pinned(void* dll_base, bool announce)
 {
     if (!dll_base) return 0;
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(dll_base), &pinned) || !pinned)
         return 0;
     const int n = patch_module(pinned);
-    if (n > 0) {
+    if (n > 0 && announce) {
         char name[64] = "?";
         wchar_t path[MAX_PATH]{};
         const DWORD length = GetModuleFileNameW(pinned, path, MAX_PATH);
@@ -612,8 +659,9 @@ void CALLBACK dll_loaded(ULONG reason, const void*, void*)
         rescan_package_modules.store(true, std::memory_order_release);
 }
 
-void patch_package_modules()
+void patch_package_modules(bool announce)
 {
+    log_query_status_once();
     std::vector<HMODULE> modules(512);
     DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) || !needed)
@@ -637,15 +685,23 @@ void patch_package_modules()
     for (unsigned i = 0; i < count; ++i) {
         if (!module_is_exe_or_package_helper(modules[i])) continue;
         ++considered;
-        const int n = patch_module_pinned(modules[i]);
+        // Per-module lines only when a slot changed; quiet scans still report those rewrites.
+        const int n = patch_module_pinned(modules[i], true);
         if (n > 0) {
             ++modules_patched;
             slots += n;
         }
     }
-    if (slots > 0 || considered > 0)
-        x2w_local::logf("x2w-runtime proxy: %d import(s) in %u of %u package module(s) (%u loaded scanned)", slots, modules_patched,
-                        considered, count);
+    // Announce every load-driven scan. Quiet periodic passes speak only when a compare-exchange
+    // stored the proxy (bound delay QueryApiImpl after first use). A restored thunk adds nothing.
+    if (announce) {
+        if (slots > 0 || considered > 0)
+            x2w_local::logf("x2w-runtime proxy: %d import(s) in %u of %u package module(s) (%u loaded scanned)", slots,
+                            modules_patched, considered, count);
+    } else if (slots > 0) {
+        x2w_local::logf("x2w-runtime proxy: %d bound delay QueryApiImpl import(s) rewritten (%u of %u package, %u loaded)",
+                        slots, modules_patched, considered, count);
+    }
 }
 
 // Patch the main EXE immediately. The load notice only requests another worker scan.
@@ -671,11 +727,14 @@ void patch_imports()
     }
     if (HANDLE worker = CreateThread(nullptr, 0, [](void*) -> DWORD {
         // Outside DllMain and the pre-link notification. Clear the request before each scan so
-        // loads that arrive during the scan are picked up on the next pass.
+        // loads that arrive during the scan are picked up on the next pass. Periodic quiet passes
+        // catch delay QueryApiImpl slots that bind after the load-driven scan.
         rescan_package_modules.store(true, std::memory_order_release);
-        for (;;) {
+        for (unsigned tick = 0;; ++tick) {
             if (rescan_package_modules.exchange(false, std::memory_order_acq_rel))
-                patch_package_modules();
+                patch_package_modules(true);
+            else if (tick % 10 == 0)
+                patch_package_modules(false);
             Sleep(25);
         }
     }, nullptr, 0, nullptr)) {
