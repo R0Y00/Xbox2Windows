@@ -1041,6 +1041,12 @@ OperationResult run_bvh_root_roundtrip(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_compute_waterfall_oracle(const OperationContext& ctx)
+{
+    check_compute_waterfall_oracle(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_bvh_differential(const OperationContext& ctx)
 {
     return skip_if_false(check_bvh_differential(ctx.device, false));
@@ -1836,6 +1842,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
+    {"--compute-waterfall-oracle", 4, 4, nullptr, kNoGate, run_compute_waterfall_oracle},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
     {"--bvh-differential-pipeline", 3, 3, nullptr, kNoGate, run_bvh_differential_pipeline},
     {"--bvh-hits", 3, 3, nullptr, kGateSm65, run_bvh_hits},

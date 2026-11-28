@@ -1008,7 +1008,9 @@ The existing dispatch path records the result, and a program is accepted only wi
 fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
 and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
 scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
-not lower) is refused. The first 16 refusals of a process are logged as
+not lower) is refused. Programs published as `<key>.txt` also bind 1D, 2D, 2D-array and 3D texture SRVs
+(`srv N tex1d|tex2d|tex2da|tex3d table R B`) from the title's described view of that dimension, or are
+refused by name; cube texture SRVs are not published. The first 16 refusals of a process are logged as
 `compute pipeline <key> not translated natively: <reason>`. A refused key is left to the
 published translations, so `-Translate` can run beside it for those pipelines. A direct module declares
 wave size 32, so an adapter without 32-lane waves refuses every program by that name. The in-process
@@ -1569,7 +1571,7 @@ the two recovery checks are its sole failures),
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
 `PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`.
 A first-chance exception stops the whole process while a debugger is attached, so `probe_readable` and the fault-safe
-copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when a debugger is attached or `X2W_PROBE_PRECHECK` is set to anything but `0` (read once; otherwise the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
+copies (`guarded_memcpy`: `copy_title_bytes`, the linear-buffer `guarded_copy`) first, when `X2W_PROBE_PRECHECK` is set to anything but `0`, or when it is unset and a debugger is attached (read once; `X2W_PROBE_PRECHECK=0` keeps it off under the debugger that title runs start in, and off, the plain touch / `__try` path runs at no extra cost), ask `VirtualQuery` (one entry per
 region, cached per thread) whether the source is in free address space (`MEM_FREE`) and refuse it with no exception.
 Reserved, committed, guard and no-access pages still go through the touch / `__try` path, because a reserved page may be
 a lazily committed xmem page that the fault handler commits on first touch; `__try` stays the last guard. The render
@@ -2845,7 +2847,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/logical_view_table.h` without a device. It covers the first and last records, one
   past the end, handles inside a record or below the heap, missing heap fields, memory that wraps past
   the top of the address space, and records crossing the end of a window.
-- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations. At process exit, one `x2w-dstorage BCPack summary` line reports request and zero-filled counts for every format 1..15 that was requested. The consumer fixture sends a format 6 request and checks that it succeeds, leaves a zero-filled destination, and appears in both counts; BC1 and BC7 requests must not be counted as zero-filled.
+- BCPack DirectStorage requests decode BC1–BC7 complete multi-lane rANS payloads into temporary memory and publish only after success. They are excluded from continuation caching. BC2/BC6H now reconstruct packed blocks; invalid formats and damaged streams fail without publishing blank textures. BC1 uses independent endpoint/index history and exact format dictionaries; the fitted window and quadrant masks have been removed. File and memory sources, outer zlib and physical-page destinations share this path. Historical zero-filled counters remain in the summary log schema but are no longer incremented. [Implementation, synthetic fixtures and oracle reproduction](experiments/bcpack-standalone.md).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
@@ -3653,9 +3655,13 @@ texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The vie
 
 
 A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
-at most 2048 texels on each side and an uncompressed format with a known element size, with one mip
-or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit the
-chain. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+at most 2048 texels on each side and a format with a known element size (8- to 128-bit texels and
+BC1 to BC7, whose largest mip must then be whole 4x4 blocks across and down; the depth is any), with
+one mip or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit
+the chain. A block-compressed volume is laid out as the volume of its 4x4 blocks, each one depth layer
+deep: the sides are rounded up to whole blocks first, and every mip size after that is counted in
+blocks (`ElemLib::AdjustSurfaceInfo`), so a mip whose texel side is not a multiple of 4 can be a block
+wider in the layout than in the view. addrlib lays a 3D resource in a standard or display mode out in thick blocks
 (`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
 16-byte elements, and the volume is stored a layer of blocks (one block deep) at a time. Each layer
@@ -3667,7 +3673,7 @@ read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoM
 depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
 without a live texture, cube views of other arrays, three-dimensional descriptions in any
-other layout or with a block-compressed format, multisampled textures, the XOR swizzle modes and
+other layout, multisampled textures, the XOR swizzle modes and
 every other layout value. The texels must be readable and span
 at most 64 MiB.
 
@@ -3708,9 +3714,10 @@ Limits and choices that are not measured against a console:
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
 - The thick `0x105` volume layout is compared with addrlib itself when the build has it
-  (`startup_gfx10_volume_addrlib`: every element address of every mip of 305 volumes, 115 of them
-  with a mip chain). Block-compressed volumes and volumes in the other modes are not handled; they
-  stay refused.
+  (`startup_gfx10_volume_addrlib`: every element address of every mip of 501 volumes, 115 of the uncompressed ones
+  with a mip chain, and 196 block-compressed ones, every mip count of four chains for each of BC1
+  to BC7). Only BC1 volumes are drawn. Volumes in the other modes are not handled; they stay
+  refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
