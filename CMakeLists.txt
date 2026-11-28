@@ -8993,6 +8993,33 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_x87_exp_log_aot_altered_lifted>")
     set_tests_properties(cpu_aot_x87_exp_log PROPERTIES
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_x87_exp_log.txt")
+    set(cpu_x87_env_aot_exports
+        "op_fdecstp_sw,op_fdecstp_wrap_env,op_fnstenv_pushed,op_fstenv_pushed,"
+        "op_fnstenv_post_cw,op_fldenv_fnstenv,op_fldenv_wait_fnstenv,op_fnsave_stack,"
+        "op_fnsave_post_cw,op_fnsave_post_sw,op_fsave_stack,op_frstor_fnsave,"
+        "op_frstor_fdecstp_fnsave,op_fld_m32_fstp_m64,op_fld_m64_fstp_m32,"
+        "op_fld_m80_fstp_m80,op_fstp_c1_fdecstp")
+    string(CONCAT cpu_x87_env_aot_exports ${cpu_x87_env_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_x87_env_aot_${variant} x87_env_aot)
+        cpu_translation(cpu_x87_env_aot_${variant} cpu_x87_env_aot "${cpu_x87_env_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_x87_env_aot_altered PRIVATE ALTER_X87_ENV)
+    set(cpu_x87_env_aot_mutants_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_env_aot_mutants.cpp")
+    add_custom_command(OUTPUT "${cpu_x87_env_aot_mutants_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_env_aot_check.py"
+            emit-mutants "$<TARGET_FILE:cpu_x87_env_aot_original>" "${cpu_x87_env_aot_mutants_cpp}"
+        DEPENDS cpu_x87_env_aot_original tests/cpu/x87_env_aot_check.py tools/cpu_x87_env_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_x87_env_aot_mutants SHARED "${cpu_x87_env_aot_mutants_cpp}")
+    add_test(NAME cpu_aot_x87_env COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/x87_env_aot_check.py"
+        "$<TARGET_FILE:cpu_x87_env_aot_original>"
+        "$<TARGET_FILE:cpu_x87_env_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_x87_env_aot_altered>"
+        "$<TARGET_FILE:cpu_x87_env_aot_altered_lifted>"
+        "$<TARGET_FILE:cpu_x87_env_aot_mutants>")
+    set_tests_properties(cpu_aot_x87_env PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_x87_env.txt")
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
