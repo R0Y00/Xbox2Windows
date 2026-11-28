@@ -1315,6 +1315,63 @@ struct DirectCompute {
             packed_f16_alu(i);
             return true;
         }
+        if (n == "v_dot2_f32_f16") {
+            if (i.enc != Encoding::Mix || i.dpp_control || permuted || (i.a & 0x2400))
+                refuse(i.pc, "unsupported v_dot2_f32_f16 encoding");
+            if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ffu))
+                refuse(i.pc, "unsupported binary16 rounding or denormal mode");
+            auto half_pair = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                if (auto inline_word = packed_f16_inline_constant(r))
+                    return to_string(*inline_word);
+                if (r <= 105 || r == 255 || (r >= 256 && r < 512))
+                    return operand32(i, r);
+                refuse(i.pc, "unsupported v_dot2_f32_f16 source");
+            };
+            const auto s0 = half_pair(0), s1 = half_pair(1);
+            const unsigned r2 = i.src[2];
+            if ((r2 > 105 && r2 < 128) || (r2 > 208 && r2 < 240) || (r2 > 248 && r2 < 255) || r2 >= 512)
+                refuse(i.pc, "unsupported v_dot2_f32_f16 source");
+            auto cbits = operand32(i, r2);
+            if (i.neg & 4u)
+                cbits = ir.binary("xor", cbits, "2147483648");
+            const auto c = ir.value("bitcast i32 " + cbits + " to float");
+            auto term = [&](const string &word, unsigned selector, bool negate) {
+                auto bits = selector ? ir.binary("lshr", word, "16") : ir.binary("and", word, "65535");
+                if (negate)
+                    bits = ir.binary("xor", bits, "32768");
+                return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+            };
+            // Pair 0 uses OP_SEL[1:0] and NEG_LO[1:0]; pair 1 uses OP_SEL_HI[1:0] and NEG_HI[1:0] (in ABS).
+            const unsigned op_sel = (i.a >> 11) & 3u, op_sel_hi = (i.b >> 27) & 3u;
+            auto a0 = term(s0, op_sel & 1u, (i.neg & 1u) != 0);
+            auto b0 = term(s1, (op_sel >> 1) & 1u, (i.neg & 2u) != 0);
+            auto a1 = term(s0, op_sel_hi & 1u, (i.abs & 1u) != 0);
+            auto b1 = term(s1, (op_sel_hi >> 1) & 1u, (i.abs & 2u) != 0);
+            auto p0 = ir.value("fmul float " + a0 + ", " + b0);
+            auto p1 = ir.value("fmul float " + a1 + ", " + b1);
+            auto sum = ir.value("fadd float " + p0 + ", " + p1);
+            auto sum_bits = ir.value("bitcast float " + sum + " to i32");
+            auto res = ir.value("fadd float " + sum + ", " + c);
+            // Desktop DXIL fadd/saturate flush binary32 denormals to zero, whereas
+            // gfx1013 starts with MODE[5:4] = 3 (keep FP32 denormals). Every nonzero
+            // binary16*binary16 sum has |sum| >= 2^-48 >> 2^-126, so a binary32
+            // subnormal accumulator c is observable iff sum == +/-0.0.
+            auto c_mag = ir.binary("and", cbits, "2147483647");
+            auto sum_zero = cmp("eq", ir.binary("and", sum_bits, "2147483647"), "0");
+            auto c_subnormal = ir.value("and i1 " + cmp("ne", c_mag, "0") + ", " + cmp("ult", c_mag, "8388608"));
+            auto keep_subnormal = ir.value("and i1 " + sum_zero + ", " + c_subnormal);
+            string res_bits;
+            if (i.clamp) {
+                auto sat = ir.invoke("float", "unary.f32", 7, {{"float", res}}, "nounwind readnone");
+                auto clamped_sub = select(cmp("slt", cbits, "0"), "0", cbits);
+                res_bits = select(keep_subnormal, clamped_sub, ir.value("bitcast float " + sat + " to i32"));
+            } else {
+                res_bits = select(keep_subnormal, cbits, ir.value("bitcast float " + res + " to i32"));
+            }
+            vector_write(i.dst, res_bits);
+            return true;
+        }
         if ((i.subword || (!i.wide && !i.dpp_control && !permuted)) &&
             (n == "v_cvt_f16_f32" || n == "v_cvt_f32_f16")) {
             const bool narrow = n == "v_cvt_f16_f32";
@@ -3732,7 +3789,7 @@ struct DirectCompute {
             if (op.name == "s_round_mode" || op.name == "s_denorm_mode" || op.name == "s_setreg_b32" ||
                 op.name == "s_setreg_imm32_b32")
                 mode_write = true;
-            if (packed_f16_arithmetic(op.name))
+            if (packed_f16_arithmetic(op.name) || op.name == "v_dot2_f32_f16")
                 half_binary = true;
             if (op.branch() && op.op != 2)
                 conditional = true;
