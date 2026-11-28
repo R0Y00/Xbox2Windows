@@ -224,8 +224,20 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
         std::ifstream meta(fs::path(input_path).replace_extension(L".pslayout"));
         std::string tag, extra;
         unsigned enable, address, wave;
-        if (!(meta >> tag >> enable >> address >> wave) || tag != "meshps1")
-            throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        if (!(meta >> tag))
+            throw std::runtime_error("raw mesh PS needs a reviewed entry layout");
+        if (tag == "meshps1") {
+            if (!(meta >> enable >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        } else if (tag == "meshps2") {
+            // As in Victory's native PS reflection, this record names the
+            // inputs delivered by ADDR when a separate ENA mask is unavailable.
+            if (!(meta >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps2 input-address wave (decimal)");
+            enable = address;
+        } else {
+            throw std::runtime_error("unknown raw mesh PS entry layout version");
+        }
         const bool guest_root = bool(meta >> extra);
         if (guest_root && (extra!="guest_root" || (meta >> extra)))
             throw std::runtime_error("unexpected raw mesh PS layout field");
@@ -1010,7 +1022,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-group-clear@BYTE_OFFSET and gfx1013-compute-wave32@BYTE_OFFSET take a req_<key>.c67.\n"
                      "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps, gfx1013-container-ms.\n"
                      "gfx1013-raw-ms reads guest mesh bytes and an explicit .mslayout sidecar.\n"
-                     "gfx1013-raw-mesh-ps uses an explicit .pslayout sidecar.\n"
+                     "gfx1013-raw-mesh-ps uses a reviewed .pslayout sidecar (meshps1 or meshps2).\n"
                      "gfx1013-container-cs reads an optional req_<key>.views next to the .cdx (GPU-selected heap slot view types).\n"
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "

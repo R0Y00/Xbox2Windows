@@ -755,6 +755,17 @@ def main():
                                   capture_output=True,text=True)
             assert result.returncode and not destination.exists(),(reason,result.stderr)
             if reason=="unbounded": assert "bounded aligned material index" in result.stderr,result.stderr
+        # Address bits 1, 11 and 15 allocate I/J, position W and packed XY.
+        # Reading v2 must use SV_Position.w, and v3 still uses screen XY.
+        position_entry = words(0x7e000302, 0x7e020303, 0xf800180f, 0x01010000, 0xbf810000)
+        (folder/"mesh-entry-w-xy.pslayout").write_text("meshps2 34818 64\n")
+        check("mesh-entry-w-xy", "gfx1013-raw-mesh-ps", position_entry)
+        w_xy = subprocess.check_output([pathlib.Path(sdk)/"dxc.exe", "-dumpbin",
+                                         folder/"mesh-entry-w-xy.cso"], text=True)
+        for channel in (0, 1, 3):
+            assert re.search(r"@dx.op.loadInput.f32\(i32 4, i32 \d+, i32 0, i8 " + str(channel) + r",", w_xy), w_xy
+        (folder/"mesh-entry-w-disabled.pslayout").write_text("meshps1 2 34818 64\n")
+        check("mesh-entry-w-disabled", "gfx1013-raw-mesh-ps", position_entry, "unsupported pixel entry VGPR 2")
         check("split-mask-two-arms", "gfx1013-container-ps", patched_pixel(len(two_arms), two_arms,
               input_address=1 << 8, input_signature=position_input))
         cmpx = [0xbefe0a7e, 0xbe8a047e, 0x7c2800f4, 0x7e0002f2,
