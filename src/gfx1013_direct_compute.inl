@@ -1890,6 +1890,52 @@ struct DirectCompute {
             vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
             return true;
         }
+        if (n == "v_div_fixup_f32") {
+            if (i.enc != Encoding::Vop3 || i.subword || i.dpp_control || permuted || i.scale || (i.a & 0x7800))
+                refuse(i.pc, "unsupported v_div_fixup_f32 operand modifiers");
+            auto src_f32 = [&](unsigned j) {
+                auto bits = operand32(i, i.src[j]);
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "2147483648");
+                return bits;
+            };
+            auto s0 = src_f32(0), s1 = src_f32(1), s2 = src_f32(2);
+            auto mag0 = ir.binary("and", s0, "2147483647");
+            auto mag1 = ir.binary("and", s1, "2147483647");
+            auto mag2 = ir.binary("and", s2, "2147483647");
+            auto sign_out = ir.binary("and", ir.binary("xor", s1, s2), "2147483648");
+            auto s1_nan = cmp("ugt", mag1, "2139095040");
+            auto s2_nan = cmp("ugt", mag2, "2139095040");
+            auto s1_inf = cmp("eq", mag1, "2139095040");
+            auto s2_inf = cmp("eq", mag2, "2139095040");
+            auto s1_zero = cmp("eq", mag1, "0");
+            auto s2_zero = cmp("eq", mag2, "0");
+            auto e1 = ir.binary("lshr", mag1, "23");
+            auto e2 = ir.binary("lshr", mag2, "23");
+            auto underflow = cmp("slt", ir.binary("sub", e2, e1), "-150");
+            auto signed_inf = ir.binary("or", sign_out, "2139095040");
+            auto invalid = ir.value("or i1 " + ir.value("and i1 " + s1_zero + ", " + s2_zero) + ", " +
+                                    ir.value("and i1 " + s1_inf + ", " + s2_inf));
+            auto to_inf = ir.value("or i1 " + s1_zero + ", " + s2_inf);
+            auto to_zero = ir.value("or i1 " + s1_inf + ", " + s2_zero);
+            // RDNA 2 ISA V_DIV_FIXUP_F32 (section 12.12, opcode 351): S2 NaN takes priority over S1 NaN,
+            // 0/0 and Inf/Inf yield 0xffc00000, exponent(S2) - exponent(S1) < -150 underflows to signed zero,
+            // and the default path sets the sign of S0 to sign(S1) ^ sign(S2).
+            string result = ir.binary("or", sign_out, mag0);
+            result = select(underflow, sign_out, result);
+            result = select(to_zero, sign_out, result);
+            result = select(to_inf, signed_inf, result);
+            result = select(invalid, "4290772992", result);
+            result = select(s1_nan, ir.binary("or", s1, "4194304"), result);
+            result = select(s2_nan, ir.binary("or", s2, "4194304"), result);
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "2147483647"), "2139095040");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("slt", result, "0"));
+                result = select(low, "0", select(cmp("sgt", result, "1065353215"), "1065353216", result));
+            }
+            vector_write(i.dst, result);
+            return true;
+        }
         const bool fract = n == "v_fract_f16";
         const bool cvt_norm = n == "v_cvt_norm_i16_f16" || n == "v_cvt_norm_u16_f16";
         if (fract || cvt_norm) {
