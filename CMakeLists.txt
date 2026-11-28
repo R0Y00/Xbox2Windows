@@ -1818,6 +1818,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
 endforeach()
 
+# List slots 14/33/37/39/45: Dispatch and compute root arguments on a console command list.
+add_executable(startup_compute_dispatch tests/startup_compute_dispatch.cpp)
+target_compile_features(startup_compute_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_compute_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_compute_dispatch_root_${backend} COMMAND startup_compute_dispatch ${backend})
+    set_tests_properties(startup_compute_dispatch_root_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TRAP_LOG=${CMAKE_CURRENT_BINARY_DIR}/startup_compute_dispatch_${backend}.log")
+endforeach()
+
 add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)
@@ -2312,7 +2322,7 @@ endforeach()
 # Negative control: without slot 43 the first forwarded case is refused, and the fixture must report it.
 add_test(NAME startup_list_dispatch_native_skip_srv_warp_control COMMAND startup_list_dispatch_native warp skip-srv)
 set_tests_properties(startup_list_dispatch_native_skip_srv_warp_control PROPERTIES TIMEOUT 60
-    PASS_REGULAR_EXPRESSION "bound: expected no Dispatch line, got 1 Dispatch line\\(s\\)[\r\n]+  x2w-render Dispatch\\(2, 3, 1\\) refused: a compute root SRV is not bound")
+    PASS_REGULAR_EXPRESSION "bound: expected no Dispatch line, got 1 Dispatch line\\(s\\)[\r\n]+  x2w-render Dispatch\\(2, 3, 1\\) refused: a compute root argument is not bound")
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_store.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
