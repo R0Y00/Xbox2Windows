@@ -178,6 +178,8 @@ struct DirectCompute {
         // M0 holds ordinary numeric ALU bits here, not an implicit memory/indexing operand.
         const bool numeric_m0 = !graphics_input && n == 124 && i.enc != Encoding::Mubuf && i.enc != Encoding::Smem;
         if (n <= 106 || n == 126 || n == 127 || (!graphics_input && n == 107) || numeric_m0 || (n >= 256 && n < 512)) {
+            if (!graphics_input && (n == 106 || n == 107))
+                sgpr_limit = 108;
             analysis.require_numeric(i, n, sgpr_limit);
             return read(n);
         }
@@ -2891,6 +2893,9 @@ struct DirectCompute {
         auto n = i.name;
         if (compute) {
             if (const auto offset = heap_offset_add(i, state)) {
+                const auto base = i.src[1 - *offset];
+                if (base == 106 || base == 107)
+                    analysis.require_numeric(i, base, 108);
                 // The heap base is slot 0 of ResourceDescriptorHeap: the low word keeps the byte offset, the carry is 0.
                 write(i.dst, operand32(i, i.src[*offset]));
                 write(128, "0");
@@ -3101,6 +3106,10 @@ struct DirectCompute {
             return;
         }
         if (auto field = byte_descriptor_field(i,state,heap_window)) {
+            if (compute)
+                for (auto src : {i.src[0], i.src[1]})
+                    if (src == 106 || src == 107)
+                        analysis.require_numeric(i, src, 108);
             // Keep derived words symbolic, including the status bit until a
             // later instruction overwrites it. Never let a numeric branch
             // observe a placeholder for this field or its SCC.
@@ -3248,30 +3257,34 @@ struct DirectCompute {
             return i.subword && j < 2 ? subword(value, i.src_select[j], i.src_sext[j]) : value;
         };
         if (n == "s_mov_b32" || n == "s_mov_b64") {
+            const bool pair = n == "s_mov_b64";
+            const unsigned src = i.src[0], last_scalar = compute ? 107 : 105;
             const bool exec_hi = i.dst == 127 && (wave64 || (compute && n == "s_mov_b32"));
             if (i.dst > 106 && i.dst != 126 && !(compute && i.dst == 107) && !exec_hi &&
                 !(compute && i.dst == 124 && n == "s_mov_b32"))
                 refuse(i.pc, "direct scalar move destination");
-            if (i.src[0] <= 105 && !state[i.src[0]].numeric()) {
-                if (i.dst > 105)
+            const bool symbolic_low = src <= last_scalar && !state[src].numeric();
+            const bool symbolic_high = pair && src <= 106 && !state[src + 1].numeric();
+            const bool copies_vcc = compute && ((src >= 106 && src <= 107) || (i.dst >= 106 && i.dst <= 107));
+            if (symbolic_low || (copies_vcc && symbolic_high)) {
+                if (i.dst > last_scalar)
                     refuse(i.pc, "descriptor used as mask");
-                if (n == "s_mov_b64" && ((i.dst | i.src[0]) & 1))
+                if (pair && ((i.dst | src) & 1))
                     refuse(i.pc, "unaligned scalar pair");
-                auto indexed = [](const Symbol &v) {
-                    return v.type == Symbol::Type::indexed_descriptor || v.type == Symbol::Type::sampler_word;
-                };
-                if (indexed(state[i.src[0]]))
-                    write(i.dst, read(i.src[0]));
-                if (n == "s_mov_b64" && indexed(state.at(i.src[0] + 1)))
-                    write(i.dst + 1, read(i.src[0] + 1));
-                // Transfer tracks symbolic low words; preserve numeric high words of a pair independently.
-                if (n == "s_mov_b64" && state.at(i.src[0] + 1).numeric())
-                    write(i.dst + 1, operand32(i, i.src[0] + 1));
+                // Transfer copies each identity. An indexed descriptor keeps
+                // its runtime slot index. A heap address keeps its byte offset.
+                for (unsigned j = 0; j < (pair ? 2u : 1u); ++j) {
+                    const auto word = src + j;
+                    if (state[word].numeric())
+                        write(i.dst + j, operand32(i, word));
+                    else if (state[word].type == Symbol::Type::indexed_descriptor || state[word].type == Symbol::Type::sampler_word ||
+                             (copies_vcc && state[word].type == Symbol::Type::heap_offset))
+                        write(i.dst + j, read(word));
+                }
                 return;
             }
             string a = val(0);
             if (n == "s_mov_b64") {
-                unsigned src = i.src[0];
                 if (src >= 240 && src != 255)
                     refuse(i.pc, "floating inline constant in 64-bit move");
                 if ((i.dst & 1) || (src < 128 && (src & 1)))
@@ -4371,7 +4384,11 @@ struct DirectCompute {
         if (i.dpp_bank_mask != 15)
             apply_mask(i.dpp_bank_mask, ir.binary("and", ir.binary("lshr", lane, "2"), "3"));
         string previous;
-        if (!write_enabled.empty()) previous = read(i.dst);
+        if (!write_enabled.empty()) {
+            if (!graphics_input && (i.dst == 106 || i.dst == 107))
+                analysis.require_numeric(i, i.dst, 108);
+            previous = read(i.dst);
+        }
         arithmetic(i, state, &word);
         if (!previous.empty())
             write(i.dst, select(write_enabled, read(i.dst), previous));
@@ -4550,6 +4567,11 @@ struct DirectCompute {
                 }
                 else {
                     unsigned r = i.op == 4 || i.op == 5 ? 128 : i.op == 6 || i.op == 7 ? 106 : 126;
+                    if (r == 106) {
+                        analysis.require_numeric(i, 106, 108);
+                        if (wave64)
+                            analysis.require_numeric(i, 107, 108);
+                    }
                     auto mask = wave64 && r != 128 ? ir.binary("or", read(r), read(r + 1)) : read(r);
                     auto pred = cmp((i.op & 1) ? "ne" : "eq", mask, "0");
                     if (virtual_waves) yield_virtual_wave(select(pred,to_string(i.target()),to_string(i.next)));
