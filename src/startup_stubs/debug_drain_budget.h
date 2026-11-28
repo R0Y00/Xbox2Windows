@@ -3,6 +3,7 @@
 // consume_map_count: a desktop Unmap is forwarded only for a counted, successful desktop Map.
 #pragma once
 #include <cstdint>
+#include <new>
 #include <unordered_map>
 
 namespace x2w_startup {
@@ -41,8 +42,14 @@ class DebugDrainBudget {
     unsigned errors_ = 0, other_ = 0;
 public:
     enum class Decision { suppress, message, repeat };
-    Decision record(unsigned severity, unsigned id) {
-        const auto count = ++counts_[id];
+    // Best effort: when the per-id counter cannot be allocated the line is dropped, never thrown to the caller.
+    Decision record(unsigned severity, unsigned id) noexcept {
+        std::uint64_t count;
+        try {
+            count = ++counts_[id];
+        } catch (const std::bad_alloc&) {
+            return Decision::suppress;
+        }
         if (count > 32) return (count & (count - 1)) == 0 ? Decision::repeat : Decision::suppress;
         unsigned& used = severity <= 1 ? errors_ : other_;
         const unsigned limit = severity <= 1 ? 4000 : 400;

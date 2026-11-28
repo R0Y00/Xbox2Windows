@@ -329,14 +329,8 @@ std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mas
 
     // Halve from the documented ceiling, testing the floor too: a driver whose maximum is below the
     // floor must not be recorded as accepting it, or the retry would ask for a size it rejects again.
-    std::uint64_t accepted = 0;
     constexpr std::uint64_t ceiling = x2w_startup::max_shader_visible_view_descriptors;
-    for (std::uint64_t size = ceiling; size >= view_heap_probe_floor; size /= 2) {
-        if (probe(size)) {
-            accepted = size;
-            break;
-        }
-    }
+    const std::uint64_t accepted = x2w_startup::largest_halving_size(ceiling, view_heap_probe_floor, probe);
     if (!accepted) {
         InterlockedExchange(&state, 2);
         log("x2w-d3d12 no probe size at or above %llu was accepted; the view heap shortcut is declined",
@@ -4955,7 +4949,13 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // to be shader visible; both are repaired before the first call (descriptor_heap_rules.h). The title
     // keeps its full-size descriptor memory; desktop writes and copies past the shader-visible prefix use a
     // companion CPU-only heap.
-    D3D12_DESCRIPTOR_HEAP_DESC clamped = x2w_startup::safe_heap_desc(*desc);
+    // Tier 3 lists 1,000,000+ shader-visible view descriptors: such a device keeps requests up to 1,048,576, and
+    // the probe below still shortens it when the driver refuses.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS binding{};
+    const bool tier3_views = SUCCEEDED(device_of(self)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &binding,
+        sizeof(binding))) && binding.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3;
+    D3D12_DESCRIPTOR_HEAP_DESC clamped = x2w_startup::safe_heap_desc(*desc,
+        tier3_views ? x2w_startup::max_tier3_view_descriptors : x2w_startup::max_shader_visible_view_descriptors);
     bool did_clamp = clamped.NumDescriptors != desc->NumDescriptors;
     const bool repaired = did_clamp || clamped.Flags != desc->Flags;
     HRESULT hr = kind_for(*iid) == descriptor_heap_kind

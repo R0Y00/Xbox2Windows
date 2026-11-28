@@ -9,7 +9,18 @@
 #include <initializer_list>
 #include <cstring>
 #include <limits>
+#include <cstdlib>
+#include <new>
 using namespace x2w_startup;
+// Allocation failure on demand, for the best-effort drain budget.
+static bool fail_allocation = false;
+void* operator new(std::size_t size) {
+    if (fail_allocation) throw std::bad_alloc();
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 int main() {
     std::uint64_t maps = 0; assert(!consume_map_count(maps));
     maps = 2; assert(consume_map_count(maps) && maps == 1);
@@ -72,4 +83,22 @@ int main() {
     DebugDrainBudget errors; messages = 0;
     for (unsigned i = 0; i < 5000; ++i) messages += errors.record(1, i) == Decision::message;
     assert(messages == 4000);
+    // A view heap request up to 2^20 stays as asked on a tier 3 device (1000000+), is clamped to 1,000,000 elsewhere,
+    // and a tier 3 device still refuses more than 2^20.
+    h = {}; h.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; h.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    h.NumDescriptors = 1048576;
+    assert(safe_heap_desc(h, max_tier3_view_descriptors).NumDescriptors == 1048576 && safe_heap_desc(h).NumDescriptors == 1000000);
+    h.NumDescriptors = 1048577; assert(safe_heap_desc(h, max_tier3_view_descriptors).NumDescriptors == 1048576);
+    // The floor is probed after the last halving step: a driver limit of 100,000 is found as 65,536.
+    assert(largest_halving_size(1000000, 65536, [](std::uint64_t n) { return n <= 100000; }) == 65536);
+    assert(largest_halving_size(1000000, 65536, [](std::uint64_t n) { return n <= 300000; }) == 250000);
+    assert(largest_halving_size(1000000, 65536, [](std::uint64_t) { return false; }) == 0);
+    assert(largest_halving_size(1000000, 65536, [](std::uint64_t n) { return n <= 65536; }) == 65536);
+    // An allocation failure while counting a new message id drops the line instead of throwing.
+    DebugDrainBudget fresh;
+    fail_allocation = true;
+    const auto dropped = fresh.record(1, 12345);
+    fail_allocation = false;
+    assert(dropped == Decision::suppress && fresh.count(12345) == 0);
+    assert(fresh.record(1, 12345) == Decision::message);
 }
