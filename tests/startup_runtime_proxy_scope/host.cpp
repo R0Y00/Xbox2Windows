@@ -1,12 +1,13 @@
 // Windows-only: EXE + package helpers through the real loader.
 //
-// Loads a fake xgameruntime.dll, an unrelated decoy that also exports QueryApiImpl, and two helpers
-// beside the EXE, then a carrier DLL that hosts runtime_proxy (X2W_RUNTIME_PROXY=1). One helper calls
-// its delay-imported QueryApiImpl before the carrier attaches, so the bind goes through the unhooked
+// Loads a fake xgameruntime.dll and an unrelated decoy that also exports QueryApiImpl, then one helper,
+// then a carrier DLL that hosts runtime_proxy (X2W_RUNTIME_PROXY=1). That helper calls its
+// delay-imported QueryApiImpl before the carrier attaches, so the bind goes through the unhooked
 // GetProcAddress and the slot holds the real export. After attach that slot must become the proxy:
-// the hooked lookup is not what writes it. The other helper is never called. After the scan its delay
-// slot must still point inside its own image. The helpers' GetProcAddress IATs are rewritten after
-// linking (outside LdrDllNotification). Looking up QueryApiImpl on xgameruntime must return the proxy;
+// the hooked lookup is not what writes it. A second helper loads after the carrier and is never
+// called. Its GetProcAddress hook needs the load-driven rescan, and its delay thunk must stay inside
+// its own image. Rewrites run after linking (outside LdrDllNotification). Looking up QueryApiImpl on
+// xgameruntime must return the proxy;
 // the same name on the decoy must still be the decoy's export. A QueryApiImpl pointer cached before
 // the proxy attaches stays the real export (pre-attach gap). RegQueryValueExW is hooked on
 // advapi32.dll only: the decoy's same-named export stays its own, with X2W_DEVICE_TYPE unset and set,
@@ -140,13 +141,6 @@ int main()
     check("helper has delay QueryApiImpl slot", delay_slot != nullptr);
     check("delay slot holds the real export before attach",
           delay_slot && xgr_query && *delay_slot == reinterpret_cast<ULONGLONG>(xgr_query));
-
-    // Never call this one. The scan must leave the delay thunk inside the helper image.
-    const HMODULE unbound = load_beside(dir, L"startup_runtime_proxy_helper_unbound.dll");
-    check("load unbound helper", unbound != nullptr);
-    ULONGLONG* unbound_slot = delay_query_slot(unbound);
-    check("unbound helper has delay QueryApiImpl slot", unbound_slot != nullptr);
-    check("unbound delay thunk starts inside its image", unbound_slot && slot_in_module(unbound, *unbound_slot));
     if (failures) return 1;
 
     const HMODULE carrier = load_beside(dir, L"startup_runtime_proxy_carrier.dll");
@@ -179,9 +173,17 @@ int main()
     // The slot already held the real export. Only the delay-slot rewrite turns it into the proxy.
     check("bound delay slot rewritten to proxy",
           delay_slot && host_xgr && wait_for_slot(delay_slot, reinterpret_cast<ULONGLONG>(host_xgr), 2000));
-    // The bound slot and the unbound slot can be visited in either order. One more quiet pass
-    // covers a helper the successful rewrite's pass had not reached yet.
-    Sleep(400);
+
+    // After the carrier's first scan. The load notification has to request another one.
+    const HMODULE unbound = load_beside(dir, L"startup_runtime_proxy_helper_unbound.dll");
+    check("late-load package helper", unbound != nullptr);
+    const auto unbound_resolve = unbound ? reinterpret_cast<ResolveFn>(GetProcAddress(unbound, "resolve_query")) : nullptr;
+    check("late-load helper exports resolve_query", unbound_resolve != nullptr);
+    ULONGLONG* unbound_slot = delay_query_slot(unbound);
+    check("unbound helper has delay QueryApiImpl slot", unbound_slot != nullptr);
+    check("unbound delay thunk starts inside its image", unbound_slot && slot_in_module(unbound, *unbound_slot));
+    check("late-load helper sees proxied xgameruntime QueryApiImpl",
+          unbound_resolve && host_xgr && wait_for_helper_hook(unbound_resolve, xgr, host_xgr, 2000));
     check("unbound delay thunk stays inside its image", unbound_slot && slot_in_module(unbound, *unbound_slot));
 
     // Intended call: invoke the proxied entry; the fake xgameruntime must run.

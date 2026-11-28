@@ -582,11 +582,20 @@ int patch_module(HMODULE module)
             VirtualProtect(slot, 8, old, &old);
             return;
         }
+        // Compare first. A quiet pass must not change protection on a slot that is already patched.
+        const ULONGLONG hooked = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+        if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
+            if (*slot == hooked) return;
+        } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
+            if (*slot == proxy) return;
+        } else {
+            return;
+        }
         DWORD old = 0;
         if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
         if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
-            if (*slot != reinterpret_cast<ULONGLONG>(&hooked_get_proc_address)) {
-                *slot = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+            if (*slot != hooked) {
+                *slot = hooked;
                 ++patched;
             }
         } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {

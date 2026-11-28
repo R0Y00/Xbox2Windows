@@ -1203,8 +1203,9 @@ set_tests_properties(startup_console_mode_control startup_console_mode_provider_
 # EXE + package helpers through the real Windows loader: proxied xgameruntime QueryApiImpl,
 # unrelated same-named export stays original. One helper binds its delay QueryApiImpl slot to the
 # real export before the proxy attaches; the scan must then store the proxy. A second helper is
-# never called, and after the scan its thunk must still lie inside its own image. A pre-attach
-# cached pointer stays the real export. Notification only enqueues; rewrite runs after link. The
+# never called. It loads after the proxy, so its GetProcAddress hook needs the load-driven rescan,
+# and its thunk must still lie inside its own image. A pre-attach cached pointer stays the real
+# export. Notification only enqueues; rewrite runs after link. The
 # gpa-patch check counts a replacement only when the slot still holds that export at the write.
 if (WIN32)
     set(X2W_PROXY_SCOPE_DIR "${CMAKE_CURRENT_BINARY_DIR}/startup_runtime_proxy_scope")
@@ -1227,7 +1228,7 @@ if (WIN32)
     # holds the real export after first use (the bound-delay rewrite path).
     target_link_libraries(startup_runtime_proxy_helper PRIVATE startup_runtime_proxy_xgr delayimp)
     target_link_options(startup_runtime_proxy_helper PRIVATE "/DELAYLOAD:xgameruntime.dll")
-    # Same delay import, never called. Its slot stays the in-image thunk.
+    # Same delay import, never called, loaded after the carrier. Its slot stays the in-image thunk.
     add_library(startup_runtime_proxy_helper_unbound SHARED
         tests/startup_runtime_proxy_scope/helper.cpp
         tests/startup_runtime_proxy_scope/helper_unbound.def)
