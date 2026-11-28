@@ -317,13 +317,19 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_min_f32", "v_max_f32",
                 "v_floor_f32", "v_ceil_f32", "v_fract_f32", "v_trunc_f32", "v_rndne_f32",
                 "v_exp_f32", "v_log_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32"};
+            static const std::set<Name> compute_bits{
+                "v_sub_co_ci_u32", "v_subrev_co_ci_u32", "v_mul_i32_i24", "v_mul_hi_i32_i24",
+                "v_mul_hi_u32_u24", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_sat_pk_u8_i16"};
+            static const std::set<Name> compute_floats{
+                "v_sin_f32", "v_cos_f32", "v_mul_legacy_f32"};
             const auto name = encoded.name;
-            const bool fp_input = half_alu || floats.count(name) || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
+            const bool float_profile = floats.count(name) || (!graphics && compute_floats.count(name));
+            const bool fp_input = half_alu || float_profile || name == "v_cvt_u32_f32" || name == "v_cvt_i32_f32" ||
                                   name == "v_cvt_f16_f32" || name == "v_cvt_f32_f16" || name == "v_cvt_pkrtz_f16_f32" ||
                                   (sdwa_compare && (name.substr(name.size()-4) == "_f32" || name.substr(name.size()-4) == "_f16"));
             const bool conversion = name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" ||
                                     name.substr(0,15) == "v_cvt_f32_ubyte";
-            if (!(fp_input || conversion || bits.count(name) || sdwa_compare) ||
+            if (!(fp_input || conversion || bits.count(name) || (!graphics && compute_bits.count(name)) || sdwa_compare) ||
                 (graphics && (name == "v_cvt_pkrtz_f16_f32" || name == "v_add_co_ci_u32")))
                 refuse(pc, "unimplemented direct SDWA operand profile");
             const Word ext = take();
@@ -342,7 +348,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                     refuse(pc, "unsupported SDWA destination modifier");
                 const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
                 if (i.dst_select == 7 || i.dst_unused == 3 ||
-                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !float_profile && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }

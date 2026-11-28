@@ -35,6 +35,12 @@ The same four operations accept VGPR half selection, input abs and neg, and half
 with pad or preserve. The readback fixture checks both halves and untouched buffer guards.
 [SDWA experiment](experiments/native-sdwa-f16.md)
 
+## Remaining lowered VOP1/VOP2 SDWA profiles in direct compute
+
+Direct compute admits the remaining nine integer/bit and three floating-point VOP1/VOP2 SDWA profiles already
+lowered by the translator. Graphics translation continues to refuse those SDWA forms.
+[Experiment and checks](experiments/native-sdwa-lowered-vop1-vop2.md)
+
 ## Guest logical 64-bit shift sources in direct compute
 
 Logical 64-bit shifts accept sign-extended inline integers, zero-extended
