@@ -1,9 +1,10 @@
 // Checks src/startup_stubs/present_planes.h on synthetic plane records: two 0x48-byte records, each
 // with a frame token, a resource count and a pointer to its resource array.
-// Also checks the window composite order (composite_steps) on synthetic plane surfaces.
-// --control reads the records with a 0x40-byte stride (the record size before the second plane was
-// measured) and composites plane 0 alone (the window present before planes were composited); the
-// second-plane rows must print FAIL.
+// Also checks the plane selection policy and the window composite order (composite_steps) on
+// synthetic plane surfaces. --control reads the records with a 0x40-byte stride (the record size
+// before the second plane was measured), composites plane 0 alone and keeps the old single-plane
+// selection (the window present before planes were composited); the second-plane and multi-plane rows
+// must print FAIL.
 #include "startup_stubs/present_planes.h"
 
 #include <cstdio>
@@ -57,6 +58,28 @@ int main(int argc, char** argv)
     check("a plane with no resources has none", present_plane_resource(empty, 1, 0, readable, stride) == 0);
     const auto unreadable = [](const void*, std::size_t) { return false; };
     check("an unreadable record has no resource", present_plane_resource(records, 2, 0, unreadable, stride) == 0);
+
+    // Selection: a multi-plane present composites every plane by default; a one-plane present stays
+    // plane 0 alone; X2W_PRESENT_PLANE=<n> keeps one plane and takes priority.
+    using x2w_startup::select_presented_planes;
+    const auto defaults_to_all = [&](unsigned planes) {
+        // The control keeps the old behavior: plane 0 alone even when more planes are presented.
+        return control ? false : select_presented_planes(planes, -1, false).all;
+    };
+    check("two planes are composited by default", defaults_to_all(2));
+    check("four planes are composited by default", defaults_to_all(4));
+    x2w_startup::PlaneSelection selection = select_presented_planes(1, -1, false);
+    check("a single plane is plane 0 alone", !selection.all && selection.only == 0);
+    selection = select_presented_planes(2, 1, false);
+    check("X2W_PRESENT_PLANE=1 keeps plane 1 alone", !selection.all && selection.only == 1);
+    selection = select_presented_planes(2, 1, true);
+    check("X2W_PRESENT_PLANE wins over the composite switch", !selection.all && selection.only == 1);
+    selection = select_presented_planes(2, 9, false);
+    check("a plane past the count falls back to plane 0", !selection.all && selection.only == 0);
+    selection = select_presented_planes(1, -1, true);
+    check("the composite switch keeps the only plane", selection.all);
+    selection = select_presented_planes(0, -1, false);
+    check("no planes keeps plane 0 alone", !selection.all && selection.only == 0);
 
     // Composite order: the lowest shown plane is opaque, later ones blend over it.
     using x2w_startup::PlaneStep;

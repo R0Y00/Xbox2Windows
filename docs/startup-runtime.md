@@ -297,11 +297,12 @@ Series S profile a title presented two planes: plane 0 at 1920x1080 stayed black
 3840x2160 held the picture, with alpha 255 wherever it drew. Showing plane 0 alone gave a black
 window. Why plane 0 stays black is not known.
 
-By default the output window still shows plane 0 alone, as before the planes were decoded. The
-experimental `X2W_PRESENT_COMPOSITE=1` makes it composite the planes instead
-(`src/startup_stubs/plane_compositor.h`, shared by the window presenter and its fixture). It stays
-opt-in until a matched comparison on the same executable, with this change alone, shows what it does
-to a real present. The contract under the switch:
+The output window composites a present with more than one plane by default: every plane the presenter
+can draw is stacked bottom to top (`src/startup_stubs/plane_compositor.h`, shared by the window
+presenter and its fixture), because plane 0 alone was measured black while plane 1 held the picture.
+A one-plane present still shows plane 0 alone. `X2W_PRESENT_PLANE=<n>` keeps one plane alone and takes
+priority over the all-plane path; `X2W_PRESENT_COMPOSITE=1` forces the all-plane path and enables the
+raw-plane sample below. The contract:
 
 - Order: plane 0 first, each later plane over it, in plane order (`composite_steps`). At most four
   planes are read.
@@ -316,10 +317,10 @@ to a real present. The contract under the switch:
 - Each plane is scaled to the whole window with a linear, clamped sampler. The planes' source and
   destination rectangles in the record (after +0x10) are not decoded; a plane that covers only part
   of the screen on the console is stretched here.
-- The baseline capture is unchanged with or without the switch: the frame capture, the presented
-  signature, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented` readback all read plane 0's
-  first resource, as before. Under the switch the highest plane above plane 0 with a known resource
-  is also sampled on the same frames, before compositing, and logged as a raw plane:
+- The baseline capture is unchanged by compositing: the frame capture, the presented signature,
+  `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented` readback all read plane 0's first resource,
+  as before. With `X2W_PRESENT_COMPOSITE=1` the highest plane above plane 0 with a known resource is
+  also sampled on the same frames, before compositing, and logged as a raw plane:
 
   ```text
   x2w-render raw plane <i> (not composited): surface <w>x<h> format <f>, sample <k>, mean level <l>/255, mean alpha <a>/255
@@ -345,9 +346,9 @@ The first presents and every 300th log each plane:
 x2w-present frame <n> plane <i>/<count>: <width>x<height> format <f> flags=0x<flags>
 ```
 
-`ctest --preset dev --no-tests=error -R '^startup_present_planes(_control)?$'` checks the record layout
-and the composite order on synthetic records; the control reads 0x40-byte records and composites
-plane 0 alone, and must print `FAIL:`.
+`ctest --preset dev --no-tests=error -R '^startup_present_planes(_control)?$'` checks the record layout,
+the plane selection policy and the composite order on synthetic records; the control reads 0x40-byte
+records, composites plane 0 alone and keeps the old single-plane selection, and must print `FAIL:`.
 `ctest --preset dev --no-tests=error -R '^startup_present_composite_(warp|overlay_removed_control_warp)$'`
 draws source-built planes through the same records, `composite_steps` and compositor (directly, without
 the switch) into a 64x32 RGBA8 target on WARP and reads every texel back: a single plane is shown as is (including a cell with alpha 0); a black
@@ -1657,8 +1658,8 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
-| `X2W_PRESENT_COMPOSITE=1` | experimental, in render mode: the output window composites every presented plane, bottom to top, instead of showing plane 0 alone, and the highest plane above plane 0 is sampled as `x2w-render raw plane <i> (not composited)`. Off by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
-| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`. See [Presented planes](#presented-planes) |
+| `X2W_PRESENT_COMPOSITE=1` | diagnostic, in render mode: forces the all-plane path, including for a one-plane present, and samples the highest plane above plane 0 as `x2w-render raw plane <i> (not composited)`. Multi-plane presents composite every drawable plane by default; the baseline capture and `x2w-render presented` read plane 0 either way. See [Presented planes](#presented-planes) |
+| `X2W_PRESENT_PLANE=<n>` | diagnostic, in render mode: the output window shows plane `n` of each present alone (plane 0 when `n` is past the count), with or without `X2W_PRESENT_COMPOSITE`; it takes priority over compositing. See [Presented planes](#presented-planes) |
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
@@ -1734,12 +1735,12 @@ access, the last covered by the
 is not evidence that the path it leads to runs.
 
 A title on the Series S profile may present its picture on a plane above plane 0 and leave plane 0
-black (see [Presented planes](#presented-planes) for a measured case). The output window shows plane 0 alone by
-default, so it then stays black. `X2W_PRESENT_COMPOSITE=1` composites the planes, and
-`X2W_PRESENT_PLANE=<n>` shows one plane alone. Whether other titles, or other profiles, present
-this way is not known. Under either switch, `X2W_D3D12_DUMP_SURFACE` and the `x2w-render presented`
-readback still read plane 0. With `X2W_PRESENT_COMPOSITE=1`, the `x2w-render raw plane <n>` line
-shows whether the higher plane holds a picture.
+black (see [Presented planes](#presented-planes) for a measured case). A multi-plane present now
+composites every drawable plane by default, so that picture is shown; `X2W_PRESENT_PLANE=<n>` still
+shows one plane alone. Whether other titles, or other profiles, present this way is not known. The
+baseline `X2W_D3D12_DUMP_SURFACE` and `x2w-render presented` readback still read plane 0. With
+`X2W_PRESENT_COMPOSITE=1`, the `x2w-render raw plane <n>` line shows whether the higher plane holds a
+picture.
 
 ## D3D12 resource budget
 
