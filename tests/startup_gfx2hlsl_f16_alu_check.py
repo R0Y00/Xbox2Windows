@@ -264,7 +264,7 @@ for asm, regs, expected in PK:
 check('inf * 0 is NaN in both lanes', M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] & 0xffff)
       and M.is_nan(run('v_pk_mul_f16 v3, v0, v1', [0x7c00 | 0xfc00 << 16, 0 | 0x8000 << 16, 0, 0])[1] >> 16))
 for asm in ('v_pk_mul_f16 v3, v0, v1 neg_lo:[1,0]', 'v_pk_mul_f16 v3, v0, v1 neg_hi:[0,1]', 'v_pk_add_f16 v3, v0, v1 clamp',
-            'v_pk_mul_f16 v3, 2.0, v1 op_sel_hi:[0,1]', 'v_pk_mul_f16 v3, v0, 0x4000', 'v_pk_add_f16 v3, s0, v1',
+            'v_pk_mul_f16 v3, 2.0, v1 op_sel_hi:[0,1]',
             'v_pk_mul_f16 v3, v0, v1 op_sel:[1]', 'v_pk_fma_f16 v3, v0, v1 op_sel:[0,0]', 'v_pk_mul_f16 v3, v0, v1 op_sel:[2,0]',
             'v_pk_mul_f16 v3, -v0, v1', 'v_pk_fma_f16 v3, v0, v1, v2 mul:2', 'v_pk_mul_f16 v[3:4], v0, v1'):
     try:

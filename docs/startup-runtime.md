@@ -2399,10 +2399,10 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
-- **Packed binary16 min/max.** `v_pk_min_f16` and `v_pk_max_f16` select each result half from
-  packed VGPR, numeric SGPR, hex literal or inline zero sources. The bitwise comparison preserves
-  signed zeros and returns the numeric operand when its partner is NaN. See
-  [the packed min/max experiment](experiments/startup-gfx2hlsl-pk-minmax.md) for the fixture and checks.
+- **Packed binary16 sources.** Min, max, add, multiply and fused multiply-add accept packed VGPRs,
+  numeric SGPRs, hex literals or inline zero. Min and max select the original encoding, preserve
+  signed-zero behavior and return the numeric operand when its partner is NaN. Arithmetic rounds each result to binary16. See
+  [the packed binary16 experiment](experiments/startup-gfx2hlsl-pk-minmax.md) for the fixture and checks.
 - **DPP quad pair broadcasts.** The four pair permutations of a pixel stage (`quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]`, `[0,1,0,1]`, with
   `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
   first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the

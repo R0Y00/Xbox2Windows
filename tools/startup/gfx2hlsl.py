@@ -10036,13 +10036,17 @@ class Stage:
     def op_v_pk_mad_i16(self, ops, mods):
         self._packed_mad_16('v_pk_mad_i16', True, ops, mods)
 
-    def packed_half(self, base, arity, text, ops, mods, *, select_bits=False):
+    PACKED_HALF_SOURCE_ERROR = '%s source %s requires a single VGPR, numeric SGPR, hex word or inline 0'
+
+    def packed_half(self, base, arity, text, ops, mods, *, select_bits=False,
+                    source_error=None):
         """Apply the same binary16 operation to each of two selected halves.
 
         Result low half = op(source i half op_sel[i], ...); high half = op(source i half op_sel_hi[i], ...). Absent
         modifiers mean op_sel [0,0,0] and op_sel_hi [1,1,1] (LLVM VOP3P defaults). Both lanes are written (no zeroing).
-        Add, mul and fma require plain VGPRs. Min and max also accept numeric SGPRs, 32-bit hex literals and inline 0,
-        and select a result by its encoding. All forms refuse neg_lo, neg_hi, clamp and other modifiers.
+        Sources can be single VGPRs, numeric SGPRs, 32-bit hex words or inline 0. Min and max select a result
+        by its encoding. Add, mul and fma operate on converted halves and round back to binary16.
+        All forms refuse neg_lo, neg_hi, clamp and other modifiers.
         """
         if len(ops) != arity + 1:
             raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
@@ -10055,34 +10059,36 @@ class Stage:
             if len(bits) != arity or any(b not in ('0', '1') for b in bits):
                 raise Unsupported('%s with %s' % (base, m))
             sel[key] = [int(b) for b in bits]
-        for i, tok in enumerate(ops):
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or ops[0] != 'v%d' % dst[1]:
+            raise Unsupported('%s operand %s is not a single VGPR' % (base, ops[0]))
+        if dst[1] > 255:
+            raise Unsupported('%s destination %s is out of range' % (base, ops[0]))
+        words = []
+        for tok, lo, hi in zip(ops[1:], sel['op_sel'], sel['op_sel_hi']):
             r = reg_range(tok)
-            if select_bits and i:
-                if re.fullmatch(r'0x[0-9a-f]{1,8}|0', tok):
-                    continue
-                if r and tok == '%s%d' % (r[0], r[1]) and r[1] <= (255 if r[0] == 'v' else 105):
-                    continue
-                raise Unsupported('%s source %s requires a single VGPR, numeric SGPR, hex word or inline 0'
-                                  % (base, tok))
-            if not r or r[0] != 'v' or r[1] != r[2] or tok != 'v%d' % r[1]:
-                raise Unsupported('%s operand %s is not a single VGPR' % (base, tok))
-            if select_bits and r[1] > 255:
-                raise Unsupported('%s destination %s is out of range' % (base, tok))
+            if r and tok == '%s%d' % (r[0], r[1]) and r[1] <= (255 if r[0] == 'v' else 105):
+                if r[0] == 's':
+                    self.reject_lane_mask_data(base, tok)
+                    words.append(self.S(r[1]))
+                else:
+                    words.append(self.u(tok, low16_only=not (lo or hi)))
+            elif re.fullmatch(r'0x[0-9a-f]{1,8}|0', tok):
+                words.append(self.u(tok))
+            else:
+                if source_error is None:
+                    source_error = (self.PACKED_HALF_SOURCE_ERROR if select_bits
+                                    else '%s operand %s is not a single VGPR')
+                raise Unsupported(source_error % (base, tok))
         lanes = []
         for picks in (sel['op_sel'], sel['op_sel_hi']):
             args = []
-            for tok, hi, both in zip(ops[1:], picks, zip(sel['op_sel'], sel['op_sel_hi'])):
-                if select_bits and tok.startswith('s'):
-                    self.reject_lane_mask_data(base, tok)
-                    word = self.S(int(tok[1:]))
-                else:
-                    word = self.u(tok, low16_only=not any(both))
+            for word, hi in zip(words, picks):
                 half = '(%s >> 16) & 0xffffu' % word if hi else '%s & 0xffffu' % word
                 args.append(half if select_bits else 'f16tof32(%s)' % half)
             expr = text.format(*args)
             lanes.append(expr if select_bits else 'f16rn(%s)' % expr)
-        d = reg_range(ops[0])[1]
-        self.set_v(d, '%s | (%s << 16)' % tuple(lanes))
+        self.set_v(dst[1], '%s | (%s << 16)' % tuple(lanes))
 
     def op_v_pk_mul_f16(self, ops, mods):
         self.packed_half('v_pk_mul_f16', 2, 'mul16({0}, {1})', ops, mods)
@@ -10094,10 +10100,12 @@ class Stage:
         self.packed_half('v_pk_fma_f16', 3, 'fma16o({0}, {1}, {2})', ops, mods)
 
     def op_v_pk_max_f16(self, ops, mods):
-        self.packed_half('v_pk_max_f16', 2, 'minmax16_bits({0}, {1}, true)', ops, mods, select_bits=True)
+        self.packed_half('v_pk_max_f16', 2, 'minmax16_bits({0}, {1}, true)', ops, mods,
+                         select_bits=True, source_error=self.PACKED_HALF_SOURCE_ERROR)
 
     def op_v_pk_min_f16(self, ops, mods):
-        self.packed_half('v_pk_min_f16', 2, 'minmax16_bits({0}, {1}, false)', ops, mods, select_bits=True)
+        self.packed_half('v_pk_min_f16', 2, 'minmax16_bits({0}, {1}, false)', ops, mods,
+                         select_bits=True, source_error=self.PACKED_HALF_SOURCE_ERROR)
 
     def op_v_pk_max_u16(self, ops, mods):
         self.packed_half('v_pk_max_u16', 2, 'max({0}, {1})', ops, mods, select_bits=True)
