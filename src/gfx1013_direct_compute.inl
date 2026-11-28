@@ -1141,8 +1141,10 @@ struct DirectCompute {
         const unsigned spatial = coords - unsigned(dim == 3 || dim == 4 || dim == 5);
         const bool a16 = (i.b & 0x40000000u) != 0;
         if (a16) {
-            if (dim != 1 || lod || (i.a & 6) || (sample && i.op != 32 && i.op != 39) || gather || (store && !half))
+            if (dim != 1 || lod || (i.a & 6) || (sample && i.op != 32 && i.op != 39) || gather ||
+                (graphics_input && store && !half))
                 refuse(i.pc, "packed image addressing");
+            // AMD RDNA 2 Shader ISA, MIMG A16: loads/stores pack unsigned 16-bit texel coordinates.
             auto packed = coordinate(0);
             c[0] = ir.binary("and", packed, "65535");
             c[1] = ir.binary("lshr", packed, "16");
