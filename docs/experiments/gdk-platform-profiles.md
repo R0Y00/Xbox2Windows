@@ -9,9 +9,13 @@ of being guessed.
 
 The GDK installation and the JSON profiles stay outside the repository.
 
+The commands below expect `$gdk` to point at your local out-of-repo GDK
+extraction. Keep that directory outside the repository.
+
     python -B tests/gdk_platform_profiles_check.py
-    python -B tools/gdk_platform_profiles.py list --root D:\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK
-    python -B tools/gdk_platform_profiles.py scan --root D:\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK --platform Gaming.Xbox.Scarlett.x64 --json out\scarlett.json
+    $gdk = '<out-of-repo GDK root>'
+    python -B tools/gdk_platform_profiles.py list --root "$gdk\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK"
+    python -B tools/gdk_platform_profiles.py scan --root "$gdk\gdk-ref\261000\gxdk\Microsoft GDK\261000\GXDK" --platform Gaming.Xbox.Scarlett.x64 --json out\scarlett.json
 
 The --sdk option selects the versioned subdirectory (261000, 999999, ...). A
 platform directory without that subdirectory is rejected before any output is

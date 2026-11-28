@@ -5,7 +5,11 @@ against the GRDK import library and once against the Xbox2Windows shim. It runs
 both executables, masks handles, console ids and per-user temp paths, and writes
 a normalized diff and a JSON report.
 
-    python tools/gdk_runtime_oracle.py run --gdk-root "D:\gdk-ref\261000\grdk\Microsoft GDK\261000\GRDK" --shim-dir "out\build\dev\fixture-shims" --fixture "tests\gdk\runtime_families_probe.cpp" --out "out\gdk-runtime" --vcvars "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+The command below expects `$gdk` to point at your local out-of-repo GDK
+extraction. Keep that directory outside the repository.
+
+    $gdk = '<out-of-repo GDK root>'
+    python tools/gdk_runtime_oracle.py run --gdk-root "$gdk\gdk-ref\261000\grdk\Microsoft GDK\261000\GRDK" --shim-dir "out\build\dev\fixture-shims" --fixture "tests\gdk\runtime_families_probe.cpp" --out "out\gdk-runtime" --vcvars "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 
 On a host without cl.exe the command returns 77. The normalization and diff
 subcommands need no SDK:

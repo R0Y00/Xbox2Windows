@@ -1,9 +1,9 @@
 # GDK knowledge coverage report
 
 tools/gdk_knowledge_report.py merges the JSON knowledge base under
-D:\gdk-oracle\knowledge and writes a deterministic coverage JSON and a
-Markdown summary. It uses only the Python standard library and never reads a
-GDK header, library or binary.
+an out-of-repo knowledge root (for example `$gdk\gdk-oracle\knowledge`) and
+writes a deterministic coverage JSON and a Markdown summary. It uses only the
+Python standard library and never reads a GDK header, library or binary.
 
 ## Inputs
 
@@ -69,7 +69,8 @@ exports.
 
     python -B tests/gdk_knowledge_report_check.py
 
-    $root = 'D:\gdk-oracle\knowledge'
+    $gdk = '<out-of-repo GDK root>'
+    $root = "$gdk\gdk-oracle\knowledge"
     python -B tools/gdk_knowledge_report.py report --root $root --json "$root\coverage.json" --markdown "$root\report.md" --defs src
 
 Add --check to exit 1 on conflicts. Add --require layouts,abi,exports to also

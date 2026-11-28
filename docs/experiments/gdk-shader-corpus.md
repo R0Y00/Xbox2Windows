@@ -5,9 +5,13 @@ retargets the Xbox container with tools/dxil_retarget.py, and records the
 source and container SHA-256 values. The HLSL sources are versioned; the .cso
 files and the corpus manifest stay outside the repository.
 
+The commands below expect `$gdk` to point at your local out-of-repo GDK
+extraction. Keep that directory outside the repository.
+
     python -B tests/gdk_shader_corpus_check.py
-    python -B tools/gdk_shader_corpus.py build --gdk-root D:\gdk-ref\261000\gxdk\Microsoft GDK\261000 --corpus tests\gdk\shaders --out D:\gdk-oracle\knowledge\shaders\corpus
-    python -B tools/gdk_shader_corpus.py verify --manifest D:\gdk-oracle\knowledge\shaders\corpus\corpus.json
+    $gdk = '<out-of-repo GDK root>'
+    python -B tools/gdk_shader_corpus.py build --gdk-root "$gdk\gdk-ref\261000\gxdk\Microsoft GDK\261000" --corpus tests\gdk\shaders --out "$gdk\gdk-oracle\knowledge\shaders\corpus"
+    python -B tools/gdk_shader_corpus.py verify --manifest "$gdk\gdk-oracle\knowledge\shaders\corpus\corpus.json"
 
 Measured on 28 November 2026 with dxcompiler_xs 1.8, build
 2610.2608.12522.14643:

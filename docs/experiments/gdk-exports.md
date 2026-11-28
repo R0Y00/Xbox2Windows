@@ -15,9 +15,13 @@ inventory used for the 261000 edition has 89 modules and 8,035 export names.
 When a module has both a .lib and a .dll, the coverage tool merges their exports
 and deduplicates the names, so d3d12_xs reports the union of the two files.
 
+The commands below expect `$gdk` to point at your local out-of-repo GDK
+extraction. Keep that directory outside the repository.
+
     python -B tests/gdk_exports_check.py
-    python -B tools/gdk_exports.py parse-dumpbin D:\gdk-oracle\dumpbin\xg_xs.txt --json out\xg_xs.json --kind dll
-    python -B tools/gdk_shim_coverage.py --exports D:\gdk-oracle\knowledge\exports-all.json --repo . --json out\coverage.json --markdown out\coverage.md
+    $gdk = '<out-of-repo GDK root>'
+    python -B tools/gdk_exports.py parse-dumpbin "$gdk\gdk-oracle\dumpbin\xg_xs.txt" --json out\xg_xs.json --kind dll
+    python -B tools/gdk_shim_coverage.py --exports "$gdk\gdk-oracle\knowledge\exports-all.json" --repo . --json out\coverage.json --markdown out\coverage.md
 
 Measured on 28 November 2026 with the 261000 LIB/DLL set:
 
