@@ -278,7 +278,8 @@ const char* load_compute_translation(ComputeTranslation& tr)
 // X2W_NATIVE_SHADERS=<directory of dxcompiler.dll and dxil.dll>: the first Dispatch of a slot 67 request translates
 // it in this process with the C++ compiler (src/gfx1013_compute_native.cpp), before a published <key>.txt is read
 // and with no offline translator running. The dispatch path below binds the result, so a program is accepted only
-// with root constants, raw table buffers and exact-width typed texture outputs.
+// with root constants, raw table buffers and exact-width typed texture outputs. The constant sampler words the
+// compiler resolved become static samplers.
 // A refusal is logged and leaves the key to the published translations. draw_lock held. Returns whether tr is ready.
 bool translate_compute_natively(ComputeTranslation& tr)
 {
@@ -291,6 +292,7 @@ bool translate_compute_natively(ComputeTranslation& tr)
         tr.uds.clear();
         tr.srvs.clear();
         tr.uavs.clear();
+        tr.samplers = {};  // a published manifest read next numbers its sampler lines from 0
         tr.root.Reset();
         tr.pipeline.Reset();
         static LONG logged;
@@ -336,7 +338,10 @@ bool translate_compute_natively(ComputeTranslation& tr)
             const unsigned channels = x2w::exact_texture_uav_channels(view.kind);
             const bool packed_x = view.kind == x2w::ComputeViewKind::packed_d16_x_uav;
             const bool half_typed = packed_x || view.kind == x2w::ComputeViewKind::half_buffer_uav;
-            const bool texture_input = view.kind == x2w::ComputeViewKind::texture_srv && view.image_dimension == 1;
+            // A comparison sample reads its 2D texture through the same kind of view as a plain one.
+            const bool texture_input = (view.kind == x2w::ComputeViewKind::texture_srv ||
+                                        view.kind == x2w::ComputeViewKind::comparison_texture_srv) &&
+                                       view.image_dimension == 1;
             const bool volume = view.kind == x2w::ComputeViewKind::texture_uav && view.image_dimension == 2;
             const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume || channels;
             auto& slots = output ? tr.uavs : tr.srvs;
@@ -346,6 +351,8 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                          " is not bound for a natively translated program");
             slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset), volume || texture_input});
             if (volume) slots.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            // The dispatch path takes an input of any other dimension for a described 1D, 2D-array or 3D view.
+            if (texture_input) slots.back().srv_dimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
             slots.back().packed_d16_x = packed_x;
             if (x2w::accepts_cbv_window(view.kind))
@@ -359,8 +366,15 @@ bool translate_compute_natively(ComputeTranslation& tr)
                                                                  D3D12_UAV_DIMENSION_TEXTURE2D;
             }
         }
-        if (!program.samplers.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
-            throw std::runtime_error("a sampler, or more entry values, inputs or outputs than the dispatch path binds");
+        // Static samplers in register order, flagged as the manifest writer names them: smpc, else smpl, else smp.
+        // The compiler has already refused sampler words that are not constants (a sampler read from memory).
+        for (const auto& sampler : program.samplers) {
+            tr.samplers.statics.push_back(sampler.words);
+            tr.samplers.comparison.push_back(sampler.comparison);
+            tr.samplers.lod_limits.push_back(sampler.explicit_lod && !sampler.comparison);
+        }
+        if (tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
+            throw std::runtime_error("more entry values, inputs or outputs than the dispatch path binds");
         // A direct module declares wave size 32 (src/dxil_module.h): without it the pipeline cannot be created.
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
         if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof(waves))) ||

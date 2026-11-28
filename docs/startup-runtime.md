@@ -1006,8 +1006,11 @@ against their key, translated and compiled to DXIL in the process. The compiler'
 
 The existing dispatch path records the result, and a program is accepted only with the bindings a
 fixture has run through it: root constants, raw table buffers loaded per lane (`buffer_load_dword`)
-and raw table buffers stored to, with their descriptors in 32-byte table records. Anything else (a
-scalar buffer load, a texture, a sampler, a typed or indexed view, an instruction the compiler does
+and raw table buffers stored to, with their descriptors in 32-byte table records. A 2D texture can be
+sampled through samplers whose four words are constants: they become static samplers with the
+descriptor's MIN_LOD and MAX_LOD, or comparison samplers
+([fixture and results](experiments/startup-compute-native-samplers.md)). Anything else (a
+scalar buffer load, a sampler read from memory, a typed or indexed view, an instruction the compiler does
 not lower) is refused. Programs published as `<key>.txt` also bind 1D, 2D, 2D-array and 3D texture SRVs
 (`srv N tex1d|tex2d|tex2da|tex3d table R B`) from the title's described view of that dimension, or are
 refused by name; cube texture SRVs are not published. The first 16 refusals of a process are logged as

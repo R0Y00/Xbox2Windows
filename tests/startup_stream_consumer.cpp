@@ -750,7 +750,11 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
 {
     constexpr UINT width = 32;
     const bool exact = mode.rfind("texture-exact-", 0) == 0;
-    const bool volume = mode == "texture-volume" || mode == "texture-volume-bad-w" || mode == "texture-exact-volume";
+    // texture-volume-native-sampled: the volume store, plus a 2x1 R32_FLOAT texture (a format a comparison sample
+    // reads) with a 1x1 second mip, whose shader resource view token is copied to table byte 32.
+    const bool sampled = mode == "texture-volume-native-sampled";
+    const bool volume = sampled || mode == "texture-volume" || mode == "texture-volume-bad-w" ||
+                        mode == "texture-exact-volume";
     const bool line = mode == "texture-line" || mode == "texture-line-bad-mip";
     const UINT first_mip = volume || line ? 1 : 0;
     const UINT height = line ? 1 : 8;
@@ -884,6 +888,18 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     read.Texture2D.MipLevels = 1;
     if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
+    void* input_texture = nullptr;
+    if (sampled) {
+        const D3D12_RESOURCE_DESC input_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 1, 1, 2, DXGI_FORMAT_R32_FLOAT, {1, 0}};
+        input_texture = make(D3D12_HEAP_TYPE_DEFAULT, input_desc, D3D12_RESOURCE_STATE_COMMON);
+        if (!input_texture) return 71;
+        D3D12_SHADER_RESOURCE_VIEW_DESC input_view{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        input_view.Texture2D.MipLevels = 2;
+        // Created at handle 0 and copied to table byte 32, which is not a handle where the increment is above 32.
+        invoke(device, 18, word(input_texture), word(&input_view), cpu);
+        std::memcpy(reinterpret_cast<void*>(cpu + 32), reinterpret_cast<void*>(cpu), 32);
+    }
     const auto transfer = [&](void* buffer, bool to_texture) {
         for (UINT layer = 0; layer < subresources; ++layer)
             for (UINT mip = 0; mip < mips; ++mip) {
@@ -897,6 +913,16 @@ static int texture_slot67(IDXGIAdapter* adapter, void* device, const std::string
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
+    // Mip 0 takes the first two sentinel words of the upload, mip 1 the word at byte 512 (word 128).
+    for (UINT mip = 0; input_texture && mip < 2; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION input_image{static_cast<ID3D12Resource*>(input_texture),
+            D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        input_image.SubresourceIndex = mip;
+        D3D12_TEXTURE_COPY_LOCATION input_source{static_cast<ID3D12Resource*>(upload),
+            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        input_source.PlacedFootprint = {mip * 512u, {DXGI_FORMAT_R32_FLOAT, 2u >> mip, 1, 1, pitch}};
+        invoke(list, 16, word(&input_image), 0, 0, 0, word(&input_source), 0);
+    }
     transfer(upload, true);
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));

@@ -15,7 +15,9 @@ cache and no offline translator, and compares all 320 output words with a CPU re
    dispatch path then resolves the table descriptors, sets the resource states and records the Dispatch.
 
 Accepted: root constants, a raw table buffer loaded per lane and a raw table buffer stored to. These are the
-bindings the fixture runs. Refused: every other view kind (a scalar buffer load included), a sampler, more than
+bindings the fixture runs; a later step samples a 2D texture through constant samplers
+([note](startup-compute-native-samplers.md)). Refused: every other view kind (a scalar buffer load included),
+a sampler read from memory, more than
 32 entry values or inputs or 8 outputs, an adapter without 32-lane waves, and whatever the frontend refuses. The
 stand-in logs the first 16 refusals of a process with their reason. A refused key is left to a published
 translation. The in-process translation is tried once per key and before a published `<key>.txt`.
@@ -80,7 +82,7 @@ ctest --preset dev --no-tests=error -V -R '^(startup_compute_dispatch(_.*)?|star
 ## Limits
 
 - Compute only. Graphics pipelines are not translated in-process.
-- A scalar buffer load, a texture, a sampler and the typed, half and indexed views are refused. This is the
+- A scalar buffer load, a sampler read from memory and the typed, half and indexed views are refused. This is the
   in-process route. The published-manifest route (`<key>.txt` from `compile_dxil --requests`) binds a
   title's 1D, 2D, 2D-array and 3D texture SRV (`srv N tex1d|tex2d|tex2da|tex3d table R B`). For 1D, 2D-array
   and 3D the title's view must be described, have the manifest's dimension and fit its texture, otherwise the
