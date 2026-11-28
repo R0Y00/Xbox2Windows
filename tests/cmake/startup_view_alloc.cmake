@@ -14,6 +14,9 @@ foreach(backend IN ITEMS warp hardware)
                 add_test(NAME ${alloc_test} COMMAND startup_view_alloc ${backend} ${site} control)
             endif()
             set(alloc_env "X2W_D3D12_BUDGET=1;X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_RENDER=1")
+            # The fixture reads record ids from title-memory tokens and fills view_records until it grows, so it covers the
+            # id tokens only (X2W_D3D12_VIEW_CONTENT_TOKENS is covered by startup_view_content_*).
+            list(APPEND alloc_env "X2W_D3D12_VIEW_CONTENT_TOKENS=0")
             list(APPEND alloc_env "X2W_D3D12_DEBUG=0" "X2W_TRAP_LOG=${CMAKE_CURRENT_BINARY_DIR}/${alloc_test}.log")
             set_tests_properties(${alloc_test} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${alloc_env}")
             if(mode STREQUAL "control")

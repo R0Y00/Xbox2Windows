@@ -1659,6 +1659,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_D3D12_VIEW_DEFAULTS=all` or `=off` | `all` is experimental: UAV, RTV and DSV descriptions with `ViewDimension` 0 also get the resource's default view, which drops their requested format and component mapping. `off` skips the measured SRV case too. Unset, only SRVs of typed non-depth textures get the default view ([details](#unknown-and-mismatched-view-dimensions)) |
 | `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
+| `X2W_D3D12_VIEW_CONTENT_TOKENS=1` | opt-in: constant buffer views and buffer shader-resource views are written into title descriptor memory as tokens that carry the view itself instead of a record id, and their records are freed and reused once no shadow slot names them, so the record count stays bounded ([details](#d3d12-view-content-tokens)). Off under `X2W_D3D12_CAPTURE`. Unset, every view keeps an id token and records are never removed |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_TABLE_ALIAS=1` | opt-in, render mode: a translated draw's table buffer view whose whole range lies in a slot 133 placed buffer that aliases title memory binds that alias instead of a per-draw frame copy, so the GPU reads the bytes at execution and the view is not cut at 16 MiB (`startup_table_alias_*`). Unset, every table buffer view is copied as before. See [Copies of title memory within a frame](#copies-of-title-memory-within-a-frame) |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
@@ -1973,7 +1974,8 @@ ctest --preset dev --no-tests=error -R '^startup_view_alloc_' --output-on-failur
 
 The stand-in keeps one record per distinct view: slot, resource, counter,
 description bytes and whether the desktop view was created. Records are not
-removed. `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
+removed, except under `X2W_D3D12_VIEW_CONTENT_TOKENS=1`
+([D3D12 view content tokens](#d3d12-view-content-tokens)). `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
 record, id or descriptor binding.
 
 The heartbeat adds a line:
@@ -2009,6 +2011,66 @@ every call, and the fixture must fail. Slots 19 to 21 are not exercised.
 ```powershell
 cmake --build --preset dev --target startup_view_census
 ctest --preset dev --no-tests=error -R "^startup_view_census" -V
+```
+
+## D3D12 view content tokens
+
+`note_view` writes a 32-byte token into the title's descriptor memory, so a
+descriptor the title copies with its own memory copy still names its view. By
+default the token holds the id of the view's record. The title can keep such a
+copy for any time, so no record can be freed: an id that was reused would make
+an old copy name another view. The records grow with every distinct view; in a
+startup run of the main executable, mostly buffer SRV windows into one buffer and
+CBVs at new addresses (#1199).
+
+With the opt-in `X2W_D3D12_VIEW_CONTENT_TOKENS=1`, a constant buffer view
+(slot 17) and a buffer shader-resource view (slot 18, `NONE` or `RAW` flags) are
+written as content tokens instead (`src/startup_stubs/view_content_token.h`):
+
+| Word | Id token | Content token |
+|---|---|---|
+| 0 | `X2WV` magic | `X2WV` magic |
+| 1 | record id (below 2^31) | bit 31 set; created flag; SRV format, `RAW` flag, component mapping |
+| 2 | slot | slot (bits 0-7); SRV `StructureByteStride` (bits 8-31) |
+| 3 | 0 | 0 (formatted-buffer readers put their own word 3 in their copy) |
+| 4-5 | resource | CBV: `BufferLocation`; SRV: resource |
+| 6-7 | 0 | CBV: `SizeInBytes`; SRV: `FirstElement`, `NumElements` |
+
+A view that does not fit (a texture, a counter, `FirstElement` of 2^32 or more, a
+format value of 1024 or more) keeps an id token. The draw and dispatch readers
+resolve both kinds through `token_view()`; a content token decodes without
+`note_lock`, with its description's padding bytes zero. A reader that still
+compared the id alone would see an unknown id and refuse the binding.
+
+A record behind a content token is then named only by shadow slots, which the
+stand-in sees change: `note_view`, `note_copy`, the out-of-memory drop and the
+release of a heap's views under `X2W_D3D12_RELEASE_RETIRED`. When the last shadow
+slot stops naming it, the record is parked: it keeps its contents and its
+`view_ids` entry, so the same view created again finds it. A new record takes the
+oldest parked one once more than 65536 are parked (about 10 MB of records and map
+nodes), and only then leaves `view_ids`. The fixture lowers that number through the
+fixture-only export `x2w_d3d12_set_view_parked_keep`. Without `X2W_D3D12_RELEASE_RETIRED`, the
+shadow slots of a destroyed heap keep their references, so those records stay.
+The switch is off under `X2W_D3D12_CAPTURE`, whose `VIEW` chunks are written once
+per id. The heartbeat adds:
+
+`x2w-d3d12 view content tokens: written <n>; records <n> (ids <n>, parked <n>), parked <n>, reused <n>, revived <n>`
+
+`startup_view_content_token` checks the encoding without a device: round trips,
+the refused views, padding bytes, and a decode that ignores word 3.
+`startup_view_content_<off|on>_<warp|hardware>` puts a buffer SRV, a CBV and a
+texture SRV into a heap over title memory, keeps copies of their tokens in plain
+memory and copies the buffer SRV into a second descriptor with
+`CopyDescriptorsSimple`. It then creates 5000 other buffer SRVs into the first
+descriptor, re-creates the first view, and lets its record be reused. Every copy
+must still name the view it was made from, as created; with the switch on the
+record count must stay bounded and the re-created view must find its parked
+record, with it off the records must grow by one per view. `startup_view_alloc_*`
+covers the id tokens only (it reads ids from tokens) and runs with the switch
+off.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_view_content' --output-on-failure
 ```
 
 ## Wrapper allocation failure

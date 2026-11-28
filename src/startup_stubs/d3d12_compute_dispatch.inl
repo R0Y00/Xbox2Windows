@@ -659,15 +659,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             // a null view would read zeros or drop the program's stores without a trace.
             ViewRecord record{};
             bool known = false, created = false;
-            if (words[0] == view_token_magic) {
-                AcquireSRWLockShared(&note_lock);
-                known = words[1] < view_records().size();
-                if (known) {
-                    record = view_records()[words[1]];
-                    created = view_materialized()[words[1]] != 0;
-                }
-                ReleaseSRWLockShared(&note_lock);
-            }
+            if (words[0] == view_token_magic) known = token_view(words, record, &created);
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr
                 : output ? static_cast<ID3D12Resource*>(wrapper->own().real) : sampled_address_texture(wrapper);

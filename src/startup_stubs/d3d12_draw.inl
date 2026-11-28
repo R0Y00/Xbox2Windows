@@ -2241,11 +2241,7 @@ bool d16_srvs_ready(const Translation& tr, const Pass& pass, std::uint32_t (&d16
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (words[0] != view_token_magic) return refuse(i, "missing view token", 0);
         ViewRecord record{};
-        bool known = false;
-        AcquireSRWLockShared(&note_lock);
-        known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = token_view(words, record);
         if (!known || record.slot != 18) return refuse(i, "view slot", static_cast<int>(record.slot));
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
         ID3D12Resource* texture = sampled_address_texture(resource);
@@ -2525,9 +2521,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
-        if (words[1] < view_records().size()) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        token_view(words, record);
         if (record.slot == 17 && record.desc_bytes >= 12) {
             UINT size = 0;
             std::memcpy(&address, record.desc, 8);
@@ -2665,10 +2659,7 @@ const char* formatted_buffer_word3(std::uint32_t* words, std::uint32_t& format)
 {
     if (words[0] == view_token_magic) {
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
-        const bool known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = token_view(words, record);
         if (!known || record.slot != 18 || record.desc_bytes < 40) return "missing hardware descriptor";
         D3D12_SHADER_RESOURCE_VIEW_DESC view;
         std::memcpy(&view, record.desc, 40);
@@ -2742,10 +2733,7 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
         std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (words[0] != view_token_magic) return refuse(i, "table entry holds no view", words[0]);
         ViewRecord record{};
-        AcquireSRWLockShared(&note_lock);
-        const bool known = words[1] < view_records().size();
-        if (known) record = view_records()[words[1]];
-        ReleaseSRWLockShared(&note_lock);
+        const bool known = token_view(words, record);
         if (!known) return refuse(i, "unknown view token", words[1]);
         if (record.slot != 19) return refuse(i, "table entry is not an unordered-access view", record.slot);
         Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
@@ -2798,9 +2786,8 @@ bool resolve_pixel_uavs(const Translation& tr, const Pass& pass, PixelUavBinding
             if (!srv_entry || !x2w_local::readable(reinterpret_cast<const void*>(srv_entry), 32)) continue;
             std::memcpy(srv_words, reinterpret_cast<const void*>(srv_entry), 32);
             if (srv_words[0] != view_token_magic) continue;
-            AcquireSRWLockShared(&note_lock);
-            const u64 srv_resource = srv_words[1] < view_records().size() ? view_records()[srv_words[1]].resource : 0;
-            ReleaseSRWLockShared(&note_lock);
+            ViewRecord srv_record{};
+            const u64 srv_resource = token_view(srv_words, srv_record) ? srv_record.resource : 0;
             if (srv_resource && srv_resource == record.resource) return refuse(i, "the texture is also an SRV of this draw", s);
         }
         out[i].resource = texture;
@@ -3098,12 +3085,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
-            if (words[0] == view_token_magic) {
-                AcquireSRWLockShared(&note_lock);
-                known = words[1] < view_records().size();
-                if (known) record = view_records()[words[1]];
-                ReleaseSRWLockShared(&note_lock);
-            }
+            if (words[0] == view_token_magic) known = token_view(words, record);
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -3236,10 +3218,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // A view the title created: a constant buffer view names its memory directly; a buffer
             // shader-resource view names a range of its resource's title memory.
             ViewRecord record{};
-            AcquireSRWLockShared(&note_lock);
-            buffer_token_known = words[1] < view_records().size();
-            if (buffer_token_known) record = view_records()[words[1]];
-            ReleaseSRWLockShared(&note_lock);
+            buffer_token_known = token_view(words, record);
             if (record.slot == 17 && record.desc_bytes >= 12) {
                 std::uint32_t size = 0;
                 std::memcpy(&address, record.desc, 8);

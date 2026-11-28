@@ -32,6 +32,7 @@
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/formatted_buffer.h"
+#include "startup_stubs/view_content_token.h"
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
 #include "startup_stubs/indexed_rect_geometry.h"
@@ -6060,6 +6061,7 @@ void retire_drop_heap_views(Wrapper* heap)
             if (id - 1 < view_records().size() && view_materialized()[id - 1])
                 view_refs_release(view_records()[id - 1].slot, view_records()[id - 1].resource,
                                   view_records()[id - 1].counter);
+            shadow_ref_drop(id);
         }
     }
     ReleaseSRWLockExclusive(&note_lock);
@@ -6581,6 +6583,61 @@ extern "C" __declspec(dllexport) void x2w_d3d12_view_probe(unsigned long long ti
         out->view_refs = static_cast<unsigned>(InterlockedCompareExchange(&r->own().retire_view_refs, 0, 0));
         out->retire_when_idle = r->own().retire_when_idle;
     }
+}
+
+// Fixture export (startup_view_content): the view a 32-byte token names as the draw and dispatch readers resolve it
+// (token_view), or the view the shadow slot of a title handle names when token is null.
+struct ResolvedViewProbe {
+    unsigned known, slot, desc_bytes, materialized;
+    unsigned long long resource;
+    unsigned char desc[64];
+};
+extern "C" __declspec(dllexport) void x2w_d3d12_resolve_view(const void* token, unsigned long long title_handle,
+                                                             ResolvedViewProbe* out)
+{
+    *out = {};
+    ViewRecord record{};
+    bool materialized = false, known = false;
+    if (token) {
+        std::uint32_t words[8];
+        std::memcpy(words, token, sizeof(words));
+        known = words[0] == view_token_magic && token_view(words, record, &materialized);
+    } else if (const std::uint32_t id = shadow_id(desktop_cpu_handle(title_handle))) {
+        AcquireSRWLockShared(&note_lock);
+        known = id - 1 < view_records().size();
+        if (known) {
+            record = view_records()[id - 1];
+            materialized = view_materialized()[id - 1] != 0;
+        }
+        ReleaseSRWLockShared(&note_lock);
+    }
+    if (!known) return;
+    out->known = 1;
+    out->slot = record.slot;
+    out->desc_bytes = record.desc_bytes;
+    out->materialized = materialized;
+    out->resource = record.resource;
+    std::memcpy(out->desc, record.desc, sizeof(out->desc));
+}
+// Fixture export (startup_view_content): how many parked view records stay findable before the oldest is reused
+// (default 65536), so a short fixture reaches the reuse.
+extern "C" __declspec(dllexport) void x2w_d3d12_set_view_parked_keep(unsigned keep)
+{
+    AcquireSRWLockExclusive(&note_lock);
+    view_parked_keep = keep;
+    ReleaseSRWLockExclusive(&note_lock);
+}
+// Fixture export (startup_view_content): content tokens written, records parked (freed), reused and revived since the
+// process started.
+extern "C" __declspec(dllexport) void x2w_d3d12_view_content_counts(long long* written, long long* freed, long long* reused,
+                                                                    long long* revived)
+{
+    AcquireSRWLockShared(&note_lock);
+    *written = content_tokens_written;
+    *freed = views_freed;
+    *reused = views_reused;
+    *revived = views_revived;
+    ReleaseSRWLockShared(&note_lock);
 }
 
 // Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
@@ -7697,6 +7754,14 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
             static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
+        if (view_content_tokens()) {
+            AcquireSRWLockShared(&note_lock);
+            const u64 records = view_records().size(), ids = view_ids().size();
+            ReleaseSRWLockShared(&note_lock);
+            log("x2w-d3d12 view content tokens: written %lld; records %llu (ids %llu, parked %u), parked %lld, reused %lld, "
+                "revived %lld", content_tokens_written, records, ids, view_parked_count, views_freed, views_reused,
+                views_revived);
+        }
         {
             char line[640];
             if (view_census_line(line, sizeof(line))) log("%s", line);
