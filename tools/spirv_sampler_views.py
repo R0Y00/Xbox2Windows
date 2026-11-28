@@ -11,8 +11,15 @@ BRIDGE = "%bridge_cmp"
 BRIDGE_SET = "3"
 
 
+def _require_assembly_str(assembly):
+    """Reject non-string SPIR-V assembly inputs."""
+    if not isinstance(assembly, str):
+        raise ValueError(f"assembly must be a str, got {type(assembly).__name__}")
+
+
 def strip_comments(assembly):
     """Split into lines and drop `;` comments; a quoted string may span lines and may hold a `;`."""
+    _require_assembly_str(assembly)
     lines, quoted, escaped = [], False, False
     for line in assembly.splitlines():
         end = len(line)
@@ -128,24 +135,70 @@ def tables_to_split(module, tables, plains):
     return resolved, ordinary, unresolved
 
 
+def _parse_uint_literal(token):
+    """Parse a non-negative ASCII decimal or 0x-prefixed hexadecimal SPIR-V literal, or None.
+
+    A multi-digit decimal token starting with ``0`` is refused with ValueError:
+    spirv-as reads such tokens as octal (``010`` is 8, ``08`` is invalid), so
+    parsing them as decimal would silently misread the register range.
+    """
+    if not isinstance(token, str) or not token.isascii():
+        return None
+    if token.isdigit():
+        if len(token) > 1 and token[0] == "0":
+            raise ValueError(
+                f"leading-zero decimal literal {token!r} is ambiguous: spirv-as reads it as octal; "
+                "use a plain decimal or 0x-prefixed hex literal"
+            )
+        return int(token, 10)
+    if len(token) > 2 and token[:2] in ("0x", "0X") and all(ch in "0123456789abcdefABCDEF" for ch in token[2:]):
+        return int(token, 16)
+    return None
+
+
+def _parse_set_literal(token):
+    """Parse a DescriptorSet literal the way spirv-as does (base-0, optional ``+``), or None.
+
+    Only used to detect a collision with descriptor set 3: ``03`` is octal 3
+    and ``+3`` is 3, so both must count as set 3 even though _parse_uint_literal
+    refuses the former and does not accept the latter.
+    """
+    if not isinstance(token, str):
+        return None
+    if not token.isascii():
+        return None
+    text = token[1:] if token.startswith("+") else token
+    if text.isdigit():
+        if len(text) > 1 and text[0] == "0":
+            return int(text, 8) if all(ch in "01234567" for ch in text) else None
+        return int(text, 10)
+    if len(text) > 2 and text[:2] in ("0x", "0X") and all(ch in "0123456789abcdefABCDEF" for ch in text[2:]):
+        return int(text, 16)
+    return None
+
+
 def table_slot(module, table):
     """The (set, binding) of a table; it must carry exactly one of each and no other decoration."""
     sets, bindings = module["sets"].get(table, []), module["bindings"].get(table, [])
     if len(sets) != 1 or len(bindings) != 1 or len(sets[0]) != 1 or len(bindings[0]) != 1:
         raise ValueError("sampler table requires one DescriptorSet and one Binding decoration")
-    if not (sets[0][0].isdigit() and bindings[0][0].isdigit()):
+    if _parse_uint_literal(sets[0][0]) is None or _parse_uint_literal(bindings[0][0]) is None:
         raise ValueError("sampler table requires literal DescriptorSet and Binding numbers")
-    if table in module["decorated"] or len(module["defs"][table]) != 3:
+    if table in module["decorated"] or len(module["defs"].get(table, [])) != 3:
         raise ValueError("unsupported sampler table declaration")
     return sets[0][0], bindings[0][0]
 
 
 def register_end(defs, table, binding):
     """The first register after a table's views; a runtime or unresolvable size has no end."""
-    shape = defs[defs[defs[table][1]][2]]
-    length = defs.get(shape[2], []) if shape[0] == "OpTypeArray" else []
-    if len(length) == 3 and length[0] == "OpConstant" and length[2].isdigit() and int(length[2]) > 0:
-        return int(binding) + int(length[2])
+    decl = defs.get(table, [])
+    pointer = defs.get(decl[1], []) if len(decl) >= 2 else []
+    shape = defs.get(pointer[2], []) if len(pointer) >= 3 else []
+    length = defs.get(shape[2], []) if len(shape) >= 3 and shape[0] == "OpTypeArray" else []
+    binding_num = _parse_uint_literal(binding)
+    length_num = _parse_uint_literal(length[2]) if len(length) == 3 and length[0] == "OpConstant" else None
+    if binding_num is not None and length_num is not None and length_num > 0:
+        return binding_num + length_num
     return None
 
 
@@ -154,16 +207,18 @@ def bridge_names(module, split):
     names, ranges = {}, []
     for number, table in enumerate(split):
         _, binding = table_slot(module, table)
+        binding_num = _parse_uint_literal(binding)
         end = register_end(module["defs"], table, binding)
         for other, start, stop in ranges:
-            if (stop is None or int(binding) < stop) and (end is None or start < end):
+            if (stop is None or binding_num < stop) and (end is None or start < end):
                 raise ValueError(f"sampler tables {other} and {table} overlap in the set 3 register range")
-        ranges.append((table, int(binding), end))
+        ranges.append((table, binding_num, end))
         names[table] = BRIDGE if number == 0 else f"{BRIDGE}_table_{number}"
     return names
 
 
 def split_sampler_views(assembly):
+    _require_assembly_str(assembly)
     if "Dref" not in assembly:
         return assembly
     lines = strip_comments(assembly)
@@ -179,8 +234,11 @@ def split_sampler_views(assembly):
         return assembly
     if module["indirect"]:
         raise ValueError("unsupported indirect descriptor decorations")
-    set_three = any(values and values[0].isdigit() and int(values[0]) == int(BRIDGE_SET)
-                    for assigned in module["sets"].values() for values in assigned)
+    set_three = any(
+        values and _parse_set_literal(values[0]) == int(BRIDGE_SET)
+        for assigned in module["sets"].values()
+        for values in assigned
+    )
     if BRIDGE in assembly or set_three:
         raise ValueError("comparison sampler view requires free descriptor set 3 and bridge_cmp IDs")
     names = bridge_names(module, split)
