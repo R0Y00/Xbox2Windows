@@ -201,19 +201,19 @@ public:
 
         // Recording 2: each refusal after a fresh Close, so no binding is left over from recording 1.
         reset();
-        ok = expect({"root SRV never set", 3, 1, 1, "a compute root SRV is not bound", 0},
+        ok = expect({"root SRV never set", 3, 1, 1, "a compute root argument is not bound", 0},
                     [&] { bind(pso_a_.Get(), root_a_.Get()); });
-        ok = ok && expect({"rejected replacement after a valid root SRV", 4, 1, 1, "a compute root SRV is not bound", 1}, [&] {
+        ok = ok && expect({"rejected replacement after a valid root SRV", 4, 1, 1, "a compute root argument is not bound", 1}, [&] {
             bind(pso_a_.Get(), root_a_.Get());
             srv(upload_);
             srv(reinterpret_cast<UINT64>(&foreign_));  // not in this recording's upload pages
         });
-        ok = ok && expect({"misaligned replacement after a valid root SRV", 5, 1, 1, "a compute root SRV is not bound", 2}, [&] {
+        ok = ok && expect({"misaligned replacement after a valid root SRV", 5, 1, 1, "a compute root argument is not bound", 2}, [&] {
             bind(pso_a_.Get(), root_a_.Get());
             srv(upload_);
             srv(upload_ + 2);  // in the upload pages, not 4-byte aligned
         });
-        ok = ok && expect({"root changed and changed back", 6, 1, 1, "a compute root SRV is not bound", 3}, [&] {
+        ok = ok && expect({"root changed and changed back", 6, 1, 1, "a compute root argument is not bound", 3}, [&] {
             bind(pso_a_.Get(), root_a_.Get());
             srv(upload_);
             root(root_b_.Get());
@@ -228,7 +228,7 @@ public:
                           [&] { bind(pso_table_.Get(), root_table_.Get()); });
         ok = ok && expect({"root with a static sampler", 9, 1, 1, "compute root arguments are not forwarded", 6},
                           [&] { bind(pso_sampler_.Get(), root_sampler_.Get()); });
-        ok = ok && expect({"root SRV never set, zero groups", 0, 10, 1, "a compute root SRV is not bound", 7},
+        ok = ok && expect({"root SRV never set, zero groups", 0, 10, 1, "a compute root argument is not bound", 7},
                           [&] { bind(pso_a_.Get(), root_a_.Get()); });
         ok = ok && expect({"bound, X over the limit", 65536, 1, 1, "group count is over 65535", 8}, [&] {
             bind(pso_a_.Get(), root_a_.Get());

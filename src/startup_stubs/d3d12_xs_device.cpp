@@ -208,7 +208,7 @@ struct alignas(16) WrapperOwn {
     ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     u64 compute_request_key;           // PipelineState: key of the slot 67 request it published, or 0
     const void* compute_request_root;  // PipelineState: root signature wrapper named by that slot 67 description
-    bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
+    bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a forwarded root argument (SRV, UAV, constants)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
@@ -2385,7 +2385,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
             w->own().root_srv_only = !heap_flags && !desc->Desc_1_1.NumStaticSamplers && desc->Desc_1_1.NumParameters;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
-                if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) w->own().root_srv_only = false;
+                if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV &&
+                    parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_UAV &&
+                    parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+                    w->own().root_srv_only = false;
                 RootParameter info{parameter.ParameterType, 0, 0};
                 if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
                     parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
@@ -2857,7 +2860,7 @@ struct Pass {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
     ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
     UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
-    // Desktop root UAVs a fixture bound through x2w_d3d12_fixture_compute_root_uav, set again after a shim compute pass.
+    // Desktop root UAVs bound through slot 45 or x2w_d3d12_fixture_compute_root_uav, set again after a shim compute pass.
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_root_uavs{};
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
@@ -3294,9 +3297,9 @@ UINT __stdcall list_resource_barriers(Wrapper* self, UINT count, const D3D12_RES
     return 0; // no console barrier actions to perform on the caller's side
 }
 
-// Compute root views on the desktop list. Root SRVs come from slot 43; root UAVs only from the fixture hook
-// x2w_d3d12_fixture_compute_root_uav (slot 45 is not forwarded). Both are recorded here so restore_compute_root can set
-// them again after a shim compute pass has replaced the desktop compute root.
+// Compute root views on the desktop list. Root SRVs come from slot 43; root UAVs from slot 45 or the fixture hook
+// x2w_d3d12_fixture_compute_root_uav. Both are recorded here so restore_compute_root can set them again after a shim
+// compute pass has replaced the desktop compute root.
 void bind_compute_root_view(Pass& pass, ID3D12GraphicsCommandList* list, UINT parameter, D3D12_ROOT_PARAMETER_TYPE type,
                             D3D12_GPU_VIRTUAL_ADDRESS address)
 {
@@ -3325,6 +3328,27 @@ void restore_compute_root(const Pass& pass, ID3D12GraphicsCommandList* list)
             list->SetComputeRootShaderResourceView(parameter, address);
         if (const auto address = pass.desktop_compute_root_uavs[parameter])
             list->SetComputeRootUnorderedAccessView(parameter, address);
+    }
+    if (const auto* params = pass.compute_params) {
+        for (UINT parameter = 0; parameter < params->size() && parameter < 16; ++parameter) {
+            const auto& p = (*params)[parameter];
+            if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                const UINT declared = (std::min)(p.constants_count, x2w_root_constants::max_words_per_parameter);
+                UINT offset = 0;
+                while (offset < declared) {
+                    if (!(pass.compute_constants.bound[parameter] & (1u << offset))) {
+                        ++offset;
+                        continue;
+                    }
+                    UINT count = 0;
+                    while (offset + count < declared && (pass.compute_constants.bound[parameter] & (1u << (offset + count)))) {
+                        ++count;
+                    }
+                    list->SetComputeRoot32BitConstants(parameter, count, &pass.compute_constants.words[parameter][offset], offset);
+                    offset += count;
+                }
+            }
+        }
     }
 }
 
@@ -3366,10 +3390,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
 }
 
 // Fixture binding of a desktop root UAV (a desktop GPU address) on a guest list's recording, under the compute root
-// set through slot 33. Not a guest slot: titles have no compute root UAV on the desktop list (slot 45 is not
-// forwarded). It records the view through bind_compute_root_view, as slot 43 does for root SRVs, so
-// restore_compute_root sets it again after a shim compute pass; a binding made on the desktop list directly would be
-// lost there.
+// set through slot 33. It records the view through bind_compute_root_view, as slot 43 does for root SRVs and slot 45
+// for placed buffer UAVs, so restore_compute_root sets it again after a shim compute pass; a binding made on the
+// desktop list directly would be lost there.
 extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* guest_list, UINT parameter, UINT64 address)
 {
     Wrapper* self = as_wrapper(guest_list);
@@ -3382,6 +3405,19 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_compute_root_uav(void* g
         !address)
         return FALSE;
     bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_UAV, address);
+    return TRUE;
+}
+
+// Fixture call to restore the compute root signature and its recorded arguments (root SRVs, root UAVs,
+// and 32-bit root constants) on a guest list's desktop recording after a shim compute pass.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_fixture_restore_compute_root(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind) return FALSE;
+    auto* list = recording(self);
+    const auto& pass = pass_of(self);
+    if (!list || !pass.desktop_compute_root) return FALSE;
+    restore_compute_root(pass, list);
     return TRUE;
 }
 
@@ -4398,6 +4434,53 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     }
 }
 
+// List slot 45 (desktop 41 + 4), SetComputeRootUnorderedAccessView(parameter, title GPU address).
+void __stdcall list_compute_root_uav(Wrapper* self, UINT parameter, u64 address)
+{
+    if (parameter >= 16) return;
+    Pass& pass = pass_of(self);
+    if (compute_binding_trace_enabled()) {
+        trace_compute_binding(self, 45, parameter, address, 0, 0);
+    }
+    auto* list = recording(self);
+    const auto* params = pass.compute_params;
+    if (!list || !pass.desktop_compute_root || !params || parameter >= params->size() ||
+        parameter >= pass.desktop_compute_root_uavs.size() ||
+        (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        if (parameter < pass.desktop_compute_root_uavs.size()) pass.desktop_compute_root_uavs[parameter] = 0;
+        return;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS desktop = 0;
+    if (const auto gpu = list_upload_gpu(self, address, 1)) {
+        if (!(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) desktop = gpu;
+    } else {
+        const auto placed = placed_buffer_range(self->own().list_device, address, 1);
+        if (!placed.reject) {
+            ID3D12Resource* res = placed.alias ? placed.alias : (placed.owner && placed.owner->own().real ? static_cast<ID3D12Resource*>(placed.owner->own().real) : nullptr);
+            if (res && placed.owner) {
+                const auto base = reinterpret_cast<u64>(placed.owner->own().title_memory);
+                const auto gpu_base = res->GetGPUVirtualAddress();
+                const auto offset = address - base;
+                if (gpu_base && offset <= ~u64{} - gpu_base) {
+                    desktop = gpu_base + offset;
+                }
+            }
+        }
+    }
+    if (desktop && !(desktop % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+        bind_compute_root_view(pass, list, parameter, D3D12_ROOT_PARAMETER_TYPE_UAV, desktop);
+        static LONG logged;
+        if (first_calls(logged, 4))
+            log("x2w-render compute root UAV %u: title 0x%llx -> desktop 0x%llx", parameter, address, desktop);
+    } else {
+        pass.desktop_compute_root_uavs[parameter] = 0;
+        static LONG unplaced_logged;
+        if (first_calls(unplaced_logged, 4))
+            log("x2w-render compute root UAV %u: title 0x%llx is not an upload or placed buffer range", parameter, address);
+    }
+}
+
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -4488,8 +4571,23 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     request.compute_root = pass.compute_root != nullptr;
     request.compute_root_has_arguments = pass.compute_root_has_arguments;
     request.root_matches_pipeline = pass.compute_pipeline_root && pass.compute_pipeline_root == pass.compute_root;
-    const UINT count = pass.compute_params ? static_cast<UINT>(pass.compute_params->size()) : 0;
-    request.root_arguments_bound = count <= 32 && (pass.compute_srv_bound & (count >= 32 ? ~0u : (1u << count) - 1)) == (count >= 32 ? ~0u : (1u << count) - 1);
+    bool all_bound = true;
+    if (pass.compute_params) {
+        for (UINT i = 0; i < pass.compute_params->size(); ++i) {
+            const auto& p = (*pass.compute_params)[i];
+            if (p.type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+                if (i >= 32 || !(pass.compute_srv_bound & (1u << i))) { all_bound = false; break; }
+            } else if (p.type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+                if (i >= pass.desktop_compute_root_uavs.size() || !pass.desktop_compute_root_uavs[i]) { all_bound = false; break; }
+            } else if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                const UINT cap = (std::min)(32u, p.constants_count);
+                if (!pass.compute_constants.is_bound(i, 0, p.constants_count, cap)) { all_bound = false; break; }
+            } else {
+                all_bound = false; break;
+            }
+        }
+    }
+    request.root_arguments_bound = all_bound;
     request.x = x, request.y = y, request.z = z;
     const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
     if (decision != x2w_startup::DispatchDecision::forward) {
@@ -7664,9 +7762,13 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
         list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
+        list_typed[45] = reinterpret_cast<ListTyped>(&list_compute_root_uav);
+        tables[list_kind][45] = reinterpret_cast<void*>(&list_compute_root_uav);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);

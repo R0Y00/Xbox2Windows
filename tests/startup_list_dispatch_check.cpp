@@ -58,7 +58,7 @@ int main(int argc, char** argv)
     d.compute_root = false;
     expect("no compute root", d, no_state ? D::forward : D::no_compute_state);
     d = ready(8, 1, 1);
-    d.compute_root_has_arguments = true;  // e.g. a root UAV set through slot 45, which is not forwarded
+    d.compute_root_has_arguments = true;  // e.g. a root CBV or unforwarded table parameter
     expect("root with arguments", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
     d.x = 0;
     expect("root with arguments, zero groups", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
