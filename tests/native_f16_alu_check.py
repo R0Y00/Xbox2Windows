@@ -306,7 +306,7 @@ def check_model(items):
 def refusal_programs():
     add = vop2(0x32, 3, 257, 2)
     programs = []
-    programs.append((vop2(0x32, 3, 233, 2) + [0xfac68801, 0xbf810000], 'SDWA or DPP vector operands'))
+    programs.append((vop2(0x32, 3, 233, 2) + [0xfac68801, 0xbf810000], 'unsupported v_add_f16 DPP form'))  # DPP8 stays refused on binary16
     # Clamp needs a wide encoding. A VOP3 with clamp and the DPP16 source selector is invalid.
     programs.append((vop3(0x32, 3, 250, 258, clamp=1) + [0xbf810000], 'unsupported v_add_f16 clamp or omod'))
     programs.append((vop3(0x35, 3, 257, 258, clamp=1) + [0xbf810000], 'unsupported v_mul_f16 clamp or omod'))

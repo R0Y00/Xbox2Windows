@@ -14,6 +14,8 @@ clamp, and output modifiers are refused. SDWA min and max remain refused.
 
 Direct wave32 compute SDWA VOPC compares can write a 32-bit mask to `vcc_hi` and read it as a scalar source.
 
+Direct compute `v_cvt_f32_f16_sdwa` supports clamp with WORD_0 or WORD_1 and DWORD/UNUSED_PAD (NaN and -0 become +0), and still refuses omod.
+
 ## Fixture
 
 The wave32 GPU fixture also covers SDWA packed RTZ f32-to-f16 placement and add-with-carry, including per-lane VCC input and output before destination placement.

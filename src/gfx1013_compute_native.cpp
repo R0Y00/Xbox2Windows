@@ -60,6 +60,7 @@ struct Inst {
     // 0..255 selects within a quad. Row operations and mirrors cross quads.
     std::optional<unsigned> dpp_control;
     unsigned dpp_row_mask = 15, dpp_bank_mask = 15;
+    std::optional<Word> dpp8_selectors;
     bool dpp_fetch_inactive = false;
     bool dpp_bound_zero = false;
     unsigned mirror_mask() const { return dpp_control == 0x141 ? 7 : dpp_control == 0x140 ? 15 : 0; }
@@ -294,6 +295,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
         const bool half_alu = !graphics && i.enc == Encoding::Vop2 && binary16_alu(encoded.name);
+        const bool dpp8 = i.src[0] == 233 || i.src[0] == 234;
+        if (direct && half_alu && dpp8)
+            refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && (i.op == 0x88 || (direct && i.op == 0x8f));
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -333,7 +337,9 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
                 if (half_alu && ((i.dst_select != 4 && i.dst_select != 5) ||
                                  (i.dst_unused != 0 && i.dst_unused != 2)))
                     refuse(pc, "unsupported SDWA destination modifier");
-                if (i.dst_select == 7 || i.dst_unused == 3 || ((i.clamp || i.scale) && !floats.count(name) && !conversion) ||
+                const bool clamp_only = !graphics && name == "v_cvt_f32_f16";
+                if (i.dst_select == 7 || i.dst_unused == 3 ||
+                    ((i.scale || (i.clamp && !clamp_only)) && !floats.count(name) && !conversion) ||
                     (sources == 1 && (ext & 0xbf000000u)))
                     refuse(pc, "unsupported SDWA destination modifier");
             }
@@ -406,7 +412,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.src[0]=256+(control&255);
             i.neg=((control>>20)&1)|((control>>21)&2);
             i.abs=((control>>21)&1)|((control>>22)&2);
-        } else if (graphics && (i.src[0] == 233 || i.src[0] == 234) && i.enc != Encoding::Vopc && !lit) {
+        } else if (direct && !graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
+            const Word control = take();
+            i.dpp8_selectors = control >> 8;
+            i.dpp_fetch_inactive = i.src[0] == 234;
+            i.src[0] = 256 + (control & 255);
+        } else if (graphics && dpp8 && i.enc != Encoding::Vopc && !lit) {
             // pixel_aot.parse_dpp: both halves of an octet must select the
             // same local 2x2 permutation to map to desktop quad operations.
             const Word control = take();

@@ -1509,11 +1509,11 @@ struct DirectCompute {
         }
         if ((i.subword || (!i.wide && !i.dpp_control && !permuted)) &&
             (n == "v_cvt_f16_f32" || n == "v_cvt_f32_f16")) {
-            if (i.scale || i.clamp || i.src_sext[0])
+            const bool narrow = n == "v_cvt_f16_f32";
+            if (i.scale || (i.clamp && (narrow || !i.subword)) || i.src_sext[0])
                 refuse(i.pc, "unsupported SDWA half conversion modifier");
             string bits = operand32(i, i.src[0]);
             if (i.subword) bits = subword(bits, i.src_select[0], false);
-            const bool narrow = n == "v_cvt_f16_f32";
             if (i.abs) bits = ir.binary("and", bits, narrow ? "2147483647" : "32767");
             if (i.neg) bits = ir.binary("xor", bits, narrow ? "2147483648" : "32768");
             if (narrow) {
@@ -1522,6 +1522,13 @@ struct DirectCompute {
             } else {
                 auto f = ir.invoke("float", "legacyF16ToF32", 131, {{"i32",bits}}, "nounwind readnone");
                 bits = ir.value("bitcast float " + f + " to i32");
+                if (i.clamp) {
+                    // Integer clamp, as v_ldexp does: a set sign bit or NaN gives +0, values above 1.0 give 1.0.
+                    // dx.op saturate may keep -0 or flush a denormal depending on the float mode.
+                    auto nan = cmp("ugt", ir.binary("and", bits, "2147483647"), "2139095040");
+                    auto low = ir.value("or i1 " + nan + ", " + cmp("slt", bits, "0"));
+                    bits = select(low, "0", select(cmp("sgt", bits, "1065353215"), "1065353216", bits));
+                }
             }
             vector_write(i.dst, place_subword(i, bits));
             return true;
@@ -3783,9 +3790,10 @@ struct DirectCompute {
         const unsigned mask = i.mirror_mask();
         const auto row = i.dpp_row();
         const bool row_op = row.op != Inst::DppRowOp::None;
-        const unsigned group_size = row_op ? 16 : mask ? mask + 1 : 4;
+        const unsigned group_size = i.dpp8_selectors ? 8 : row_op ? 16 : mask ? mask + 1 : 4;
         if (threads % group_size)
-            refuse(i.pc, row_op ? "DPP row shift or rotate needs a thread count divisible by 16"
+            refuse(i.pc, i.dpp8_selectors ? "DPP8 needs a thread count divisible by eight"
+                              : row_op ? "DPP row shift or rotate needs a thread count divisible by 16"
                               : mask ? "DPP mirror needs complete source lane groups"
                               : "DPP quad_perm needs a thread count divisible by four");
         const auto rule = alu_rules.find(i.name);
@@ -3794,7 +3802,13 @@ struct DirectCompute {
         if (i.enc == Encoding::Vop1 && ((i.neg | i.abs) & 2))
             refuse(i.pc, "unexpected second DPP source modifier");
         string source_lane, source_usable;
-        if (row_op) {
+        if (i.dpp8_selectors) {
+            auto octet_base = ir.binary("and", lane, "4294967288");
+            auto octet_lane = ir.binary("and", lane, "7");
+            auto shift = ir.binary("mul", octet_lane, "3");
+            auto fields = ir.binary("lshr", to_string(*i.dpp8_selectors), shift);
+            source_lane = ir.binary("or", octet_base, ir.binary("and", fields, "7"));
+        } else if (row_op) {
             auto row_base = ir.binary("and", lane, "4294967280");
             auto row_lane = ir.binary("and", lane, "15");
             auto amount = to_string(row.amount);
@@ -3823,7 +3837,8 @@ struct DirectCompute {
         }
         string write_enabled;
         if (!source_usable.empty()) {
-            if (i.dpp_bound_zero) word = select(source_usable, word, "0");
+            // DPP8 supplies zero for a disabled source when FI is clear.
+            if (i.dpp8_selectors || i.dpp_bound_zero) word = select(source_usable, word, "0");
             else write_enabled = source_usable;
         }
         // Row and bank masks gate destination writes independently of the source and BOUND_CTRL.
@@ -4019,7 +4034,7 @@ struct DirectCompute {
                     if (virtual_waves) yield_virtual_wave(select(pred,to_string(i.target()),to_string(i.next)));
                     else ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
                 }
-            } else if (i.dpp_control)
+            } else if (i.dpp_control || i.dpp8_selectors)
                 lower_dpp(i, p.before[k], x*y*z);
             else if (i.name == "s_endpgm") {
                 if (virtual_waves) yield_virtual_wave("4294967295");
