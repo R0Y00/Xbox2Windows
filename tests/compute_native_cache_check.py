@@ -136,16 +136,18 @@ def main(argv=None):
         path = evidence / name / f"{native.key_text(key)}.json"
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="ascii")
 
-    # -- toolchain pins ---------------------------------------------------------------
+    # -- toolchain fingerprints -------------------------------------------------------
     try:
-        native.verify_compile_toolchain(args.dxc, args.validator)
-        compile_pin = True
-        compile_pin_detail = ""
+        identity = native.expected_identity(library=args.llvm, dxc=args.dxc, validator=args.validator)
+        compile_identity = identity["compiler"] == sha_file(Path(args.dxc).parent / "dxcompiler.dll") \
+            and identity["validator"] == sha_file(args.validator or Path(args.dxc).parent / "dxil.dll")
+        compile_detail = ""
     except native.ToolchainMismatch as error:
-        compile_pin = False
-        compile_pin_detail = str(error)
-    check("toolchain: compiler and validator match the pinned identity", compile_pin, compile_pin_detail)
-    identity = native.expected_identity()
+        compile_identity = False
+        compile_detail = str(error)
+        identity = {}
+    check("toolchain: compiler and validator hashes describe the supplied files",
+          compile_identity, compile_detail)
     check("toolchain: translator and decoder identities are computed from source",
           identity["translator"].startswith("compute_store_aot/") and
           identity["decoder"].startswith("pixel_aot/") and len(identity["pipeline"]) == 16,
@@ -158,9 +160,9 @@ def main(argv=None):
         "dxil_sha256": sha_file(validator),
         "probe_sha256": sha_file(args.probe),
         "pso_probe_sha256": sha_file(args.pso_probe),
-        "pinned_llvm_sha256": native.PINNED_LLVM,
-        "pinned_compiler_sha256": native.PINNED_COMPILER,
-        "pinned_validator_sha256": native.PINNED_VALIDATOR,
+        "llvm_sha256": identity["llvm"],
+        "compiler_sha256": identity["compiler"],
+        "validator_sha256": identity["validator"],
         "identity": identity,
         "python": sys.version.split()[0],
     }, indent=2, sort_keys=True) + "\n", encoding="ascii")
@@ -271,13 +273,13 @@ def main(argv=None):
 
     for name in ("1d", "2d"):
         paths = native.cache_paths(cache, keys[name])
-        finding = native.inspect_entry(cache, keys[name], REQUIRED)
+        finding = native.inspect_entry(cache, keys[name], REQUIRED, expected=identity)
         check(f"{name}: authoritative acceptance is a hit", finding["state"] == "hit",
               f'state={finding["state"]} {finding["detail"]}')
         manifest = native.parse_manifest(paths["manifest"].read_text(encoding="utf-8"))
         missing = sorted(set(native.MANIFEST_VALIDATED) - set(manifest))
         check(f"{name}: manifest declares every mandatory field", not missing, missing)
-        check(f"{name}: manifest identity is the pinned identity",
+        check(f"{name}: manifest identity matches the supplied toolchain",
               all(manifest[field] == identity[field] for field in native.MANIFEST_IDENTITY))
         check(f"{name}: manifest evidence is green",
               manifest["validation"] == native.VALIDATION_OK and manifest["rts0"] == "present"
@@ -288,7 +290,7 @@ def main(argv=None):
               and manifest["hlsl_sha256"] == sha_file(paths["hlsl"]))
         check(f"{name}: published HLSL is the accepted translation",
               paths["hlsl"].read_bytes() == (golden_1d if name == "1d" else golden_2d))
-        verdict = native.verify_entry(cache, keys[name], REQUIRED)
+        verdict = native.verify_entry(cache, keys[name], REQUIRED, expected=identity)
         check(f"{name}: consumer verification returns the verified bytes",
               verdict["accepted"] and verdict["output"] == paths["output"].read_bytes()
               and verdict["hlsl"] == paths["hlsl"].read_bytes(), verdict["problems"])
@@ -369,7 +371,7 @@ def main(argv=None):
                                .read_text(encoding="utf-8"))
     inventory = validation_2d["ir"]["xbox_intrinsics"]
     gate = {"verdict": "ALLOW"}
-    verified_cache = native.verify_entry(cache, keys["2d"], REQUIRED)
+    verified_cache = native.verify_entry(cache, keys["2d"], REQUIRED, expected=identity)
     blob = native.cache_paths(cache, keys["2d"])["output"].read_bytes()
     hlsl = native.cache_paths(cache, keys["2d"])["hlsl"].read_bytes()
 
@@ -480,7 +482,7 @@ def main(argv=None):
         fields = manifest_of(target, keys["2d"])
         fields.pop(field)
         rewrite_manifest(target, keys["2d"], fields)
-        finding = native.inspect_entry(target, keys["2d"], REQUIRED)
+        finding = native.inspect_entry(target, keys["2d"], REQUIRED, expected=identity)
         state(f"manifest: missing {field} is not a hit", finding["state"] == "corrupt",
               f'state={finding["state"]} {finding["detail"]}')
 
@@ -490,7 +492,7 @@ def main(argv=None):
         fields[field] = "foreign/0000000000000000"
         rewrite_manifest(target, keys["2d"], fields)
         state(f"manifest: foreign {field} is stale",
-              native.entry_state(target, keys["2d"], REQUIRED)[0] == "stale")
+              native.entry_state(target, keys["2d"], REQUIRED, expected=identity)[0] == "stale")
 
     for field, bad in (("record_version", "9"), ("validation", "container=0x80004005 module=0x00000000"),
                        ("rts0", "a test marker"), ("gate", "DENY"), ("signed", "unsigned"),
@@ -677,7 +679,7 @@ def main(argv=None):
                                          verified_cache["hlsl"], verified_cache["output"],
                                          validation_2d, gate,
                                          native.verified_backends(verified_cache["fields"]),
-                                         native.expected_identity())
+                                         identity)
             except OSError:
                 pass
     state("publication: an interrupted validated publish is never a hit",
@@ -710,7 +712,7 @@ def main(argv=None):
         native.publish_validated(writer, stale_error, keys["2d"], verified_cache["record"],
                                  verified_cache["hlsl"], verified_cache["output"], validation_2d,
                                  gate, native.verified_backends(verified_cache["fields"]),
-                                 native.expected_identity())
+                                 identity)
     state("publication: a successful publish clears the error marker",
           native.entry_state(stale_error, keys["2d"], REQUIRED)[0] == "hit"
           and not native.cache_paths(stale_error, keys["2d"])["error"].exists())
@@ -734,7 +736,7 @@ def main(argv=None):
     rewrite_manifest(backend, keys["2d"], fields)
     state("backend: a WARP-only entry does not satisfy a hardware request",
           native.entry_state(backend, keys["2d"], ("hardware",))[0] == "backend-missing")
-    verdict = native.verify_entry(backend, keys["2d"], REQUIRED)
+    verdict = native.verify_entry(backend, keys["2d"], REQUIRED, expected=identity)
     state("backend: consumer verification refuses a backend-missing entry",
           not verdict["accepted"] and verdict["state"] == "backend-missing")
     state("backend: the same entry satisfies a WARP-only request",
@@ -822,15 +824,22 @@ def main(argv=None):
     mismatch = clone("toolchain")
     foreign = fresh("foreign-toolchain")
     (foreign / "dxc.exe").write_bytes(b"not a compiler")
-    (foreign / "dxcompiler.dll").write_bytes(b"not the pinned compiler")
-    (foreign / "dxil.dll").write_bytes(b"not the pinned validator")
-    try:
-        native.stage_compile(mismatch, foreign / "dxc.exe", args.probe, args.pso_probe, REQUIRED)
-        state("toolchain: a foreign compiler hash is refused before any mutation", False, "accepted")
-    except native.ToolchainMismatch as error:
-        state("toolchain: a foreign compiler hash is refused before any mutation", True, str(error))
-    state("toolchain: the refusal mutated nothing",
-          native.entry_state(mismatch, keys["2d"], REQUIRED)[0] == "hit")
+    (foreign / "dxcompiler.dll").write_bytes(b"second compiler build")
+    (foreign / "dxil.dll").write_bytes(b"second validator build")
+    foreign_identity = native.expected_identity(dxc=foreign / "dxc.exe", validator=foreign / "dxil.dll")
+    state("toolchain: an alternate compiler build makes the old artifact stale",
+          native.entry_state(mismatch, keys["2d"], REQUIRED, expected=foreign_identity)[0] == "stale")
+    with mock.patch.object(native, "compile_dxil", return_value=(blob, ["DXIL", "RTS0"])), \
+         mock.patch.object(native, "validate_and_sign", return_value=(validation_2d, blob, gate)), \
+         mock.patch.object(native, "collect_backends",
+                           return_value={"backends": native.verified_backends(verified_cache["fields"]),
+                                         "raw": {}}):
+        outcomes = native.stage_compile(mismatch, foreign / "dxc.exe", args.probe, args.pso_probe,
+                                        REQUIRED, validator=foreign / "dxil.dll")
+    state("toolchain: stale artifact is rebuilt with supplied compiler hashes",
+          any(outcome == "validated" for _, outcome, _ in outcomes)
+          and native.entry_state(mismatch, keys["2d"], REQUIRED, expected=foreign_identity)[0] == "hit",
+          outcomes)
 
     # ------------------------------------------------------------------ infrastructure mocks
     work = fresh("mock-work")

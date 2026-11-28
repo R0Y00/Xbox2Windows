@@ -23,12 +23,15 @@ import json
 import hashlib
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "tools" / "startup"))
 
 import compute_store_aot as aot  # noqa: E402
+import compute_native as native  # noqa: E402
 from pixel_aot import disassemble  # noqa: E402
 from resource_inventory import parts  # noqa: E402
 
@@ -473,6 +476,44 @@ def compile_hlsl(dxc, source, output, directory, *, root):
     return (directory / output).read_bytes(), result.returncode
 
 
+def tool_unit_checks():
+    """Keep record validation covered without the optional compiler and GPU toolchain."""
+    record = native.build_record(
+        profile=native.PROFILE_2D, code=b"\x00\x00\x00\x00", group=(1024, 2, 1),
+        dispatch=(1, 1, 1), user_sgpr_count=4, table_reg=0, group_reg=2, group_reg_y=3,
+        descriptor_offset=0, constant_descriptor=32, source_descriptor=16, source_stride=0,
+        u0_stride=4096, address_layout=2, column_shift=2, element_bytes=4,
+        guard_axis=0, bound_constant=0, cap_constant=1)
+    try:
+        native.validate(record)
+    except native.RecordError as error:
+        if str(error) != "Unsupported thread group product 2048":
+            raise AssertionError(f"unexpected oversized group refusal: {error}") from error
+    else:
+        raise AssertionError("thread group product 2048 was accepted")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        llvm = directory / "libLLVM.so"
+        dxc = directory / "dxc.exe"
+        compiler = directory / "dxcompiler.dll"
+        validator = directory / "dxil.dll"
+        for path, content in ((llvm, b"llvm-build-a"), (dxc, b"dxc-wrapper"),
+                              (compiler, b"compiler-build-a"), (validator, b"validator-build-a")):
+            path.write_bytes(content)
+        first = native.expected_identity(library=llvm, dxc=dxc, validator=validator)
+        compiler.write_bytes(b"compiler-build-b")
+        validator.write_bytes(b"validator-build-b")
+        llvm.write_bytes(b"llvm-build-b")
+        second = native.expected_identity(library=llvm, dxc=dxc, validator=validator)
+        for field in ("llvm", "compiler", "validator"):
+            if first[field] == second[field]:
+                raise AssertionError(f"{field} identity did not change with its supplied file")
+
+    print("compute_native_tool_unit: PASS (group limit and supplied-toolchain identity)")
+    return 0
+
+
 def compare_hlsl(out, machine_dir):
     """Decoded-code HLSL against the accepted text-mode HLSL; a newline difference must be the only one."""
     result = {}
@@ -514,7 +555,12 @@ def main(argv=None):
     parser.add_argument("--root-probe")
     parser.add_argument("--device-probe")
     parser.add_argument("--warp-only", action="store_true")
+    parser.add_argument("--unit", action="store_true",
+                        help="run toolchain-free record validation checks")
     args = parser.parse_args(argv)
+
+    if args.unit:
+        return tool_unit_checks()
 
     if args.linux_worker:
         return linux_worker(argv)

@@ -39,7 +39,6 @@ import struct
 import subprocess
 import sys
 import time
-from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,14 +79,6 @@ ROOT_FIXTURE = (
 )
 ROOT_SIGNATURE = 'SRV(t0),UAV(u0),RootConstants(num32BitConstants=16,b0)'
 ROOT_CONSTANTS = 16
-
-# Deliberately pinned, content-addressed toolchain identities. The translate stage hashes the
-# libLLVM file it is given and refuses a different one; the compile stage hashes dxcompiler.dll and
-# dxil.dll next to the dxc it is given. A toolchain change is an explicit edit here and invalidates
-# every entry through the manifest identity, never silently through a stale acceptance.
-PINNED_LLVM = "de2e35a4f9b3f6a06d2a8a3342b3f62a3842b1923b8dfc2a6ce48e0cc2d1e85d"
-PINNED_COMPILER = "495033935c058fc6d318ac257afdfa910795bf41b7e5ba905a0e7191dc8bd4fa"
-PINNED_VALIDATOR = "db108ffef7bcecb984bdccf2b4725719d65b2ce7f1ebc40019dbe6c5a7016e09"
 
 # Repository tools whose content is part of the produced artifact's identity. Names only: no
 # absolute path ever enters a record or a manifest.
@@ -160,7 +151,7 @@ class Retryable(Exception):
 
 
 class ToolchainMismatch(Exception):
-    """The local toolchain is not the pinned, verified one. Nothing is mutated."""
+    """A required local toolchain component is unavailable or unreadable."""
 
 
 def fnv_bytes(data, current=1469598103934665603):
@@ -179,9 +170,8 @@ def file_sha256(path):
 
 # ---------------------------------------------------------------- identity
 
-@lru_cache(maxsize=1)
-def expected_identity():
-    """The pinned identity every validated manifest must declare exactly."""
+def expected_identity(*, library=None, dxc=None, validator=None):
+    """Return source and supplied toolchain identities for cache validation."""
     digests = []
     for name, relative in PIPELINE_TOOLS:
         path = ROOT / relative
@@ -193,42 +183,41 @@ def expected_identity():
     pipeline = digest_hex("".join(sorted(digests)).encode("ascii"))[:16]
     translator = f"{TRANSLATOR_NAME}/{file_sha256(ROOT / 'tools' / 'compute_store_aot.py')[:16]}"
     decoder = f"{DECODER_NAME}/{file_sha256(ROOT / 'tools' / 'pixel_aot.py')[:16]}"
-    return {
+    identity = {
         "translator": translator,
         "decoder": decoder,
         "pipeline": pipeline,
-        "llvm": PINNED_LLVM,
-        "compiler": PINNED_COMPILER,
-        "validator": PINNED_VALIDATOR,
         "target": TARGET,
         "dxc_flags": DXC_FLAGS,
     }
+    if library is not None:
+        identity["llvm"] = verify_translate_toolchain(library)
+    if dxc is not None:
+        identity.update(verify_compile_toolchain(dxc, validator))
+    return identity
 
 
 def verify_translate_toolchain(library):
-    """Refuse a different libLLVM before any cache mutation."""
+    """Fingerprint the exact LLVM library used to decode machine code."""
     try:
-        observed = file_sha256(library)
+        return file_sha256(library)
     except OSError as error:
         raise ToolchainMismatch(f"cannot read {library}: {error}") from error
-    if observed != PINNED_LLVM:
-        raise ToolchainMismatch(f"libLLVM identity {observed[:16]} is not the pinned "
-                                f"{PINNED_LLVM[:16]}")
 
 
 def verify_compile_toolchain(dxc, validator=None):
-    """Refuse a different compiler or validator before any cache mutation."""
+    """Fingerprint the actual compiler and validator used for this artifact."""
     dxc = Path(dxc)
     compiler = dxc.parent / "dxcompiler.dll"
     validator_path = Path(validator) if validator else dxc.parent / "dxil.dll"
-    for label, path, pin in (("dxcompiler.dll", compiler, PINNED_COMPILER),
-                             ("dxil.dll", validator_path, PINNED_VALIDATOR)):
+    identities = {}
+    for field, label, path in (("compiler", "dxcompiler.dll", compiler),
+                               ("validator", "dxil.dll", validator_path)):
         try:
-            observed = file_sha256(path)
+            identities[field] = file_sha256(path)
         except OSError as error:
             raise ToolchainMismatch(f"cannot read {label} next to dxc: {error}") from error
-        if observed != pin:
-            raise ToolchainMismatch(f"{label} identity {observed[:16]} is not the pinned {pin[:16]}")
+    return identities
 
 
 # ---------------------------------------------------------------- record
@@ -965,9 +954,9 @@ def inspect_entry(directory, key, required=(), *, expected=None, want_artifacts=
         if name not in fields:
             _problems_add(problems, "missing", name)
     for name in MANIFEST_IDENTITY:
-        if name in fields and fields[name] != expected[name]:
+        if name in fields and name in expected and fields[name] != expected[name]:
             result.update(state="stale", detail=f"manifest {name} {fields[name]!r} is not the "
-                                                f"pinned {expected[name]!r}")
+                                                f"current {expected[name]!r}")
             return result
     for name in MANIFEST_EVIDENCE:
         if name not in fields:
@@ -1065,14 +1054,14 @@ def _load_record(paths, key):
     return record
 
 
-def entry_state(directory, key, required=()):
-    result = inspect_entry(directory, key, required)
+def entry_state(directory, key, required=(), *, expected=None):
+    result = inspect_entry(directory, key, required, expected=expected)
     return result["state"], result["detail"]
 
 
-def verify_entry(directory, key, required):
+def verify_entry(directory, key, required, *, expected):
     """Consumer-side acceptance. The returned bytes are exactly the bytes that were verified."""
-    result = inspect_entry(directory, key, required)
+    result = inspect_entry(directory, key, required, expected=expected)
     return {"accepted": result["state"] == "hit", "state": result["state"],
             "detail": result["detail"], "problems": result["problems"],
             "fields": result["fields"], "record": result["record"],
@@ -1169,8 +1158,9 @@ def verify_translation_receipt(directory, key, record, hlsl, expected):
     if receipt.get("hlsl_sha256") != digest_hex(hlsl):
         raise Retryable("translation receipt does not describe this HLSL")
     for name in ("translator", "decoder", "pipeline", "llvm"):
-        if receipt.get(name) != expected[name]:
-            raise Retryable(f"translation receipt {name} is not the pinned identity")
+        if name in expected and receipt.get(name) != expected[name]:
+            raise Retryable(f"translation receipt {name} does not match the current identity")
+    return receipt
 
 
 # ---------------------------------------------------------------- jobs
@@ -1216,14 +1206,13 @@ def stage_request(directory, records, required, evidence=None):
 
 
 def stage_translate(directory, library, required, evidence=None):
-    verify_translate_toolchain(library)
-    expected = expected_identity()
+    expected = expected_identity(library=library)
     results = []
     for request in sorted(directory.glob("req_*.csn")):
         key = int(request.name[4:-4], 16)
         try:
             with writer_lock(directory, key) as writer:
-                state = inspect_entry(directory, key, required)["state"]
+                state = inspect_entry(directory, key, required, expected=expected)["state"]
                 if state in ("hit", "refused", "backend-missing"):
                     results.append((key, state, ""))
                     continue
@@ -1282,14 +1271,13 @@ def stage_translate(directory, library, required, evidence=None):
 
 
 def stage_compile(directory, dxc, probe, pso_probe, required, *, validator=None, evidence=None):
-    verify_compile_toolchain(dxc, validator)
-    expected = expected_identity()
+    expected = expected_identity(dxc=dxc, validator=validator)
     results = []
     for request in sorted(directory.glob("req_*.csn")):
         key = int(request.name[4:-4], 16)
         try:
             with writer_lock(directory, key) as writer:
-                finding = inspect_entry(directory, key, required)
+                finding = inspect_entry(directory, key, required, expected=expected)
                 state = finding["state"]
                 if state in ("hit", "refused"):
                     results.append((key, state, ""))
@@ -1324,8 +1312,9 @@ def stage_compile(directory, dxc, probe, pso_probe, required, *, validator=None,
                                                      pso_probe, required)
                         if evidence is not None:
                             evidence(key, "pso", collected["raw"])
+                        identity = dict(expected, llvm=finding["fields"]["llvm"])
                         publish_validated(writer, directory, key, record, hlsl, signed, checks, gate,
-                                          collected["backends"], expected)
+                                          collected["backends"], identity)
                         results.append((key, "revalidated", ",".join(sorted(collected["backends"]))))
                         continue
                     hlsl = finding["hlsl"]
@@ -1334,7 +1323,8 @@ def stage_compile(directory, dxc, probe, pso_probe, required, *, validator=None,
                         if not paths["hlsl"].exists():
                             raise Retryable("translation has not run for this key")
                         hlsl = read_bounded(paths["hlsl"], MAX_HLSL)
-                    verify_translation_receipt(directory, key, record, hlsl, expected)
+                    receipt = verify_translation_receipt(directory, key, record, hlsl, expected)
+                    identity = dict(expected, llvm=receipt["llvm"])
                     work = directory / f"work-{key_text(key)}"
                     work.mkdir(exist_ok=True)
                     output, tags = compile_dxil(hlsl, dxc, work)
@@ -1349,7 +1339,7 @@ def stage_compile(directory, dxc, probe, pso_probe, required, *, validator=None,
                     if evidence is not None:
                         evidence(key, "pso", collected["raw"])
                     publish_validated(writer, directory, key, record, hlsl, signed, checks, gate,
-                                      collected["backends"], expected)
+                                      collected["backends"], identity)
                     results.append((key, "validated", ",".join(sorted(collected["backends"]))))
                 except Refusal as error:
                     try:

@@ -18054,29 +18054,30 @@ artifact is removed, and it is permanent for that revision. Refusal manifests
 carry no dependency identity, so a translator change does not expire them; a
 cache produced under another translator must be regenerated rather than reused.
 
-### Dependency identity and toolchain pins
+### Dependency identity
 
 Every validated manifest declares eight identity fields. Three of them hash the
 working-tree content of the repository tools used to produce the artifact:
 `translator` (`compute_store_aot.py`), `decoder` (`pixel_aot.py`) and `pipeline`
 (all of `compute_store_aot.py`, `pixel_aot.py`, `resource_inventory.py`,
 `dxil_retarget.py`, `probe_roots.py`, `xbox_intrinsic_gate.py` and
-`compute_native.py`). The other five are the pinned toolchain:
+`compute_native.py`). The remaining fields identify the selected toolchain or
+compilation contract:
 
-| Field | Pinned value |
+| Field | Identity |
 |---|---|
-| `llvm` | `de2e35a4f9b3f6a06d2a8a3342b3f62a3842b1923b8dfc2a6ce48e0cc2d1e85d` (LLVM 15.0.7 `libLLVM-15.so.1`) |
-| `compiler` | `495033935c058fc6d318ac257afdfa910795bf41b7e5ba905a0e7191dc8bd4fa` (`dxcompiler.dll`, Windows SDK 10.0.26100) |
-| `validator` | `db108ffef7bcecb984bdccf2b4725719d65b2ce7f1ebc40019dbe6c5a7016e09` (`dxil.dll`) |
+| `llvm` | SHA-256 of the supplied `libLLVM` |
+| `compiler` | SHA-256 of `dxcompiler.dll` beside the selected `dxc` |
+| `validator` | SHA-256 of the supplied `dxil.dll` |
 | `target` | `dxil-ms-dx` |
 | `dxc_flags` | `cs_6_0 -E main` |
 
 The three content identities hash the bytes on disk, so the same tools checked
 out with `core.autocrlf=true` and with LF line endings produce different
-`translator`, `decoder` and `pipeline` values. A cache is therefore
-machine-local: it is valid for the checkout that produced it, and a manifest
-from another checkout is refused as stale rather than silently accepted. The
-toolchain pins are file hashes and do not depend on line endings.
+`translator`, `decoder` and `pipeline` values. A cache is therefore machine-local: it is
+valid for the checkout and toolchain that produced it. A manifest from another
+checkout, LLVM library, compiler or validator is stale; the compile stage
+rebuilds it instead of accepting an artifact produced by a different toolchain.
 
 ### Reproduction
 
@@ -18115,6 +18116,9 @@ split by hand with `compute_native.py --pending <cache> --stage request`,
 
 ### Measured results
 
+The measurements below predate the change from pinned to supplied-toolchain
+hashes; they document the earlier run and do not verify this revision.
+
 On Windows 11 build 26300.9974 with LLVM 15.0.7 in WSL Ubuntu-22.04, Windows SDK
 10.0.26100 DXC, WARP and an Intel Iris Xe (`8086:9a49`, driver 31.0.101.5333):
 
@@ -18139,18 +18143,13 @@ compile, validate and probe stages, with 9 text refusals and 9 byte refusals. Th
 refusals include a `COMPUTE_PGM_RSRC2` combined with explicit group registers
 (`COMPUTE_PGM_RSRC2 places the group IDs; do not also give group registers`) and
 `TG_SIZE_EN` (`COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported`); the adapter does
-not interpret that field. The cache suite passed all 156 checks, including a
-second compile that translated and compiled nothing and reported both keys as
-`hit`, every identity and evidence mutation as non-accepted, artifact/digest
-mismatches, interrupted publication, lock contention, and a published refusal
-that removes the obsolete artifacts only after the refusal itself is visible.
+not interpret that field. The earlier cache-suite run covered request,
+translation, publication, acceptance, identity, locking, refusals, cache hits
+and stale entries.
 
-A manifest rewritten to a different identity is refused, not revalidated:
-`translator 'compute_store_aot/036cdd081f7f709a' is not the pinned
-'compute_store_aot/d47dacfb7be907f9'`, and likewise for `decoder` and
-`pipeline`. The cache is trusted only as far as the local filesystem and the
-toolchain pins: every accepted entry is re-hashed on read, and nothing verifies
-who wrote it.
+A manifest rewritten to a different identity is stale, not accepted. The cache
+is trusted only as far as the local filesystem: every accepted entry is
+re-hashed on read, and nothing verifies who wrote it.
 
 ### Scope and registration
 
@@ -18159,9 +18158,8 @@ stand-in, a slot 62 loader, production slot 67 parsing, ExecuteIndirect, any new
 instruction lowering, profiles other than the two above, interpreted
 `COMPUTE_PGM_RSRC2`, `TG_SIZE_EN`, and guest waves other than 32.
 
-The two Python checks are not registered in `CMakeLists.txt`: they need a WSL
-distribution name, an explicitly selected DXC, both probe executables and
-optionally a physical adapter, none of which the build system currently names.
-They are run manually with the commands above. Registering them would need the
-WSL distribution and toolchain paths exposed as cache variables, and a decision
-about whether a missing adapter is a skip (77) or a failure.
+`tests/compute_native_check.py --unit` is registered in the Linux Python check
+list. It covers the oversized thread-group refusal and supplied-toolchain
+fingerprinting without requiring DXC, LLVM, WSL or a GPU. The full preflight and
+cache suite remain manual because they require a selected WSL distribution,
+DXC, both probe executables and, for the full suite, a physical adapter.
