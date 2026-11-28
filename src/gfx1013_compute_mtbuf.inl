@@ -56,9 +56,9 @@ void formatted_byte_load(const Inst &i, const State &s) {
     const auto numeric = static_cast<ChannelNumber>(unsigned(family->first_number) + format - family->first);
     // The byte-address rewrite of a descriptor (stride cleared in word 1) is read as the same raw view, as for MUBUF.
     const unsigned base = (i.b >> 16 & 31) * 4;
-    const auto handle = resource(i, s, base, s.at(base + 1).type == Symbol::Type::zero_stride_word
-                                                 ? ComputeViewKind::byte_window_srv
-                                                 : ComputeViewKind::raw_vector_srv, 4);
+    const bool window = s.at(base + 1).type == Symbol::Type::zero_stride_word;
+    const auto kind = window ? ComputeViewKind::byte_window_srv : ComputeViewKind::raw_vector_srv;
+    const auto handle = resource(i, s, base, kind, 4, nullptr, window);
     const unsigned scalar_offset = i.b >> 24;
     auto addr = to_string(i.a & 4095);
     if (scalar_offset != 125 && scalar_offset != 128)

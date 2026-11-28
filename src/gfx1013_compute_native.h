@@ -80,6 +80,7 @@ struct ComputeViewBinding {
     unsigned image_dimension = 1; // ISA dimension field; 1 denotes Texture2D.
     enum class ScalarTable { unknown, reflected_cbv, declared_cbv, srv };
     ScalarTable scalar_table = ScalarTable::unknown;
+    bool requires_identity_dst_sel = false;
 };
 bool apply_reflected_table_use(ComputeViewBinding &binding, const GuestShaderStage &stage,
                                std::optional<unsigned> packed_sgpr = {});

@@ -166,17 +166,15 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   size rule of the contract are not exercised. The HLSL path's `heap_stride_srv` (`src/gfx1013_compute_native.cpp`,
   used by `tests/native_compute_grid.cpp`) is unchanged.
 - A formatted load (`tbuffer_load_format_*`) bounds its element with the size of the desktop raw view
-  (`getDimensions`), not with the guest window's byte count, and returns 0 for the whole element when it does not fit.
-  A runtime that binds a byte window, as a table view or as a GPU-selected heap slot, must create the raw view with
-  exactly the guest window's byte count. The descriptor's DST_SEL (word 3) is not applied: only the identity channel
-  order is translated, and it is not checked. In the startup dispatch, the in-process route
-  (`translate_compute_natively`, `src/startup_stubs/d3d12_compute_dispatch.inl`) binds only `raw_vector_srv` inputs
-  and falls through to the manifest route for a byte window. A published manifest names a table byte window as
-  `srv <i> buf table <param> <byte>`, as for the raw byte window; the dispatch then binds the table descriptor as a raw
-  view of
-  `max(stride, 1) * num_records` bytes (`indirect_table_buffer`, `src/startup_stubs/d3d12_draw.inl`), the guest
-  window's byte count, or of the title's own view size for a view token. No fixture runs this manifest path for a
-  window.
+  (`getDimensions`) and returns 0 for the whole element when it does not fit. A runtime that binds a byte window
+  must create the raw view with the exact guest window's byte count. The heap replay uses identity channel order.
+  A published table manifest marks the MTBUF window with `srv <i> buf table <param> <byte> identity_dst_sel`, including
+  after a frontend cache hit. The compute binder checks word 3's DST_SEL of the hardware descriptor or the
+  component mapping of a slot 18 buffer SRV before binding the raw view for the exact range. The in-process
+  path falls through to that manifest for a byte window.
+- `startup_compute_mtbuf_window_{hardware,warp}` compares 12 pairs and the surrounding guards through the published
+  path for both a hardware descriptor and a buffer SRV token. A 44-byte window holds five full pairs. The partial
+  pair and the later pairs read zero. Swapped X/Y selectors refuse before Dispatch, and the output keeps its sentinel.
 - Typed loads (`buffer_load_format_*`) through a heap descriptor and scalar loads through the rewritten descriptor stay
   refused. The startup runtime
   does not pass a contract yet, so none of this reaches a title run (#3023).

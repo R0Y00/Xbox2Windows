@@ -34,6 +34,7 @@ struct ComputeTranslation {
         std::uint32_t at = 0, times = 0;
         Source source = root_constant;
         D3D12_UAV_DIMENSION uav_dimension = D3D12_UAV_DIMENSION_UNKNOWN;
+        bool requires_identity_dst_sel = false;
         bool root = false;
         bool atomic_uint_texture = false;
         unsigned channels = 4;
@@ -172,6 +173,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uds.push_back({a, 0, false, false, -1, 0, 0, 0, source()});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "srv %u buf table %d %d identity_dst_sel%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.srvs.size()) {
+            tr.srvs.push_back({a, b});
+            tr.srvs.back().requires_identity_dst_sel = true;
+        }
         else if (std::sscanf(line.c_str(), "srv %u buf root %d%n", &i, &a, &used) == 2 && whole() && a >= 0 &&
                  i == tr.srvs.size()) {
             tr.srvs.push_back({a, 0});
@@ -593,7 +599,8 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         }
         if (!output) {
             // Each condition of a complete GPU-backed buffer range has its own reason.
-            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true);
+            const IndirectBufferView view = indirect_table_buffer(self, words, false, &reason, 16u << 20, true,
+                                                                  slot.requires_identity_dst_sel);
             if (view.source == 1) InterlockedIncrement(&compute_inputs_gpu_copied);
             if (view.source == 2) {
                 InterlockedIncrement(&compute_inputs_snapshot);

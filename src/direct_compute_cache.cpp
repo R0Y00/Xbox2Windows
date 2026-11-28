@@ -90,7 +90,7 @@ Bytes encode(const NativeComputeShader &program) {
     for (const auto &b : program.bindings) {
         word(out, static_cast<uint32_t>(b.kind));
         for (unsigned n : {b.root_parameter, b.byte_offset, b.shader_register, b.required_bytes, b.array_count,
-                           b.array_position, b.image_dimension, unsigned(b.scalar_table)})
+                           b.array_position, b.image_dimension, unsigned(b.scalar_table), unsigned(b.requires_identity_dst_sel)})
             word(out, n);
     }
     word(out, static_cast<uint32_t>(program.constants.size()));
@@ -134,6 +134,7 @@ NativeComputeShader decode(std::string_view bytes) {
         auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::float3_texture_uav)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
+        b.requires_identity_dst_sel = in.count(1) != 0;
         const bool sampler_heap = kind == ComputeViewKind::heap_sampler;
         if (!b.array_count || b.array_position >= b.array_count ||
             (sampler_heap ? b.root_parameter != compute_sampler_heap
@@ -795,8 +796,10 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 return refuse("SRV registers not contiguous");
             if (b.kind == ComputeViewKind::buffer_srv || b.kind == ComputeViewKind::raw_vector_srv ||
                 b.kind == ComputeViewKind::byte_window_srv) {
-                srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
-                          << '\n';
+                srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset;
+                if (b.requires_identity_dst_sel)
+                    srv_lines << " identity_dst_sel";
+                srv_lines << '\n';
             } else if (b.kind == ComputeViewKind::texture_srv && b.image_dimension == 1 && b.array_count == 1) {
                 srv_lines << "srv " << b.shader_register << " tex2d table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
