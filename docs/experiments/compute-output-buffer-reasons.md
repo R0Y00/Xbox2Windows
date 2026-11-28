@@ -96,3 +96,11 @@ The descriptor checks follow the buffer resource format in the
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
 The matching desktop view uses `FirstElement` and `NumElements` from
 the [D3D12 buffer UAV contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_buffer_uav).
+
+Direct Compute also accepts the explicit MTBUF `tbuffer_store_format_d16_x`,
+`_xy` and `_xyzw` forms for their exact binary16 FLOAT formats. They use
+the matching typed buffer UAV for an element index or element zero.
+The immediate and scalar byte offsets must be zero. Byte-addressed forms,
+three-component stores and other numeric formats remain outside this path.
+The source-built tests compare the MTBUF forms against the same reference
+as MUBUF. A single-writer case also checks the element-zero addressing form.
