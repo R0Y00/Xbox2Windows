@@ -2362,7 +2362,7 @@ bool title_input_snapshot_enabled()
 IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* words, bool allow_address_alias = false,
                                          const char** why = nullptr,
                                          u64 limit = u64{4} << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP,
-                                         bool allow_title_snapshot = false)
+                                         bool allow_title_snapshot = false, bool requires_identity_dst_sel = false)
 {
     const auto refuse = [why](const char* reason) {
         if (why) *why = reason;
@@ -2379,6 +2379,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         if (words[1] < view_records().size()) record = view_records()[words[1]];
         ReleaseSRWLockShared(&note_lock);
         if (record.slot == 17 && record.desc_bytes >= 12) {
+            if (requires_identity_dst_sel) return refuse("an MTBUF byte window requires a buffer SRV");
             UINT size = 0;
             std::memcpy(&address, record.desc, 8);
             std::memcpy(&size, record.desc + 8, 4);
@@ -2386,6 +2387,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         } else if (record.slot == 18 && record.desc_bytes >= 40) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
             std::memcpy(&view, record.desc, 40);
+            if (requires_identity_dst_sel && view.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
+                return refuse("an MTBUF byte window requires identity component mapping");
             owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
             if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
                 view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
@@ -2416,6 +2419,8 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
             return refuse("an input view token is not a buffer view of a desktop resource");
         }
     } else {
+        if (requires_identity_dst_sel && (words[3] & 0xfffu) != 0xfacu)
+            return refuse("an MTBUF byte window requires identity DST_SEL");
         address = words[0] | (u64{words[1] & 0xffff} << 32);
         stride = (words[1] >> 16) & 0x3fff;
         bytes = u64{stride ? stride : 1} * words[2];

@@ -369,7 +369,7 @@ struct DirectCompute {
     }
     std::set<std::pair<unsigned,unsigned>> read_write_raw_views;
     string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
-                    unsigned *bound_register = nullptr) {
+                    unsigned *bound_register = nullptr, bool requires_identity_dst_sel = false) {
         const auto &symbol = s.at(base);
         const bool indexed = symbol.type == Symbol::Type::indexed_descriptor;
         if (indexed && symbol.value == compute_resource_heap)
@@ -378,6 +378,8 @@ struct DirectCompute {
             (kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::raw_vector_srv ||
              kind == ComputeViewKind::byte_window_srv) &&
             read_write_raw_views.count({symbol.value, symbol.offset})) {
+            if (requires_identity_dst_sel)
+                refuse(i.pc, "a writable MTBUF byte window has no verified view contract");
             // Both instructions read the same descriptor table entry. A
             // second, SRV binding would conflict with its writable resource state.
             kind = ComputeViewKind::raw_buffer_uav;
@@ -390,6 +392,9 @@ struct DirectCompute {
         });
         if (it == analysis.result.bindings.end())
             throw std::logic_error("missing direct binding");
+        if (requires_identity_dst_sel)
+            for (unsigned j = 0; j < count; ++j)
+                it[j].requires_identity_dst_sel = true;
         if (bound_register) *bound_register = it->shader_register;
         const bool raw = kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::buffer_srv ||
                          kind == ComputeViewKind::raw_vector_srv || kind == ComputeViewKind::byte_window_srv ||

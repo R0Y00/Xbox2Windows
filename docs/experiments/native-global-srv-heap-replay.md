@@ -141,6 +141,18 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   - With the high-word check removed, both tests fail at the `mov_high` controls.
   - `ctest --preset dev --no-tests=error -R "native_|startup_compute|compile_dxil" -j 8`: 415 tests, 404 passed and
     11 skipped (77, WARP).
+- Formatted loads through the byte window (original #3034 result for #3023): `tbuffer_load_format_*` through the rewritten descriptor now reads
+  the same raw view as `buffer_load_dword` (`src/gfx1013_compute_mtbuf.inl` picks `byte_window_srv` when word 1 is the
+  stride-cleared word). Before, it was refused with "non-contiguous resource descriptor". On the local capture with the
+  raw contract forced and a typed heap load prototyped (both uncommitted), 861 of the 2,689 requests stopped first at
+  this refusal; with the change they move on to other, already-known refusals. `native_global_srv_heap_replay_hardware`
+  passes with 94 assertions (record, compile and replay of a 32_UINT `tbuffer_load_format_x` through the heap window
+  for selections 0 and 1, the cross-slot mismatch control, the loop guard for the formatted load, and a compile-only
+  8_8_8_8_UNORM case). `native_mtbuf_hardware` repeats its 11-format value check through a byte window of its table SRV
+  and matches, including the element at the end of the view that returns 0 (`tests/native_store_replay.cpp` accepts
+  the window binding as the same raw view). `native_direct_container` compiles both formats through a compute table
+  window and refuses the window without the byte-count product. Against `837728dd` the heap check fails at the
+  `twindow_loop` shape (text "non-contiguous resource descriptor").
 
 ## Limits
 
@@ -153,6 +165,16 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   byte-address rewrite consumes it. The fixture's descriptor words are never evaluated, so a stride above 1 and the
   size rule of the contract are not exercised. The HLSL path's `heap_stride_srv` (`src/gfx1013_compute_native.cpp`,
   used by `tests/native_compute_grid.cpp`) is unchanged.
+- A formatted load (`tbuffer_load_format_*`) bounds its element with the size of the desktop raw view
+  (`getDimensions`) and returns 0 for the whole element when it does not fit. A runtime that binds a byte window
+  must create the raw view with the exact guest window's byte count. The heap replay uses identity channel order.
+  A published table manifest marks the MTBUF window with `srv <i> buf table <param> <byte> identity_dst_sel`, including
+  after a frontend cache hit. The compute binder checks word 3's DST_SEL of the hardware descriptor or the
+  component mapping of a slot 18 buffer SRV before binding the raw view for the exact range. The in-process
+  path falls through to that manifest for a byte window.
+- `startup_compute_mtbuf_window_{hardware,warp}` compares 12 pairs and the surrounding guards through the published
+  path for both a hardware descriptor and a buffer SRV token. A 44-byte window holds five full pairs. The partial
+  pair and the later pairs read zero. Swapped X/Y selectors refuse before Dispatch, and the output keeps its sentinel.
 - Typed loads (`buffer_load_format_*`) through a heap descriptor and scalar loads through the rewritten descriptor stay
   refused. The startup runtime
   does not pass a contract yet, so none of this reaches a title run (#3023).
