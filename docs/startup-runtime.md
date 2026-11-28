@@ -2470,7 +2470,12 @@ These are measured on one executable; treat them as hypotheses for others.
   [#2618](https://github.com/R0Y00/Xbox2Windows/issues/2618)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
-  `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
+  `-AssertSites N` (`--assert-sites N` for `run.sh`), which steps over every hit at up to N distinct
+  main-image `int3` sites, so a site that repeats never runs the budget out however long the run is.
+  The first hit at one more site still stops the run, as do `X2W_STOP_AT` sites. `-ContinueAsserts N`
+  counts hits instead: it steps over the first N hits at any site. A hit is stepped over when either
+  budget allows it, and each budget counts only the hits it covers: the site budget takes the first N
+  distinct sites, and the hit budget counts the hits at other sites. Run `ctest --preset dev --no-tests=error -R "^startup_debug"`. One of them fires about ten times a second in the texture-streaming path
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.

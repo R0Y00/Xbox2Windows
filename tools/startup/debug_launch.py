@@ -2,11 +2,16 @@
 
 usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
                       [--suspend-others 0] [--capture-every S]
+                      [--continue-asserts N] [--assert-sites N]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
 Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
 A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
+--continue-asserts N steps over the first N main-image int3 hits in total. --assert-sites N instead
+steps over every hit at up to N distinct main-image int3 sites, so a site that repeats does not use
+the budget up however long the run lasts; the first hit at one more site stops the run. A hit is
+stepped over when either budget allows it.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
 """
@@ -131,8 +136,10 @@ def main():
         timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
         memory_gib = float(opts.get("--memory-gib", 16))
         skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+        assert_sites = int(opts.get("--assert-sites", "0"))  # distinct sites whose every hit is continued
     except ValueError:
-        print("expected numeric --timeout and --memory-gib values and an integer --continue-asserts value")
+        print("expected numeric --timeout and --memory-gib values and integer --continue-asserts and "
+              "--assert-sites values")
         return 2
     stop_first = opts.get("--stop-first-chance") == "1"
     try:
@@ -145,12 +152,20 @@ def main():
     if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
         print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
         return 2
+    if assert_sites < 0:
+        print("expected an --assert-sites value of 0 or greater")
+        return 2
     # The job always sets JOB_MEMORY (0x200), so a limit of 0 would deny the process any commit.
     if not 1 <= memory_gib * 2**30 < 2**(8 * ctypes.sizeof(ctypes.c_size_t)):
         print("expected a finite --memory-gib that is at least one byte and fits the Windows size_t limit")
         return 2
     memory = int(memory_gib * 2**30)
     asserts_seen = {}
+    # The two assert budgets keep their own books, so a hit one of them covers never uses up the other:
+    # assert_sites_admitted holds the sites --assert-sites covers (the first assert_sites distinct ones),
+    # asserts_counted the hits --continue-asserts stepped over.
+    assert_sites_admitted = set()
+    asserts_counted = 0
     # X2W_NOP_SOFT_ASSERTS=1: after the first hit of a main-image int3 that is continued, replace the
     # trap byte with NOP. DBG_CONTINUE already bypasses the title's handler, so the visible behavior is
     # unchanged, but a long mapping that traps once per chunk then runs at native speed.
@@ -1053,8 +1068,13 @@ def main():
                     log(f"X2W_LOG_AT ignored {rva:#x}: cannot arm a main-image instruction breakpoint")
                     del log_at[rva]
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites
+                       or skip_asserts == -1 or asserts_counted < skip_asserts)
                   and (ex_addr - main_base) not in stop_at):
+                if ex_addr in assert_sites_admitted or len(assert_sites_admitted) < assert_sites:
+                    assert_sites_admitted.add(ex_addr)
+                else:
+                    asserts_counted += 1
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 if nop_soft_asserts and ex_addr not in nop_sites and read(ex_addr, 1) == b"\xcc" and write(ex_addr, b"\x90"):
                     nop_sites[ex_addr] = 1
