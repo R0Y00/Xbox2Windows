@@ -3,11 +3,13 @@
 import argparse
 import ctypes
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 import random
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 import types
@@ -1956,12 +1958,175 @@ def generate_bits(seed, count):
                                                        for kind in BITS_CONTROLS)]
 
 
+FAULT_PAGE = 0x1000
+FAULT_ACCESS_VIOLATION = 0xC0000005
+FAULT_DISPLACEMENTS = (4, 8, 12, 16, 24, 32, 48, 64)
+FAULT_PROBES = (
+    ("valid", "valid_a", "valid_b"),
+    ("valid_alt", "valid_b", "valid_a"),
+    ("noaccess_both", "noaccess_a", "noaccess_b"),
+    ("low_unmapped", "low", "low"),
+    ("noaccess_rcx", "noaccess_a", "valid_b"),
+    ("noaccess_rdx", "valid_a", "noaccess_b"),
+    ("null_both", "null", "null"),
+)
+
+
+def _fault_address(base_kind, rng):
+    if base_kind == "rcx":
+        return "[rcx]"
+    if base_kind == "rdx":
+        return "[rdx]"
+    return f"[rcx+{rng.choice(FAULT_DISPLACEMENTS)}]"
+
+
+def fault_reads_function(name, width, base_kind, pattern, rng):
+    """A bounded leaf function performing dead/overwritten guest memory reads at width in (1, 2, 4, 8)."""
+    addr = _fault_address(base_kind, rng)
+    tag = rng.randrange(0x1000, 0x7FFF)
+    tag2 = rng.randrange(0x1000, 0x7FFF)
+    dest = rng.choice(("rax", "r9", "r10", "r11"))
+    lines = ["mov QWORD PTR [r8], 1"]
+    if pattern == "mov_overwrite":
+        if width < 4:
+            lines.insert(0, f"mov {dest}, {tag2}")
+        lines.append(f"mov {part(dest, width)}, {PTR[width]} {addr}")
+    elif pattern == "movzx_sx_overwrite":
+        if width in (1, 2):
+            op = rng.choice(("movzx", "movsx"))
+            target = part(dest, 4 if op == "movzx" else 8)
+            lines.append(f"{op} {target}, {PTR[width]} {addr}")
+        elif width == 4:
+            lines.append(f"movsxd {dest}, DWORD PTR {addr}")
+        else:
+            lines.append(f"mov {dest}, QWORD PTR {addr}")
+    elif pattern == "cmp_dead":
+        lines.append(f"cmp {PTR[width]} {addr}, {rng.choice((0, 1, 7, 42, 127))}")
+    elif pattern == "test_dead":
+        lines.append(f"test {PTR[width]} {addr}, {rng.choice((1, 3, 15, 85, 127))}")
+    elif pattern == "alu_overwrite":
+        op = rng.choice(("add", "sub", "xor", "or", "and"))
+        lines.insert(0, f"mov {dest}, {tag2}")
+        lines.append(f"{op} {part(dest, width)}, {PTR[width]} {addr}")
+    elif pattern == "cmov_dead":
+        cmov_width = width if width in (4, 8) else 8
+        cc = rng.choice(("ne", "g", "l"))
+        lines = [
+            "mov r11d, 1",
+            f"mov {dest}, {tag2}",
+            "cmp r11d, r11d",
+            "mov QWORD PTR [r8], 1",
+            f"cmov{cc} {part(dest, cmov_width)}, {PTR[cmov_width]} {addr}",
+        ]
+    elif pattern == "bt_dead":
+        bt_width = width if width in (2, 4, 8) else 4
+        lines.append(f"bt {PTR[bt_width]} {addr}, {rng.randrange(bt_width * 8)}")
+    else:
+        # Two dead reads from [rcx]/[rcx+disp] and [rdx], overwritten before returning.
+        w2 = rng.choice((1, 2, 4, 8))
+        addr1 = f"[rcx+{rng.choice(FAULT_DISPLACEMENTS)}]" if base_kind == "rcx+disp" else "[rcx]"
+        lines = [
+            f"mov r9, {tag}",
+            f"mov r10, {tag2}",
+            "mov QWORD PTR [r8], 1",
+            f"mov {part('r9', width)}, {PTR[width]} {addr1}",
+            f"mov {part('r10', w2)}, {PTR[w2]} [rdx]",
+        ]
+        dest = "r9"
+    lines += [
+        "mov QWORD PTR [r8+8], 2",
+        f"mov {dest}, {tag}",
+        f"mov QWORD PTR [r8+16], {dest}",
+        "xor r11d, r11d",
+        "cmp rcx, rcx",
+        "setne r11b",
+        "cmp rdx, rdx",
+        "setne r11b",
+        f"mov eax, {tag ^ tag2}",
+        "ret",
+    ]
+    return Function(name, lines)
+
+
+def fault_reads_controls():
+    """Live-read controls at 8/16/32/64 bits plus a null-skipping valid-pointer control."""
+    touch_both = ["xor r11d, r11d", "cmp rcx, rcx", "setne r11b", "cmp rdx, rdx", "setne r11b"]
+    return [
+        Function("fuzz_fault_control_live_b", [
+            "mov QWORD PTR [r8], 1",
+            "movzx eax, BYTE PTR [rcx]",
+            "mov QWORD PTR [r8+8], 2",
+            "mov QWORD PTR [r8+16], rax",
+            *touch_both,
+            "ret",
+        ]),
+        Function("fuzz_fault_control_live_w", [
+            "mov QWORD PTR [r8], 1",
+            "movzx eax, WORD PTR [rdx]",
+            "mov QWORD PTR [r8+8], 2",
+            "mov QWORD PTR [r8+16], rax",
+            *touch_both,
+            "ret",
+        ]),
+        Function("fuzz_fault_control_live_d", [
+            "mov QWORD PTR [r8], 1",
+            "mov eax, DWORD PTR [rcx+16]",
+            "mov QWORD PTR [r8+8], 2",
+            "mov QWORD PTR [r8+16], rax",
+            *touch_both,
+            "ret",
+        ]),
+        Function("fuzz_fault_control_live_q", [
+            "mov QWORD PTR [r8], 1",
+            "mov rax, QWORD PTR [rdx]",
+            "mov QWORD PTR [r8+8], 2",
+            "mov QWORD PTR [r8+16], rax",
+            *touch_both,
+            "ret",
+        ]),
+        Function("fuzz_fault_control_skip_zero", [
+            "mov QWORD PTR [r8], 1",
+            "cmp rcx, 0",
+            "je fuzz_fault_control_skip_zero_done",
+            "mov rax, QWORD PTR [rcx]",
+            "mov QWORD PTR [r8+24], 3",
+            "fuzz_fault_control_skip_zero_done:",
+            "mov QWORD PTR [r8+8], 2",
+            "mov eax, 66",
+            "mov QWORD PTR [r8+16], rax",
+            "xor r11d, r11d",
+            "cmp rdx, rdx",
+            "setne r11b",
+            "ret",
+        ]),
+    ]
+
+
+def generate_fault_reads(seed, count):
+    """Exports with dead/overwritten 8/16/32/64-bit guest memory reads plus valid-pointer controls."""
+    rng = random.Random(seed)
+    combos = [(width, base_kind) for width in (1, 2, 4, 8) for base_kind in ("rcx", "rdx", "rcx+disp")]
+    patterns_by_width = {
+        1: ("mov_overwrite", "movzx_sx_overwrite", "cmp_dead", "test_dead", "alu_overwrite", "pair_dead"),
+        2: ("mov_overwrite", "movzx_sx_overwrite", "cmp_dead", "test_dead", "alu_overwrite", "bt_dead", "pair_dead"),
+        4: ("mov_overwrite", "movzx_sx_overwrite", "cmp_dead", "test_dead", "alu_overwrite", "cmov_dead", "bt_dead", "pair_dead"),
+        8: ("mov_overwrite", "movzx_sx_overwrite", "cmp_dead", "test_dead", "alu_overwrite", "cmov_dead", "bt_dead", "pair_dead"),
+    }
+    functions = []
+    for index in range(count):
+        width, base_kind = combos[index % len(combos)]
+        choices = patterns_by_width[width]
+        pattern = choices[(index // len(combos) + rng.randrange(len(choices))) % len(choices)]
+        functions.append(fault_reads_function(f"fuzz_fault_{index}", width, base_kind, pattern, rng))
+    return [*functions, *fault_reads_controls()]
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
          "switches": (generate_switches, "cpu_fuzz_switches"),
          "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp"),
          "loops": (generate_loops, "cpu_fuzz_loops"), "x87": (generate_x87, "cpu_fuzz_x87"),
-         "bits": (generate_bits, "cpu_fuzz_bits")}
+         "bits": (generate_bits, "cpu_fuzz_bits"), "fault_reads": (generate_fault_reads, "cpu_fuzz_fault_reads")}
 
 
 def inputs_for(seed, area="leaf", signature=None):
@@ -2102,6 +2267,215 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _parse_ctypes_exception_status(error: OSError) -> int | None:
+    text = str(error)
+    if "access violation" in text.lower():
+        return FAULT_ACCESS_VIOLATION
+    match = re.search(r"exception code (0x[0-9a-fA-F]+)", text)
+    return int(match.group(1), 16) if match else None
+
+
+def _fault_probe_main(argv: list[str]) -> int:
+    """Isolated child probe runner for fault_reads: tests one DLL under one pointer configuration."""
+    if len(argv) < 4:
+        print("usage: --_fault-probe <dll> <prefix> <probe_name> <function>...", file=sys.stderr)
+        return 2
+    dll_path, prefix, probe_name, *fn_names = argv
+    probe_spec = next((item for item in FAULT_PROBES if item[0] == probe_name), None)
+    if probe_spec is None:
+        print(f"unknown probe {probe_name!r}", file=sys.stderr)
+        return 2
+    _, rcx_kind, rdx_kind = probe_spec
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.VirtualProtect.restype = ctypes.c_int
+    kernel32.VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p]
+    kernel32.VirtualFree.restype = ctypes.c_int
+    kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    kernel32.SetErrorMode(0x0001 | 0x0002)
+
+    def alloc_two_pages(fill_seed):
+        base = kernel32.VirtualAlloc(None, 2 * FAULT_PAGE, 0x3000, 0x04)
+        if not base:
+            raise ctypes.WinError(ctypes.get_last_error())
+        data = bytes(((i * fill_seed + 17) & 0xFF) or 0xA5 for i in range(FAULT_PAGE))
+        ctypes.memmove(base, data, FAULT_PAGE)
+        old = ctypes.c_uint32()
+        if not kernel32.VirtualProtect(base + FAULT_PAGE, FAULT_PAGE, 0x01, ctypes.byref(old)):
+            kernel32.VirtualFree(base, 0, 0x8000)
+            raise ctypes.WinError(ctypes.get_last_error())
+        return base
+
+    base_a = alloc_two_pages(37)
+    base_b = alloc_two_pages(53)
+    try:
+        pointers = {
+            "valid_a": base_a + 0x40,
+            "valid_b": base_b + 0x40,
+            "noaccess_a": base_a + FAULT_PAGE,
+            "noaccess_b": base_b + FAULT_PAGE,
+            "low": 0x100,
+            "null": 0,
+        }
+        rcx_val = pointers[rcx_kind]
+        rdx_val = pointers[rdx_kind]
+        library = ctypes.CDLL(str(dll_path))
+        for fn_name in fn_names:
+            symbol = getattr(library, prefix + fn_name)
+            symbol.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
+            symbol.restype = ctypes.c_uint64
+            out_buf = ctypes.create_string_buffer(288)
+            ctypes.memset(out_buf, 0x5A, len(out_buf))
+            r8_val = ctypes.addressof(out_buf) + 16
+            try:
+                ret = symbol(rcx_val, rdx_val, r8_val)
+                record = {"name": fn_name, "status": 0, "return": int(ret), "buffer": out_buf.raw.hex()}
+            except OSError as exc:
+                status = _parse_ctypes_exception_status(exc)
+                if status is None:
+                    raise
+                record = {"name": fn_name, "status": status, "return": None, "buffer": out_buf.raw.hex()}
+            print(json.dumps(record), flush=True)
+    finally:
+        kernel32.VirtualFree(base_b, 0, 0x8000)
+        kernel32.VirtualFree(base_a, 0, 0x8000)
+    return 0
+
+
+def _run_fault_probe_subprocess(dll_path: Path, prefix: str, probe_name: str,
+                                function_names: list[str]) -> dict[str, dict]:
+    """Run fault_reads probes in isolated subprocesses, isolating any uncaught crash per function."""
+    cmd = [sys.executable, "-B", str(Path(__file__).resolve()), "--_fault-probe",
+           str(dll_path), prefix, probe_name, *function_names]
+    completed = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    results: dict[str, dict] = {}
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if line:
+            entry = json.loads(line)
+            results[entry["name"]] = entry
+    if completed.returncode == 0 and len(results) == len(function_names):
+        return results
+    exit_code = completed.returncode & 0xFFFFFFFF
+    if len(function_names) == 1:
+        if exit_code >= 0x80000000:
+            return {function_names[0]: {"name": function_names[0], "status": exit_code, "return": None, "buffer": ""}}
+        raise RuntimeError(f"probe subprocess failed for {dll_path} {probe_name} {function_names[0]} "
+                           f"(exit={exit_code:#x}): {completed.stderr.strip()}")
+    if completed.returncode != 0 and not results and exit_code < 0x80000000:
+        raise RuntimeError(f"probe subprocess failed for {dll_path} {probe_name} "
+                           f"(exit={exit_code:#x}): {completed.stderr.strip()}")
+    for fn_name in function_names:
+        if fn_name not in results:
+            results.update(_run_fault_probe_subprocess(dll_path, prefix, probe_name, [fn_name]))
+    return results
+
+
+def _format_fault_outcome(entry: dict) -> str:
+    if entry["status"] == 0:
+        return f"exit=0 return={entry['return']:#x}"
+    return f"exception={entry['status']:#010x}"
+
+
+def run_fault_reads_check(seed, count, native, lifted, o2, selected, *, input_index=None, mutant=None):
+    if input_index is not None:
+        if not 0 <= input_index < len(FAULT_PROBES):
+            raise SystemExit(f"no input matches --input {input_index}")
+        probes = [FAULT_PROBES[input_index]]
+    else:
+        probes = list(FAULT_PROBES)
+    names = [fn.name for fn in selected]
+    fn_by_name = {fn.name: fn for fn in selected}
+
+    native_results = {p[0]: _run_fault_probe_subprocess(Path(native), "", p[0], names) for p in probes}
+    lifted_results = {p[0]: _run_fault_probe_subprocess(Path(lifted), "lifted_", p[0], names) for p in probes}
+    o2_results = {p[0]: _run_fault_probe_subprocess(Path(o2), "lifted_", p[0], names) for p in probes}
+
+    checks = 0
+    saw_valid = False
+    saw_noaccess_fault = False
+    saw_low_fault = False
+    for probe_idx, (probe_name, _, _) in enumerate(probes):
+        for fn_name in names:
+            nat = native_results[probe_name][fn_name]
+            if probe_name in ("valid", "valid_alt") and nat["status"] != 0:
+                print(f"native valid-pointer control failed: {fn_name} probe={probe_name} {_format_fault_outcome(nat)}",
+                      file=sys.stderr)
+                return 1
+            if nat["status"] == 0 and probe_name in ("valid", "valid_alt"):
+                saw_valid = True
+            if nat["status"] == FAULT_ACCESS_VIOLATION:
+                if probe_name == "noaccess_both":
+                    saw_noaccess_fault = True
+                elif probe_name == "low_unmapped":
+                    saw_low_fault = True
+            if probe_name in ("noaccess_both", "low_unmapped") and fn_name.startswith("fuzz_fault_") and not fn_name.startswith("fuzz_fault_control_skip_"):
+                if nat["status"] != FAULT_ACCESS_VIOLATION:
+                    print(f"native bad-pointer probe did not fault: {fn_name} probe={probe_name} {_format_fault_outcome(nat)}",
+                          file=sys.stderr)
+                    return 1
+            for variant, var_results in (("default", lifted_results), ("/O2", o2_results)):
+                got = var_results[probe_name][fn_name]
+                checks += 1
+                nat_buf = bytes.fromhex(nat["buffer"])
+                got_buf = bytes.fromhex(got["buffer"])
+                diff = first_difference(nat_buf, got_buf) if (nat_buf and got_buf) else None
+                same_ret = (nat["status"] != 0) or (nat["return"] == got["return"])
+                if nat["status"] != got["status"] or not same_ret or diff is not None:
+                    print(f"seed={seed:#x} functions={count} function={fn_name} probe={probe_name} (input={probe_idx})",
+                          file=sys.stderr)
+                    print(f"native {_format_fault_outcome(nat)} vs {variant} {_format_fault_outcome(got)}",
+                          file=sys.stderr)
+                    if diff is not None:
+                        low = max(0, diff - 8)
+                        high = min(len(nat_buf), diff + 8)
+                        print(f"first differing byte={diff} (output offset {diff - 16})", file=sys.stderr)
+                        print(f"native {buffer_text(nat_buf, low, high)}", file=sys.stderr)
+                        print(f"lifted {buffer_text(got_buf, low, high)}", file=sys.stderr)
+                    print(fn_by_name[fn_name].asm(), file=sys.stderr)
+                    command = (f"python -B tools/fuzz_cpu.py check {seed:#x} {count} {native} {lifted} {o2} "
+                               f"--area fault_reads --only {fn_name} --input {probe_idx}")
+                    print(f"reproduce: {command}", file=sys.stderr)
+                    return 1
+
+    if input_index is None:
+        if not saw_valid:
+            print("fault_reads check observed no valid-pointer pass", file=sys.stderr)
+            return 1
+        if any(p[0] == "noaccess_both" for p in probes) and not saw_noaccess_fault:
+            print("fault_reads check observed no PAGE_NOACCESS fault", file=sys.stderr)
+            return 1
+        if any(p[0] == "low_unmapped" for p in probes) and not saw_low_fault:
+            print("fault_reads check observed no unmapped low-address fault", file=sys.stderr)
+            return 1
+
+    print(f"area=fault_reads seed={seed:#x} functions={len(selected)} inputs={len(probes)} "
+          f"comparisons={checks} default and /O2 matched")
+
+    if mutant is not None:
+        mutant_results = {p[0]: _run_fault_probe_subprocess(Path(mutant), "lifted_", p[0], names) for p in probes}
+        mismatches = fault_drops = total = 0
+        failing = set()
+        for probe_name, _, _ in probes:
+            for fn_name in names:
+                nat = native_results[probe_name][fn_name]
+                mut = mutant_results[probe_name][fn_name]
+                total += 1
+                if nat["status"] != mut["status"] or (nat["status"] == 0 and nat["return"] != mut["return"]) or nat["buffer"] != mut["buffer"]:
+                    mismatches += 1
+                    failing.add(fn_name)
+                    if nat["status"] == FAULT_ACCESS_VIOLATION and mut["status"] == 0:
+                        fault_drops += 1
+        print(f"mutant {MUTANTS['fault_reads'][0]}: {mismatches}/{total} mismatches "
+              f"({fault_drops} dropped faults) in {len(failing)}/{len(selected)} functions")
+        if not fault_drops:
+            print("the planted dead-read fault did not drop any faulting read under /O2", file=sys.stderr)
+            return 1
+    return 0
+
+
 def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area="leaf", mutant=None):
     _validate_count(count)
     for path, label in ((native, "native"), (lifted, "lifted"), (o2, "o2")):
@@ -2127,6 +2501,12 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
         if features != probe.host_features:
             print(f"capability skip: {probe.name} reports {features:#b}, not {probe.host_features:#b}")
             return 77
+    selected = [function for function in functions if only is None or function.name == only]
+    if not selected:
+        raise SystemExit(f"no generated function matches --only {only!r}")
+    if area == "fault_reads":
+        return run_fault_reads_check(seed, count, native, lifted, o2, selected,
+                                     input_index=input_index, mutant=mutant)
     libraries = [(native, ""), (lifted, "lifted_"), (o2, "lifted_")]
     if mutant is not None:
         libraries.append((mutant, "lifted_"))
@@ -2139,14 +2519,11 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
         loaded.append((library, prefix))
 
     native_library, lifted_library, o2_library = (item[0] for item in loaded[:3])
-    selected = [function for function in functions if only is None or function.name == only]
 
     def function_inputs(function):
         return [(index, value) for index, value in enumerate(inputs_for(seed, area, function.signature))
                 if input_index is None or index == input_index]
 
-    if not selected:
-        raise SystemExit(f"no generated function matches --only {only!r}")
     if not function_inputs(selected[0]):
         raise SystemExit(f"no input matches --input {input_index}")
     checks = 0
@@ -2430,11 +2807,28 @@ def plant_set_reset_swap(cpu_switch_aot, image, functions):
     tests[M.BTS], tests[M.BTR] = tests[M.BTR], tests[M.BTS]
 
 
+def plant_drop_dead_read(cpu_switch_aot, image, functions):
+    """Drop the volatile qualifier on load_always so /O2 optimizes out unused guest memory reads."""
+    original = cpu_switch_aot.translate
+    needle = "return *reinterpret_cast<const volatile T __unaligned*>(address);"
+    replacement = "return *reinterpret_cast<const T __unaligned*>(address);"
+
+    def translate(*args, **kwargs):
+        source, rest = original(*args, **kwargs)
+        mutated = source.replace(needle, replacement, 1)
+        if mutated == source:
+            raise SystemExit("the drop_dead_read fault found no volatile load_always")
+        return mutated, rest
+
+    cpu_switch_aot.translate = translate
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
            "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap),
            "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit),
-           "x87": ("subr_as_sub", plant_subr_as_sub), "bits": ("set_reset_swap", plant_set_reset_swap)}
+           "x87": ("subr_as_sub", plant_subr_as_sub), "bits": ("set_reset_swap", plant_set_reset_swap),
+           "fault_reads": ("drop_dead_read", plant_drop_dead_read)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):
@@ -2471,6 +2865,13 @@ def translate(seed, count, image, output, area="leaf", mutant=False):
 
 
 def main(argv=None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv and raw_argv[0] == "--_fault-probe":
+        try:
+            return _fault_probe_main(raw_argv[1:])
+        except (OSError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     emit_parser = commands.add_parser("emit")
