@@ -630,7 +630,8 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
         return field(a,T::byte_oob);
     return {};
 }
-State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct) {
+State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct,
+               bool narrow_wave64) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
@@ -664,7 +665,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
     const bool compared = graphics && i.enc == Encoding::Vopc && i.dst < 106 && i.name.substr(0,6) == "v_cmp_";
     if (mask || compared) {
         const unsigned dst = mask.value_or(i.dst);
-        if ((dst > 105 && dst != 106) || (wave64 && (dst & 1)))
+        const bool numeric_vcc_hi = dst == 107 && direct && !graphics && !wave64;
+        if ((dst > 106 && !numeric_vcc_hi) || (wave64 && (dst & 1)))
             refuse(i.pc, compared ? "unsupported comparison mask destination" : "unsupported carry mask destination");
         const bool tagged = graphics && dst != 106;
         set(dst, tagged ? Symbol{Symbol::Type::lane_mask,i.pc,0} : Symbol{});
@@ -716,6 +718,14 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
         // Both the saved/written destination and the updated EXEC are numeric mask words.
         set(i.dst, {});
         set(126, {});
+    } else if (!graphics && i.enc == Encoding::Sop1 && i.name.size() >= 13 &&
+               (i.name.substr(i.name.size() - 13) == "_saveexec_b64" ||
+                i.name.substr(i.name.size() - 11) == "_wrexec_b64")) {
+        // These instructions also overwrite both EXEC words implicitly.
+        set(i.dst, {});
+        set(i.dst + 1, {});
+        set(126, {});
+        set(127, {});
     } else if (i.name == "s_and_b32" || i.name == "s_lshl_b32") {
         const auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol out{};
@@ -751,7 +761,8 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_win
                i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32")
     {
         set(i.dst, {});
-        if ((wave64 && i.enc == Encoding::Vopc) || ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
+        if (((wave64 || (narrow_wave64 && i.dst == 126)) && i.enc == Encoding::Vopc) ||
+            ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) &&
             i.name.size() >= 4 &&
             (i.name.substr(i.name.size() - 4) == "_b64" || i.name.substr(i.name.size() - 4) == "_i64" ||
              i.name.substr(i.name.size() - 4) == "_u64") &&
@@ -831,7 +842,7 @@ std::map<unsigned, Inst> fixed_vertex_loads(const string &code) {
     return found ? result : std::map<unsigned, Inst>{};
 }
 Program parse(const string &code, unsigned entry, const State &initial, bool graph, bool graphics=false, bool wave64=false, bool fixed_vertex=false,
-              bool heap_window=false) {
+              bool heap_window=false, bool narrow_wave64=false) {
     Program p;
     p.graphics_wave64 = graphics && wave64;
     if ((entry & 3) || entry >= code.size() || code.size() > 1u << 20)
@@ -880,7 +891,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
         auto k = work.front();
         work.pop_front();
         auto &i = p.code[k];
-        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph);
+        auto after = transfer(i, p.before[k], wave64, graphics, heap_window, graph, narrow_wave64);
         auto merge = [&](size_t t) {
             bool changed = !p.reached[t];
             auto &in = p.before[t];
@@ -1766,9 +1777,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model
     // does not write the zero high word that a wave64 compare or carry-out stores in an SGPR pair destination.
     const bool wave64 = stage ? !stage->wave32 : direct_dxil && !request.wave32 && threads > 32;
+    const bool narrow_wave64 = !stage && direct_dxil && !request.wave32 && !wave64;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
-    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
+    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window, narrow_wave64);
     Emit emit{{}, program,layout->Desc_1_1};
     emit.result.constants = constants;
     if (!lds)
@@ -1776,13 +1788,24 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
             if (inst.enc == Encoding::Lds)
                 refuse(inst.pc, "LDS instruction without allocation");
     if (direct_dxil) {
+        const bool guest_wave32 = stage ? stage->wave32 : request.wave32;
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
+        compiler.narrow_wave64 = narrow_wave64;
         compiler.heap_view = heap_view;
         compiler.heap_window = heap_window;
         for (size_t i = 0; i < program.code.size(); ++i) {
             const auto& inst = program.code[i];
-            if (!program.reached[i] || inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
+            if (!program.reached[i]) continue;
+            // The narrow wave64 model still requires a guest-aligned carry destination pair.
+            if (!guest_wave32 && carry_destination(inst) == 107)
+                refuse(inst.pc, "unsupported carry mask destination");
+            // s107 is a numeric wave32 mask only for a guest wave32.
+            if (!guest_wave32 && inst.name == "v_cndmask_b32" && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported wave32 conditional mask source");
+            if (!guest_wave32 && inst.name.find("_ci_") != Name::npos && inst.src[2] == 107)
+                refuse(inst.pc, "unsupported carry-in mask source");
+            if (inst.enc != Encoding::Mubuf || inst.name != "buffer_store_raw") continue;
             const auto& symbol = program.before[i].at(((inst.b >> 16) & 31) * 4);
             if (symbol.type == Symbol::Type::descriptor)
                 compiler.read_write_raw_views.emplace(symbol.value, symbol.offset);
