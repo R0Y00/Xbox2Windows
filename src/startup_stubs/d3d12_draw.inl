@@ -1244,16 +1244,11 @@ bool needs_rtv_variant(DXGI_FORMAT format)
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    // The PSO-failure fixture needs a native candidate even when a disk pair already exists;
-    // production keeps the disk pair's precedence.
-    const bool force_native = x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_PSO_FAILURE") ||
-                              x2w_local::env_on("X2W_TEST_NATIVE_GRAPHICS_PREFER_NATIVE");
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
         if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
 #ifdef X2W_NATIVE_SHADERS
-        if ((base->manifest_retry.pending() || native_shaders_only() || force_native) &&
-            !base->native_graphics_attempted) {
+        if ((base->manifest_retry.pending() || native_shaders_only()) && !base->native_graphics_attempted) {
             base->native_graphics_attempted = true;
             try_native_graphics(*base);
         }
@@ -1271,13 +1266,6 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
         entry->rtv_request = request;
         load_translation(*entry, request);
     }
-#ifdef X2W_NATIVE_SHADERS
-    if (force_native && !entry->native_graphics_attempted) {
-        entry->native_graphics_attempted = true;
-        if (entry->state != 1) publish_shader_request(key, L".rtv", request.data(), request.size());
-        if (try_native_graphics(*entry, true)) return entry;
-    } else
-#endif
     if (entry->state != 1) {
         const bool published = publish_shader_request(key, L".rtv", request.data(), request.size());
 #ifdef X2W_NATIVE_SHADERS
@@ -1537,6 +1525,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
             Translation fallback;
             fallback.key = tr.key;
             fallback.rtv_request = tr.rtv_request;
+            wchar_t publish[MAX_PATH];
+            const DWORD publish_length = GetEnvironmentVariableW(L"X2W_TEST_MANIFEST_BEFORE_FALLBACK", publish, MAX_PATH);
+            if (publish_length && publish_length < MAX_PATH) {
+                const std::wstring pending = std::wstring(publish) + L".pending";
+                if (MoveFileW(pending.c_str(), publish))
+                    log("x2w-draw native graphics %016llx manifest published before fallback", tr.key);
+            }
             load_translation(fallback, tr.rtv_request, {}, false);
             if (fallback.state == 1) {
                 fallback.revision = tr.revision + 1;
