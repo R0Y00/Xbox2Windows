@@ -759,7 +759,11 @@ set_tests_properties(startup_present_signature_unheld_source_control_warp PROPER
 if(EXISTS "${INTAKE_PYTHON}")
     add_executable(startup_present_producer tests/startup_present_producer.cpp)
     target_compile_features(startup_present_producer PRIVATE cxx_std_17)
-    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi)
+    target_include_directories(startup_present_producer PRIVATE src)
+    target_link_libraries(startup_present_producer PRIVATE d3d12_xs_shim d3d12 dxgi user32)
+    add_test(NAME startup_output_window_close COMMAND "${INTAKE_PYTHON}" -B
+             "${CMAKE_SOURCE_DIR}/tests/startup_output_window_close_check.py" "$<TARGET_FILE:startup_present_producer>")
+    set_tests_properties(startup_output_window_close PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_present_producer_${backend} COMMAND "${INTAKE_PYTHON}" -B
                  "${CMAKE_SOURCE_DIR}/tests/startup_present_producer_check.py" "${backend}" "$<TARGET_FILE:startup_present_producer>")

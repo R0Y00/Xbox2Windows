@@ -255,6 +255,16 @@ column. The same pipeline translated with pairing by number reads COLOR and fail
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+With `run.ps1 -Render`, Close asks the launcher to end the child in its Windows job.
+The debugger waits for the child process to exit before returning. Minimize keeps the
+session active. In a direct shim host, Close hides the output and leaves the host
+active. The launcher's internal `--managed-window 1` option uses a private
+`X2W_SESSION_CLOSE_EVENT` to distinguish that managed session; an inherited event
+value is discarded before creating the child. After requesting job shutdown, the
+launcher waits for the debugger's process handle as a defensive safeguard.
+Build `startup_present_producer` and run
+`ctest --preset release --no-tests=error -R '^startup_output_window_close$'`
+to check both host modes with a source-built presenter.
 Its title starts with `Xbox2Windows <rev>`, where `<rev>` is `git rev-parse --short=8 HEAD` of the
 source tree the shim was built from, with `-dirty` for uncommitted changes to tracked files, or `unknown`
 without git. The `D3D12XboxCreateDevice` log line ends with the same `build=<rev>`. The build refreshes

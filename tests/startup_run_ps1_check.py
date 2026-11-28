@@ -275,6 +275,8 @@ def run_case(shell, script, code, work, translate=False, switches=(), passed=(),
             "--trace-files", "1", "--continue-asserts", "4", "--assert-sites", "2", *passed]
     record = startup / "debugger.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
+    if "-Render" in switches or translate or native:
+        want.extend(["--managed-window", "1"])
     expected = [want, "1" if "-TraceApi" in switches else trace_api_env,
                 str(sdk) if native else None,
                 "1234" if manifest in ("normal", "bracket") else None,

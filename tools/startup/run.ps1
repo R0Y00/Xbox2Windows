@@ -104,6 +104,8 @@ if ($watchShaders) {
 }
 $traceArgs = @()
 if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
+$windowArgs = @()
+if ($Render) { $windowArgs = @("--managed-window", "1") }
 $mapArgs = @()
 if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
@@ -114,7 +116,7 @@ try {
     & {
         $ErrorActionPreference = "Continue"
         & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs
+            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs @windowArgs
         $script:debuggerExit = $LASTEXITCODE
     } *> "$LogDir.out"
 } finally {
