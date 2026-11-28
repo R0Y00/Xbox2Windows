@@ -2,6 +2,24 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## First native graphics draw through the stand-in
+
+Set `X2W_NATIVE_SHADERS` to the desktop DXC directory and `X2W_SHADER_CACHE` to a writable cache.
+The stand-in reads the published graphics request, links the pair, and uses the compiler's persistent
+frontend and bytecode caches. The runtime consumes the same supported binding manifest as the offline
+compiler. The source-built triangle fixture uses one RGBA8 target and checks all 32 pixels in each
+of two processes. A third process supplies an unsupported pixel stage and checks the untouched clear.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer d3d12_xs_shim compile_dxil
+ctest --preset dev --no-tests=error -V -R '^startup_native_graphics_draw_(hardware|warp)$'
+```
+
+## Slot 67 wave size in direct compute
+
+State block A bit 20 of dword 4 selects the guest wave size.
+[Capture inference and hardware fixture](experiments/native-slot67-wave-size.md)
+
 ## Plain binary16 arithmetic in direct compute
 
 VOP2 and VOP3 add, sub, subrev and mul use binary32 arithmetic and an integer nearest-even conversion back
@@ -69,6 +87,8 @@ permutation. The compute shader exchanges the first operand before applying the
 local second operand. A sparse EXEC mask distinguishes fetching an inactive
 source, supplying zero and retaining the destination. The test checks both
 workgroups and the surrounding buffer guards.
+
+Wave32 direct compute lowers `s_or_saveexec_b32`. As with `s_mov_b32 exec_lo`, EXEC keeps bits past the group; a lane runs only if its own bit is set.
 
 The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
 lane writes and reads back lanes in each half of a guest wave64. The compiler
@@ -16589,7 +16609,7 @@ ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_ad
 
 #### Volumes in the 4 KiB standard layout
 
-Slot 70 also reads a single-mip, uncompressed 3D texture whose layout is `0x105`. addrlib lays it
+Slot 70 also reads an uncompressed 3D texture whose layout is `0x105`, at first a single mip. addrlib lays it
 out in thick 4 KiB blocks (`GFX10_SW_4K_S3_PATINFO`). `startup_gfx10_volume` needs no device. It
 checks the address bit of every x, y and z bit against the restated one-pipe rows for the five element
 sizes, the block sizes, and the order of blocks in a 17 by 17 by 17 RGBA8 volume. It also checks that
@@ -16612,6 +16632,26 @@ published.
 Two local mutations were run once and are not registered tests: the layer pitch of the upload set
 to zero, and the hold counting one footprint per layer. Each fails `startup_address_console_warp`:
 the first on the first volume's pixels, the second on the held volume.
+
+Volumes with a mip chain are read too. Each layer of blocks holds that layer of every mip: the tail
+block first, then the mips from the smallest to the largest. A mip at most a block wide and half a
+block high goes in the tail while at most five mips remain, at an origin read from its byte offset
+in the tail block. `startup_gfx10_volume` checks the addresses of a 32 by 32 by 32 RGBA8 volume with
+six mips: 11 blocks to a layer, mip 1 after the tail block, mip 0 after mip 1, and mips 2 to 5 at
+(0,8), (4,4), (4,0) and (0,4) in the tail block. It also checks the distinct bytes and tile/detile
+round trips of every mip of ten chains (a tail from mip 0, a chain with no tail, odd sides, a deep
+volume whose depth allows the mip count), and the mip chains slot 70 takes and the views of them it
+allows. `startup_gfx10_volume_tail_control` puts every tail mip at the start of the tail block and
+must fail. `startup_gfx10_volume_addrlib` now also compares every mip count of four chains for each
+element size: 305 volumes and 12,704,487 element addresses with 0 mismatches.
+
+`startup_address_console_{warp,hardware}` draws four mips of two chains, RGBA8 32 by 32 by 32 with
+six mips (mip 1, and mip 3 in the tail) and 20 by 24 by 16 with five mips (mip 1, and mip 3 in the
+tail), from a backing that holds every mip with its own texels. All 65,536 pixels of each must match.
+A local mutation that drops the tail origins of a volume, run once, fails it on the first tail mip,
+which then reads another mip's texels. A chain whose layout runs past the size the XG stand-in
+reports is held as before: RGBA8 33 by 9 by 18 with six mips takes 135,168 bytes in the layout against
+65,536 reported.
 
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_volume'

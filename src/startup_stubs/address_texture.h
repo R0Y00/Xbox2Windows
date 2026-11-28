@@ -33,7 +33,9 @@ inline bool console_address_texture(const D3D12_RESOURCE_DESC& r)
         r.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
         // The draw uploads a one-dimensional texture only when it is not an array (d3d12_draw.inl).
         (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && r.DepthOrArraySize != 1) ||
-        !((std::max)(r.Width, UINT64{r.Height}) >> (r.MipLevels - 1)) ||
+        // The largest side, depth included for a volume, must allow the mip count.
+        !((std::max)({r.Width, UINT64{r.Height},
+                      UINT64{r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? r.DepthOrArraySize : 1u}}) >> (r.MipLevels - 1)) ||
         (r.Alignment && r.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
          r.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) ||
         address_depth_format(r.Format))
@@ -74,7 +76,7 @@ inline bool address_component_mapping(UINT mapping)
     return true;
 }
 
-// A one-dimensional, two-dimensional or array view that stays inside the texture and reads its texels
+// A one-dimensional, two-dimensional, array or cube view that stays inside the texture and reads its texels
 // as stored.
 inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
@@ -98,6 +100,10 @@ inline bool address_view_fits(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_R
                mips_fit(v.Texture2DArray.MostDetailedMip, v.Texture2DArray.MipLevels) &&
                inside(v.Texture2DArray.FirstArraySlice, v.Texture2DArray.ArraySize, r.DepthOrArraySize) &&
                !v.Texture2DArray.PlaneSlice && v.Texture2DArray.ResourceMinLODClamp == 0.0f;
+    // A cube view reads the six slices of a two-dimensional array of six as its faces (+X, -X, +Y, -Y, +Z, -Z).
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 6 &&
+               mips_fit(v.TextureCube.MostDetailedMip, v.TextureCube.MipLevels) && v.TextureCube.ResourceMinLODClamp == 0.0f;
     if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
         return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                mips_fit(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels) &&
