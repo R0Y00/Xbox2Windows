@@ -15,6 +15,7 @@
 //     x2w_d3d12_lazy_texture_count() return to 0 with X2W_D3D12_RELEASE_RETIRED=1).
 //   6 Control (X2W_D3D12_LAZY_TEXTURES=0): all 16 MiB textures are committed immediately.
 #include "startup_stubs/resource_budget.h"
+#include "native_compute_output.h"
 
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -796,7 +797,8 @@ int main(int argc, char** argv)
         }
         {
             std::ofstream mf(cache_dir / (key_hex + ".txt"), std::ios::binary);
-            mf << "x2w-manifest 2\nstage cs\ngroup 1 1 1\nud 0\nsrv 0 tex2d table 0 0\nuav 0 table 1 0\n";
+            mf << "x2w-manifest 2\nstage cs\ngroup 1 1 1\nud 0\nnative " << x2w::native_compute_output_revision
+               << "\nsrv 0 tex2d table 0 0\nuav 0 table 1 0\n";
             std::ofstream cf(cache_dir / (key_hex + ".cs.cso"), std::ios::binary);
             cf.write(static_cast<const char*>(comp_cso->GetBufferPointer()),
                      static_cast<std::streamsize>(comp_cso->GetBufferSize()));

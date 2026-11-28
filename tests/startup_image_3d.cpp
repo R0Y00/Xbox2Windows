@@ -26,21 +26,24 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
-// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
-constexpr UINT mip_base = 4;
 constexpr UINT max_levels = 3;
+// A cube fixture: six 4x4 faces, one level (dim:SQ_RSRC_IMG_CUBE, #2943).
+constexpr UINT cube_faces = 6;
+constexpr UINT cube_side = 4;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
 // alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
-void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, UINT base, float out[4])
 {
     if (levels == 1) {
         const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
         std::memcpy(out, one, sizeof(one));
         return;
     }
-    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    const UINT area = base * base;
+    const float red = float(1 + x + base * y + area * (s + 2 * m)) / float(8 * area);
+    const float many[4] = {red, float(x), float(y), float(s + 2 * m)};
     std::memcpy(out, many, sizeof(many));
 }
 
@@ -68,13 +71,15 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, UINT mip_base, bool cube)
 {
+    if (cube && (levels != 1 || array || one_dimensional || two_dimensional || view_levels))
+        throw std::runtime_error("A cube image fixture has one level and no other layout");
     if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
     if (view_levels && ((!two_dimensional && !array) || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");
-    const UINT base = levels > 1 ? mip_base : side;
+    const UINT base = cube ? cube_side : (levels > 1 ? mip_base : side);
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
@@ -117,19 +122,19 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     D3D12_RESOURCE_DESC td{};
     td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
-                 : (array || two_dimensional) ? D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                 : (array || two_dimensional || cube) ? D3D12_RESOURCE_DIMENSION_TEXTURE2D
                  : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = base;
     td.Height = one_dimensional ? 1 : base;
-    td.DepthOrArraySize = (one_dimensional || two_dimensional) ? 1 : side;
+    td.DepthOrArraySize = cube ? cube_faces : (one_dimensional || two_dimensional) ? 1 : side;
     td.MipLevels = levels;
     td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
     // The subresource of slice s and mip m is m + s * levels.
-    const UINT subresources = (array ? side : 1) * levels;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
+    const UINT subresources = (cube ? cube_faces : array ? side : 1) * levels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[cube_faces * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];
@@ -142,13 +147,18 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     for (UINT tz = 0; tz < td.DepthOrArraySize; ++tz)
         for (UINT level = 0; level < levels; ++level) {
             const UINT extent = base >> level;
-            const auto& place = footprints[level + (array ? tz * levels : 0)];
+            const auto& place = footprints[level + ((array || cube) ? tz * levels : 0)];
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
-                    texel_value(tx, ty, tz, level, levels, texel);
+                    texel_value(tx, ty, tz, level, levels, base, texel);
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
-                    auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
+                    if (cube) {
+                        // Every one of the 96 texels differs: face f, column tx and row ty.
+                        const float face[4] = {(1.0f + tx + 4.0f * ty + 16.0f * tz) / 128.0f, float(tx), float(ty), float(tz)};
+                        std::memcpy(texel, face, sizeof(face));
+                    }
+                    auto* const slice = (array || cube) ? start + place.Offset : start + place.Offset + tz * slice_pitch;
                     const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
                     std::memcpy(slice + ty * place.Footprint.RowPitch + tx * texel_bytes, texel, texel_bytes);
                 }
@@ -188,7 +198,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
             view.Texture2D.MipLevels = view_levels;
         }
     }
-    device->CreateShaderResourceView(texture.Get(), view_levels ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    if (cube) {
+        view.Format = td.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.TextureCube.MostDetailedMip = 0;
+        view.TextureCube.MipLevels = 1;
+    }
+    device->CreateShaderResourceView(texture.Get(), (view_levels || cube) ? &view : nullptr,
+                                     views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvs)), "Create image 3D RTV heap");
     const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -233,7 +251,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
     readback->Unmap(0, &none);
     std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n",
-                one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
+                cube ? "cube" : one_dimensional ? "1d" : two_dimensional ? "2d" : array ? "2d_array" : "3d",
                 z, color[0], color[1], color[2], color[3]);
 }
 
