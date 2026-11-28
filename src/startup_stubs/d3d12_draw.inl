@@ -576,6 +576,10 @@ static bool try_native_graphics(Translation& tr)
         candidate.native_graphics_attempted = true;
         candidate.vs = vs.Get();
         candidate.ps = ps.Get();
+        // Source-built first-draw fixture: fail after both stages have compiled and
+        // the local candidate holds both blobs. The later disk load stays valid.
+        if (GetEnvironmentVariableW(L"X2W_TEST_NATIVE_GRAPHICS_BAD_MANIFEST", nullptr, 0))
+            *manifest = "x2w-manifest 0\n";
         load_translation(candidate, {}, std::move(*manifest));
         const bool ready = candidate.state == 1;
         log("x2w-draw native graphics %016llx ready=%u cache(frontend,vs,ps)=%u,%u,%u",
