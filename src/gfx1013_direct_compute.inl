@@ -2101,7 +2101,7 @@ struct DirectCompute {
         const bool unfused_mad = n == "v_mad_f32" || n == "v_mad_legacy_f32" || n == "v_mac_f32" ||
                                  n == "v_mac_legacy_f32" || n == "v_madmk_f32" || n == "v_madak_f32";
         if (!mixed && !to_integer && !byte_to_float && !off_i4_to_float && !round && !cube && !unfused_mad &&
-            n != "v_mul_legacy_f32" &&
+            n != "v_mul_legacy_f32" && !(n == "v_div_fmas_f32" && !graphics_input) &&
             n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
             return false;
         auto source = [&](unsigned j) {
@@ -2206,6 +2206,31 @@ struct DirectCompute {
                 auto c = n == "v_fmac_f32" ? as_float(read(i.dst)) : n == "v_fmaak_f32" ? as_float(to_string(i.literal)) :
                          n == "v_fmamk_f32" ? fp(1) : fp(2);
                 result = ir.invoke("float", "tertiary.f32", 46, {{"float", a}, {"float", b}, {"float", c}}, "nounwind readnone");
+            } else if (n == "v_div_fmas_f32") {
+                if (!i.wide || i.scale || (i.a & 0x7800) || i.subword || i.dpp_control || permuted)
+                    refuse(i.pc, "unsupported v_div_fmas_f32 encoding");
+                auto b = fp(1), c = fp(2);
+                auto vcc_word = wave64 ? select(upper_half, read(107), read(106)) : read(106);
+                auto vcc_bit = cmp("ne", ir.binary("and", vcc_word, lane_bit), "0");
+                // Pre-scale inputs by 2^32 when |s2| < 2^95 and |s0| or |s1| < 2^95 so subnormal
+                // intermediate sums (e.g. 2^-126 * 0.5 = 2^-127) are not flushed before scaling.
+                auto can_scale = [&](const string &f) {
+                    return cmp("ult", ir.binary("and", ir.value("bitcast float " + f + " to i32"), "2147483647"),
+                               "1862270976");
+                };
+                auto c_small = can_scale(c);
+                auto pre_a = ir.value("and i1 " + vcc_bit + ", " + ir.value("and i1 " + can_scale(a) + ", " + c_small));
+                auto pre_b = ir.value("and i1 " + vcc_bit + ", " +
+                                      ir.value("and i1 " + ir.value("xor i1 " + pre_a + ", true") + ", " +
+                                               ir.value("and i1 " + can_scale(b) + ", " + c_small)));
+                auto pre_scaled = ir.value("or i1 " + pre_a + ", " + pre_b);
+                auto post_scale = ir.value("and i1 " + vcc_bit + ", " + ir.value("xor i1 " + pre_scaled + ", true"));
+                auto a_in = select_float(pre_a, ir.value("fmul float " + a + ", 4294967296.0"), a);
+                auto b_in = select_float(pre_b, ir.value("fmul float " + b + ", 4294967296.0"), b);
+                auto c_in = select_float(pre_scaled, ir.value("fmul float " + c + ", 4294967296.0"), c);
+                auto fma = ir.invoke("float", "tertiary.f32", 46,
+                                     {{"float", a_in}, {"float", b_in}, {"float", c_in}}, "nounwind readnone");
+                result = select_float(post_scale, ir.value("fmul float " + fma + ", 4294967296.0"), fma);
             } else if (unfused_mad) {
                 // gfx2hlsl.py mad32 and pixel_aot (#3005): flush denormal inputs to signed zero, round the product on
                 // its own (the legacy form makes 0 * anything 0), add the flushed addend and flush the sum. Plain
