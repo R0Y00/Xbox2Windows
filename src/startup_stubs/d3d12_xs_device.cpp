@@ -4709,6 +4709,11 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
+        static LONG skipped;
+        if (first_calls(skipped, 4)) {
+            log("x2w-render DrawInstanced skipped: pipeline_real=%d targets_bound=%d topology_ok=%d srv_bound=0x%x",
+                pass.pipeline_real ? 1 : 0, pass.targets_bound ? 1 : 0, pass.topology_ok ? 1 : 0, pass.srv_bound);
+        }
     }
 }
 
