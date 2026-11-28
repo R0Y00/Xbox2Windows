@@ -1745,6 +1745,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         initial[next] = {Symbol::Type::table, compute_resource_heap};
         initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
     }
+    // Tagged slot-67 CS state packs group Z into the low 16 bits of word 4
+    // and wave32 into bit 20. Leave untagged synthetic request ABIs alone.
+    const bool packed_state = !stage && direct_dxil && word(request.sa,0)==0x4005cf00 &&
+                               word(request.sa,4)==0x6c090102;
     // The legacy HLSL profile models wave32. Direct DXIL supports both guest wave sizes. A wave64 request whose
     // group has at most 32 threads stays on the wave32 model, as before the wave size was read: its one guest wave
     // has lanes 0..31 only, so EXEC's high word is zero and v_mbcnt_hi adds nothing for its lanes. The model

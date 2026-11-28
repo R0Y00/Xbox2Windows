@@ -254,6 +254,15 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
             wave32};
 }
 
+void x2w::validate_compute_request_shape(const ComputeRequest &r) {
+    check_compute_extents(r.description, r.code.size(), r.data.size(), r.sa.size(), r.sb.size());
+    if (r.root.size() > (16u << 20) || r.code.size() > (1u << 20) ||
+        r.data.size() > (1u << 20) || r.sa.size() > 4096 || r.sb.size() > 4096)
+        throw std::runtime_error("inconsistent compute request");
+    if (r.root.empty() || r.sa.size() != 28 || r.code.empty() || r.data.empty() || r.code.size() % 4)
+        throw std::runtime_error(r.sa.size() != 28 ? "compute state block A is not 28 bytes" : "inconsistent compute request");
+}
+
 std::string x2w::read_shader_container_bytes(const fs::path &file) {
     std::ifstream stream(file, std::ios::binary | std::ios::ate);
     auto length = stream.tellg();
