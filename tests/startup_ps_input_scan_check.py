@@ -143,13 +143,22 @@ SHADERS = {
                           interp(7, 1, 0, True), exp(7, 7, 7, 7)),
     'alias_straight': shader(mov(4, 0), interp(7, 4, 0, False), interp(7, 1, 0, True), exp(7, 7, 7, 7)),
     'unsat_v40': shader(add(6, 40, 40), exp(6, 6, 6, 6)),
+    # Diamond: a forward conditional branch skips the write to v2 and the join reads v2, so on the
+    # taken edge v2 still holds its entry value. v1 is never written.
+    'diamond_skip': shader(br('s_cbranch_scc1', 0, 8), mov_zero(2), add(6, 2, 1), exp(6, 6, 6, 6)),
+    # The same join with v2 written on both incoming edges: v2 is defined on every path.
+    'diamond_both': shader(br('s_cbranch_scc1', 0, 12), mov_zero(2), br('s_branch', 8, 16), mov_zero(2),
+                           add(6, 2, 1), exp(6, 6, 6, 6)),
 }
 
 # The address mask each informative shader needs, and one that satisfies it.
 MASKS = {'packed_only@v1': 0x8100, 'packed_sdwa@v1': 0x8080, 'packed_bfe@v1': 0x8200,
          'packed_alias@v1': 0x8100, 'pair_then_packed@v2': 0x8002, 'two_pairs': 0x0012,
          'no_inputs': 0x0004, 'write_first': 0x0001, 'packed_misfire': 0x8100,
-         'loop_ambiguous': 0x0001, 'unsat_v40': 0x0001}
+         'loop_ambiguous': 0x0001, 'unsat_v40': 0x0001,
+         'diamond_skip': 0x0082, 'diamond_both': 0x0001}
+# A decoy mask that omits v2: two registers, v0 and v1. It is tight for diamond_skip unless v2 is live-in.
+DIAMOND_DECOY = 0x0001
 
 
 def empty_contract():
@@ -164,7 +173,9 @@ def unit_checks():
         'no_inputs': ([], [], []), 'write_first': ([], [], []),
         'cmp_and_exp': ([1, 2, 3, 4], [], []), 'packed_misfire': ([0, 1], [], [0]), 'overwritten': ([1], [], []),
         'loop_ambiguous': ([], [], []), 'loop_definite': ([1], [], []), 'loop_rmw': ([1, 5], [], []),
-        'alias_block': ([0, 1], [], []), 'alias_straight': ([0, 1], [0], []), 'unsat_v40': ([40], [], []),
+        # The branch skips the move into v4, so v4 can reach the interpolation with its entry value.
+        'alias_block': ([0, 1, 4], [], []), 'alias_straight': ([0, 1], [0], []), 'unsat_v40': ([40], [], []),
+        'diamond_skip': ([1, 2], [], []), 'diamond_both': ([1], [], []),
     }
     for name, code in SHADERS.items():
         assert sets(contract_of(code)) == expected[name], (name, sets(contract_of(code)))
@@ -172,6 +183,30 @@ def unit_checks():
     assert all(not contract_of(code).ambiguous for name, code in SHADERS.items() if name != 'loop_ambiguous')
     print('loop rule: loop-carried v5 is ambiguous, not live-in; unwritten and read-modify-write '
           'loop registers stay live-in; no alias across a block boundary')
+    skip = contract_of(SHADERS['diamond_skip'])
+    assert S.consistent(skip, DIAMOND_DECOY) == (False, 'C1 coverage'), S.consistent(skip, DIAMOND_DECOY)
+    assert S.consistent(skip, MASKS['diamond_skip']) == (True, '')
+    assert S.Judge(skip).code(DIAMOND_DECOY) & S.RULE_MASK == 1
+    print('join rule: a write skipped by a forward branch leaves v2 live-in at the join, so the decoy '
+          'mask without v2 fails C1; written on both edges, v2 is not live-in')
+
+    # Two cases from review: the I/J pair inputs and the context-index tags, against literal values.
+    pair_starts = {0, 1, 2, 4, 5, 6}   # PERSP_SAMPLE/CENTER/CENTROID, LINEAR_SAMPLE/CENTER/CENTROID
+    for bit in range(16):
+        pair = S.Contract(frozenset({0}), frozenset({0}), frozenset())
+        expected_ok = bit in pair_starts
+        assert S.consistent(pair, 1 << bit) == (expected_ok, '' if expected_ok else 'C2 pairs'), bit
+        assert (S.Judge(pair).code(1 << bit) & S.RULE_MASK == 0) == expected_ok, bit
+    words = [7, 0x1B3, 0x8100, 0x8102, 0x9]                    # a context run: index, ena, addr
+    assert S.tag_values(words) == {'tag:ctxrun': (0x8100, 0x8102)}, S.tag_values(words)
+    words = [0x1B4, 0x0002, 0x1B3, 0x0003, 0]                  # separate tags, addr before ena
+    assert S.tag_values(words) == {'tag:ctxindex': (0x0003, 0x0002), 'tag:ctxrun': (0x0003, 0)}, \
+        S.tag_values(words)
+    words = [0x286D0, 0x0012, 0xA1B4, 0x0102, 0x286CC, 0x0010, 0xA1B3, 0x0100]
+    assert S.tag_values(words) == {'tag:byteaddr': (0x0010, 0x0012), 'tag:mmindex': (0x0100, 0x0102)}, \
+        S.tag_values(words)
+    print('tables: bit 0, 1, 2, 4, 5 and 6 start an I/J pair and the other ten do not; byte-address, '
+          'context-index, context-run and mm tags read their own enable and address words')
     with mock.patch.object(G, 'decode', side_effect=G.Unsupported('undecodable word at +0x4: fixture')):
         try:
             S.make_record('0', b'', {})
@@ -478,6 +513,24 @@ def end_to_end(tmp):
     print('loop control: a loop-carried register is ambiguous and the planted location stays the unique '
           'full match; an unsatisfiable contract (v40) is excluded and counted')
 
+    # Diamond decoy: header +16/+20 holds the same masks as +8/+12, except that the diamond_skip
+    # shader gets a mask without v2 there. With v2 missed at the join the decoy is tight for that
+    # shader and wins; with v2 live-in it fails C1 there.
+    def diamond_maker(index, name):
+        words = list(struct.unpack('<12I', header_words(index, MASKS[name], MASKS[name])))
+        words[4] = words[5] = DIAMOND_DECOY if name == 'diamond_skip' else MASKS[name]
+        return blob_with_header(w(*words), SHADERS[name])
+    build(tmp / 'l', diamond_maker, names=ORDER + ('diamond_skip', 'diamond_both'))
+    text, data = scan(tmp / 'l', tmp, 'l')
+    assert data['verdict'] == 'unique full match ps.header pair32@8', text
+    top = data['candidates'][0]
+    assert (top['candidate'], top['tight'], top['inconsistent']) == ('pair32@8', 8, 0), top
+    decoy = by_name(data, 'ps.header', 'pair32@16')
+    assert not decoy['full_match'] and (decoy['inconsistent'], decoy['fail_c1']) == (1, 1), decoy
+    assert decoy['example_inconsistent'][1] == 'C1 coverage' and decoy['rank'] > top['rank'], decoy
+    print('diamond decoy: the mask without v2 fails C1 for the branch-skipped write; the planted '
+          'location stays the unique full match with 8 tight')
+
     # Packed lens: two full matches tie on tight; only the real one agrees on every packed split.
     alternatives = {'pair_then_packed@v2': 0x0102, 'packed_only@v1': 0x0300, 'two_pairs': 0x0012,
                     'no_inputs': 0x0004}
@@ -514,7 +567,8 @@ def end_to_end(tmp):
     capture_case(tmp)
 
     determinism(tmp)
-    count = reference_check(tmp / 'a') + reference_check(tmp / 'd') + reference_check(tmp / 'h')
+    count = (reference_check(tmp / 'a') + reference_check(tmp / 'd') + reference_check(tmp / 'h')
+             + reference_check(tmp / 'l'))
     print('reference: %d candidate summaries equal a direct per-candidate evaluation' % count)
 
     # Usage errors exit 2; an empty directory still completes.

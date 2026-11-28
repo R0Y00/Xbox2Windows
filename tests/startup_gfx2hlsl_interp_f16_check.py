@@ -20,7 +20,8 @@ with struct ('e' format) conversions, not from the lowering: the translated text
 interpreter of exactly the statements the fixture produces. Negative controls: the lowering removed (the pair is
 refused), the high bit inverted on both instructions (the evaluated words differ from the reference), and every
 modifier or form the fixture does not cover (refused),
-including every op_sel bit (ACO's v_interp_p2_hi_f16 writes the high half of the destination).
+including every op_sel bit (ACO's v_interp_p2_hi_f16, op_sel 0x8 on p2, is lowered by startup_gfx2hlsl_interp_p2_hi_check.py;
+here it is refused where no plain p2 low half precedes it).
 
 Plain export (follow-up of #2052): real programs pack the binary16 halves into a plain 32-bit export, e.g. with
 v_cvt_pkrtz_f16_f32, and read all four channels. Half h of 32-bit channel c is f16tof32(word_c >> 16 * h) (the low
@@ -119,6 +120,28 @@ PS_VARIANTS = {name: bytes.fromhex(h) for name, h in (
     ('unrelated read of v2', '0203fcbe0203107e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
     ('unrelated write of v9', '0203fcbef202127e040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e0f1800f804050607000081bf'),
 )}
+# Loops: a constant-trip loop (s20 = 2) around the pair and its full-width conversions. The scan holds no state across a
+# branch, so the back edge needs no refusal of its own; the two refused loops carry a p1ll result or an unconverted p2
+# result along the back edge. The back-edge offset is patched into the llvm-mc listing (an unresolved fixup, 0x0a).
+LOOP_HEAD = 's_mov_b32 m0, s2\ns_mov_b32 s20, 2\n'
+LOOP_BACK = 's_sub_u32 s20, s20, 1\ns_cmp_lg_u32 s20, 0\ns_cbranch_scc1 L0\n'
+LOOP_CVT = ''.join('v_cvt_f32_f16 v%d, v%d\n' % (n, n) for n in range(4, 8))
+LOOP_SOURCES = {
+    'loop': LOOP_HEAD + 'L0:\n' + V_BODY.split('v_cvt_f32_f16')[0] + LOOP_CVT + LOOP_BACK + 'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+    'loop p1ll pending across the back edge':
+        LOOP_HEAD + 'v_interp_p1ll_f16 v4, v0, attr0.x\nL0:\nv_interp_p2_f16 v4, v1, attr0.x, v4\nv_cvt_f32_f16 v4, v4\n'
+        'v_interp_p1ll_f16 v4, v0, attr0.x\n' + LOOP_BACK + V_TAIL,
+    'loop p2 result not converted before the back edge':
+        LOOP_HEAD + 'L0:\n' + V_FIRST + LOOP_BACK + 'v_cvt_f32_f16 v4, v4\n' + V_TAIL,
+}
+LOOP_WORDS = {name: bytes.fromhex(h) for name, h in (
+    ('loop', '0203fcbe820394be040042d70000020004005ad700021204050042d70001020005005ad700031604060042d74000020006005ad740021a04'
+             '070042d74001020007005ad740031e040417087e05170a7e06170c7e07170e7e14819480148007bfe9ff85bf0f1800f804050607000081bf'),
+    ('loop p1ll pending across the back edge',
+     '0203fcbe820394be040042d70000020004005ad7000212040417087e040042d70000020014819480148007bff8ff85bf0f1800f804040404000081bf'),
+    ('loop p2 result not converted before the back edge',
+     '0203fcbe820394be040042d70000020004005ad70002120414819480148007bff9ff85bf0417087e0f1800f804040404000081bf'),
+)}
 # Plain-export fixture: the vertex stage packs 8 binary16 values with v_cvt_pkrtz_f16_f32 (inputs are the f32 values
 # below) and exports the four words without compr; PLAIN_PS_LO / PLAIN_PS_HI read half 0 / half 1 of channels x..w.
 PLAIN_VALUES = ((1.5, -2.0), (0.5, 3.0), (4.0, -0.25), (8.0, 0.125))  # (low, high) half of each word
@@ -211,7 +234,7 @@ def evaluate(vs, ps, channels=None, regs=None):
                               for r, sh, zero in args]
     state = {}
     for line in ps.splitlines():
-        stmt = re.fullmatch(r'    (v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.(param0|hparam0_lo|hparam0_hi)\.([xyzw])\);',
+        stmt = re.fullmatch(r' +(v\d+) = \((v\d+) & 0xffff0000u\) \| f32tof16\(i\.(param0|hparam0_lo|hparam0_hi)\.([xyzw])\);',
                             line)
         if stmt:
             assert stmt.group(1) == stmt.group(2), line
@@ -220,7 +243,7 @@ def evaluate(vs, ps, channels=None, regs=None):
             f32 = source['xyzw'.index(stmt.group(4))]
             state[stmt.group(1)] = f16_bits(struct.unpack('<f', struct.pack('<I', f32))[0])
             continue
-        stmt = re.fullmatch(r'    (v\d+) = U\(f16tof32\((v\d+)\)\);', line)
+        stmt = re.fullmatch(r' +(v\d+) = U\(f16tof32\((v\d+)\)\);', line)
         if stmt:
             state[stmt.group(1)] = f16_to_f32_bits(state[stmt.group(2)] & 0xffff)
     return tuple(state['v%d' % n] for n in (4, 5, 6, 7))
@@ -347,6 +370,7 @@ def controls():
     # be refused as "not exported with compr"); plain_controls() covers it.
     assert 'hparam0_lo' in translate(PS_WORDS, F32_VS_WORDS).hlsl_ps()
     barycentric_controls(expected)
+    loop_controls(expected)
     plain_controls(expected)
     print('controls ok')
 
@@ -495,6 +519,28 @@ def barycentric_controls(expected):
     refused('branch skips the full-width conversion', skip_conversion, 'result across a branch')
 
 
+def loop_controls(expected):
+    """A constant-trip loop around the pair translates (the pair is recomputed every iteration, so the exported words
+    are the reference words); a p1ll result or an unconverted p2 result carried along the back edge stays refused."""
+    pipe = translate(LOOP_WORDS['loop'])
+    ps = pipe.hlsl_ps()
+    assert 'pc = (scc) ? 1 : 2;' in ps and ps.count('f32tof16(i.param0.') == 4, ps
+    got = evaluate(pipe.hlsl_vs(), ps)
+    assert got == expected, ('loop translated words', [hex(w) for w in got], [hex(w) for w in expected])
+    print('translated loop: %s' % ','.join('%08x' % w for w in got))
+    refused('loop: p1ll result pending across the back edge', LOOP_WORDS['loop p1ll pending across the back edge'],
+            'a branch between')
+    refused('loop: p2 result not converted before the back edge',
+            LOOP_WORDS['loop p2 result not converted before the back edge'], 'result across a branch')
+    # The high bit inverted on the pair inside the loop reads the other halves: translated, other words.
+    flipped = bytearray(LOOP_WORDS['loop'])
+    for index in range(8):  # the pair starts after two dwords (s_mov m0, s_mov s20)
+        flipped[8 + 8 * index + 4 + 1] ^= 0x01
+    flipped = bytes(flipped)
+    other = evaluate(*(lambda p: (p.hlsl_vs(), p.hlsl_ps()))(translate(flipped)))
+    assert other != expected, 'loop with the high bit inverted evaluated to the reference words'
+
+
 def normalise(words):
     """Clear the unused src2 field of v_interp_p1ll_f16, which newer llvm-mc encodes as 128 and LLVM 15 as 0."""
     out = bytearray(words)
@@ -524,6 +570,14 @@ def check_binary(llvm_mc):
         built = built.replace(bytes.fromhex('0a0a86bf'), bytes.fromhex('020086bf'))
         if built != PS_VARIANTS[name]:
             raise AssertionError('%s variant: assembled %s, recorded %s' % (name, built.hex(), PS_VARIANTS[name].hex()))
+    for name, source in LOOP_SOURCES.items():
+        built = normalise(assemble(llvm_mc, source))
+        # a backward branch is an unresolved fixup too (0x0a): the offset counts dwords from the label to the branch
+        label = len(normalise(assemble(llvm_mc, source.split('L0:')[0]))) // 4
+        branch = built.index(bytes.fromhex('0a0a85bf')) // 4
+        built = built.replace(bytes.fromhex('0a0a85bf'), struct.pack('<HBB', (label - branch - 1) & 0xffff, 0x85, 0xbf))
+        if built != LOOP_WORDS[name]:
+            raise AssertionError('%s: assembled %s, recorded %s' % (name, built.hex(), LOOP_WORDS[name].hex()))
     print('fixture words match llvm-mc')
 
 
@@ -538,6 +592,7 @@ def check_compile(dxc):
         directory = Path(tmp)
         compile_hlsl(dxc, 'dxc', vs, 'vs', 'vs_6_0', directory)
         compile_hlsl(dxc, 'dxc', ps, 'ps', 'ps_6_0', directory)
+        compile_hlsl(dxc, 'dxc', translate(LOOP_WORDS['loop']).hlsl_ps(), 'ps_loop', 'ps_6_0', directory)
     for half in (0, 1):
         vs, ps = plain_pair(half)
         with tempfile.TemporaryDirectory() as tmp:
@@ -566,6 +621,20 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0:
             raise AssertionError('high inverted: control read the reference words')
         print('high inverted: fails as expected', flush=True)
+        # The constant-trip loop around the pair exports the reference words; its high bit inverted does not.
+        loop = translate(LOOP_WORDS['loop'])
+        loop_ps = compile_hlsl(dxc, 'dxc', loop.hlsl_ps(), 'ps_loop', 'ps_6_0', directory)
+        run = draw(renderer, adapter, vs_cso, loop_ps, expected)
+        if run.returncode:
+            raise AssertionError('loop around the pair\n%s\n%s' % (run.stdout, run.stderr))
+        print('loop around the pair: %s' % expected, flush=True)
+        loop_flipped = bytearray(LOOP_WORDS['loop'])
+        for index in range(8):
+            loop_flipped[8 + 8 * index + 4 + 1] ^= 0x01
+        bad_loop = compile_hlsl(dxc, 'dxc', translate(bytes(loop_flipped)).hlsl_ps(), 'ps_loop_high', 'ps_6_0', directory)
+        if draw(renderer, adapter, vs_cso, bad_loop, expected).returncode == 0:
+            raise AssertionError('loop with the high bit inverted read the reference words')
+        print('loop, high inverted: fails as expected', flush=True)
         # The plain export: low and high halves of channels x..w, and the high bit inverted.
         for half in (0, 1):
             expected_plain = ','.join('%08x' % w for w in plain_reference(half))

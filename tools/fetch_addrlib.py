@@ -34,36 +34,42 @@ def require_clean(dest):
         sys.exit(f"{dest} has local changes. Keep them and choose an empty --dest.\n{dirty}")
 
 
-def main():
+def main(argv=None) -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dest", type=pathlib.Path, default=root / "out" / "deps" / "mesa")
-    args = parser.parse_args()
-    dest = args.dest.resolve()
+    args = parser.parse_args(argv)
+    try:
+        dest = args.dest.resolve()
+        if dest.exists() and not dest.is_dir():
+            raise ValueError(f"{dest} is not a directory")
 
-    if (dest / ".git").is_dir():
-        if git_output("remote", "get-url", "origin", cwd=dest) != URL:
-            sys.exit(f"{dest} is not the Mesa dependency checkout. Choose an empty --dest.")
+        if (dest / ".git").is_dir():
+            if git_output("remote", "get-url", "origin", cwd=dest) != URL:
+                sys.exit(f"{dest} is not the Mesa dependency checkout. Choose an empty --dest.")
+            require_clean(dest)
+        else:
+            dest.mkdir(parents=True, exist_ok=True)
+            if sorted(dest.iterdir()):
+                sys.exit(f"{dest} is not empty. Choose an empty --dest.")
+            git("init", "-q", cwd=dest)
+            git("remote", "add", "origin", URL, cwd=dest)
+        git("sparse-checkout", "set", "--cone", SUBDIR, cwd=dest)
+        git("fetch", "--depth", "1", "--filter=blob:none", "origin", COMMIT, cwd=dest)
+        git("checkout", "-q", "--detach", COMMIT, cwd=dest)
         require_clean(dest)
-    else:
-        dest.mkdir(parents=True, exist_ok=True)
-        if any(dest.iterdir()):
-            sys.exit(f"{dest} is not empty. Choose an empty --dest.")
-        git("init", "-q", cwd=dest)
-        git("remote", "add", "origin", URL, cwd=dest)
-    git("sparse-checkout", "set", "--cone", SUBDIR, cwd=dest)
-    git("fetch", "--depth", "1", "--filter=blob:none", "origin", COMMIT, cwd=dest)
-    git("checkout", "-q", "--detach", COMMIT, cwd=dest)
-    require_clean(dest)
-    head = git_output("rev-parse", "HEAD", cwd=dest)
-    if head != COMMIT:
-        sys.exit(f"checked out {head}, expected {COMMIT}")
-    addrlib = dest / SUBDIR
-    if not (addrlib / "inc" / "addrinterface.h").is_file():
-        sys.exit(f"{addrlib} has no inc/addrinterface.h")
+        head = git_output("rev-parse", "HEAD", cwd=dest)
+        if head != COMMIT:
+            sys.exit(f"checked out {head}, expected {COMMIT}")
+        addrlib = dest / SUBDIR
+        if not (addrlib / "inc" / "addrinterface.h").is_file():
+            sys.exit(f"{addrlib} has no inc/addrinterface.h")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        parser.exit(1, f"fetch_addrlib: {exc}\n")
     print(f"addrlib {COMMIT} at {addrlib}")
     print(f"configure with -DXBOX2WINDOWS_ADDRLIB_DIR={addrlib.as_posix()}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

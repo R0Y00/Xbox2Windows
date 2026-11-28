@@ -37,13 +37,14 @@ them: LLVM 15 prints a negative SIMM16 unsigned (s_branch 65535).
   mesh_loop_census.py DIR --llvm-mc LLVM_MC   decode with llvm-mc (the same instruction printer)
 """
 import argparse
+from collections import Counter
+from collections.abc import Sequence
 import hashlib
+from pathlib import Path
 import re
 import struct
 import subprocess
 import sys
-from collections import Counter
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mesh_dynamic_aot  # noqa: E402
@@ -251,24 +252,47 @@ def census(programs):
     return c
 
 
+def _validate_directory(root):
+    path = Path(root)
+    if not path.exists():
+        raise ValueError(f"Input directory does not exist: {root}")
+    if not path.is_dir():
+        raise ValueError(f"Input path is not a directory: {root}")
+    return path
+
+
+def _validate_backend(flag, value):
+    if value is None:
+        return
+    if not value.strip():
+        raise ValueError(f"Expected a non-empty {flag} path")
+    if Path(value).is_dir():
+        raise ValueError(f"{flag} path is an existing directory: {value}")
+
+
 def read_programs(root, population, library):
-    seen = set()
-    for path in sorted(p for p in Path(root).rglob("*") if p.is_file()):
-        blob = path.read_bytes()
-        if blob[:4] != b"DXBC":
-            population["files without a DXBC container"] += 1
-            continue
-        try:
-            decoded, limits = mesh_entry_aot.decode_mesh(blob, library)
-        except (ValueError, KeyError, struct.error) as error:
-            population["containers not decoded: " + normalise(str(error))] += 1
-            continue
-        key = hashlib.sha256(repr((limits, [line for _, line in decoded])).encode()).digest()
-        if key in seen:
-            population["duplicate mesh programs"] += 1
-            continue
-        seen.add(key)
-        yield signed_branches(decoded), limits
+    root_path = _validate_directory(root)
+
+    def _iter_programs():
+        seen = set()
+        for path in sorted(p for p in root_path.rglob("*") if p.is_file()):
+            blob = path.read_bytes()
+            if blob[:4] != b"DXBC":
+                population["files without a DXBC container"] += 1
+                continue
+            try:
+                decoded, limits = mesh_entry_aot.decode_mesh(blob, library)
+            except (ValueError, KeyError, struct.error) as error:
+                population["containers not decoded: " + normalise(str(error))] += 1
+                continue
+            key = hashlib.sha256(repr((limits, [line for _, line in decoded])).encode()).digest()
+            if key in seen:
+                population["duplicate mesh programs"] += 1
+                continue
+            seen.add(key)
+            yield signed_branches(decoded), limits
+
+    return _iter_programs()
 
 
 def table(title, rows, header="Programs"):
@@ -307,20 +331,27 @@ def render(c, population):
     return "\n".join(out[1:]) + "\n"
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("directory", type=Path)
     backend = parser.add_mutually_exclusive_group(required=True)
     backend.add_argument("--llvm", help="LLVM C library with the AMDGPU disassembler")
     backend.add_argument("--llvm-mc", help="llvm-mc with the AMDGPU target")
     args = parser.parse_args(argv)
-    if args.llvm_mc:
-        use_llvm_mc(args.llvm_mc)
-    population = Counter()
-    counters = census(read_programs(args.directory, population, args.llvm or args.llvm_mc))
-    sys.stdout.write(render(counters, population))
+    try:
+        _validate_directory(args.directory)
+        _validate_backend("--llvm", args.llvm)
+        _validate_backend("--llvm-mc", args.llvm_mc)
+        if args.llvm_mc is not None:
+            use_llvm_mc(args.llvm_mc)
+        population = Counter()
+        counters = census(read_programs(args.directory, population, args.llvm or args.llvm_mc))
+        report = render(counters, population)
+    except (OSError, ValueError, struct.error) as error:
+        parser.exit(1, f"mesh_loop_census: {error}\n")
+    sys.stdout.write(report)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

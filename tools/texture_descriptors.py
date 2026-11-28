@@ -229,13 +229,26 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--lookup-key", metavar="KEY",
                       help="Find all descriptor indices for a decimal or 0x-prefixed 64-bit texture key")
     args = parser.parse_args(argv)
+    if args.lookup_key is None and len(args.archives) != 1:
+        parser.error("Multiple archives require --lookup-key")
     archive = args.archives[0]
     try:
         for index in (args.descriptor, args.raw_page_map, args.zlib_segment):
             if index is not None and index < 0:
                 raise ValueError("Descriptor index outside the ETPF table (must be nonnegative)")
+        key: int | None = None
         if args.lookup_key is not None:
             key = int(args.lookup_key, 16 if args.lookup_key.lower().startswith("0x") else 10)
+            if not 0 <= key < 1 << 64:
+                raise ValueError("Texture key must be an unsigned 64-bit integer")
+        for candidate in args.archives:
+            archive = candidate
+            if not candidate.exists():
+                raise FileNotFoundError("Archive file not found")
+            if not candidate.is_file():
+                raise ValueError("Archive path is not a regular file")
+        archive = args.archives[0]
+        if key is not None:
             seen: set[tuple[int, int]] = set()
             matches: list[dict[str, str | int]] = []
             for archive in args.archives:
@@ -250,8 +263,6 @@ def main(argv: list[str] | None = None) -> int:
             json.dump({"matches": matches}, sys.stdout, indent=2)
             print()
         else:
-            if len(args.archives) != 1:
-                parser.error("Multiple archives require --lookup-key")
             with archive.open("rb") as file:
                 if args.descriptor is not None:
                     print(json.dumps(describe_descriptor(file, args.descriptor), indent=2))

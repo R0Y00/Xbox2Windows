@@ -43,11 +43,13 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -325,7 +327,10 @@ def run_once(dxc, hlsl, cso, flags, timeout_s, sample_interval=0.005):
     except subprocess.TimeoutExpired:
         timed_out = True
         proc.kill()
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = b"", b""
     elapsed = time.perf_counter() - start
     stop.set()
     if thread:
@@ -492,19 +497,52 @@ def print_table(records):
             print(f"    passes: {top_passes_text(record['passes'])}")
 
 
-def write_report(path, payload, records):
+def _same_path(left, right):
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_paths(dxc, out_path, work_dir):
+    if out_path is not None:
+        if out_path.exists() and out_path.is_dir():
+            raise ValueError(f"--out path is an existing directory: {out_path}")
+        if _same_path(out_path, dxc):
+            raise ValueError(f"--out path collides with --dxc: {out_path}")
+        if work_dir is not None and _same_path(out_path, work_dir):
+            raise ValueError(f"--out path collides with --work-dir: {out_path}")
+    if work_dir is not None and work_dir.exists() and not work_dir.is_dir():
+        raise ValueError(f"--work-dir path is an existing regular file: {work_dir}")
+
+
+def _atomic_write_stage(path, write_fn):
     path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        write_fn(staged)
+        os.replace(staged, path)
+
+
+def write_report(path, payload, records):
+    path = Path(path)
+    if path.exists() and path.is_dir():
+        raise ValueError(f"--out path is an existing directory: {path}")
     if path.suffix.lower() == ".json":
-        path.write_text(json.dumps({**payload, "variants": records}, indent=1) + "\n",
-                        encoding="utf-8")
+        content = json.dumps({**payload, "variants": records}, indent=1) + "\n"
+        _atomic_write_stage(path, lambda staged: staged.write_text(content, encoding="utf-8"))
     else:
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(csv_row(record) for record in records)
+        rows = [csv_row(record) for record in records]
+
+        def write_csv(staged):
+            with staged.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+
+        _atomic_write_stage(path, write_csv)
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dxc", type=Path,
@@ -547,8 +585,8 @@ def main(argv=None):
         parser.error("--repeat must be at least 1")
     if args.timeout is None:
         parser.error("--timeout is required; pass the local policy value, for example 90")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a finite positive number")
     if args.dxc is None:
         parser.error("--dxc is required unless --list-variants is given")
     if not args.dxc.is_file():
@@ -566,46 +604,51 @@ def main(argv=None):
     except ValueError as exc:
         parser.error(str(exc))
 
-    flags = ["-T", args.target, "-E", args.entry, "-enable-16bit-types", *args.extra_arg]
-    if args.ftime_report:
-        flags.append("-ftime-report")
-    print(f"DXC: {args.dxc}")
-
-    temporary = None
-    if args.work_dir:
-        args.work_dir.mkdir(parents=True, exist_ok=True)
-        work = args.work_dir
-    else:
-        temporary = tempfile.TemporaryDirectory(prefix="dxc-compile-time-")
-        work = Path(temporary.name)
-
-    records = []
     try:
-        for name in names:
-            print(f"{name}:")
-            records.append(measure_variant(name, args.dxc, work, flags, args.repeat,
-                                           args.timeout, args.ftime_report))
-    finally:
-        if temporary:
-            temporary.cleanup()
+        _validate_paths(args.dxc, args.out, args.work_dir)
+        flags = ["-T", args.target, "-E", args.entry, "-enable-16bit-types", *args.extra_arg]
+        if args.ftime_report:
+            flags.append("-ftime-report")
+        print(f"DXC: {args.dxc}")
 
-    print_table(records)
-    payload = {
-        "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "dxc": str(args.dxc),
-        "dxc_version": dxc_version(args.dxc),
-        "target": args.target,
-        "entry": args.entry,
-        "flags": flags,
-        "repeat": args.repeat,
-        "timeout_s": args.timeout,
-        "ftime_report": args.ftime_report,
-    }
-    if args.out:
-        write_report(args.out, payload, records)
-        print(f"\nwrote {args.out}")
-    else:
-        print("\nNo --out given; nothing written. Use --out measurements.csv or .json.")
+        temporary = None
+        if args.work_dir is not None:
+            args.work_dir.mkdir(parents=True, exist_ok=True)
+            work = args.work_dir
+        else:
+            temporary = tempfile.TemporaryDirectory(prefix="dxc-compile-time-")
+            work = Path(temporary.name)
+
+        records = []
+        try:
+            for name in names:
+                print(f"{name}:")
+                records.append(measure_variant(name, args.dxc, work, flags, args.repeat,
+                                               args.timeout, args.ftime_report))
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+
+        print_table(records)
+        payload = {
+            "recorded_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "dxc": str(args.dxc),
+            "dxc_version": dxc_version(args.dxc),
+            "target": args.target,
+            "entry": args.entry,
+            "flags": flags,
+            "repeat": args.repeat,
+            "timeout_s": args.timeout,
+            "ftime_report": args.ftime_report,
+        }
+        if args.out is not None:
+            write_report(args.out, payload, records)
+            print(f"\nwrote {args.out}")
+        else:
+            print("\nNo --out given; nothing written. Use --out measurements.csv or .json.")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"dxc_compile_time: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

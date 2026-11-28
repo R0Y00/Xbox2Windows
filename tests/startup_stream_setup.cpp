@@ -7,11 +7,13 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cstddef>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
 
+#include "adapter_name_filter.h"
 #include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
@@ -34,6 +36,12 @@ struct alignas(8) Layout {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
     D3D12_INPUT_LAYOUT_DESC desc;
 };
+// X2W_TEST_RASTERIZER: a RASTERIZER subobject after the shaders, so a translated draw runs with the cull
+// mode and front-face winding of the console pipeline instead of the default (no culling).
+struct alignas(8) Raster {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_RASTERIZER_DESC desc;
+};
 // X2W_TEST_INPUT_LAYOUT: the stream also declares two per-vertex float3 elements, TEXCOORD in slot 0 and POSITION in
 // slot 1 at D3D12_APPEND_ALIGNED_ELEMENT, in the opposite order of the vertex shader's input signature
 // (startup_stream_fetch_check.py).
@@ -41,9 +49,19 @@ struct LayoutStream {
     Layout layout;
     Stream stream;
 };
+struct RasterLayoutStream {
+    LayoutStream stream;
+    Raster rasterizer;
+};
 static const D3D12_INPUT_ELEMENT_DESC layout_elements[] = {
     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+};
+// X2W_TEST_INPUT_LAYOUT=gradient: 12-byte records whose first dword is a mask and whose XY follows at +4
+// (startup_rect_gap_check.py). Both views name the same records, each with a 12-byte stride.
+static const D3D12_INPUT_ELEMENT_DESC gradient_elements[] = {
+    {"TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 4, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
 };
 
 namespace {
@@ -79,32 +97,20 @@ int pick_stream_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
     if (!hardware) return SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))) ? 0 : 4;
 
-    wchar_t wanted[128]{};
-    const DWORD length = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
-    if (length >= 128) {
-        std::fputs("XBOX2WINDOWS_ADAPTER is longer than 127 characters\n", stderr);
-        return 4;
-    }
+    AdapterNameFilter filter;
+    if (!filter.read()) return 4;
     ComPtr<IDXGIFactory6> factory6;
     if (FAILED(factory.As(&factory6))) return 77;
     for (UINT n = 0;; ++n) {
         ComPtr<IDXGIAdapter1> candidate;
         const HRESULT hr = factory6->EnumAdapterByGpuPreference(
             n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
-        if (hr == DXGI_ERROR_NOT_FOUND) {
-            if (!length) return 77;
-            std::fprintf(stderr, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
-            return 4;
-        }
+        if (hr == DXGI_ERROR_NOT_FOUND) return filter.no_match();
         if (FAILED(hr)) return 4;
         DXGI_ADAPTER_DESC1 desc{};
         if (FAILED(candidate->GetDesc1(&desc))) return 4;
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-        bool matches = length == 0;
-        for (const wchar_t* p = desc.Description; !matches && *p; ++p) {
-            matches = _wcsnicmp(p, wanted, length) == 0;
-        }
-        if (matches && SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0,
+        if (filter.matches(desc.Description) && SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0,
                                                     __uuidof(ID3D12Device), nullptr))) {
             adapter = candidate;
             return 0;
@@ -128,6 +134,15 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
             return 77;
         }
         debug->EnableDebugLayer();
+        // X2W_TEST_GPU_VALIDATION=1: also check the states of resources reached through descriptor tables.
+        ComPtr<ID3D12Debug1> debug1;
+        if (GetEnvironmentVariableW(L"X2W_TEST_GPU_VALIDATION", nullptr, 0)) {
+            if (FAILED(debug.As(&debug1))) {
+                std::printf("no GPU-based validation: skipped\n");
+                return 77;
+            }
+            debug1->SetEnableGPUBasedValidation(TRUE);
+        }
     }
 
     if (const int rc = pick_stream_adapter(hardware, adapter)) return rc;
@@ -141,16 +156,24 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 5;
 
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
+    const bool vertex_srv_pair = GetEnvironmentVariableW(L"X2W_TEST_COPIED_VERTEX_SRV_PAIR", nullptr, 0) != 0;
+    char pixel_uav_mode[32]{};
+    GetEnvironmentVariableA("X2W_TEST_PIXEL_UAV", pixel_uav_mode, sizeof(pixel_uav_mode));
+    const bool raw_pixel = std::strncmp(pixel_uav_mode, "raw-", 4) == 0;
+    if (raw_pixel)
+        std::printf("raw descriptor stride: %llu\n", static_cast<unsigned long long>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
+    const D3D12_DESCRIPTOR_RANGE srv{raw_pixel ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        raw_pixel ? 4u : (joined_table || vertex_srv_pair ? 2u : 1u), 0, 0, 0};
     D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
         D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        table.ShaderVisibility = vertex_srv_pair ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = textured_parameters;
-        if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
+        if (joined_table || GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
             D3D12_ROOT_PARAMETER& constant = textured_parameters[1];
             constant.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             constant.Constants = {0, 0, 1};
@@ -160,11 +183,13 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     }
     // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
     // "wrong_type" declares a shader resource view there instead.
+    // X2W_TEST_ROOT_SRV_DRAW (startup_root_srv_draw.cpp) declares it as a shader resource view as well.
     D3D12_ROOT_PARAMETER root_cbv{};
     char cbv_mode[16]{};
-    if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
-        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
-                                                                          : D3D12_ROOT_PARAMETER_TYPE_CBV;
+    const bool root_srv_draw = GetEnvironmentVariableW(L"X2W_TEST_ROOT_SRV_DRAW", nullptr, 0) != 0;
+    if (!textured && (root_srv_draw || GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode)))) {
+        root_cbv.ParameterType = root_srv_draw || std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                                                                                           : D3D12_ROOT_PARAMETER_TYPE_CBV;
         root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
         root_desc.pParameters = &root_cbv;
@@ -198,13 +223,36 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
                                                             &stream_alternate_root))) return 7;
     }
 
-    LayoutStream with_layout{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, {layout_elements, 2}},
+    wchar_t layout_mode[16] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", layout_mode, 16);
+    const bool empty_layout = std::wcscmp(layout_mode, L"empty") == 0;  // declared layout with zero elements
+    const bool gradient_layout = std::wcscmp(layout_mode, L"gradient") == 0;
+    LayoutStream with_layout{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+                              {gradient_layout ? gradient_elements : layout_elements, empty_layout ? 0u : 2u}},
                              {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
                               {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
     const bool layout = GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", nullptr, 0) != 0;
-    void* first = layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
-    const SIZE_T whole = layout ? sizeof(with_layout) : sizeof(with_layout.stream);
+    // X2W_TEST_RASTERIZER=back|back-ccw|front: cull mode and front-face winding for the translated draw.
+    char rasterizer_mode[16]{};
+    const bool cull = GetEnvironmentVariableA("X2W_TEST_RASTERIZER", rasterizer_mode, sizeof(rasterizer_mode)) != 0;
+    RasterLayoutStream with_rasterizer{};
+    static_assert(offsetof(RasterLayoutStream, rasterizer.desc) == offsetof(RasterLayoutStream, stream) + sizeof(LayoutStream) + 4);
+    if (cull) {
+        std::memcpy(&with_rasterizer.stream, &with_layout, sizeof(with_layout));
+        with_rasterizer.rasterizer.tag = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        D3D12_RASTERIZER_DESC& raster = with_rasterizer.rasterizer.desc;
+        raster.FillMode = D3D12_FILL_MODE_SOLID;
+        raster.CullMode = std::strcmp(rasterizer_mode, "front") == 0 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        raster.FrontCounterClockwise = std::strcmp(rasterizer_mode, "back-ccw") == 0 ? TRUE : FALSE;
+        raster.DepthClipEnable = TRUE;
+    }
+    void* first = cull ? static_cast<void*>(&with_rasterizer)
+                 : layout ? static_cast<void*>(&with_layout)
+                          : static_cast<void*>(&with_layout.stream);
+    const SIZE_T whole = cull ? sizeof(with_rasterizer) - sizeof(Raster) + sizeof(unsigned) + sizeof(D3D12_RASTERIZER_DESC)
+                        : layout ? sizeof(with_layout)
+                                 : sizeof(with_layout.stream);
     auto submit = [&](SIZE_T bytes) {
         D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, first};
         const auto hr = reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso);

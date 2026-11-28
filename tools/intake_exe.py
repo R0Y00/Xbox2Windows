@@ -230,14 +230,45 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("Use --build to select a package")
         args.build = builds[0].parent
     try:
+        if not args.build.exists():
+            raise FileNotFoundError(f"--build directory not found: {args.build}")
+        if not args.build.is_dir():
+            raise NotADirectoryError(f"--build path is not a directory: {args.build}")
+        if args.reports.is_symlink():
+            raise ValueError(f"failed to write report in {args.reports}: report directory must not be a symlink")
+        if args.reports.is_file():
+            raise ValueError(f"failed to write report in {args.reports}: path is a regular file")
+        for parent in args.reports.parents:
+            if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+                raise NotADirectoryError(
+                    f"failed to write report in {args.reports}: parent is not a directory: {parent}"
+                )
         root = args.build.resolve()
         reports = args.reports.resolve()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if reports.is_relative_to(root) or reports.is_relative_to(PROJECT / "game-files"):
         parser.error("Choose a report directory outside game files")
     integrity = args.integrity or PROJECT / "out/integrity" / (root.name + ".json")
+    try:
+        if (
+            args.candidate is not None
+            and (args.candidate.exists() or args.candidate.is_symlink())
+            and not args.candidate.is_file()
+        ):
+            raise ValueError(f"candidate path is not a regular file: {args.candidate}")
+        if args.baseline.is_dir():
+            raise IsADirectoryError(f"--baseline path is a directory: {args.baseline}")
+        if not args.baseline.is_file():
+            raise FileNotFoundError(f"--baseline file not found: {args.baseline}")
+        if integrity.is_dir():
+            raise IsADirectoryError(f"--integrity path is a directory: {integrity}")
+        if not integrity.is_file():
+            raise FileNotFoundError(f"--integrity file not found: {integrity}")
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     report = {"schema": 1, "status": "error"}
     try:
         code = collect(root, args.candidate.resolve() if args.candidate else None,

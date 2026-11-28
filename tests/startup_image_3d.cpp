@@ -26,21 +26,21 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
-// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
-constexpr UINT mip_base = 4;
 constexpr UINT max_levels = 3;
 
 // The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
 // several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
 // alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
-void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, UINT base, float out[4])
 {
     if (levels == 1) {
         const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
         std::memcpy(out, one, sizeof(one));
         return;
     }
-    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    const UINT area = base * base;
+    const float red = float(1 + x + base * y + area * (s + 2 * m)) / float(8 * area);
+    const float many[4] = {red, float(x), float(y), float(s + 2 * m)};
     std::memcpy(out, many, sizeof(many));
 }
 
@@ -64,22 +64,38 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup:
 
 // array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
 // view of a two-slice texture is a Texture2DArray over both. Multi-mip fixtures use a 4x4 base.
-// A nonzero view_levels selects an explicit 2D SRV starting at first_mip. When sampler_line is a
+// A nonzero view_levels selects an explicit 2D or 2D-array SRV starting at first_mip. When sampler_line is a
 // comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional,
-                            bool two_dimensional, UINT first_mip, UINT view_levels)
+                            bool two_dimensional, UINT first_mip, UINT view_levels, UINT mip_base)
 {
-    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional))
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array && !two_dimensional && !one_dimensional))
         throw std::runtime_error("Unsupported image mip level count");
-    if (view_levels && (!two_dimensional || first_mip >= levels || view_levels > levels - first_mip))
+    if (view_levels && ((!two_dimensional && !array) || first_mip >= levels || view_levels > levels - first_mip))
         throw std::runtime_error("2D mip window exceeds the resource");
     const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
-        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    const char* newline = std::strchr(sampler_line, '\n');
+    if (!newline) {
+        if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+            throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    } else {
+        const std::string first(sampler_line, newline);
+        const char* second = newline + 1;
+        int first_index = -1, second_index = -1;
+        if (!two_dimensional || !view_levels || std::strchr(second, '\n') ||
+            (std::sscanf(first.c_str(), "smp %d", &first_index) != 1 &&
+             std::sscanf(first.c_str(), "smpl %d", &first_index) != 1) ||
+            (std::sscanf(second, "smp %d", &second_index) != 1 &&
+             std::sscanf(second, "smpl %d", &second_index) != 1) ||
+            first_index != 0 || second_index != 1 ||
+            !samplers.read_manifest_line(first.c_str()) || !samplers.read_manifest_line(second) ||
+            samplers.statics.size() != 2 || samplers.heap || samplers.comparison[0] || samplers.comparison[1])
+            throw std::runtime_error("Expected two ordered noncomparison inline samplers in the 2D view draw");
+    }
     const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
     const auto root = create_root(device, samplers);
 
@@ -130,7 +146,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
             for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
-                    texel_value(tx, ty, tz, level, levels, texel);
+                    texel_value(tx, ty, tz, level, levels, base, texel);
                     if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
                     const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
@@ -161,10 +177,16 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     if (view_levels) {
         view.Format = td.Format;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.ViewDimension = array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Texture2D.MostDetailedMip = first_mip;
-        view.Texture2D.MipLevels = view_levels;
+        if (array) {
+            view.Texture2DArray.MostDetailedMip = first_mip;
+            view.Texture2DArray.MipLevels = view_levels;
+            view.Texture2DArray.ArraySize = td.DepthOrArraySize;
+        } else {
+            view.Texture2D.MostDetailedMip = first_mip;
+            view.Texture2D.MipLevels = view_levels;
+        }
     }
     device->CreateShaderResourceView(texture.Get(), view_levels ? &view : nullptr, views->GetCPUDescriptorHandleForHeapStart());
     hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
@@ -215,18 +237,23 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
                 z, color[0], color[1], color[2], color[3]);
 }
 
-// Draws an 8x2 R32G32B32A32_UINT target against an 8x2 2D source texture with no static samplers:
+// Draws an 8x2 R32G32B32A32_UINT target against a two-mip (8x2 mip 0, 4x1 mip 1) 2D or two-slice 2D-array
+// source texture with no static samplers:
 //   depth16 == true:  DXGI_FORMAT_R16_UNORM (16-bit depth SRV format) covering zero, binary16 subnormals,
-//                     exact fractions and values where IEEE round-to-nearest-even differs from RTZ;
+//                     exact fractions, double-rounding discriminators (0xffaf, 0xffef) and RNE-vs-RTZ codes;
 //   depth16 == false: DXGI_FORMAT_R32G32B32A32_FLOAT covering four distinct channels per texel, halfway ties
 //                     to even, 1-ULP midpoint neighbours, subnormals, signed zero, overflow and quiet NaNs.
 void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                  bool depth16, std::uint32_t words[64])
+                                  bool depth16, std::uint32_t words[64], bool array)
 {
-    constexpr UINT width = 8, height = 2;
+    constexpr UINT width = 8, height = 2, d16_mips = 2;
     static constexpr std::uint16_t kDepthTexels[width * height] = {
         0x0000, 0x0001, 0x0003, 0x1234, 0x2aad, 0x4008, 0x5555, 0x8000,
         0x8010, 0xa018, 0xc018, 0xe00c, 0xffaf, 0xffef, 0xfffe, 0xffff,
+    };
+    static constexpr std::uint16_t kDepthMip1[2][width / 2] = {
+        {0xffaf, 0xffef, 0x0003, 0x8010},
+        {0xffef, 0xffaf, 0x5555, 0xa018},
     };
     static constexpr std::uint32_t kFloatTexels[width * height][4] = {
         {0x3f801000u, 0x3f803000u, 0x3f801001u, 0x3f7fffffu},
@@ -245,6 +272,12 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
         {0xb4000000u, 0xb4800000u, 0xb5000000u, 0xb5800000u},
         {0x3fc00000u, 0xc0000000u, 0x40200000u, 0xc0400000u},
         {0x477fe000u, 0xc77fe000u, 0x38800000u, 0xb8800000u},
+    };
+    static constexpr std::uint32_t kFloatMip1[width / 2][4] = {
+        {0x3f803000u, 0x387fe000u, 0xbf803000u, 0x477fefffu},
+        {0x33800000u, 0x33000001u, 0x80000000u, 0x7fc00001u},
+        {0x44006000u, 0xc4006000u, 0x39003000u, 0xb9003000u},
+        {0x477ff000u, 0xc77ff000u, 0x3e200000u, 0xbe200000u},
     };
 
     const auto vs = read_blob(vertex_path);
@@ -271,29 +304,46 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
     ComPtr<ID3D12PipelineState> pipeline;
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image_load d16 PSO");
 
+    const UINT slices = array ? 2u : 1u;
+    const UINT subresources = slices * d16_mips;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = width;
     td.Height = height;
-    td.DepthOrArraySize = 1;
-    td.MipLevels = 1;
+    td.DepthOrArraySize = static_cast<UINT16>(slices);
+    td.MipLevels = d16_mips;
     td.Format = depth16 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprint{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_footprints[4]{};
     UINT64 upload_size = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, &src_footprint, nullptr, nullptr, &upload_size);
+    device->GetCopyableFootprints(&td, 0, subresources, 0, src_footprints, nullptr, nullptr, &upload_size);
     const auto upload = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image_load d16 texels");
-    auto* const dst_bytes = static_cast<std::uint8_t*>(mapped) + src_footprint.Offset;
-    const UINT row_bytes = depth16 ? width * sizeof(std::uint16_t) : width * 4 * sizeof(std::uint32_t);
-    for (UINT y = 0; y < height; ++y) {
-        const void* row_src = depth16 ? static_cast<const void*>(&kDepthTexels[y * width])
-                                      : static_cast<const void*>(&kFloatTexels[y * width][0]);
-        std::memcpy(dst_bytes + y * src_footprint.Footprint.RowPitch, row_src, row_bytes);
+    const UINT texel_bytes = depth16 ? sizeof(std::uint16_t) : 4 * sizeof(std::uint32_t);
+    for (UINT s = 0; s < slices; ++s) {
+        for (UINT m = 0; m < d16_mips; ++m) {
+            const UINT sub = m + s * d16_mips;
+            const UINT mw = width >> m, mh = height >> m;
+            auto* const sub_bytes = static_cast<std::uint8_t*>(mapped) + src_footprints[sub].Offset;
+            for (UINT y = 0; y < mh; ++y) {
+                for (UINT x = 0; x < mw; ++x) {
+                    auto* const cell = sub_bytes + y * src_footprints[sub].Footprint.RowPitch + x * texel_bytes;
+                    if (m == 0) {
+                        const UINT idx = s == 0 ? (y * width + x) : (width * height - 1u - (y * width + x));
+                        if (depth16) std::memcpy(cell, &kDepthTexels[idx], texel_bytes);
+                        else std::memcpy(cell, &kFloatTexels[idx][0], texel_bytes);
+                    } else {
+                        const UINT idx = s == 0 ? x : ((width / 2 - 1u) - x);
+                        if (depth16) std::memcpy(cell, &kDepthMip1[s][x], texel_bytes);
+                        else std::memcpy(cell, &kFloatMip1[idx][0], texel_bytes);
+                    }
+                }
+            }
+        }
     }
     upload->Unmap(0, nullptr);
 
@@ -323,11 +373,13 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    to.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    from.PlacedFootprint = src_footprint;
-    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    for (UINT sub = 0; sub < subresources; ++sub) {
+        D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = sub;
+        D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        from.PlacedFootprint = src_footprints[sub];
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[]{views.Get()};

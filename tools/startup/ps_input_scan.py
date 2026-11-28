@@ -122,35 +122,81 @@ def parse_instruction(asm):
     return mnemonic, base, ops, mods, destination if has_destination else None, sources, writes
 
 
+def branch_of(name, asm):
+    """-> (target byte offset or None, falls through, unknown) for one instruction. `unknown` is set
+    for a branch whose target the text does not give and for indirect forms."""
+    base = base_name(name)
+    if base == 's_branch' or base.startswith('s_cbranch'):
+        m = re.search(r'label_0x([0-9a-f]+)', asm)
+        if m is None or 'fork' in base or 'join' in base:
+            return None, base != 's_branch', True
+        return int(m.group(1), 16), base != 's_branch', False
+    if base in UNKNOWN_FLOW:
+        return None, base in ('s_swappc_b64', 's_call_b64'), True
+    return None, not base.startswith('s_endpgm'), False
+
+
 def control_flow(decoded):
-    """-> (branch targets, backward spans (target, source), unknown): offsets from the label text.
-    `unknown` is set for a branch whose target the text does not give and for indirect forms."""
+    """-> (branch targets, backward spans (target, source), unknown): offsets from the label text."""
     targets, spans, unknown = set(), [], False
     for off, _, name, asm in decoded:
-        base = base_name(name)
-        if base == 's_branch' or base.startswith('s_cbranch'):
-            m = re.search(r'label_0x([0-9a-f]+)', asm)
-            if m is None or 'fork' in base or 'join' in base:
-                unknown = True
-            else:
-                target = int(m.group(1), 16)
-                targets.add(target)
-                if target <= off:
-                    spans.append((target, off))
-        elif base in UNKNOWN_FLOW:
-            unknown = True
+        target, _, indirect = branch_of(name, asm)
+        unknown |= indirect
+        if target is not None:
+            targets.add(target)
+            if target <= off:
+                spans.append((target, off))
     return targets, spans, unknown
+
+
+def must_defined(decoded, writes):
+    """-> per instruction, a bit set of the vector registers written on every path from the entry
+    to it (the definitions available on all incoming edges, intersected at each join).
+
+    `writes[i]` lists the spans instruction i writes. A branch with an unknown target may reach any
+    instruction, so its state joins every instruction. An instruction no path reaches keeps every
+    bit set (-1), which leaves the linear rule in charge there."""
+    count = len(decoded)
+    index = {off: i for i, (off, _, _, _) in enumerate(decoded)}
+    gen = [sum(((1 << (last + 1)) - (1 << first)) for first, last in spans) for spans in writes]
+    preds, anywhere = [[] for _ in range(count)], []
+    for i, (_, _, name, asm) in enumerate(decoded):
+        target, falls, indirect = branch_of(name, asm)
+        if indirect:
+            anywhere.append(i)
+        if target in index:
+            preds[index[target]].append(i)
+        if falls and i + 1 < count:
+            preds[i + 1].append(i)
+    state, out = [-1] * count, [-1] * count
+    changed = True
+    while changed:   # the sets only lose bits, so this ends
+        changed = False
+        everywhere = -1
+        for u in anywhere:
+            everywhere &= out[u]
+        for i in range(count):
+            value = 0 if i == 0 else everywhere
+            for p in preds[i]:
+                value &= out[p]
+            if value != state[i]:
+                state[i], out[i], changed = value, value | gen[i], True
+    return state
 
 
 def contract_of_decoded(decoded):
     """Scan decoded instructions, (offset, length, name, asm) as gfx2hlsl.decode returns them.
 
-    A register first read before any write is live-in, unless the read sits inside a loop (a
-    backward branch spans it) and the register is written later in program order: then the value may
-    be loop-carried, the register is `ambiguous` and takes no part in any rule. Evidence taken from
-    a read that is unsafe in that sense is dropped, and aliases do not cross basic blocks."""
+    A register read where it may still hold its entry value is live-in: it is not written earlier in
+    program order, or it is not written on every path to the read (a forward branch can skip the
+    write, so the definitions of the incoming edges are intersected at each join). The exception is
+    a read inside a loop (a backward branch spans it) of a register written later in program order:
+    then the value may be loop-carried, the register is `ambiguous` and takes no part in any rule.
+    Evidence taken from a read that is unsafe in that sense is dropped, and aliases do not cross
+    basic blocks."""
     parsed = [(off,) + parse_instruction(asm) for off, _, _, asm in decoded]
     targets, spans, unknown = control_flow(decoded)
+    defined = must_defined(decoded, [item[-1] for item in parsed])
     last_write = {}
     for item in parsed:
         for first, last in item[-1]:
@@ -169,12 +215,13 @@ def contract_of_decoded(decoded):
         span = operand_vregs(token)
         return span[0] if span and span[0] == span[1] else None
 
-    for off, mnemonic, base, ops, mods, destination, sources, writes in parsed:
+    for position, (off, mnemonic, base, ops, mods, destination, sources, writes) in enumerate(parsed):
         if off in targets:
             holds.clear()
         if not ops:
             continue
         in_loop = unknown or any(t <= off <= s for t, s in spans)
+        everywhere = defined[position]
 
         def unsafe(register):
             later = last_write.get(register)
@@ -184,7 +231,7 @@ def contract_of_decoded(decoded):
             span = operand_vregs(token)
             if span:
                 for register in range(span[0], span[1] + 1):
-                    if register not in written:
+                    if register not in written or not everywhere >> register & 1:
                         (ambiguous if unsafe(register) else live_in).add(register)
 
         fields = {}

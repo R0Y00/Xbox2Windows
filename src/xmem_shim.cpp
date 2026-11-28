@@ -15,6 +15,7 @@
 #include "era_title_gpu.h"
 #include "xmem_gpu_usage.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/profile_zone.h"
 
 #include <unordered_set>
 
@@ -83,17 +84,19 @@ bool local_free(void* block)
 extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
 {
     void* allocation = era_heap::allocate(bytes, attributes);
-    if (!allocation && bytes && x2w_local::env_on("X2W_XMEM_PERMISSIVE")) return local_alloc(bytes, attributes);
     // Desktop policy: graphics memory types count as GPU-intended for XMemVirtualQuery.
-    if (allocation && is_graphics(attributes) && !era_title_gpu::track(allocation, bytes)) {
+    if (!allocation && bytes && x2w_local::env_on("X2W_XMEM_PERMISSIVE")) allocation = local_alloc(bytes, attributes);
+    else if (allocation && is_graphics(attributes) && !era_title_gpu::track(allocation, bytes)) {
         era_heap::release_with_attributes(allocation, attributes);
         return nullptr;
     }
+    if (allocation) X2W_ALLOC(allocation, bytes, "XMemAlloc");
     return allocation;
 }
 
 extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
 {
+    if (allocation) X2W_FREE(allocation, "XMemAlloc");
     if (allocation && local_free(allocation)) return;
     if (allocation && is_graphics(attributes)) {
         era_title_gpu::untrack(allocation);
@@ -101,9 +104,28 @@ extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
     era_heap::release_with_attributes(allocation, attributes);
 }
 
+extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context);
+
+// The answer for a page of a shared-view run is taken outside a run break (x2w_xmem_stable_call): inside one the
+// page would read as reserved. era_query writes a local buffer, and on success its tail_offset + 1 bytes (the MBI and
+// the tail byte, all that era_query writes) go to the caller's after the call: on stable_call's mutex path the
+// lazy-commit handler passes faults on, so an uncommitted mapped slot is not written there. The caller's buffer is
+// not read, and nothing is written to it on failure.
 extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)
 {
-    return era_query::query(process, address, buffer, query_buffer_bytes) != 0;
+    struct Query {
+        HANDLE process;
+        LPCVOID address;
+        unsigned char* buffer;
+        unsigned char copy[query_buffer_bytes];
+        std::size_t result;
+    } query{process, address, static_cast<unsigned char*>(buffer), {}, 0};
+    x2w_xmem_stable_call([](void* context) {
+        auto& q = *static_cast<Query*>(context);
+        q.result = era_query::query(q.process, q.address, q.buffer ? q.copy : nullptr, query_buffer_bytes);
+    }, &query);
+    if (query.buffer && query.result) std::memcpy(query.buffer, query.copy, era_query::tail_offset + 1);
+    return query.result != 0;
 }
 
 // Desktop policy (docs/experiments.md): writes only +8, with this process's GPU memory in bytes;
