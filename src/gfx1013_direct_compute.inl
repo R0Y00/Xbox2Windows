@@ -1354,16 +1354,67 @@ struct DirectCompute {
                 << ":\n";
         const auto address = read(256 + op.address);
         for (unsigned j = 0; j < op.count; ++j) {
-            auto index = ir.binary("lshr", ir.binary("add", address, to_string(op.byte_offset(j))), "2");
+            const auto byte_address = ir.binary("add", address, to_string(op.byte_offset(j)));
+            // Skip odd effective halfword addresses because guest behavior is unverified.
+            if (op.read_bits == 16) {
+                const auto aligned = ir.value("icmp eq i32 " + ir.binary("and", byte_address, "1") + ", 0");
+                ir.body << "  br i1 " << aligned << ", label %dsReadAligned" << label << ", label %dsDone"
+                        << label << "\ndsReadAligned" << label << ":\n";
+            }
+            if (op.store_bits == 16) {
+                const auto aligned = ir.value("icmp eq i32 " + ir.binary("and", byte_address, "1") + ", 0");
+                ir.body << "  br i1 " << aligned << ", label %dsAligned" << label << ", label %dsDone" << label
+                        << "\ndsAligned" << label << ":\n";
+            }
+            auto index = ir.binary("lshr", byte_address, "2");
             auto ptr = shared_address("lds", words, index);
-            if (op.read)
-                write(256 + op.destination + j, ir.value("load i32, i32 addrspace(3)* " + ptr + ", align 4"));
-            else {
+            if (op.read) {
+                const auto dst = 256 + op.destination + j;
+                auto value = ir.value("load i32, i32 addrspace(3)* " + ptr + ", align 4");
+                if (op.read_bits) {
+                    const auto shift = ir.binary("shl", ir.binary("and", byte_address, "3"), "3");
+                    value = ir.binary("lshr", value, shift);
+                    const auto mask = (1u << op.read_bits) - 1;
+                    if (op.read_signed) {
+                        const auto extend = to_string(32 - op.read_bits);
+                        value = ir.binary("ashr", ir.binary("shl", value, extend), extend);
+                    } else {
+                        value = ir.binary("and", value, to_string(mask));
+                    }
+                    if (op.read_d16) {
+                        const auto bit = op.read_destination_shift;
+                        if (bit)
+                            value = ir.binary("shl", value, to_string(bit));
+                        const auto preserved = ir.binary("and", read(dst), to_string(~(mask << bit)));
+                        value = ir.binary("or", preserved, value);
+                    }
+                }
+                write(dst, value);
+            } else {
                 auto data = read(256 + op.data_register(j));
                 if (op.compare_exchange) {
                     auto result = ir.value("cmpxchg i32 addrspace(3)* " + ptr + ", i32 " + data + ", i32 " +
                                            read(256 + op.data1) + " monotonic monotonic");
                     write(256 + op.destination, ir.value("extractvalue { i32, i1 } " + result + ", 0"));
+                } else if (op.store_bits) {
+                    const auto mask = to_string((1u << op.store_bits) - 1);
+                    const auto shift = ir.binary("shl", ir.binary("and", byte_address, "3"), "3");
+                    const auto clear = ir.binary("xor", ir.binary("shl", mask, shift), "-1");
+                    const auto insert = ir.binary("shl", ir.binary("and", data, mask), shift);
+                    const auto initial = ir.value("load i32, i32 addrspace(3)* " + ptr + ", align 4");
+                    const auto from = (op.store_bits == 16 ? "dsAligned" : "ds") + label;
+                    const auto retry = "dsRetry" + label;
+                    const auto observed = "%dsObserved" + label;
+                    ir.body << "  br label %" << retry << "\n" << retry << ":\n";
+                    const auto old = ir.value("phi i32 [ " + initial + ", %" + from + " ], [ " +
+                                              observed + ", %" + retry + " ]");
+                    const auto replacement = ir.binary("or", ir.binary("and", old, clear), insert);
+                    const auto exchanged = ir.value("cmpxchg i32 addrspace(3)* " + ptr + ", i32 " + old +
+                                                    ", i32 " + replacement + " monotonic monotonic");
+                    ir.body << "  " << observed << " = extractvalue { i32, i1 } " << exchanged << ", 0\n";
+                    const auto success = ir.value("icmp eq i32 " + observed + ", " + old);
+                    ir.body << "  br i1 " << success << ", label %dsDone" << label << ", label %" << retry
+                            << "\n";
                 } else if (op.atomic_ir) {
                     if (op.subtract)
                         data = ir.binary("sub", "0", data);
@@ -1375,7 +1426,9 @@ struct DirectCompute {
                     ir.body << "  store i32 " << data << ", i32 addrspace(3)* " << ptr << ", align 4\n";
             }
         }
-        ir.body << "  br label %dsDone" << label << "\ndsDone" << label << ":\n";
+        if (!op.store_bits)
+            ir.body << "  br label %dsDone" << label << "\n";
+        ir.body << "dsDone" << label << ":\n";
     }
     string shift(const string &op, const string &a, const string &b) {
         return ir.binary(op, a, ir.binary("and", b, "31"));

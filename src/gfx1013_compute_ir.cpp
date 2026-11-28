@@ -28,10 +28,23 @@ LocalDataAccess decode_local_data(uint32_t instruction, uint32_t operands) {
     case 0x2d: access.atomic_ir = "xchg"; access.atomic_hlsl = "Exchange"; break;
     case 0x30: access.compare_exchange = true; break;
     case 0x36: access.read = true; break; // read_b32
+    case 0x39: case 0x3a: case 0x3b: case 0x3c: // i8, u8, i16, u16
+        access.read = true;
+        access.read_bits = op <= 0x3a ? 8 : 16;
+        access.read_signed = (op & 1) != 0;
+        break;
+    case 0xa6: case 0xa7: // u16_d16, u16_d16_hi
+        access.read = true;
+        access.read_bits = 16;
+        access.read_d16 = true;
+        access.read_destination_shift = op == 0xa7 ? 16 : 0;
+        break;
     case 0x76: access.read = true; access.count = 2; break;
     case 0xfe: access.read = true; access.count = 3; break;
     case 0xff: access.read = true; access.count = 4; break;
     case 0x0d: break; // write_b32
+    case 0x1e: access.store_bits = 8; break;
+    case 0x1f: access.store_bits = 16; break;
     case 0x4d: access.count = 2; break;
     case 0xde: access.count = 3; break;
     case 0xdf: access.count = 4; break;
@@ -58,6 +71,50 @@ static std::string lower_lds(uint32_t instruction, uint32_t operands) {
     const auto access = decode_local_data(instruction, operands);
     // Preserve the input address when a read writes back to the address VGPR.
     std::string out = "if (exec & 1u) { uint ds_addr = v" + std::to_string(access.address) + "; ";
+    if (access.store_bits) {
+        const auto mask = std::to_string((1u << access.store_bits) - 1) + "u";
+        out += "ds_addr += " + std::to_string(access.offset) + "u; ";
+        // Skip odd effective halfword addresses because guest behavior is unverified.
+        if (access.store_bits == 16)
+            out += "if ((ds_addr & 1u) == 0u) { ";
+        out += "uint shift = (ds_addr & 3u) << 3u; "
+               "uint clear_mask = ~(" + mask + " << shift); "
+               "uint insert_bits = (v" + std::to_string(access.data0) + " & " + mask + ") << shift; "
+               "uint word_index = ds_addr >> 2u; "
+               "uint observed = lds[word_index]; uint old_word; "
+               "[allow_uav_condition] do { "
+               "old_word = observed; "
+               "uint replacement = (old_word & clear_mask) | insert_bits; "
+               "InterlockedCompareExchange(lds[word_index], old_word, replacement, observed); "
+               "} while (observed != old_word); ";
+        if (access.store_bits == 16)
+            out += "} ";
+        return out + "}";
+    }
+    if (access.read_bits) {
+        out += "ds_addr += " + std::to_string(access.offset) + "u; ";
+        // Match the store policy for odd effective halfword addresses.
+        if (access.read_bits == 16)
+            out += "if ((ds_addr & 1u) == 0u) { ";
+        out += "uint field = lds[ds_addr >> 2u] >> ((ds_addr & 3u) << 3u); ";
+        const auto mask = (1u << access.read_bits) - 1;
+        const auto shift = std::to_string(32 - access.read_bits) + "u";
+        const auto dst = "v" + std::to_string(access.destination);
+        if (access.read_signed)
+            out += "field = asuint(asint(field << " + shift + ") >> " + shift + "); ";
+        else
+            out += "field &= " + std::to_string(mask) + "u; ";
+        if (access.read_d16) {
+            const auto bit = access.read_destination_shift;
+            out += dst + " = (" + dst + " & " + std::to_string(~(mask << bit)) +
+                   "u) | (field << " + std::to_string(bit) + "u); ";
+        } else {
+            out += dst + " = field; ";
+        }
+        if (access.read_bits == 16)
+            out += "} ";
+        return out + "}";
+    }
     for (unsigned i = 0; i < access.count; ++i) {
         auto location = "lds[(ds_addr + " + std::to_string(access.byte_offset(i)) + "u) >> 2]";
         auto reg = "v" + std::to_string(access.read ? access.destination + i : access.data_register(i));

@@ -9,6 +9,9 @@ struct LocalDataAccess {
     bool read, stride64, return_old;
     const char *atomic_ir, *atomic_hlsl;
     bool subtract, compare_exchange;
+    unsigned store_bits;
+    unsigned read_bits, read_destination_shift;
+    bool read_signed, read_d16;
     unsigned byte_offset(unsigned element) const {
         if (!pair_words) return offset + 4 * element;
         unsigned encoded = (offset >> (8 * (element / pair_words))) & 255;
