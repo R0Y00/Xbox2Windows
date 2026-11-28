@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as datetime_module
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -347,10 +348,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_report_path(option: str, raw_path: Path) -> Path:
+    path = raw_path.expanduser()
+    if path.is_symlink():
+        raise MatrixError(f"{option} path must not be a symlink: {path}")
+    if path.is_dir():
+        raise MatrixError(f"{option} path is a directory: {path}")
+    if path.exists() and not path.is_file():
+        raise MatrixError(f"{option} path is not a regular file: {path}")
+    for parent in path.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise MatrixError(f"{option} parent is not a directory: {parent}")
+    return path
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _validate_report_paths(output_arg: Path | None, json_arg: Path | None) -> None:
+    output_path = _validate_report_path("--output", output_arg) if output_arg is not None else None
+    json_path = _validate_report_path("--json", json_arg) if json_arg is not None else None
+    if output_path is not None and json_path is not None and _same_path(output_path, json_path):
+        raise MatrixError("--output and --json must not refer to the same path")
+
+
 def _write(path: Path, content: str) -> None:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,12 +408,16 @@ def main(argv: list[str] | None = None) -> int:
     if not selection.strip():
         parser.error("the filter must not be empty")
 
-    build_dir = args.build_dir.expanduser().resolve()
-    if not build_dir.is_dir():
-        parser.error(f"build directory does not exist: {build_dir}")
     try:
+        raw_build_dir = args.build_dir.expanduser()
+        if raw_build_dir.is_symlink():
+            parser.error(f"build directory must not be a symlink: {raw_build_dir}")
+        build_dir = raw_build_dir.resolve()
+        if not build_dir.is_dir():
+            parser.error(f"build directory does not exist: {build_dir}")
         ctest = _ctest_command(args.ctest)
-    except MatrixError as error:
+        _validate_report_paths(args.output, args.json)
+    except (MatrixError, OSError, ValueError) as error:
         parser.error(str(error))
 
     try:
@@ -404,13 +452,19 @@ def main(argv: list[str] | None = None) -> int:
         "summary": summary,
     }
 
-    if args.output:
-        _write(args.output, markdown)
+    try:
+        if args.output is not None:
+            _write(args.output, markdown)
+        if args.json is not None:
+            _write(args.json, json.dumps(payload, indent=2) + "\n")
+    except OSError as error:
+        print(f"ui_regression_matrix: error: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    if args.output is not None:
         print(f"ui_regression_matrix: wrote {args.output}")
     else:
         print(markdown)
-    if args.json:
-        _write(args.json, json.dumps(payload, indent=2) + "\n")
+    if args.json is not None:
         print(f"ui_regression_matrix: wrote {args.json}")
     print(
         "ui_regression_matrix: "
