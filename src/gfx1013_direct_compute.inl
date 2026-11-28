@@ -737,6 +737,21 @@ struct DirectCompute {
     string select_float(const string &condition, const string &yes, const string &no) {
         return ir.value("select i1 " + condition + ", float " + yes + ", float " + no);
     }
+    // Reduce an angle in turns before converting to radians, preserving signed
+    // zero and exact quarter-turn zeros (0.5 for sin; 0.25 and 0.75 for cos).
+    string trig_turns(bool cosine, const string &a) {
+        auto unary_f32 = [&](unsigned op, const string &v) {
+            return ir.invoke("float", "unary.f32", op, {{"float", v}}, "nounwind readnone");
+        };
+        auto part = ir.value("fsub float " + a + ", " + unary_f32(26, a));
+        part = select_float(ir.value("fcmp oeq float " + a + ", 0.0"), a, part);
+        auto radians = ir.value("fmul float " + part + ", 0x401921FB60000000");
+        auto mag_part = unary_f32(6, part);
+        auto exact = ir.value("fcmp oeq float " + mag_part + (cosine ? ", 0.25" : ", 0.5"));
+        if (cosine)
+            exact = ir.value("or i1 " + exact + ", " + ir.value("fcmp oeq float " + mag_part + ", 0.75"));
+        return select_float(exact, "0.0", unary_f32(cosine ? 12 : 13, radians));
+    }
     // Invert the cube projection. Each pair of faces has a common major
     // axis, with the negative face second. The two minor axes span [-1,1].
     std::array<string, 3> cube_axes(const string &face, const string &u, const string &v, bool tangent) {
@@ -1899,9 +1914,12 @@ struct DirectCompute {
             const auto source = half_bits(0);
             auto a = widen(source);
             const bool rsq = n == "v_rsq_f16", exp = n == "v_exp_f16";
+            const bool trig = n == "v_sin_f16" || n == "v_cos_f16";
             string widened;
             if (n == "v_rcp_f16") {
                 widened = ir.value("fdiv float 1.000000e+00, " + a);
+            } else if (trig) {
+                widened = trig_turns(n == "v_cos_f16", a);
             } else if (binary16_unary(n)) {
                 const unsigned opcode = rsq ? 25 : exp ? 21 : 24;
                 widened = ir.invoke("float", "unary.f32", opcode, {{"float", a}}, "nounwind readnone");
@@ -1932,6 +1950,12 @@ struct DirectCompute {
                 rounded = select(cmp("eq", source, to_string(0xce40)), "0", rounded);
                 const auto magnitude = ir.binary("and", source, "32767");
                 rounded = select(cmp("ugt", magnitude, "31744"), "32256", rounded);
+            } else if (trig) {
+                const auto magnitude = ir.binary("and", source, "32767");
+                // Map +/-Inf and NaN to canonical quiet NaN; preserve -0.0 on v_sin_f16.
+                rounded = select(cmp("uge", magnitude, "31744"), "32256", rounded);
+                if (n == "v_sin_f16")
+                    rounded = select(cmp("eq", source, "32768"), "32768", rounded);
             }
             // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest says
             // "On gfx10, all 16-bit instructions preserve the high bits", as v_cvt_f16_f32 above already does.
@@ -2154,14 +2178,7 @@ struct DirectCompute {
                                      ir.value("fcmp oeq float " + b + ", 0.0"));
                 result = select_float(zero, "0.0", ir.value("fmul float " + a + ", " + b));
             } else if (n == "v_sin_f32" || n == "v_cos_f32") {
-                // Victory trig_turns: reduce in turns before converting to
-                // radians, preserving signed zero and exact quarter-turn zeros.
-                auto part = ir.value("fsub float " + a + ", " + unary(26, a));
-                part = select_float(ir.value("fcmp oeq float " + a + ", 0.0"), a, part);
-                const bool cosine = n == "v_cos_f32";
-                auto radians = ir.value("fmul float " + part + ", 0x401921FB60000000");
-                auto exact = ir.value("fcmp oeq float " + unary(6, part) + (cosine ? ", 0.25" : ", 0.5"));
-                result = select_float(exact, "0.0", unary(cosine ? 12 : 13, radians));
+                result = trig_turns(n == "v_cos_f32", a);
             } else if (cube)
                 result = cube_alu(n, a, fp(1), fp(2));
             else if (n == "v_add_f32" || n == "v_sub_f32" || n == "v_subrev_f32" || n == "v_mul_f32") {
