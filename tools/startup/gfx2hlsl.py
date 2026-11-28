@@ -10260,6 +10260,37 @@ class Stage:
     def op_v_dot8_u32_u4(self, ops, mods):
         return self.dot8_int('v_dot8_u32_u4', False, ops, mods)
 
+    def dot2_int(self, name, signed, ops, mods):
+        """VOP3P 2-halfword integer dot product with 32-bit accumulate and optional saturating clamp."""
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        if any(m != 'clamp' for m in mods):
+            raise Unsupported('%s with unsupported modifiers %s' % (name, mods))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        args = []
+        for tok in ops[1:4]:
+            if (tok.startswith('|') or tok.endswith('|') or tok.startswith(('abs(', 'neg('))
+                    or (tok.startswith('-') and not re.fullmatch(r'-\d+', tok))):
+                raise Unsupported('%s source modifier %s' % (name, tok))
+            sr = reg_range(tok)
+            if sr and (sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105)):
+                raise Unsupported('%s source %s' % (name, tok))
+            args.append(self.u(tok))
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None and isinstance(getattr(pipe, 'uses_dot2', None), set):
+            pipe.uses_dot2.add(name)
+        helper = 'dot2_i32_i16' if signed else 'dot2_u32_u16'
+        sat = 'true' if 'clamp' in mods else 'false'
+        self.set_v(dst[1], '%s(%s, %s, %s, %s)' % (helper, args[0], args[1], args[2], sat))
+
+    def op_v_dot2_i32_i16(self, ops, mods):
+        return self.dot2_int('v_dot2_i32_i16', True, ops, mods)
+
+    def op_v_dot2_u32_u16(self, ops, mods):
+        return self.dot2_int('v_dot2_u32_u16', False, ops, mods)
+
     def i64_words(self, tok, signed=False, literal=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
         32-bit hex literal when `literal` is set (zero-extended, sign-extended when the operation is signed)."""
@@ -11852,6 +11883,7 @@ class Pipeline:
     uses_cube_dir = False
     uses_gather_2d_lod = False
     uses_store_d16_x = False
+    uses_dot2 = ()
     uses_sad = ()
     uses_dot8 = ()
     uses_lerp_u8 = False
@@ -11898,6 +11930,7 @@ class Pipeline:
         self.uses_cube_dir = False
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
+        self.uses_dot2 = set()
         self.uses_sad = set()
         self.uses_dot8 = set()
         self.uses_lerp_u8 = False
@@ -12339,6 +12372,28 @@ class Pipeline:
                 '    }',
                 '}',
             ))
+        if 'v_dot2_u32_u16' in self.uses_dot2:
+            # RDNA 2 ISA V_DOT2_U32_U16: two unsigned 16-bit products + S2, exact uint32 clamp.
+            out.append(
+                'uint dot2_u32_u16(uint a, uint b, uint c, bool sat) {'
+                ' uint p0 = (a & 0xffffu) * (b & 0xffffu);'
+                ' uint p1 = (a >> 16u) * (b >> 16u);'
+                ' uint r0 = c + p0; uint carry = (r0 < c) ? 1u : 0u;'
+                ' uint r1 = r0 + p1; carry += (r1 < r0) ? 1u : 0u;'
+                ' return (sat && carry != 0u) ? 0xffffffffu : r1; }')
+        if 'v_dot2_i32_i16' in self.uses_dot2:
+            # RDNA 2 ISA V_DOT2_I32_I16: two signed 16-bit products + int(S2), exact int32 clamp via 64-bit acc.
+            out.append(
+                'uint dot2_i32_i16(uint a, uint b, uint c, bool sat) {'
+                ' int p0 = (asint((a & 0xffffu) << 16u) >> 16) * (asint((b & 0xffffu) << 16u) >> 16);'
+                ' int p1 = (asint(a) >> 16) * (asint(b) >> 16);'
+                ' uint lo = c; int hi = (asint(c) < 0) ? -1 : 0;'
+                ' uint t0 = lo + asuint(p0); hi += ((p0 < 0) ? -1 : 0) + ((t0 < lo) ? 1 : 0); lo = t0;'
+                ' uint t1 = lo + asuint(p1); hi += ((p1 < 0) ? -1 : 0) + ((t1 < lo) ? 1 : 0); lo = t1;'
+                ' if (sat) {'
+                ' if (hi > 0 || (hi == 0 && (lo & 0x80000000u) != 0u)) return 0x7fffffffu;'
+                ' if (hi < -1 || (hi == -1 && (lo & 0x80000000u) == 0u)) return 0x80000000u; }'
+                ' return lo; }')
         if self.uses_bitreplicate:
             # RDNA 2 ISA S_BITREPLICATE_B64_B32: replicate each of the low 16 bits twice into 32 bits.
             out.append(
@@ -12643,6 +12698,7 @@ class ComputePipeline(Pipeline):
         self.resheap_count = 0
         self.uses_gather_2d_lod = False
         self.uses_store_d16_x = False
+        self.uses_dot2 = set()
         self.uses_bvh = False
         self.uses_sad = set()
         self.uses_dot8 = set()
